@@ -93,6 +93,7 @@ import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
+import { mirrorPreparedTurn } from '../services/rca-shadow-mirror.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -1865,6 +1866,16 @@ export function sendWorkerInput(
       ? { vcMeetingImTurnOrigin }
       : {}),
   } as DaemonToWorker);
+  if (turnId) {
+    mirrorPreparedTurn({
+      larkAppId: ds.larkAppId,
+      sessionId: ds.session.sessionId,
+      turnId,
+      topicId: sessionAnchorId(ds),
+      title: ds.currentTurnTitle ?? ds.session.title,
+      preparedInput: normalized,
+    });
+  }
   return true;
 }
 
@@ -2165,6 +2176,16 @@ export function forkWorker(
     skillPolicy: botCfg.skills,
   };
   worker.send(initMsg);
+  if (initAttributionTurnId) {
+    mirrorPreparedTurn({
+      larkAppId: ds.larkAppId,
+      sessionId: ds.session.sessionId,
+      turnId: initAttributionTurnId,
+      topicId: sessionAnchorId(ds),
+      title: ds.currentTurnTitle ?? ds.session.title,
+      preparedInput: promptPayload,
+    });
+  }
   ds.initConfig = initMsg;
 
   // Stamp cliId on the persisted session so the dashboard can show a CLI badge
