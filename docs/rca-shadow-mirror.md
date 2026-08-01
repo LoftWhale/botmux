@@ -8,7 +8,7 @@ Configure the Botmux daemon process environment:
 
 ```bash
 BOTMUX_RCA_MIRROR_URL=http://10.37.125.55:7310
-BOTMUX_RCA_MIRROR_TOKEN=<same value as Search RCA RCA_API_TOKEN>
+BOTMUX_RCA_MIRROR_TOKEN_FILE=/home/zhubowen.cc/.botmux/rca-mirror-token
 BOTMUX_RCA_MIRROR_BOT_APP_IDS=<RCA bot app id>
 BOTMUX_RCA_MIRROR_TIMEOUT_MS=500
 BOTMUX_RCA_MIRROR_MAX_IN_FLIGHT=2
@@ -22,6 +22,8 @@ BOTMUX_RCA_SHADOW_POLL_TIMEOUT_MS=900000
 ordinary Botmux agents out of the experiment. Botmux session, Lark turn, and
 topic identifiers are HMACed before they become correlation fields in the
 Search RCA API. No response from Search RCA is used by the current Coco path.
+`BOTMUX_RCA_MIRROR_TOKEN` remains available for ephemeral environments, but a
+mode-600 token file avoids persisting the secret in daemon configuration.
 
 After Search RCA accepts the first turn, Botmux polls only the public Event ID.
 When the candidate completes or fails, the RCA bot posts one top-level card to

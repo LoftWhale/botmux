@@ -37,6 +37,16 @@ describe('RCA shadow mirror', () => {
     expect(mirror.submit(turn())).toBe('disabled');
   });
 
+  it('can load the mirror token from a protected file', () => {
+    const parsed = rcaShadowMirrorConfigFromEnv({
+      BOTMUX_RCA_MIRROR_TOKEN_FILE: new URL(
+        './fixtures/rca-mirror-token.txt',
+        import.meta.url,
+      ).pathname,
+    });
+    expect(parsed.token).toBe('file-secret');
+  });
+
   it('sends opaque correlation fields and the exact prepared input', async () => {
     const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
     const mirror = new RcaShadowMirror(config(), { fetchImpl: fetchMock as any });
