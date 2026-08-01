@@ -2,9 +2,21 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   buildRcaShadowCard,
   RcaShadowNotifier,
+  rcaShadowNotifierConfigFromEnv,
 } from '../src/services/rca-shadow-notifier.js';
 
 describe('RCA shadow topic notifier', () => {
+  it('loads the shared mirror token from the protected token file', () => {
+    const parsed = rcaShadowNotifierConfigFromEnv({
+      BOTMUX_RCA_MIRROR_TOKEN_FILE: new URL(
+        './fixtures/rca-mirror-token.txt',
+        import.meta.url,
+      ).pathname,
+    });
+
+    expect(parsed.token).toBe('file-secret');
+  });
+
   it('builds one concise A/B card without inventing a Champion conclusion', () => {
     const card = buildRcaShadowCard({
       event: { id: 'event-1', title: 'panic' },

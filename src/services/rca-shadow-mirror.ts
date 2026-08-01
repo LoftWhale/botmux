@@ -1,8 +1,10 @@
 import { createHmac } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import type { CliTurnPayload } from '../types.js';
 import { logger } from '../utils/logger.js';
-import { notifyRcaCandidateAccepted } from './rca-shadow-notifier.js';
+import {
+  notifyRcaCandidateAccepted,
+  rcaShadowTokenFromEnv,
+} from './rca-shadow-notifier.js';
 
 export interface RcaShadowMirrorConfig {
   url: string;
@@ -35,24 +37,12 @@ function nonNegativeInteger(value: string | undefined, fallback: number): number
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
-function mirrorToken(env: NodeJS.ProcessEnv): string {
-  const direct = env.BOTMUX_RCA_MIRROR_TOKEN?.trim();
-  if (direct) return direct;
-  const file = env.BOTMUX_RCA_MIRROR_TOKEN_FILE?.trim();
-  if (!file) return '';
-  try {
-    return readFileSync(file, 'utf8').trim();
-  } catch {
-    return '';
-  }
-}
-
 export function rcaShadowMirrorConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): RcaShadowMirrorConfig {
   return {
     url: env.BOTMUX_RCA_MIRROR_URL?.trim() || '',
-    token: mirrorToken(env),
+    token: rcaShadowTokenFromEnv(env),
     botAppIds: (env.BOTMUX_RCA_MIRROR_BOT_APP_IDS || '')
       .split(',')
       .map((value) => value.trim())

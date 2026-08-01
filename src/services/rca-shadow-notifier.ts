@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { sendMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 
@@ -37,12 +38,24 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+export function rcaShadowTokenFromEnv(env: NodeJS.ProcessEnv): string {
+  const direct = env.BOTMUX_RCA_MIRROR_TOKEN?.trim();
+  if (direct) return direct;
+  const file = env.BOTMUX_RCA_MIRROR_TOKEN_FILE?.trim();
+  if (!file) return '';
+  try {
+    return readFileSync(file, 'utf8').trim();
+  } catch {
+    return '';
+  }
+}
+
 export function rcaShadowNotifierConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): RcaShadowNotifierConfig {
   return {
     rcaUrl: env.BOTMUX_RCA_MIRROR_URL?.trim() || '',
-    token: env.BOTMUX_RCA_MIRROR_TOKEN?.trim() || '',
+    token: rcaShadowTokenFromEnv(env),
     chatId: env.BOTMUX_RCA_SHADOW_CHAT_ID?.trim() || '',
     pollIntervalMs: positiveInteger(env.BOTMUX_RCA_SHADOW_POLL_INTERVAL_MS, 1_000),
     pollTimeoutMs: positiveInteger(env.BOTMUX_RCA_SHADOW_POLL_TIMEOUT_MS, 15 * 60_000),
