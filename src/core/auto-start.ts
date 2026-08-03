@@ -21,6 +21,12 @@ export interface AutoStartPrefs {
   autoStartOnNewTopic: boolean;
 }
 
+/** Stable source-only attribution for the synthetic first turn created by a
+ * bot-added event. The mirror HMACs it before crossing the machine boundary. */
+export function groupJoinSyntheticTurnId(chatId: string): string {
+  return `auto-group-join:${chatId}`;
+}
+
 /**
  * 场景②: should a non-@mention message auto-start a session?
  *

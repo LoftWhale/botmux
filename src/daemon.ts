@@ -29,7 +29,7 @@ import {
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
-import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
+import { groupJoinSyntheticTurnId, resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigs,
   registerBot,
@@ -14896,6 +14896,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       hasHistory: false,
       pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptBody,
+      pendingTurnId: groupJoinSyntheticTurnId(chatId),
       pendingCodexAppText: botCfg.cliId === 'codex-app' ? codexAppText : undefined,
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
@@ -14928,7 +14929,8 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       const prompt = await buildPrompt();
       await noteTurnReceived(ds, anchor, promptBody);
       rememberLastCliInput(ds, promptBody, prompt);
-      forkWorker(ds, prompt);
+      forkWorker(ds, prompt, { turnId: groupJoinSyntheticTurnId(chatId) });
+      ds.pendingTurnId = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
       return;
     }
@@ -14949,7 +14951,8 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       const prompt = await buildPrompt();
       await noteTurnReceived(ds, anchor, promptBody);
       rememberLastCliInput(ds, promptBody, prompt);
-      forkWorker(ds, prompt);
+      forkWorker(ds, prompt, { turnId: groupJoinSyntheticTurnId(chatId) });
+      ds.pendingTurnId = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录且无可选项目，直接开工`);
     }
   } finally {

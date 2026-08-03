@@ -2,10 +2,18 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   chatHasAllowedUser,
+  groupJoinSyntheticTurnId,
   resolveGroupJoinPrompt,
   shouldAutoStartOnNewTopic,
   waitForAllowedUserInChat,
 } from '../src/core/auto-start.js';
+
+describe('groupJoinSyntheticTurnId', () => {
+  it('is stable per chat and distinct across chats', () => {
+    expect(groupJoinSyntheticTurnId('oc_alarm')).toBe(groupJoinSyntheticTurnId('oc_alarm'));
+    expect(groupJoinSyntheticTurnId('oc_alarm')).not.toBe(groupJoinSyntheticTurnId('oc_other'));
+  });
+});
 
 describe('shouldAutoStartOnNewTopic (场景②)', () => {
   const base = {

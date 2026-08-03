@@ -258,6 +258,39 @@ beforeEach(() => {
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 describe('repo select card — plain switch', () => {
+  it('keeps the synthetic auto-group first turn through deferred repo selection', async () => {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: '请根据群内报警开始排查',
+      pendingTurnId: 'auto-group-join:oc_alarm',
+      worker: null,
+    });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledWith(
+      ds,
+      { content: 'mock-prompt' },
+      { turnId: 'auto-group-join:oc_alarm' },
+    );
+  });
+
+  it('does not attribute a synthetic turn when deferred prompt construction emits no model input', async () => {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: '',
+      pendingTurnId: 'auto-group-join:oc_alarm',
+      worker: null,
+    });
+    vi.mocked(buildNewTopicCliInput).mockReturnValueOnce({ content: '' });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledWith(ds, { content: '' });
+  });
+
   it('pendingRepo selection forks the CLI with the buffered prompt', async () => {
     const ds = makeDs({
       pendingRepo: true,

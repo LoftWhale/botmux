@@ -483,7 +483,7 @@ export async function commitRepoSelection(
         if (pendingRawInput) {
           // pendingRawTurnId is applied at the literal PTY write boundary.
           forkWorker(ds, '', false);
-        } else if (pendingTurnId && hasBufferedInput) {
+        } else if (pendingTurnId && wrappedInput.content.trim().length > 0) {
           forkWorker(ds, prompt, { turnId: pendingTurnId });
         } else {
           forkWorker(ds, prompt);
