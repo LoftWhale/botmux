@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import {
   captureRcaSourceSnapshot,
+  deliverRcaChampionResult,
   RcaShadowMirror,
   rcaShadowMirrorConfigFromEnv,
   SOURCE_SNAPSHOT_CAPTURE_TIMEOUT_MS,
@@ -721,6 +722,47 @@ describe('RCA shadow mirror', () => {
     expect(cold.indexOf('mirrorPreparedTurn({')).toBeGreaterThan(cold.indexOf('worker.send(initMsg)'));
     expect(live).toContain("turnKind: 'follow_up'");
     expect(cold).toContain("turnKind: resume ? 'follow_up' : 'first_turn'");
+  });
+
+  it('posts the online runtime final answer through the same opaque turn identity', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ accepted: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    await deliverRcaChampionResult({
+      larkAppId: 'app_rca',
+      sessionId: 'botmux-private-session',
+      turnId: 'lark-private-message',
+      result: 'online production conclusion',
+      runtime: { cliId: 'coco', model: 'online-model' },
+    }, config(), fetchMock as any);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe('http://rca.internal:7310/api/mirrors/champions');
+    const body = JSON.parse(String(init.body));
+    expect(body.result).toBe('online production conclusion');
+    expect(body.runtime).toEqual({ cliId: 'coco', model: 'online-model' });
+    expect(body.correlationKey).toMatch(/^[a-f0-9]{64}$/);
+    expect(body.turnKey).toMatch(/^[a-f0-9]{64}$/);
+    expect(JSON.stringify(body)).not.toContain('botmux-private-session');
+    expect(JSON.stringify(body)).not.toContain('lark-private-message');
+  });
+
+  it('captures final_output for Champion diff before forwarding it to the original alarm group', () => {
+    const source = readFileSync(
+      new URL('../src/core/worker-pool.ts', import.meta.url),
+      'utf8',
+    );
+    const finalOutput = source.slice(
+      source.indexOf("case 'final_output':"),
+      source.indexOf("case 'adopt_preamble':"),
+    );
+    expect(finalOutput).toContain('mirrorChampionResult({');
+    expect(finalOutput.indexOf('mirrorChampionResult({')).toBeLessThan(
+      finalOutput.indexOf('deliverFinalOutput(ds, msg, t, 0)'),
+    );
   });
 
   it('attributes both auto group-join spawn paths to a stable synthetic first turn', () => {

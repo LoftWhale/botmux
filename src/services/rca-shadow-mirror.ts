@@ -35,6 +35,18 @@ export interface RcaShadowTurn {
   sourceSnapshot?: RcaSourceSnapshot;
 }
 
+export interface RcaChampionResult {
+  larkAppId: string;
+  sessionId: string;
+  turnId: string;
+  result: string;
+  runtime?: {
+    cliId?: string;
+    model?: string;
+    backendType?: string;
+  };
+}
+
 export interface RcaSourceSnapshotMessage {
   referenceKey: string;
   relation: 'current' | 'quoted' | 'recent';
@@ -113,6 +125,46 @@ function opaqueKey(token: string, namespace: string, value: string): string {
   return createHmac('sha256', token)
     .update(`${namespace}\0${value}`)
     .digest('hex');
+}
+
+export async function deliverRcaChampionResult(
+  input: RcaChampionResult,
+  config: RcaShadowMirrorConfig = rcaShadowMirrorConfigFromEnv(),
+  fetchImpl: FetchLike = fetch,
+): Promise<'sent' | 'disabled'> {
+  if (!config.url || !config.token || !config.botAppIds.includes(input.larkAppId)) {
+    return 'disabled';
+  }
+  const result = input.result.trim();
+  if (!result) return 'disabled';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
+  timeout.unref();
+  try {
+    const response = await fetchImpl(
+      `${config.url.replace(/\/+$/, '')}/api/mirrors/champions`,
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${config.token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          correlationKey: opaqueKey(config.token, 'session', input.sessionId),
+          turnKey: opaqueKey(config.token, 'turn', input.turnId),
+          result,
+          ...(input.runtime ? { runtime: input.runtime } : {}),
+        }),
+        signal: controller.signal,
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`RCA Server returned HTTP ${response.status}`);
+    }
+    return 'sent';
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function signalSource(content: string): string {
@@ -543,4 +595,16 @@ export function mirrorPreparedTurn(turn: RcaShadowTurn): void {
       `[rca-shadow] mirror submission ignored: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+}
+
+/** Capture the result produced by the currently deployed RCA runtime without
+ * delaying or changing its original Lark delivery. The RCA Server joins it to
+ * the already mirrored input through the same opaque session/turn identity. */
+export function mirrorChampionResult(input: RcaChampionResult): void {
+  const mirrorReady = defaultMirror?.onIdle() ?? Promise.resolve();
+  void mirrorReady.then(() => deliverRcaChampionResult(input)).catch((error) => {
+    logger.warn(
+      `[rca-shadow] Champion callback ignored: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
 }

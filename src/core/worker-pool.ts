@@ -93,7 +93,7 @@ import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
-import { mirrorPreparedTurn } from '../services/rca-shadow-mirror.js';
+import { mirrorChampionResult, mirrorPreparedTurn } from '../services/rca-shadow-mirror.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -3322,6 +3322,17 @@ function setupWorkerHandlers(
           logger.debug(`[${t}] final_output deduped (key ${dedupeKey.substring(0, 48)})`);
           break;
         }
+        mirrorChampionResult({
+          larkAppId: ds.larkAppId,
+          sessionId: ds.session.sessionId,
+          turnId: msg.turnId,
+          result: msg.content,
+          runtime: {
+            cliId: ds.session.cliId,
+            model: ds.initConfig?.model,
+            backendType: ds.session.backendType,
+          },
+        });
         // Worker pops the turn off its queue right after emit, so it will
         // NOT re-send this payload on its own. Daemon owns retry on
         // transient Lark failures.
