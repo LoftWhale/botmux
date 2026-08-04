@@ -25,11 +25,14 @@ Search RCA API. No response from Search RCA is used by the current Coco path.
 `BOTMUX_RCA_MIRROR_TOKEN` remains available for ephemeral environments, but a
 mode-600 token file avoids persisting the secret in daemon configuration.
 
-After the online Agent produces an accepted `final_output`, Botmux also posts
-that current-version conclusion to `/api/mirrors/champions` with the same
-HMAC-derived session and turn keys. The callback is fire-and-forget and runs
-independently of the normal Lark delivery. Search RCA uses this result as the
-pre-cutover Champion; it must not substitute one of its own earlier runs.
+After the online Agent successfully delivers a primary `botmux send`, Botmux
+posts that user-visible body to `/api/mirrors/champions` with the same
+HMAC-derived session and turn keys. An accepted `final_output` is retained as a
+fallback for paths that do not explicitly send. Both callbacks are
+fire-and-forget; the first result for one turn is immutable. Search RCA
+persists an early callback until the matching mirrored turn arrives and uses
+that result as the pre-cutover Champion. It must not substitute one of its own
+earlier runs.
 
 After Search RCA accepts the first turn, Botmux polls only the public Event ID.
 When the candidate completes or fails, the RCA bot posts one top-level card to

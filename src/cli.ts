@@ -130,6 +130,7 @@ import {
   whiteboardPath,
 } from './services/whiteboard-store.js';
 import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
+import { mirrorChampionResult } from './services/rca-shadow-mirror.js';
 import { bindRestartLeaseTo, writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 import { repairMissingChatScope, stripLegacyPendingCardFields } from './services/session-store.js';
 import {
@@ -6916,6 +6917,17 @@ async function cmdSend(rest: string[]): Promise<void> {
       });
       messageId = await dispatchPrimary(cardJson, 'interactive');
     }
+
+    // The Champion is the body that the current RCA bot actually delivered to
+    // users for this turn. Capture it only after Lark accepts the primary
+    // message; later final_output callbacks are an idempotent fallback.
+    mirrorChampionResult({
+      larkAppId: appId,
+      sessionId: sid,
+      turnId: liveMarkerCtx?.turnId ?? currentTurnId,
+      result: text,
+      runtime: { cliId: s.cliId },
+    });
 
     // Bridge fallback marker — append-only jsonl per session. Same-thread
     // sends can suppress transcript fallback when their content appears to

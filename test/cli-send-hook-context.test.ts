@@ -24,6 +24,18 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toMatch(/replyMessage\(\s*appId,\s*sendTarget\.rootMessageId,\s*content,\s*msgType,\s*sendTarget\.mode === 'thread',\s*uuid,\s*hookContext,/);
   });
 
+  it('captures the successfully delivered botmux send body as the online RCA Champion', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+
+    expect(cmdSend).toContain('mirrorChampionResult({');
+    expect(cmdSend).toContain('turnId: liveMarkerCtx?.turnId ?? currentTurnId');
+    expect(cmdSend).toContain('result: text');
+    expect(cmdSend.indexOf('mirrorChampionResult({'))
+      .toBeGreaterThan(cmdSend.indexOf("messageId = await dispatchPrimary(cardJson, 'interactive')"));
+  });
+
   it('resolves mention-back from the explicit VC turn instead of the latest queued sender', () => {
     expect(cliSource).toContain(
       'const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId',
