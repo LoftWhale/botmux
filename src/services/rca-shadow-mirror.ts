@@ -2,7 +2,11 @@ import { createHmac } from 'node:crypto';
 import type { CliTurnPayload } from '../types.js';
 import type { getBotOpenId } from '../bot-registry.js';
 import type { getMessageDetail, listChatMessages } from '../im/lark/client.js';
-import { parseApiMessage, resolveMergedCardContent } from '../im/lark/message-parser.js';
+import {
+  cardContentHasUpgradeFallback,
+  parseApiMessage,
+  resolveMergedCardContent,
+} from '../im/lark/message-parser.js';
 import { logger } from '../utils/logger.js';
 import {
   notifyRcaCandidateAccepted,
@@ -74,7 +78,7 @@ async function loadDefaultCaptureDeps(): Promise<SnapshotCaptureDeps> {
 const SOURCE_SNAPSHOT_MAX_MESSAGES = 8;
 const SOURCE_SNAPSHOT_MAX_CHARS = 12_000;
 const SOURCE_SNAPSHOT_RECENT_MESSAGES = 8;
-export const SOURCE_SNAPSHOT_CAPTURE_TIMEOUT_MS = 2_000;
+export const SOURCE_SNAPSHOT_CAPTURE_TIMEOUT_MS = 5_000;
 
 type FetchLike = typeof fetch;
 type LogLike = Pick<typeof logger, 'info' | 'warn'>;
@@ -123,6 +127,95 @@ function normalizedInput(input: string | CliTurnPayload): CliTurnPayload {
   return typeof input === 'string' ? { content: input } : input;
 }
 
+const RAW_LARK_IDENTIFIER = /\b(?:oc|om|ou|on)_[A-Za-z0-9_-]{16,}\b/g;
+
+function sanitizeTransportText(value: string): string {
+  return value
+    .replace(
+      /<attachments\b[^>]*>[\s\S]*?<\/attachments>/gi,
+      '[attachments omitted: source-local paths unavailable]',
+    )
+    .replace(/<session_id>[\s\S]*?<\/session_id>/gi, '')
+    .replace(/<botmux_routing>[\s\S]*?<\/botmux_routing>/gi, '')
+    .replace(/<botmux_reminder>[\s\S]*?<\/botmux_reminder>/gi, '')
+    .replace(/<botmux_builtin_skills>[\s\S]*?<\/botmux_builtin_skills>/gi, '')
+    .replace(
+      /\bbotmux\s+(?:history|quoted|send|bots)\b(?:\s+(?:(?:oc|om|ou|on)_[A-Za-z0-9_-]+|list|--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s,，。；;]+)?|\d+)){0,3}/gi,
+      '[transport-command-removed]',
+    )
+    .replace(RAW_LARK_IDENTIFIER, '[redacted-reference]')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function sanitizedInput(input: string | CliTurnPayload): CliTurnPayload {
+  const content = sanitizeTransportText(normalizedInput(input).content);
+  return { content: content || '[transport metadata removed]' };
+}
+
+function stableKeplerIdentifiers(
+  content: string,
+  name: 'submonitorId' | 'eventId',
+): Set<string> {
+  const values = new Set<string>();
+  const pattern = new RegExp(
+    `["']?${name}["']?\\s*(?:=|:)\\s*["']?([A-Za-z0-9._:-]{1,256})`,
+    'gi',
+  );
+  for (const match of content.matchAll(pattern)) {
+    if (match[1]) values.add(match[1]);
+  }
+  return values;
+}
+
+function keplerIncidentKey(token: string, candidates: string[]): string | null {
+  if (!candidates.some(content => content.toLowerCase().includes('kepler'))) return null;
+  const completePairs = new Set<string>();
+  for (const content of candidates) {
+    const submonitorIds = stableKeplerIdentifiers(content, 'submonitorId');
+    const eventIds = stableKeplerIdentifiers(content, 'eventId');
+    if (submonitorIds.size > 1 || eventIds.size > 1) return null;
+    if (submonitorIds.size === 1 && eventIds.size === 1) {
+      completePairs.add(`${[...submonitorIds][0]}\0${[...eventIds][0]}`);
+    }
+  }
+  if (completePairs.size !== 1) return null;
+  return opaqueKey(token, 'kepler-incident', [...completePairs][0]!);
+}
+
+function sanitizedSourceSnapshot(snapshot: RcaSourceSnapshot): RcaSourceSnapshot {
+  return {
+    schemaVersion: sanitizeTransportText(snapshot.schemaVersion) as RcaSourceSnapshot['schemaVersion'],
+    capturedAt: sanitizeTransportText(snapshot.capturedAt),
+    captureStatus: sanitizeTransportText(snapshot.captureStatus) as RcaSourceSnapshot['captureStatus'],
+    warnings: snapshot.warnings.map(sanitizeTransportText),
+    timeline: snapshot.timeline.map(item => ({
+      referenceKey: sanitizeTransportText(item.referenceKey),
+      relation: sanitizeTransportText(item.relation) as RcaSourceSnapshotMessage['relation'],
+      senderRole: sanitizeTransportText(item.senderRole) as RcaSourceSnapshotMessage['senderRole'],
+      ...(item.senderName ? { senderName: sanitizeTransportText(item.senderName) } : {}),
+      messageType: sanitizeTransportText(item.messageType),
+      content: sanitizeTransportText(item.content),
+      ...(item.at ? { at: sanitizeTransportText(item.at) } : {}),
+    })),
+  };
+}
+
+function incidentCandidates(
+  preparedInput: CliTurnPayload,
+  sourceSnapshot: RcaSourceSnapshot,
+): string[] {
+  const byRelation = (relation: RcaSourceSnapshotMessage['relation']) => sourceSnapshot.timeline
+    .filter(item => item.relation === relation)
+    .map(item => item.content);
+  return [
+    ...byRelation('current'),
+    preparedInput.content,
+    ...byRelation('quoted'),
+    ...byRelation('recent'),
+  ];
+}
+
 function failedSourceSnapshot(
   warning = 'source_snapshot_capture_failed',
   now: Date = new Date(),
@@ -154,19 +247,30 @@ function senderRole(message: any, selfBotOpenId: string | undefined): RcaSourceS
 }
 
 function redactLarkIdentifiers(content: string): string {
-  return content.replace(/\b(?:oc|om|ou|on)_[A-Za-z0-9_-]+\b/g, '[redacted-reference]');
+  return content.replace(RAW_LARK_IDENTIFIER, '[redacted-reference]');
 }
 
 async function snapshotContent(
   turn: RcaShadowTurn,
   message: any,
   deps: SnapshotCaptureDeps,
+  allowRemoteResolution: boolean,
 ): Promise<string> {
+  const parsed = parseApiMessage(message).content;
+  const hasCompleteLocalBody = message?.msg_type !== 'interactive'
+    || Boolean(
+      parsed
+      && parsed !== '[卡片]'
+      && parsed !== '[卡片 (模板)]'
+      && parsed.includes('\n')
+      && !cardContentHasUpgradeFallback(parsed),
+    );
+  if (hasCompleteLocalBody || !allowRemoteResolution) return parsed;
   if (message?.msg_type === 'interactive' && typeof message?.message_id === 'string') {
     const merged = await deps.resolveMergedCardContent(turn.larkAppId, message.message_id).catch(() => null);
     if (merged?.text) return merged.text;
   }
-  return parseApiMessage(message).content;
+  return parsed;
 }
 
 /** Capture bounded Lark context on the source daemon. Raw Lark identifiers are
@@ -194,7 +298,12 @@ export async function captureRcaSourceSnapshot(
     }
     const role = senderRole(message, selfBotOpenId);
     if (relation === 'recent' && role === 'self_bot') return;
-    let content = redactLarkIdentifiers(await snapshotContent(turn, message, deps).catch(() => ''));
+    let content = redactLarkIdentifiers(await snapshotContent(
+      turn,
+      message,
+      deps,
+      relation !== 'recent',
+    ).catch(() => ''));
     if (!content) return;
     if (content.length > remainingChars) {
       content = content.slice(0, remainingChars);
@@ -213,12 +322,24 @@ export async function captureRcaSourceSnapshot(
     });
   };
 
+  const currentRequest = deps.getMessageDetail(turn.larkAppId, turn.turnId)
+    .then(detail => ({ detail, failed: false as const }))
+    .catch(() => ({ detail: null, failed: true as const }));
+  const recentRequest = deps.listChatMessages(
+    turn.larkAppId,
+    turn.chatId,
+    SOURCE_SNAPSHOT_RECENT_MESSAGES,
+  )
+    .then(recent => ({ recent, failed: false as const }))
+    .catch(() => ({ recent: [] as Awaited<ReturnType<typeof deps.listChatMessages>>, failed: true as const }));
+
   let current: any | null = null;
-  try {
-    current = rawMessageItem(await deps.getMessageDetail(turn.larkAppId, turn.turnId));
+  const currentResult = await currentRequest;
+  if (!currentResult.failed) {
+    current = rawMessageItem(currentResult.detail);
     if (current) await append(current, 'current');
     else warnings.push('current_message_unavailable');
-  } catch {
+  } else {
     warnings.push('current_message_unavailable');
   }
 
@@ -233,15 +354,11 @@ export async function captureRcaSourceSnapshot(
     }
   }
 
-  try {
-    const recent = await deps.listChatMessages(
-      turn.larkAppId,
-      turn.chatId,
-      SOURCE_SNAPSHOT_RECENT_MESSAGES,
-    );
-    for (const message of recent) await append(message, 'recent');
-  } catch {
+  const recentResult = await recentRequest;
+  if (recentResult.failed) {
     warnings.push('recent_messages_unavailable');
+  } else {
+    for (const message of recentResult.recent) await append(message, 'recent');
   }
 
   const finalWarnings = truncated ? [...warnings, 'source_snapshot_truncated'] : warnings;
@@ -350,8 +467,18 @@ export class RcaShadowMirror {
   }
 
   private async deliver(turn: RcaShadowTurn): Promise<void> {
-    const preparedInput = normalizedInput(turn.preparedInput);
-    const sourceSnapshot = turn.sourceSnapshot ?? await this.captureSourceSnapshot(turn);
+    const preparedInput = sanitizedInput(turn.preparedInput);
+    const sourceSnapshot = sanitizedSourceSnapshot(
+      turn.sourceSnapshot ?? await this.captureSourceSnapshot(turn),
+    );
+    const incidentContent = [
+      preparedInput.content,
+      ...sourceSnapshot.timeline.map(item => item.content),
+    ].join('\n');
+    const incidentKey = keplerIncidentKey(
+      this.config.token,
+      incidentCandidates(preparedInput, sourceSnapshot),
+    );
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     timeout.unref();
@@ -370,11 +497,9 @@ export class RcaShadowMirror {
             turnKind: turn.turnKind,
             preparedInput,
             sourceSnapshot,
-            signalSource: signalSource([
-              preparedInput.content,
-              ...sourceSnapshot.timeline.map(item => item.content),
-            ].join('\n')),
-            title: turn.title?.trim() || 'Botmux RCA mirror',
+            signalSource: signalSource(incidentContent),
+            ...(incidentKey ? { incidentKey } : {}),
+            title: sanitizeTransportText(turn.title ?? '') || 'Botmux RCA mirror',
             symptom: preparedInput.content.slice(0, 2_000),
             championReference: {
               delivery: 'original_alarm_group',

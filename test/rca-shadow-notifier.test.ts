@@ -17,6 +17,14 @@ describe('RCA shadow topic notifier', () => {
     expect(parsed.token).toBe('file-secret');
   });
 
+  it('loads the persisted shadow topic chat id from the environment', () => {
+    const parsed = rcaShadowNotifierConfigFromEnv({
+      BOTMUX_RCA_SHADOW_CHAT_ID: '  oc_persisted_shadow_topic  ',
+    });
+
+    expect(parsed.chatId).toBe('oc_persisted_shadow_topic');
+  });
+
   it('builds one concise A/B card without inventing a Champion conclusion', () => {
     const card = buildRcaShadowCard({
       event: { id: 'event-1', title: 'panic' },
@@ -30,6 +38,38 @@ describe('RCA shadow topic notifier', () => {
     expect(text).toContain('当前版结论保留在原报警话题');
     expect(text).toContain('候选结论与证据');
     expect(text).toContain('http://rca/events/event-1');
+  });
+
+  it.each([
+    ['resolved', 'green', '新版候选已完成'],
+    ['insufficient_context', 'orange', '信息不足 / 需继续排查'],
+    ['indeterminate', 'grey', '结论状态未确认'],
+    [undefined, 'grey', '结论状态未确认'],
+    ['runtime_failed', 'red', '运行失败'],
+    ['failed', 'red', '运行失败'],
+  ])('renders outcome %s with its own status and color', (outcome, template, statusText) => {
+    const card = buildRcaShadowCard({
+      event: { id: 'event-outcome', title: 'panic' },
+      run: {
+        status: 'completed',
+        ...(outcome ? { outcome } : {}),
+        firstTurn: { response: '候选结论正文必须保留' },
+      },
+    }, 'http://rca/events/event-outcome');
+
+    expect((card.header as { template: string }).template).toBe(template);
+    expect(JSON.stringify(card)).toContain(statusText);
+    expect(JSON.stringify(card)).toContain('候选结论正文必须保留');
+  });
+
+  it('keeps legacy failed run status red even without an outcome', () => {
+    const card = buildRcaShadowCard({
+      run: { status: 'failed', error: 'runtime exploded' },
+    }, 'http://rca/events/event-failed');
+
+    expect((card.header as { template: string }).template).toBe('red');
+    expect(JSON.stringify(card)).toContain('运行失败');
+    expect(JSON.stringify(card)).toContain('runtime exploded');
   });
 
   it('polls a public Event id and sends exactly one top-level topic card', async () => {

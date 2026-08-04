@@ -6,6 +6,7 @@ interface CandidateDetail {
   event?: { id?: string; title?: string };
   run?: {
     status?: string;
+    outcome?: 'resolved' | 'insufficient_context' | 'indeterminate' | 'runtime_failed' | 'failed' | string;
     firstTurn?: { response?: string } | null;
     error?: string | null;
   };
@@ -67,17 +68,33 @@ function truncate(value: string, limit: number): string {
   return points.length <= limit ? value : `${points.slice(0, limit).join('')}…`;
 }
 
+function candidateStatus(run: CandidateDetail['run']): {
+  template: 'green' | 'orange' | 'grey' | 'red';
+  text: string;
+} {
+  if (run?.status === 'failed' || run?.outcome === 'runtime_failed' || run?.outcome === 'failed') {
+    return { template: 'red', text: "<font color='red'>运行失败</font>" };
+  }
+  if (run?.outcome === 'resolved') {
+    return { template: 'green', text: "<font color='green'>新版候选已完成</font>" };
+  }
+  if (run?.outcome === 'insufficient_context') {
+    return { template: 'orange', text: "<font color='orange'>信息不足 / 需继续排查</font>" };
+  }
+  return { template: 'grey', text: "<font color='grey'>结论状态未确认</font>" };
+}
+
 export function buildRcaShadowCard(
   detail: CandidateDetail,
   detailUrl: string,
 ): Record<string, unknown> {
-  const failed = detail.run?.status === 'failed';
+  const status = candidateStatus(detail.run);
   const conclusion = detail.run?.firstTurn?.response
     || detail.run?.error
     || '候选调查尚未形成结论';
   return {
     header: {
-      template: failed ? 'red' : 'blue',
+      template: status.template,
       title: {
         tag: 'plain_text',
         content: `RCA Shadow · ${truncate(detail.event?.title || '未命名报警', 60)}`,
@@ -95,7 +112,7 @@ export function buildRcaShadowCard(
             is_short: true,
             text: {
               tag: 'lark_md',
-              content: `**方案 B**\n${failed ? "<font color='red'>运行失败</font>" : '新版候选已完成'}`,
+              content: `**方案 B**\n${status.text}`,
             },
           },
         ],

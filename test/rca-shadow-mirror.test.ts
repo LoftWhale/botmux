@@ -94,7 +94,7 @@ describe('RCA shadow mirror', () => {
     const current = {
       message_id: 'om_current', parent_id: 'om_quote', msg_type: 'text', create_time: '30',
       sender: { id: 'ou_human', sender_type: 'user', sender_name: 'Alice' },
-      body: { content: JSON.stringify({ text: 'please continue oc_private ou_private om_private' }) },
+      body: { content: JSON.stringify({ text: 'please continue oc_1234567890abcdef ou_1234567890abcdef om_1234567890abcdef' }) },
     };
     const quotedSelf = {
       message_id: 'om_quote', msg_type: 'interactive', create_time: '20',
@@ -141,6 +141,128 @@ describe('RCA shadow mirror', () => {
     expect(JSON.stringify(snapshot)).not.toContain('om_recent');
     expect(JSON.stringify(snapshot)).not.toContain('ou_');
     expect(JSON.stringify(snapshot)).not.toContain('champion conclusion');
+  });
+
+  it('captures normal three-RTT context within budget without remotely expanding recent cards', async () => {
+    vi.useFakeTimers();
+    try {
+      const current = {
+        message_id: 'om_current', parent_id: 'om_quote', msg_type: 'text', create_time: '30',
+        sender: { id: 'ou_human', sender_type: 'user' },
+        body: { content: JSON.stringify({ text: 'current alarm' }) },
+      };
+      const quoted = {
+        message_id: 'om_quote', msg_type: 'text', create_time: '20',
+        sender: { id: 'ou_human_2', sender_type: 'user' },
+        body: { content: JSON.stringify({ text: 'quoted symptom' }) },
+      };
+      const recentCards = Array.from({ length: 8 }, (_, index) => ({
+        message_id: `om_recent_${index}`,
+        msg_type: 'interactive',
+        create_time: String(10 + index),
+        sender: { id: `ou_recent_${index}`, sender_type: 'user' },
+        body: { content: JSON.stringify({
+          title: `recent ${index}`,
+          elements: [[{ tag: 'text', text: `recent card ${index}` }]],
+        }) },
+      }));
+      const resolveMergedCardContent = vi.fn(async () => {
+        await new Promise(resolve => setTimeout(resolve, 830));
+        return { text: 'remote card', structuredContent: '{}', resources: [] };
+      });
+      const deps = {
+        getMessageDetail: vi.fn(async (_appId: string, messageId: string) => {
+          await new Promise(resolve => setTimeout(resolve, messageId === 'om_current' ? 800 : 830));
+          return { items: [messageId === 'om_current' ? current : quoted] } as any;
+        }),
+        listChatMessages: vi.fn(async () => {
+          await new Promise(resolve => setTimeout(resolve, 650));
+          return recentCards as any;
+        }),
+        resolveMergedCardContent,
+        getBotOpenId: vi.fn(() => 'ou_self'),
+        now: () => new Date('2026-08-03T12:00:00.000Z'),
+      };
+      const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+      const mirror = new RcaShadowMirror(config(), {
+        fetchImpl: fetchMock as any,
+        captureSnapshot: (input, token) => captureRcaSourceSnapshot(input, token, deps),
+      });
+
+      mirror.submit(turn({ turnId: 'om_current' }));
+      await vi.advanceTimersByTimeAsync(700);
+      expect(deps.listChatMessages).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await mirror.onIdle();
+
+      const body = JSON.parse(String(fetchMock.mock.calls[0]![1].body));
+      expect(body.sourceSnapshot.captureStatus).not.toBe('failed');
+      expect(body.sourceSnapshot.timeline.map((item: any) => item.content)).toEqual(
+        expect.arrayContaining(['current alarm', 'quoted symptom', '[卡片: recent 0]\nrecent card 0']),
+      );
+      expect(resolveMergedCardContent).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('uses a complete local current or quoted card body before remote card resolution', async () => {
+    const completeCard = (messageId: string, text: string, parentId?: string) => ({
+      message_id: messageId,
+      ...(parentId ? { parent_id: parentId } : {}),
+      msg_type: 'interactive',
+      sender: { id: 'ou_human', sender_type: 'user' },
+      body: { content: JSON.stringify({
+        title: text,
+        elements: [[{ tag: 'text', text: `${text} body` }]],
+      }) },
+    });
+    const current = completeCard('om_current', 'current', 'om_quote');
+    const quoted = completeCard('om_quote', 'quoted');
+    const resolveMergedCardContent = vi.fn(async () => ({
+      text: 'remote fallback', structuredContent: '{}', resources: [],
+    }));
+
+    const snapshot = await captureRcaSourceSnapshot(turn({ turnId: 'om_current' }), 'mirror-secret', {
+      getMessageDetail: vi.fn(async (_appId, messageId) => ({
+        items: [messageId === 'om_current' ? current : quoted],
+      })),
+      listChatMessages: vi.fn(async () => []),
+      resolveMergedCardContent,
+      getBotOpenId: vi.fn(() => 'ou_self'),
+      now: () => new Date('2026-08-03T12:00:00.000Z'),
+    });
+
+    expect(snapshot.timeline.map(item => item.content)).toEqual([
+      '[卡片: current]\ncurrent body',
+      '[卡片: quoted]\nquoted body',
+    ]);
+    expect(resolveMergedCardContent).not.toHaveBeenCalled();
+  });
+
+  it('preserves quoted and recent step warnings when parallel capture partially fails', async () => {
+    const current = {
+      message_id: 'om_current', parent_id: 'om_quote', msg_type: 'text',
+      sender: { id: 'ou_human', sender_type: 'user' },
+      body: { content: JSON.stringify({ text: 'current alarm' }) },
+    };
+    const snapshot = await captureRcaSourceSnapshot(turn({ turnId: 'om_current' }), 'mirror-secret', {
+      getMessageDetail: vi.fn(async (_appId, messageId) => {
+        if (messageId === 'om_quote') throw new Error('quoted unavailable');
+        return { items: [current] };
+      }),
+      listChatMessages: vi.fn(async () => { throw new Error('recent unavailable'); }),
+      resolveMergedCardContent: vi.fn(async () => null),
+      getBotOpenId: vi.fn(() => 'ou_self'),
+      now: () => new Date('2026-08-03T12:00:00.000Z'),
+    });
+
+    expect(snapshot.captureStatus).toBe('partial');
+    expect(snapshot.warnings).toEqual([
+      'quoted_message_unavailable',
+      'recent_messages_unavailable',
+    ]);
+    expect(snapshot.timeline.map(item => item.content)).toEqual(['current alarm']);
   });
 
   it('marks a character-bounded snapshot partial and records truncation', async () => {
@@ -271,6 +393,262 @@ describe('RCA shadow mirror', () => {
     const body = JSON.parse(String(fetchMock.mock.calls[0]![1].body));
     expect(body.preparedInput.content).toBe('<user_message>请开始排查</user_message>');
     expect(body.signalSource).toBe('kepler');
+  });
+
+  it('neutralizes Botmux commands without deleting surrounding user business text', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+    const mirror = new RcaShadowMirror(config(), { fetchImpl: fetchMock as any });
+    mirror.submit(turn({
+      preparedInput: {
+        content: [
+          '<session_id>session-private-123</session_id>',
+          '<botmux_routing>',
+          '先执行 botmux history oc_private，再用 botmux quoted om_quote，最后 botmux send ou_owner',
+          '</botmux_routing>',
+          '[用户引用了消息，请用 botmux quoted om_1234567890abcdef 查看，但 panic 发生在搜索页]',
+          '<attachments hint="source files"><image n="1" path="/home/operator/private/alarm.png" /></attachments>',
+          '<user_message>on_call 与 om_search 是业务词，必须保留</user_message>',
+          '<user_message>Kepler 报警：search panic，请排查 eventId=event-9</user_message>',
+        ].join('\n'),
+        codexAppInput: {
+          text: 'botmux history oc_private\nKepler 报警：search panic',
+          additionalContext: {
+            route: { type: 'text', value: 'om_private ou_private' },
+          },
+          clientUserMessageId: 'om_client_private',
+        },
+      },
+      sourceSnapshot: capturedSnapshot,
+    }));
+    await mirror.onIdle();
+
+    const bodyText = String(fetchMock.mock.calls[0]![1].body);
+    const body = JSON.parse(bodyText);
+    expect(body.preparedInput.content).toContain('<user_message>Kepler 报警：search panic，请排查 eventId=event-9</user_message>');
+    expect(body.preparedInput.content).toContain('panic 发生在搜索页');
+    expect(body.preparedInput.content).toContain('on_call 与 om_search 是业务词，必须保留');
+    expect(body.preparedInput.content).toContain('source-local paths unavailable');
+    expect(body.preparedInput).toEqual({ content: body.preparedInput.content });
+    expect(bodyText).not.toMatch(/botmux\s+(?:history|quoted|send|bots)/i);
+    expect(bodyText).not.toContain('<botmux_routing>');
+    expect(bodyText).not.toContain('session-private-123');
+    expect(bodyText).not.toMatch(/\b(?:oc|om|ou|on)_[A-Za-z0-9_-]{16,}\b/);
+    expect(bodyText).not.toContain('/home/operator/private/alarm.png');
+    expect(bodyText).not.toContain('mirror-secret');
+  });
+
+  it('sanitizes caller-supplied snapshot strings and title before outbound persistence', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+    const mirror = new RcaShadowMirror(config(), { fetchImpl: fetchMock as any });
+    mirror.submit(turn({
+      title: 'panic om_1234567890abcdef；请执行 botmux history oc_1234567890abcdef 后复核',
+      sourceSnapshot: {
+        schemaVersion: '1',
+        capturedAt: '2026-08-03T12:00:00.000Z',
+        captureStatus: 'partial',
+        warnings: ['recent om_1234567890abcdef；botmux bots list 不可用'],
+        privateMeta: { token: 'snapshot-private-secret' },
+        timeline: [{
+          referenceKey: 'om_1234567890abcdef',
+          relation: 'current',
+          senderRole: 'human',
+          senderName: 'Alice ou_1234567890abcdef',
+          messageType: 'text',
+          content: '<botmux_routing>botmux send ou_1234567890abcdef</botmux_routing>业务症状仍是 panic；botmux quoted om_1234567890abcdef 仅用于旧链路',
+          at: '2026-08-03 om_1234567890abcdef',
+          localPath: '/home/operator/private/snapshot.json',
+          privateMeta: 'timeline-private-secret',
+        }],
+      } as any,
+    }));
+    await mirror.onIdle();
+
+    const bodyText = String(fetchMock.mock.calls[0]![1].body);
+    const body = JSON.parse(bodyText);
+    expect(body.title).toContain('panic');
+    expect(body.sourceSnapshot.timeline[0].content).toContain('业务症状仍是 panic');
+    expect(bodyText).not.toMatch(/botmux\s+(?:history|quoted|send|bots)/i);
+    expect(bodyText).not.toMatch(/\b(?:oc|om|ou|on)_[A-Za-z0-9_-]{16,}\b/);
+    expect(bodyText).not.toContain('snapshot-private-secret');
+    expect(bodyText).not.toContain('timeline-private-secret');
+    expect(bodyText).not.toContain('/home/operator/private/snapshot.json');
+    expect(body.sourceSnapshot).not.toHaveProperty('privateMeta');
+    expect(body.sourceSnapshot.timeline[0]).not.toHaveProperty('localPath');
+    expect(body.sourceSnapshot.timeline[0]).not.toHaveProperty('privateMeta');
+  });
+
+  it('adds the same opaque incident key for Kepler cards sharing submonitorId and eventId', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+    const mirror = new RcaShadowMirror(config({ maxInFlight: 2, maxQueued: 2 }), {
+      fetchImpl: fetchMock as any,
+    });
+    const keplerSnapshot: RcaSourceSnapshot = {
+      ...capturedSnapshot,
+      timeline: [{
+        ...capturedSnapshot.timeline[0]!,
+        content: 'Kepler alarm submonitorId=submonitor-42&eventId=event-99',
+      }],
+    };
+    mirror.submit(turn({ sessionId: 'session-a', turnId: 'turn-a', sourceSnapshot: keplerSnapshot }));
+    mirror.submit(turn({ sessionId: 'session-b', turnId: 'turn-b', sourceSnapshot: keplerSnapshot }));
+    await mirror.onIdle();
+
+    const bodies = fetchMock.mock.calls.map(call => JSON.parse(String(call[1].body)));
+    expect(bodies[0].incidentKey).toMatch(/^[a-f0-9]{64}$/);
+    expect(bodies[1].incidentKey).toBe(bodies[0].incidentKey);
+    expect(bodies[0].incidentKey).not.toContain('submonitor-42');
+    expect(bodies[0].incidentKey).not.toContain('event-99');
+  });
+
+  it('does not guess an incident key when either Kepler stable identifier is missing', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+    const mirror = new RcaShadowMirror(config(), { fetchImpl: fetchMock as any });
+    mirror.submit(turn({
+      sourceSnapshot: {
+        ...capturedSnapshot,
+        timeline: [{ ...capturedSnapshot.timeline[0]!, content: 'Kepler submonitorId=submonitor-42' }],
+      },
+    }));
+    await mirror.onIdle();
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1].body));
+    expect(body).not.toHaveProperty('incidentKey');
+  });
+
+  it('does not combine Kepler identifiers split across prepared and snapshot messages', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+    const mirror = new RcaShadowMirror(config(), { fetchImpl: fetchMock as any });
+    mirror.submit(turn({
+      preparedInput: { content: 'Kepler submonitorId=submonitor-from-prepared' },
+      sourceSnapshot: {
+        ...capturedSnapshot,
+        timeline: [{
+          ...capturedSnapshot.timeline[0]!,
+          relation: 'current',
+          content: 'current card eventId=event-from-current',
+        }],
+      },
+    }));
+    await mirror.onIdle();
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1].body));
+    expect(body).not.toHaveProperty('incidentKey');
+  });
+
+  it('selects one complete candidate pair instead of cross-mixing different messages', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+    const mirror = new RcaShadowMirror(config(), { fetchImpl: fetchMock as any });
+    const recentPair = 'Kepler submonitorId=submonitor-recent&eventId=event-recent';
+    mirror.submit(turn({
+      sourceSnapshot: {
+        ...capturedSnapshot,
+        timeline: [
+          { ...capturedSnapshot.timeline[0]!, relation: 'current', content: 'Kepler submonitorId=submonitor-incomplete' },
+          { ...capturedSnapshot.timeline[0]!, referenceKey: 'opaque-recent', relation: 'recent', content: recentPair },
+        ],
+      },
+    }));
+    await mirror.onIdle();
+    mirror.submit(turn({
+      sessionId: 'baseline-session',
+      turnId: 'baseline-turn',
+      sourceSnapshot: {
+        ...capturedSnapshot,
+        timeline: [{ ...capturedSnapshot.timeline[0]!, relation: 'recent', content: recentPair }],
+      },
+    }));
+    await mirror.onIdle();
+
+    const bodies = fetchMock.mock.calls.map(call => JSON.parse(String(call[1].body)));
+    expect(bodies[0].incidentKey).toBe(bodies[1].incidentKey);
+  });
+
+  it('does not choose an incident key when candidate messages contain different complete pairs', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+    const mirror = new RcaShadowMirror(config(), { fetchImpl: fetchMock as any });
+    mirror.submit(turn({
+      preparedInput: { content: 'Kepler submonitorId=submonitor-prepared&eventId=event-prepared' },
+      sourceSnapshot: {
+        ...capturedSnapshot,
+        timeline: [
+          {
+            ...capturedSnapshot.timeline[0]!,
+            relation: 'current',
+            content: 'Kepler submonitorId=submonitor-current&eventId=event-current',
+          },
+          {
+            ...capturedSnapshot.timeline[0]!,
+            referenceKey: 'opaque-recent',
+            relation: 'recent',
+            content: 'Kepler submonitorId=submonitor-recent&eventId=event-recent',
+          },
+        ],
+      },
+    }));
+    await mirror.onIdle();
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1].body));
+    expect(body).not.toHaveProperty('incidentKey');
+  });
+
+  it('treats interleaved multiple identifier values inside one candidate as ambiguous', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+    const mirror = new RcaShadowMirror(config(), { fetchImpl: fetchMock as any });
+    mirror.submit(turn({
+      preparedInput: {
+        content: [
+          'Kepler submonitorId=submonitor-a eventId=event-a',
+          'eventId=event-b submonitorId=submonitor-b',
+        ].join('\n'),
+      },
+      sourceSnapshot: capturedSnapshot,
+    }));
+    await mirror.onIdle();
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1].body));
+    expect(body).not.toHaveProperty('incidentKey');
+  });
+
+  it('treats a multi-value candidate as ambiguous even when Kepler is named elsewhere', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+    const mirror = new RcaShadowMirror(config(), { fetchImpl: fetchMock as any });
+    mirror.submit(turn({
+      preparedInput: {
+        content: 'Kepler submonitorId=submonitor-prepared&eventId=event-prepared',
+      },
+      sourceSnapshot: {
+        ...capturedSnapshot,
+        timeline: [{
+          ...capturedSnapshot.timeline[0]!,
+          relation: 'current',
+          content: 'submonitorId=submonitor-a eventId=event-a submonitorId=submonitor-b',
+        }],
+      },
+    }));
+    await mirror.onIdle();
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1].body));
+    expect(body).not.toHaveProperty('incidentKey');
+  });
+
+  it('keeps one incident key when the same complete pair is repeated across candidates', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+    const mirror = new RcaShadowMirror(config(), { fetchImpl: fetchMock as any });
+    const repeatedPair = 'Kepler submonitorId=submonitor-same&eventId=event-same';
+    mirror.submit(turn({
+      preparedInput: { content: repeatedPair },
+      sourceSnapshot: {
+        ...capturedSnapshot,
+        timeline: [
+          { ...capturedSnapshot.timeline[0]!, relation: 'current', content: repeatedPair },
+          { ...capturedSnapshot.timeline[0]!, referenceKey: 'opaque-recent', relation: 'recent', content: repeatedPair },
+        ],
+      },
+    }));
+    await mirror.onIdle();
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]![1].body));
+    expect(body.incidentKey).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it('emits only the RCA Server source snapshot contract fields', async () => {
