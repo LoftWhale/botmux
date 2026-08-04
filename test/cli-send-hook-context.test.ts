@@ -29,8 +29,12 @@ describe('cmdSend hook context wiring', () => {
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
     const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
 
+    expect(cmdSend).toContain(
+      'const championTurnId = liveMarkerCtx?.turnId ?? currentTurnId;',
+    );
+    expect(cmdSend).toContain('if (championTurnId) {');
     expect(cmdSend).toContain('mirrorChampionResult({');
-    expect(cmdSend).toContain('turnId: liveMarkerCtx?.turnId ?? currentTurnId');
+    expect(cmdSend).toContain('turnId: championTurnId');
     expect(cmdSend).toContain('result: text');
     expect(cmdSend.indexOf('mirrorChampionResult({'))
       .toBeGreaterThan(cmdSend.indexOf("messageId = await dispatchPrimary(cardJson, 'interactive')"));
