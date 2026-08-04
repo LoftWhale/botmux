@@ -1873,6 +1873,7 @@ export function sendWorkerInput(
       turnId,
       turnKind: 'follow_up',
       chatId: ds.chatId,
+      ...(turnId.startsWith('om_') ? { sourceMessageId: turnId } : {}),
       topicId: sessionAnchorId(ds),
       title: ds.currentTurnTitle ?? ds.session.title,
       preparedInput: normalized,
@@ -2185,6 +2186,9 @@ export function forkWorker(
       turnId: initAttributionTurnId,
       turnKind: resume ? 'follow_up' : 'first_turn',
       chatId: ds.chatId,
+      ...(initAttributionTurnId.startsWith('om_')
+        ? { sourceMessageId: initAttributionTurnId }
+        : {}),
       topicId: sessionAnchorId(ds),
       title: ds.currentTurnTitle ?? ds.session.title,
       preparedInput: promptPayload,

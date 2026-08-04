@@ -190,13 +190,27 @@ export class RcaShadowNotifier {
         }`;
         const card = buildRcaShadowCard(detail, detailUrl);
         const sendCard = this.deps.sendCard || sendMessage;
-        await sendCard(
+        const messageId = await sendCard(
           larkAppId,
           this.config.chatId,
           JSON.stringify(card),
           'interactive',
           `search-rca-${eventId}`,
         );
+        const deliveryResponse = await fetchImpl(
+          `${base}/api/events/${encodeURIComponent(eventId)}/shadow-deliveries`,
+          {
+            method: 'POST',
+            headers: {
+              authorization: `Bearer ${this.config.token}`,
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify({ provider: 'lark', messageId }),
+          },
+        );
+        if (!deliveryResponse.ok) {
+          throw new Error(`RCA delivery receipt returned HTTP ${deliveryResponse.status}`);
+        }
         this.notified.add(eventId);
         if (this.notified.size > 5_000) {
           const oldest = this.notified.values().next().value;

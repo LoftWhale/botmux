@@ -144,6 +144,106 @@ describe('RCA shadow mirror', () => {
     expect(JSON.stringify(snapshot)).not.toContain('champion conclusion');
   });
 
+  it('uses chat history instead of treating a synthetic group-join turn as a Lark message', async () => {
+    const alarm = {
+      message_id: 'om_alarm', msg_type: 'interactive', create_time: '1',
+      sender: { id: 'ou_argos', sender_type: 'app', sender_name: 'Argos平台报警' },
+      body: { content: JSON.stringify({
+        title: 'TLB 总流量下降报警',
+        elements: [[{ tag: 'text', text: '报警时间: 2026-08-04 17:25\n规则: TLB 总流量下降报警' }]],
+      }) },
+    };
+    const noise = Array.from({ length: 12 }, (_, index) => ({
+      message_id: `om_system_${index}`,
+      msg_type: 'system',
+      create_time: String(index + 2),
+      sender: { id: '', sender_type: '' },
+      body: { content: JSON.stringify({ template: `member event ${index}` }) },
+    }));
+    const allMessages = [alarm, ...noise];
+    const getMessageDetail = vi.fn(async () => {
+      throw new Error('synthetic ids are not Lark messages');
+    });
+    const listChatMessages = vi.fn(async (_appId: string, _chatId: string, pageSize: number) => (
+      allMessages.slice(-pageSize)
+    ));
+
+    const snapshot = await captureRcaSourceSnapshot(turn({
+      turnId: 'auto-group-join:oc_alarm_chat',
+    }), 'mirror-secret', {
+      getMessageDetail,
+      listChatMessages,
+      resolveMergedCardContent: vi.fn(async () => null),
+      getBotOpenId: vi.fn(() => 'ou_self'),
+      now: () => new Date('2026-08-04T09:26:04.000Z'),
+    });
+
+    expect(getMessageDetail).not.toHaveBeenCalled();
+    expect(listChatMessages).toHaveBeenCalledWith('app_rca', 'lark-private-chat', 50);
+    expect(snapshot.timeline.map(item => item.content).join('\n')).toContain('报警时间: 2026-08-04 17:25');
+  });
+
+  it('keeps available chat context when the current-message lookup stalls', async () => {
+    vi.useFakeTimers();
+    try {
+      const alarm = {
+        message_id: 'om_alarm', msg_type: 'text', create_time: '1',
+        sender: { id: 'ou_argos', sender_type: 'app', sender_name: 'Argos平台报警' },
+        body: { content: JSON.stringify({ text: '报警时间: 2026-08-04 17:25 规则: panic' }) },
+      };
+      const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
+      const mirror = new RcaShadowMirror(config(), {
+        fetchImpl: fetchMock as any,
+        captureSnapshot: (input, token) => captureRcaSourceSnapshot(input, token, {
+          getMessageDetail: vi.fn(async () => new Promise(() => {})),
+          listChatMessages: vi.fn(async () => [alarm]),
+          resolveMergedCardContent: vi.fn(async () => null),
+          getBotOpenId: vi.fn(() => 'ou_self'),
+          now: () => new Date('2026-08-04T09:26:04.000Z'),
+        }),
+      });
+
+      mirror.submit(turn({ turnId: 'om_current', sourceMessageId: 'om_current' }));
+      await vi.advanceTimersByTimeAsync(SOURCE_SNAPSHOT_CAPTURE_TIMEOUT_MS);
+      await mirror.onIdle();
+
+      const body = JSON.parse(String(fetchMock.mock.calls[0]![1].body));
+      expect(body.sourceSnapshot.captureStatus).toBe('partial');
+      expect(body.sourceSnapshot.warnings).toContain('current_message_unavailable');
+      expect(body.sourceSnapshot.timeline.map((item: any) => item.content)).toContain(
+        '报警时间: 2026-08-04 17:25 规则: panic',
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('expands a selected recent alarm card when the list API returns only a fallback', async () => {
+    const fallbackCard = {
+      message_id: 'om_alarm', msg_type: 'interactive', create_time: '1',
+      sender: { id: 'ou_argos', sender_type: 'app', sender_name: 'Argos平台报警' },
+      body: { content: JSON.stringify({ title: 'TLB 总流量下降报警' }) },
+    };
+    const resolveMergedCardContent = vi.fn(async () => ({
+      text: '报警时间: 2026-08-04 17:25\n规则: TLB 总流量下降报警\nTags: service_cluster=pc-search',
+      structuredContent: '{}',
+      resources: [],
+    }));
+
+    const snapshot = await captureRcaSourceSnapshot(turn({
+      turnId: 'auto-group-join:oc_alarm_chat',
+    }), 'mirror-secret', {
+      getMessageDetail: vi.fn(async () => { throw new Error('not a message'); }),
+      listChatMessages: vi.fn(async () => [fallbackCard]),
+      resolveMergedCardContent,
+      getBotOpenId: vi.fn(() => 'ou_self'),
+      now: () => new Date('2026-08-04T09:26:04.000Z'),
+    });
+
+    expect(resolveMergedCardContent).toHaveBeenCalledWith('app_rca', 'om_alarm');
+    expect(snapshot.timeline[0]?.content).toContain('service_cluster=pc-search');
+  });
+
   it('captures normal three-RTT context within budget without remotely expanding recent cards', async () => {
     vi.useFakeTimers();
     try {

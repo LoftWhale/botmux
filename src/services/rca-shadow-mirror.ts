@@ -29,6 +29,8 @@ export interface RcaShadowTurn {
   turnKind: 'first_turn' | 'follow_up';
   /** Source-only lookup key. Never serialized into the RCA Server request. */
   chatId: string;
+  /** Genuine Lark message id when the turn was triggered by a message. */
+  sourceMessageId?: string;
   topicId: string;
   title?: string;
   preparedInput: string | CliTurnPayload;
@@ -89,7 +91,9 @@ async function loadDefaultCaptureDeps(): Promise<SnapshotCaptureDeps> {
 
 const SOURCE_SNAPSHOT_MAX_MESSAGES = 8;
 const SOURCE_SNAPSHOT_MAX_CHARS = 12_000;
-const SOURCE_SNAPSHOT_RECENT_MESSAGES = 8;
+const SOURCE_SNAPSHOT_RECENT_MESSAGES = 50;
+const SOURCE_SNAPSHOT_MESSAGE_TIMEOUT_MS = 1_200;
+const SOURCE_SNAPSHOT_HISTORY_TIMEOUT_MS = 2_400;
 export const SOURCE_SNAPSHOT_CAPTURE_TIMEOUT_MS = 5_000;
 
 type FetchLike = typeof fetch;
@@ -302,6 +306,47 @@ function redactLarkIdentifiers(content: string): string {
   return content.replace(RAW_LARK_IDENTIFIER, '[redacted-reference]');
 }
 
+async function settleWithin<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+): Promise<{ ok: true; value: T } | { ok: false }> {
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<{ ok: false }>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false }), timeoutMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([
+      operation.then(value => ({ ok: true as const, value })).catch(() => ({ ok: false as const })),
+      timedOut,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function looksLikeAlarmContext(message: any): boolean {
+  const parsed = parseApiMessage(message);
+  const haystack = `${parsed.senderName ?? ''}\n${parsed.content}`;
+  return /报警时间|告警时间|触发时间|规则摘要|告警规则|报警规则|Tags?\s*[:：]|Vars?\s*[:：]|argos|kepler|slardar/i.test(haystack);
+}
+
+function recentContextMessages(
+  recent: Awaited<ReturnType<typeof listChatMessages>>,
+  selfBotOpenId: string | undefined,
+): any[] {
+  return recent
+    .map((message, index) => ({
+      message,
+      index,
+      role: senderRole(message, selfBotOpenId),
+      alarm: looksLikeAlarmContext(message),
+    }))
+    .filter(item => item.role !== 'self_bot' && item.message?.msg_type !== 'system')
+    .sort((left, right) => Number(right.alarm) - Number(left.alarm) || left.index - right.index)
+    .map(item => item.message);
+}
+
 async function snapshotContent(
   turn: RcaShadowTurn,
   message: any,
@@ -340,7 +385,11 @@ export async function captureRcaSourceSnapshot(
   let remainingChars = SOURCE_SNAPSHOT_MAX_CHARS;
   let truncated = false;
 
-  const append = async (message: any, relation: RcaSourceSnapshotMessage['relation']): Promise<void> => {
+  const append = async (
+    message: any,
+    relation: RcaSourceSnapshotMessage['relation'],
+    resolvedContent?: string,
+  ): Promise<void> => {
     const messageId = typeof message?.message_id === 'string' ? message.message_id : '';
     if (!messageId || seenMessageIds.has(messageId)) return;
     seenMessageIds.add(messageId);
@@ -350,12 +399,14 @@ export async function captureRcaSourceSnapshot(
     }
     const role = senderRole(message, selfBotOpenId);
     if (relation === 'recent' && role === 'self_bot') return;
-    let content = redactLarkIdentifiers(await snapshotContent(
-      turn,
-      message,
-      deps,
-      relation !== 'recent',
-    ).catch(() => ''));
+    const localContent = parseApiMessage(message).content;
+    const contentResult = resolvedContent === undefined
+      ? await settleWithin(
+        snapshotContent(turn, message, deps, true),
+        SOURCE_SNAPSHOT_MESSAGE_TIMEOUT_MS,
+      )
+      : { ok: true as const, value: resolvedContent };
+    let content = redactLarkIdentifiers(contentResult.ok ? contentResult.value : localContent);
     if (!content) return;
     if (content.length > remainingChars) {
       content = content.slice(0, remainingChars);
@@ -374,43 +425,60 @@ export async function captureRcaSourceSnapshot(
     });
   };
 
-  const currentRequest = deps.getMessageDetail(turn.larkAppId, turn.turnId)
-    .then(detail => ({ detail, failed: false as const }))
-    .catch(() => ({ detail: null, failed: true as const }));
-  const recentRequest = deps.listChatMessages(
-    turn.larkAppId,
-    turn.chatId,
-    SOURCE_SNAPSHOT_RECENT_MESSAGES,
-  )
-    .then(recent => ({ recent, failed: false as const }))
-    .catch(() => ({ recent: [] as Awaited<ReturnType<typeof deps.listChatMessages>>, failed: true as const }));
+  const sourceMessageId = turn.sourceMessageId
+    ?? (turn.turnId.startsWith('om_') ? turn.turnId : '');
+  const currentRequest = sourceMessageId
+    ? settleWithin(
+      deps.getMessageDetail(turn.larkAppId, sourceMessageId),
+      SOURCE_SNAPSHOT_MESSAGE_TIMEOUT_MS,
+    )
+    : Promise.resolve({ ok: false as const });
+  const recentRequest = settleWithin(
+    deps.listChatMessages(turn.larkAppId, turn.chatId, SOURCE_SNAPSHOT_RECENT_MESSAGES),
+    SOURCE_SNAPSHOT_HISTORY_TIMEOUT_MS,
+  );
 
   let current: any | null = null;
   const currentResult = await currentRequest;
-  if (!currentResult.failed) {
-    current = rawMessageItem(currentResult.detail);
+  if (currentResult.ok) {
+    current = rawMessageItem(currentResult.value);
     if (current) await append(current, 'current');
     else warnings.push('current_message_unavailable');
-  } else {
+  } else if (sourceMessageId) {
     warnings.push('current_message_unavailable');
   }
 
   const quotedMessageId = typeof current?.parent_id === 'string' ? current.parent_id : '';
   if (quotedMessageId) {
-    try {
-      const quoted = rawMessageItem(await deps.getMessageDetail(turn.larkAppId, quotedMessageId));
+    const quotedResult = await settleWithin(
+      deps.getMessageDetail(turn.larkAppId, quotedMessageId),
+      SOURCE_SNAPSHOT_MESSAGE_TIMEOUT_MS,
+    );
+    if (quotedResult.ok) {
+      const quoted = rawMessageItem(quotedResult.value);
       if (quoted) await append(quoted, 'quoted');
       else warnings.push('quoted_message_unavailable');
-    } catch {
+    } else {
       warnings.push('quoted_message_unavailable');
     }
   }
 
   const recentResult = await recentRequest;
-  if (recentResult.failed) {
+  if (!recentResult.ok) {
     warnings.push('recent_messages_unavailable');
   } else {
-    for (const message of recentResult.recent) await append(message, 'recent');
+    const candidates = recentContextMessages(recentResult.value, selfBotOpenId)
+      .filter(message => !seenMessageIds.has(message?.message_id))
+      .slice(0, Math.max(0, SOURCE_SNAPSHOT_MAX_MESSAGES - messages.length));
+    const resolved = await Promise.all(candidates.map(async message => {
+      const localContent = parseApiMessage(message).content;
+      const result = await settleWithin(
+        snapshotContent(turn, message, deps, true),
+        SOURCE_SNAPSHOT_MESSAGE_TIMEOUT_MS,
+      );
+      return { message, content: result.ok ? result.value : localContent };
+    }));
+    for (const item of resolved) await append(item.message, 'recent', item.content);
   }
 
   const finalWarnings = truncated ? [...warnings, 'source_snapshot_truncated'] : warnings;

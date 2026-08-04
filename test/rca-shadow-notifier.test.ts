@@ -73,10 +73,14 @@ describe('RCA shadow topic notifier', () => {
   });
 
   it('polls a public Event id and sends exactly one top-level topic card', async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
-      event: { id: 'event-1', title: 'panic' },
-      run: { status: 'completed', firstTurn: { response: 'candidate result' } },
-    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => (
+      init?.method === 'POST'
+        ? new Response(JSON.stringify({ accepted: true }), { status: 201 })
+        : new Response(JSON.stringify({
+          event: { id: 'event-1', title: 'panic' },
+          run: { status: 'completed', firstTurn: { response: 'candidate result' } },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+    ));
     const sendCard = vi.fn(async () => 'om_shadow_root');
     const notifier = new RcaShadowNotifier({
       rcaUrl: 'http://rca.internal:7310',
@@ -92,7 +96,15 @@ describe('RCA shadow topic notifier', () => {
     notifier.start('event-1', 'app_rca', 'event-view-key');
     await notifier.onIdle();
 
-    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl).toHaveBeenLastCalledWith(
+      'http://rca.internal:7310/api/events/event-1/shadow-deliveries',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ authorization: 'Bearer token' }),
+        body: JSON.stringify({ provider: 'lark', messageId: 'om_shadow_root' }),
+      }),
+    );
     expect(sendCard).toHaveBeenCalledOnce();
     expect(sendCard).toHaveBeenCalledWith(
       'app_rca',
