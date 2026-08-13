@@ -7,6 +7,7 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -108,7 +109,11 @@ function fixture(): { root: string; contract: CandidateRuntimeContract } {
   };
 }
 
-function buildArtifactFixture(): { root: string; dist: string; manifestPath: string } {
+function buildArtifactFixture(ignoreRule = 'dist/\n'): {
+  root: string;
+  dist: string;
+  manifestPath: string;
+} {
   const root = mkdtempSync(join(tmpdir(), 'botmux-build-artifact-'));
   const dist = join(root, 'dist');
   mkdirSync(join(root, 'scripts'), { recursive: true });
@@ -117,7 +122,7 @@ function buildArtifactFixture(): { root: string; dist: string; manifestPath: str
     join(import.meta.dirname, '..', 'scripts', 'audit-dist.mjs'),
     join(root, 'scripts', 'audit-dist.mjs'),
   );
-  writeFileSync(join(root, '.gitignore'), 'dist/\n');
+  writeFileSync(join(root, '.gitignore'), ignoreRule);
   writeFileSync(join(root, 'package.json'), '{"name":"candidate-botmux-fixture"}\n');
   writeFileSync(join(dist, 'index-daemon.js'), 'export const daemon = true;\n');
   writeFileSync(join(dist, 'worker.js'), 'export const worker = true;\n');
@@ -175,6 +180,14 @@ describe('Candidate runtime contract', () => {
     writeFileSync(join(added.dist, 'unmanifested-runtime.bin'), 'rogue runtime payload\n');
     expect(() => candidateBotmuxBuildIdentity(added.root)).toThrow(/artifact|dist tree/i);
 
+    const nestedManifestName = buildArtifactFixture();
+    writeFileSync(
+      join(nestedManifestName.dist, 'assets', 'botmux-build-manifest.json'),
+      '{"rogue":"runtime payload"}\n',
+    );
+    expect(() => candidateBotmuxBuildIdentity(nestedManifestName.root))
+      .toThrow(/artifact|dist tree/i);
+
     const deleted = buildArtifactFixture();
     renameSync(join(deleted.dist, 'assets', 'runtime.css'), join(deleted.root, 'runtime.css.moved'));
     expect(() => candidateBotmuxBuildIdentity(deleted.root)).toThrow(/artifact|dist tree/i);
@@ -182,6 +195,23 @@ describe('Candidate runtime contract', () => {
     const tampered = buildArtifactFixture();
     writeFileSync(join(tampered.dist, 'worker.js'), 'export const worker = "tampered";\n');
     expect(() => candidateBotmuxBuildIdentity(tampered.root)).toThrow(/artifact|dist tree/i);
+  });
+
+  it('rejects a dist root redirected outside the clean Candidate checkout', () => {
+    const build = buildArtifactFixture('dist\n');
+    const buildPayload = join(mkdtempSync(join(tmpdir(), 'botmux-external-dist-')), 'payload');
+    renameSync(build.dist, buildPayload);
+    symlinkSync(buildPayload, build.dist, 'dir');
+    expect(() => execFileSync(process.execPath, [join(build.root, 'scripts', 'audit-dist.mjs')], {
+      cwd: build.root,
+      encoding: 'utf8',
+    })).toThrow(/dist.*directory|symbolic link/i);
+
+    const runtime = buildArtifactFixture();
+    const runtimePayload = join(mkdtempSync(join(tmpdir(), 'botmux-external-dist-')), 'payload');
+    renameSync(runtime.dist, runtimePayload);
+    symlinkSync(runtimePayload, runtime.dist, 'dir');
+    expect(() => candidateBotmuxBuildIdentity(runtime.root)).toThrow(/dist.*directory|symbolic link/i);
   });
 
   it('rejects artifact drift at the production launch boundary before Feishu send', async () => {

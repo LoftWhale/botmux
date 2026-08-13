@@ -126,8 +126,8 @@ function describeDistTree(target: string, base = target): Array<{ path: string; 
   return readdirSync(target, { withFileTypes: true })
     .sort((left, right) => left.name.localeCompare(right.name))
     .flatMap((entry) => {
-      if (entry.name === BOTMUX_BUILD_MANIFEST) return [];
       const absolute = join(target, entry.name);
+      if (absolute === join(base, BOTMUX_BUILD_MANIFEST)) return [];
       if (entry.isDirectory()) return describeDistTree(absolute, base);
       if (!entry.isFile() || !lstatSync(absolute).isFile() || realpathSync(absolute) !== absolute) {
         throw new Error(`Candidate BotMux dist tree contains an unsupported entry: ${absolute}`);
@@ -416,7 +416,11 @@ export function candidateBotmuxBuildIdentity(
     }).trim();
     if (status) throw new Error('Candidate BotMux worktree must be clean');
   }
-  const distRoot = realpathSync(join(git.realpath, 'dist'));
+  const configuredDistRoot = join(git.realpath, 'dist');
+  if (!lstatSync(configuredDistRoot).isDirectory()) {
+    throw new Error('Candidate BotMux dist must be a real directory inside the source checkout');
+  }
+  const distRoot = realpathSync(configuredDistRoot);
   const manifestPath = join(distRoot, BOTMUX_BUILD_MANIFEST);
   if (!lstatSync(manifestPath).isFile()) {
     throw new Error('Candidate BotMux build manifest must be a regular file');

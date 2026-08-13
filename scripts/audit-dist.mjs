@@ -9,6 +9,9 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const distDir = resolve(repoRoot, 'dist');
+if (!lstatSync(distDir).isDirectory()) {
+  throw new Error('BotMux dist must be a real directory inside the clean source worktree');
+}
 const sourceStatus = execFileSync('git', ['-C', repoRoot, 'status', '--porcelain'], {
   encoding: 'utf8',
   timeout: 10_000,
@@ -80,7 +83,7 @@ function runtimeFiles(directory) {
     .flatMap((entry) => {
       const target = resolve(directory, entry.name);
       if (entry.isDirectory()) return runtimeFiles(target);
-      if (entry.name === manifestName) return [];
+      if (target === resolve(distDir, manifestName)) return [];
       if (!entry.isFile() || !lstatSync(target).isFile()) {
         throw new Error(`BotMux dist contains an unsupported entry: ${target}`);
       }
