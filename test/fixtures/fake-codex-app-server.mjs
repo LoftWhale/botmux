@@ -62,6 +62,12 @@ function write(message) {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
 }
 
+function writeBatch(messages) {
+  process.stdout.write(messages
+    .map(message => JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n')
+    .join(''));
+}
+
 function respond(id, result) {
   write({ id, result });
 }
@@ -79,7 +85,8 @@ function completeTurn(request) {
   const turnId = `turn-fake-${turnAttempt}`;
   const responseLast = behavior === 'start-response-last'
     || behavior === 'start-response-last-goal';
-  if (!responseLast) respond(request.id, { turn: { id: turnId } });
+  const batchHistoryCompletion = behavior.startsWith('history-') && !responseLast;
+  if (!responseLast && !batchHistoryCompletion) respond(request.id, { turn: { id: turnId } });
   notify('turn/started', { threadId, turn: { id: turnId } });
   // Exercise duplicate pre-response lifecycle notifications: the runner must
   // buffer one edge and must not misclassify a duplicate as autonomous work.
@@ -170,7 +177,21 @@ function completeTurn(request) {
           { id: `message-fake-${turnAttempt}`, type: 'agentMessage', phase: 'final_answer', text: `reconciled answer ${turnAttempt}` },
         ],
       };
-      notify('turn/completed', { threadId, turn: { id: `turn-unrelated-${turnAttempt}` } });
+      const completion = {
+        method: 'turn/completed',
+        params: { threadId, turn: { id: `turn-unrelated-${turnAttempt}` } },
+      };
+      if (batchHistoryCompletion) {
+        // Deterministically exercise the app-server race: resolving the RPC
+        // promise does not resume the runner's await until this entire stdout
+        // chunk (including the completion) has been dispatched.
+        writeBatch([
+          { id: request.id, result: { turn: { id: turnId } } },
+          completion,
+        ]);
+      } else {
+        write(completion);
+      }
       if (responseLast) respond(request.id, { turn: { id: turnId } });
       return;
     }
@@ -181,7 +202,14 @@ function completeTurn(request) {
         || behavior === 'goal-steer-race'
         || behavior === 'goal-autocomplete'
         || behavior === 'start-response-last-goal') && turnAttempt === 1) {
-      startGoalContinuation(threadId, 'turn-goal-auto');
+      // Force the continuation into a later stdout read for the basic Goal
+      // scenario. The runner must debounce the apparent idle gap between this
+      // turn/completed and the immediately-following autonomous turn/started.
+      if (behavior === 'goal-continuation') {
+        setTimeout(() => startGoalContinuation(threadId, 'turn-goal-auto'), 5);
+      } else {
+        startGoalContinuation(threadId, 'turn-goal-auto');
+      }
       // goal-autocomplete: the autonomous Goal finishes on its own (no steer),
       // exercising the B3 gate — a non-steerable input parked behind it must
       // start its OWN turn only after this completion, never merge into it.
@@ -451,7 +479,6 @@ function handle(request) {
       }
       steerCount += 1;
       groupClientIds.push(request.params.clientUserMessageId ?? null);
-      respond(request.id, { turnId: activeTurn.turnId });
       // Complete after the 1st steer, but emit turn/completed under a DIFFERENT
       // native id than the steered turn (non-canonical), whose full items contain
       // only the ROOT clientId — not the follow-up. The runner must NOT close the
@@ -469,19 +496,25 @@ function handle(request) {
           { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'foreign root-only answer' },
         ],
       };
-      notify('turn/completed', {
-        threadId,
-        turn: {
-          id: 'turn-foreign-noncanonical',
-          status: 'completed',
-          itemsView: 'full',
-          error: null,
-          items: [
-            { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
-            { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'foreign root-only answer' },
-          ],
+      writeBatch([
+        { id: request.id, result: { turnId: activeTurn.turnId } },
+        {
+          method: 'turn/completed',
+          params: {
+            threadId,
+            turn: {
+              id: 'turn-foreign-noncanonical',
+              status: 'completed',
+              itemsView: 'full',
+              error: null,
+              items: [
+                { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+                { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'foreign root-only answer' },
+              ],
+            },
+          },
         },
-      });
+      ]);
       activeTurn = undefined;
       return;
     }
@@ -492,7 +525,6 @@ function handle(request) {
       }
       steerCount += 1;
       groupClientIds.push(request.params.clientUserMessageId ?? null);
-      respond(request.id, { turnId: activeTurn.turnId });
       // Group grew to 2 (root + this follow-up). Emit a NON-canonical completion
       // (different id), and seed history with the UNIQUE full-group turn
       // 'turn-B-full' containing BOTH clientIds in order. The runner's
@@ -513,10 +545,13 @@ function handle(request) {
           { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'authoritative B answer' },
         ],
       };
-      notify('turn/completed', {
-        threadId,
-        turn: { id: 'turn-foreign-noncanonical', status: 'completed' },
-      });
+      writeBatch([
+        { id: request.id, result: { turnId: activeTurn.turnId } },
+        {
+          method: 'turn/completed',
+          params: { threadId, turn: { id: 'turn-foreign-noncanonical', status: 'completed' } },
+        },
+      ]);
       // A newer autonomous Goal C claims native-busy AFTER the non-canonical
       // completion — the CAS-clear must leave C intact.
       startGoalContinuation(threadId, 'turn-goal-C');
