@@ -19,6 +19,13 @@ const sourceStatus = execFileSync('git', ['-C', repoRoot, 'status', '--porcelain
 if (sourceStatus) {
   throw new Error('BotMux build manifest requires a clean source worktree');
 }
+const botmuxCommit = execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], {
+  encoding: 'utf8',
+  timeout: 10_000,
+}).trim();
+if (!/^[0-9a-f]{40}$/.test(botmuxCommit)) {
+  throw new Error('BotMux build manifest requires a full Git commit');
+}
 const retiredModules = [
   'workflows/attempt-resume',
   'workflows/blob',
@@ -91,13 +98,6 @@ function runtimeFiles(directory) {
     });
 }
 
-const botmuxCommit = execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], {
-  encoding: 'utf8',
-  timeout: 10_000,
-}).trim();
-if (!/^[0-9a-f]{40}$/.test(botmuxCommit)) {
-  throw new Error('BotMux build manifest requires a full Git commit');
-}
 const files = runtimeFiles(distDir).map((file) => {
   if (!statSync(file).isFile()) throw new Error(`BotMux runtime artifact is not a file: ${file}`);
   return {
@@ -110,6 +110,17 @@ for (const entrypoint of ['index-daemon.js', 'worker.js']) {
   if (!files.some(file => file.path === entrypoint)) {
     throw new Error(`BotMux build manifest is missing ${entrypoint}`);
   }
+}
+const finalSourceStatus = execFileSync('git', ['-C', repoRoot, 'status', '--porcelain'], {
+  encoding: 'utf8',
+  timeout: 10_000,
+}).trim();
+const finalCommit = execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], {
+  encoding: 'utf8',
+  timeout: 10_000,
+}).trim();
+if (finalSourceStatus || finalCommit !== botmuxCommit) {
+  throw new Error('BotMux source changed while generating the build manifest');
 }
 writeFileSync(resolve(distDir, manifestName), `${JSON.stringify({
   schemaVersion: 1,

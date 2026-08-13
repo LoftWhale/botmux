@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { execFile, execFileSync } from 'node:child_process';
 import {
+  chmodSync,
   copyFileSync,
   mkdirSync,
   mkdtempSync,
@@ -173,6 +174,35 @@ describe('Candidate runtime contract', () => {
       'worker.js',
     ]);
     expect(manifest.treeSha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('rejects source drift between the clean check and manifest write', () => {
+    const { root } = buildArtifactFixture();
+    const fakeBin = mkdtempSync(join(tmpdir(), 'botmux-fake-git-'));
+    const fakeGit = join(fakeBin, 'git');
+    const marker = join(fakeBin, 'mutated');
+    const packageJson = join(root, 'package.json');
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    writeFileSync(fakeGit, `#!/usr/bin/env node
+const { existsSync, writeFileSync } = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+const result = spawnSync(${JSON.stringify(realGit)}, args, { encoding: 'utf8' });
+if (args.includes('status') && !existsSync(${JSON.stringify(marker)})) {
+  writeFileSync(${JSON.stringify(marker)}, 'mutated\\n');
+  writeFileSync(${JSON.stringify(packageJson)}, '{"name":"source-drift"}\\n');
+}
+process.stdout.write(result.stdout || '');
+process.stderr.write(result.stderr || '');
+process.exit(result.status ?? 1);
+`);
+    chmodSync(fakeGit, 0o755);
+
+    expect(() => execFileSync(process.execPath, [join(root, 'scripts', 'audit-dist.mjs')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}` },
+    })).toThrow(/clean|changed/i);
   });
 
   it('rejects added, deleted, or tampered files outside the complete dist tree summary', () => {
