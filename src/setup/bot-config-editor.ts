@@ -34,6 +34,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '24': 'riff',
   '25': 'reasonix',
   '26': 'opencode2',
+  '27': 'dsh',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -70,6 +71,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'kiro-cli': 'Kiro',
   'riff': 'Riff',
   'reasonix': 'Reasonix',
+  'dsh': 'DeepSeek Harness',
 };
 
 /**

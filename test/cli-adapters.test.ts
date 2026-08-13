@@ -41,6 +41,7 @@ import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
+import { createDshAdapter } from '../src/adapters/cli/dsh.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
@@ -56,7 +57,7 @@ import type { CliAdapter, CliId, PtyHandle } from '../src/adapters/cli/types.js'
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'reasonix'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -80,7 +81,7 @@ describe('createCliAdapterSync factory', () => {
 
   it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
-    if (id === 'codex-app' || id === 'mira' || id === 'mir') expect(adapter.resolvedBin).toBe(process.execPath);
+    if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh') expect(adapter.resolvedBin).toBe(process.execPath);
     else expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 });
@@ -604,6 +605,64 @@ describe('mir buildArgs (runner model)', () => {
   it('injectsSessionContext (runner injects its own context) + empty systemHints', () => {
     expect(adapter.injectsSessionContext).toBe(true);
     expect(adapter.systemHints).toEqual([]);
+  });
+});
+
+describe('dsh buildArgs (runner model)', () => {
+  const adapter = createDshAdapter();
+
+  it('spawns the dsh-runner via node with --session-id', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-dsh', resume: false });
+    expect(adapter.resolvedBin).toBe(process.execPath);
+    expect(args[0]).toMatch(/dsh-runner\.js$/);
+    expect(args).toContain('--session-id');
+    expect(args).toContain('sess-dsh');
+  });
+
+  it('forwards model + bot name to the runner', () => {
+    const args = adapter.buildArgs({
+      sessionId: 's', resume: false, model: 'deepseek-v4-pro', botName: 'DS',
+    });
+    expect(args).toContain('--model');
+    expect(args).toContain('deepseek-v4-pro');
+    expect(args).toContain('--bot-name');
+    expect(args).toContain('DS');
+  });
+
+  it('passes --reject-permissions only when disableCliBypass is set', () => {
+    expect(adapter.buildArgs({ sessionId: 's', resume: false })).not.toContain('--reject-permissions');
+    expect(adapter.buildArgs({ sessionId: 's', resume: false, disableCliBypass: true })).toContain('--reject-permissions');
+  });
+
+  it('passes a cliPathOverride to the runner via --dsh-bin (absolute kept as-is)', () => {
+    const overridden = createDshAdapter('/opt/dsh/bin/dsh');
+    const args = overridden.buildArgs({ sessionId: 's', resume: false });
+    const idx = args.indexOf('--dsh-bin');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('/opt/dsh/bin/dsh');
+  });
+
+  it('omits --dsh-bin when no cliPathOverride is configured', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false });
+    expect(args).not.toContain('--dsh-bin');
+  });
+
+  it('always reports "no resume target" (rc-stage ACP is fresh-session only)', () => {
+    expect(adapter.checkResumeTargetExists?.({ sessionId: 'bm-1', cliSessionId: 'acp-9' })).toBe(false);
+    expect(adapter.buildResumeCommand?.({ sessionId: 'bm-1', cliSessionId: 'acp-9' })).toBeNull();
+  });
+
+  it('readyPattern matches the runner prompt indicator', () => {
+    expect(adapter.readyPattern?.test('› ')).toBe(true);
+  });
+
+  it('injectsSessionContext (stdout delivery — no botmux send routing block) + empty systemHints', () => {
+    expect(adapter.injectsSessionContext).toBe(true);
+    expect(adapter.systemHints).toEqual([]);
+  });
+
+  it('binds the whole harness home rw in the file sandbox (credentials + profile + sessions)', () => {
+    expect(adapter.authPaths).toEqual(['~/.dsh']);
   });
 });
 
@@ -1606,6 +1665,7 @@ describe('id property', () => {
     ['copilot', () => createCopilotAdapter('/bin/copilot')],
     ['kiro-cli', () => createKiroCliAdapter('/bin/kiro-cli')],
     ['reasonix', () => createReasonixAdapter('/bin/reasonix')],
+    ['dsh', () => createDshAdapter()],
   ];
 
   it.each(expected)('adapter id is "%s"', (expectedId, factory) => {

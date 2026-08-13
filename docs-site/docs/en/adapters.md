@@ -36,6 +36,7 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `mira` | Mira APP | API / remote | |
 | `mir` | Mir CLI (local mircli + MCP bridge) | local process | |
 | `riff` | riff | cloud agent (API) | |
+| `dsh` | DeepSeek Harness (dsh, ACP channel) | local process | ✅ |
 
 > The `model` field only takes effect for adapters that support a model parameter; others ignore it. Mir CLI's extra prerequisites (login / miramcp) are in the section below.
 

@@ -1132,11 +1132,12 @@ function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
 }
 
 /** CLIs whose model→Lark delivery is the daemon's stdout-runner fallback card
- *  (NOT the model calling `botmux send`): mira (Web API runner) and mir (local
- *  mircli runner). They can't @-trigger a peer bot themselves, so for bot-to-bot
- *  handoffs the fallback card must carry the real <at> back to the dispatcher. */
+ *  (NOT the model calling `botmux send`): mira (Web API runner), mir (local
+ *  mircli runner) and dsh (DeepSeek Harness ACP runner). They can't @-trigger a
+ *  peer bot themselves, so for bot-to-bot handoffs the fallback card must carry
+ *  the real <at> back to the dispatcher. */
 function isRunnerDeliveryCli(cliId?: string): boolean {
-  return cliId === 'mira' || cliId === 'mir';
+  return cliId === 'mira' || cliId === 'mir' || cliId === 'dsh';
 }
 
 function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {

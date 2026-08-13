@@ -70,6 +70,9 @@ function defaultLocalExecutable(cliId: CliId, adapterResolvedBin: string, cliPat
   if (cliId === 'codex-app') return 'codex';
   if (cliId === 'mira') return null;
   if (cliId === 'mir') return 'mircli';
+  // dsh ACP sessions live inside the runner's harness process; there is no
+  // terminal command that reattaches to one.
+  if (cliId === 'dsh') return null;
   return adapterResolvedBin;
 }
 
