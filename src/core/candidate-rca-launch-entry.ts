@@ -185,6 +185,9 @@ export async function launchCandidateRcaFromDaemon(
       const claimed = new CandidateTurnDurability({ dataDir: deps.dataDir }).acceptAndClaimSync({
         incidentKey: frozenRequest.incidentKey,
         candidateDispatchId: frozenRequest.candidateDispatchId,
+        releaseId: frozenRequest.launchContext.releaseId,
+        releaseManifestSha256: frozenRequest.launchContext.releaseManifestSha256,
+        runtimeBundleId: frozenRequest.launchContext.runtimeBundleId,
         larkAppId: frozenRequest.larkAppId,
         chatId: frozenRequest.chatId,
         rootMessageId,

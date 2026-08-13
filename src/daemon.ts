@@ -16127,6 +16127,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       await acceptCandidateTurnFromDaemon({
         incidentKey: candidateConversation.incidentKey,
         candidateDispatchId: candidateConversation.candidateDispatchId,
+        releaseId: ds.session.candidateRuntimeContract!.releaseId,
+        releaseManifestSha256: ds.session.candidateRuntimeContract!.releaseManifestSha256,
+        runtimeBundleId: ds.session.candidateRuntimeContract!.runtimeBundleId,
         larkAppId,
         chatId: ctxChatId,
         rootMessageId: candidateConversation.rootMessageId,
@@ -16231,6 +16234,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       await acceptCandidateTurnFromDaemon({
         incidentKey: candidateConversation.incidentKey,
         candidateDispatchId: candidateConversation.candidateDispatchId,
+        releaseId: ds.session.candidateRuntimeContract!.releaseId,
+        releaseManifestSha256: ds.session.candidateRuntimeContract!.releaseManifestSha256,
+        runtimeBundleId: ds.session.candidateRuntimeContract!.runtimeBundleId,
         larkAppId,
         chatId: ctxChatId,
         rootMessageId: candidateConversation.rootMessageId,

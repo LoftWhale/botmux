@@ -32,6 +32,9 @@ function input(turnId: string, prompt = `prompt:${turnId}`) {
   return {
     incidentKey: 'argos:alarm-42',
     candidateDispatchId: 'cand_alarm_42',
+    releaseId: 'release-a',
+    releaseManifestSha256: '1'.repeat(64),
+    runtimeBundleId: 'runtime-a',
     larkAppId: 'cli_candidate',
     chatId: 'oc_shadow',
     rootMessageId: 'om_candidate_root',

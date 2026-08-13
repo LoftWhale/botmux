@@ -11,6 +11,9 @@ export type CandidateTurnStatus = 'accepted' | 'submitted' | 'completed' | 'fail
 export interface CandidateTurnIdentity {
   incidentKey: string;
   candidateDispatchId: string;
+  releaseId: string;
+  releaseManifestSha256: string;
+  runtimeBundleId: string;
   larkAppId: string;
   chatId: string;
   rootMessageId: string;
@@ -86,6 +89,9 @@ interface CandidateTurnStream {
   schemaVersion: 1;
   incidentKey: string;
   candidateDispatchId: string;
+  releaseId: string;
+  releaseManifestSha256: string;
+  runtimeBundleId: string;
   larkAppId: string;
   chatId: string;
   rootMessageId: string;
@@ -118,6 +124,9 @@ function dispatchFromReceipt(receipt: CandidateTurnReceipt): CandidateTurnDispat
   return {
     incidentKey: receipt.incidentKey,
     candidateDispatchId: receipt.candidateDispatchId,
+    releaseId: receipt.releaseId,
+    releaseManifestSha256: receipt.releaseManifestSha256,
+    runtimeBundleId: receipt.runtimeBundleId,
     larkAppId: receipt.larkAppId,
     chatId: receipt.chatId,
     rootMessageId: receipt.rootMessageId,
@@ -189,6 +198,9 @@ function readStream(dataDir: string, candidateDispatchId: string): CandidateTurn
 function sameStreamIdentity(stream: CandidateTurnStream, input: CandidateTurnIdentity): boolean {
   return stream.incidentKey === input.incidentKey
     && stream.candidateDispatchId === input.candidateDispatchId
+    && stream.releaseId === input.releaseId
+    && stream.releaseManifestSha256 === input.releaseManifestSha256
+    && stream.runtimeBundleId === input.runtimeBundleId
     && stream.larkAppId === input.larkAppId
     && stream.chatId === input.chatId
     && stream.rootMessageId === input.rootMessageId
@@ -198,8 +210,11 @@ function sameStreamIdentity(stream: CandidateTurnStream, input: CandidateTurnIde
 }
 
 function assertIdentity(input: CandidateTurnIdentity): void {
-  for (const field of ['incidentKey', 'candidateDispatchId', 'larkAppId', 'chatId', 'rootMessageId', 'botmuxSessionId', 'botmuxCommit', 'botmuxArtifactSha256', 'turnId'] as const) {
+  for (const field of ['incidentKey', 'candidateDispatchId', 'releaseId', 'releaseManifestSha256', 'runtimeBundleId', 'larkAppId', 'chatId', 'rootMessageId', 'botmuxSessionId', 'botmuxCommit', 'botmuxArtifactSha256', 'turnId'] as const) {
     if (!nonEmpty(input[field])) throw new Error(`Candidate turn identity gap: ${field}`);
+  }
+  if (!/^[0-9a-f]{64}$/.test(input.releaseManifestSha256)) {
+    throw new Error('Candidate turn release manifest must be a SHA-256 digest');
   }
   if (!/^[0-9a-f]{40}$/.test(input.botmuxCommit)) {
     throw new Error('Candidate turn BotMux commit must be a full lowercase git SHA');
@@ -247,6 +262,9 @@ export class CandidateTurnDurability {
           schemaVersion: 1,
           incidentKey: input.incidentKey,
           candidateDispatchId: input.candidateDispatchId,
+          releaseId: input.releaseId,
+          releaseManifestSha256: input.releaseManifestSha256,
+          runtimeBundleId: input.runtimeBundleId,
           larkAppId: input.larkAppId,
           chatId: input.chatId,
           rootMessageId: input.rootMessageId,
@@ -328,6 +346,9 @@ export class CandidateTurnDurability {
             schemaVersion: 1,
             incidentKey: input.incidentKey,
             candidateDispatchId: input.candidateDispatchId,
+            releaseId: input.releaseId,
+            releaseManifestSha256: input.releaseManifestSha256,
+            runtimeBundleId: input.runtimeBundleId,
             larkAppId: input.larkAppId,
             chatId: input.chatId,
             rootMessageId: input.rootMessageId,

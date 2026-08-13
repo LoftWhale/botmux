@@ -17,7 +17,7 @@ import {
   type RcaSourceSnapshot,
 } from '../src/services/rca-shadow-mirror.js';
 import * as runtimeContractModule from '../src/services/candidate-runtime-contract.js';
-import type { CandidateTurnReceipt } from '../src/services/candidate-turn-durability.js';
+import { CandidateTurnDurability } from '../src/services/candidate-turn-durability.js';
 import type { DaemonSession } from '../src/types.js';
 
 const snapshot: RcaSourceSnapshot = {
@@ -159,7 +159,7 @@ describe('Candidate RCA recursion isolation', () => {
     })).toThrow(/Candidate.*app.*exclusion|Shadow.*chat.*exclusion/i);
   });
 
-  it('reports the BotMux commit observed by the Candidate runtime in every turn receipt', async () => {
+  it('reports the frozen Release and observed BotMux identity in every durable turn receipt', async () => {
     const botmuxCommit = runtimeContractModule.candidateBotmuxCommit();
     const botmuxArtifactSha256 = '6'.repeat(64);
     expect(botmuxCommit).toMatch(/^[0-9a-f]{40}$/);
@@ -212,10 +212,15 @@ describe('Candidate RCA recursion isolation', () => {
     })).toThrow(/BotMux commit mismatch/i);
 
     const fetchMock = vi.fn(async () => new Response('', { status: 202 }));
-    const receipt = {
-      schemaVersion: 1,
+    const durability = new CandidateTurnDurability({
+      dataDir: mkdtempSync(join(tmpdir(), 'botmux-release-receipt-')),
+    });
+    const { receipt } = await durability.accept({
       incidentKey: contract.incidentKey,
       candidateDispatchId: contract.candidateDispatchId,
+      releaseId: contract.releaseId,
+      releaseManifestSha256: contract.releaseManifestSha256,
+      runtimeBundleId: contract.runtimeBundleId,
       larkAppId: 'candidate_rca',
       chatId: 'oc_shadow',
       rootMessageId: 'om_root',
@@ -223,24 +228,14 @@ describe('Candidate RCA recursion isolation', () => {
       botmuxCommit,
       botmuxArtifactSha256,
       turnId: 'om_turn',
-      sequence: 1,
-      inputHash: '5'.repeat(64),
       prompt: 'continue',
-      status: 'accepted',
-      dispatchAttempt: 0,
-      workerGeneration: 0,
-      transitions: [{
-        status: 'accepted',
-        occurredAt: '2026-08-13T00:00:01.000Z',
-        dispatchAttempt: 0,
-        workerGeneration: 0,
-        evidence: { kind: 'lark_inbound', messageId: 'om_turn' },
-      }],
-      createdAt: '2026-08-13T00:00:01.000Z',
-      updatedAt: '2026-08-13T00:00:01.000Z',
-    } as CandidateTurnReceipt & { botmuxCommit: string };
+      acceptedAt: '2026-08-13T00:00:01.000Z',
+    });
     await deliverCandidateTurnReceipt(receipt, config(), fetchMock as any);
     expect(JSON.parse(String(fetchMock.mock.calls[0]![1].body))).toMatchObject({
+      releaseId: contract.releaseId,
+      releaseManifestSha256: contract.releaseManifestSha256,
+      runtimeBundleId: contract.runtimeBundleId,
       botmuxCommit,
       botmuxArtifactSha256,
     });

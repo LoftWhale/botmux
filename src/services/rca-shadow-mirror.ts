@@ -239,6 +239,9 @@ export async function deliverCandidateTurnReceipt(
         body: JSON.stringify({
           incidentKey: receipt.incidentKey,
           candidateDispatchId: receipt.candidateDispatchId,
+          releaseId: receipt.releaseId,
+          releaseManifestSha256: receipt.releaseManifestSha256,
+          runtimeBundleId: receipt.runtimeBundleId,
           turnId: receipt.turnId,
           sequence: receipt.sequence,
           larkAppId: receipt.larkAppId,

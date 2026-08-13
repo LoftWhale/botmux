@@ -64,6 +64,9 @@ async function seedCandidateSession(): Promise<DaemonSession> {
   session.larkAppId = APP;
   session.cliId = 'coco';
   session.candidateRuntimeContract = {
+    releaseId: 'release-a',
+    releaseManifestSha256: '1'.repeat(64),
+    runtimeBundleId: 'runtime-a',
     botmuxCommit: BOTMUX_COMMIT,
     botmuxArtifactSha256: BOTMUX_ARTIFACT_SHA256,
   } as never;
@@ -96,6 +99,9 @@ async function seedCandidateSession(): Promise<DaemonSession> {
     chatId: CHAT,
     topicMessage: 'Candidate Shadow',
     launchContext: {
+      releaseId: 'release-a',
+      releaseManifestSha256: '1'.repeat(64),
+      runtimeBundleId: 'runtime-a',
       botmuxCommit: BOTMUX_COMMIT,
       botmuxArtifactSha256: BOTMUX_ARTIFACT_SHA256,
     } as never,

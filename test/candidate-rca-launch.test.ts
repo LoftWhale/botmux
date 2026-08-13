@@ -474,6 +474,9 @@ describe('Candidate RCA launch identity', () => {
     const launchTurn = new CandidateTurnDurability({ dataDir: root })
       .get(request().candidateDispatchId, request().candidateDispatchId);
     expect(launchTurn).toMatchObject({
+      releaseId: runtimeContract().releaseId,
+      releaseManifestSha256: runtimeContract().releaseManifestSha256,
+      runtimeBundleId: runtimeContract().runtimeBundleId,
       status: 'accepted',
       dispatchAttempt: 1,
       workerGeneration: 1,
