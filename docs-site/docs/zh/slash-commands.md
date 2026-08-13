@@ -180,7 +180,7 @@
 
 ## 👥 多机器人协作
 
-`@botA @botB /t <prompt>`（各自开新话题）· `botmux bots list`（查看当前群可协作 bot）
+`@botA @botB /t <prompt>`（各自开新话题）· `/introduce`（让机器人自我介绍）· `botmux bots list`（查看当前群可协作 bot）
 
 ## ⏰ 定时 & ❓帮助
 
