@@ -21,6 +21,13 @@ HTTP virtual/API-task session，不能由 `/api/trigger` 请求，普通聊天�
 不受影响。缺省为关闭；bot/session 的 `sandbox`、bot 的 `readIsolation` 和
 host 级 `BOTMUX_SANDBOX=1` 仍优先强制隔离。
 
+注意开启后的凭证语义：文件沙盒关闭意味着 agent 进程以同一 OS 用户身份可以
+直接读磁盘上的 `~/.botmux/bots.json`（含各 bot 的 app secret）等原本由文件
+沙盒遮蔽的凭证文件。env 级 no-transport 冻结仍会删除本 bot 的
+`BOTMUX_LARK_APP_SECRET`，Botmux 自身的发送链路不会被该会话复用，但这不构成
+恶意代码下的凭证硬隔离；device-credential 强制隔离（enrolled 设备）不受影响，
+仍独立生效。开启前请确认信任该 bot 的全部 API 任务内容。
+
 ## 工作原理
 
 ```
