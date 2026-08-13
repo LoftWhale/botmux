@@ -361,6 +361,22 @@ describe('buildVcMeetingAgentOptions', () => {
     }]);
   });
 
+  it('shows an OFFLINE bot\'s persisted Feishu name (not the raw appId)', () => {
+    // Regression: cli_xxx bots that are offline used to fall through to appId in
+    // the dropdown. The dashboard now feeds onlineBotName from bots-info.json so
+    // an offline bot keeps its friendly name. Here isOnline=false but the name
+    // resolver still returns the persisted name.
+    const bot = { larkAppId: 'cli_offline', name: '' } as unknown as BotConfig;
+    const deps = makeDeps({
+      loadBotConfigs: vi.fn(() => [bot]),
+      onlineBotName: vi.fn(() => 'LastResort(Codex)'),
+      isOnline: vi.fn(() => false),
+    });
+    const options = buildVcMeetingAgentOptions(deps);
+    expect(options[0]?.label).toBe('LastResort(Codex)');
+    expect(options[0]?.online).toBe(false);
+  });
+
   it('returns [] when config loading throws (options degrade, not 500)', () => {
     const deps = makeDeps({ loadBotConfigs: vi.fn(() => { throw new Error('boom'); }) });
     expect(buildVcMeetingAgentOptions(deps)).toEqual([]);

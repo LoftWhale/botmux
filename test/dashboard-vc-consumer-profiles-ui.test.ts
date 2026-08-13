@@ -350,10 +350,10 @@ describe('VcConsumerProfilesSection · Listener 归属与语义文案', () => {
     expect(en('settings.vcMeetingListenerBot')).toBe('Meeting event receiver Bot');
     expect(zh('settings.vcProfiles.fieldAgent')).toBe('角色执行 Bot');
     expect(en('settings.vcProfiles.fieldAgent')).toBe('Role execution Bot');
-    expect(zh('settings.vcProfiles.defaultMode')).toContain('未操作');
-    expect(en('settings.vcProfiles.defaultMode')).toContain('no selection');
-    expect(zh('settings.vcProfiles.defaultConsumers')).toContain('未操作');
-    expect(en('settings.vcProfiles.defaultConsumers')).toContain('no selection');
+    expect(zh('settings.vcProfiles.defaultMode')).toContain('默认行为');
+    expect(en('settings.vcProfiles.defaultMode')).toContain('Default behavior');
+    expect(zh('settings.vcProfiles.defaultConsumers')).toContain('默认行为');
+    expect(en('settings.vcProfiles.defaultConsumers')).toContain('default behavior');
     expect(zh('settings.vcProfiles.migrationOffer')).toContain('会中文字和语音必须经过受管输出闸门');
     expect(zh('settings.vcProfiles.migrationOffer')).toContain('语音还需 Listener 语音设施已启用');
     expect(en('settings.vcProfiles.migrationOffer')).toContain('listener-thread replies can be sent directly');

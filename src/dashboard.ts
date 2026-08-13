@@ -811,13 +811,36 @@ function refreshLocalVcMeetingAgentConfig(appId: string): void {
   }
 }
 
+/** Map appId → persisted Feishu-probed botName from bots-info.json (offline
+ *  bots keep a friendly name in the dashboard). Best-effort; empty on any error. */
+function readPersistedBotNames(): Map<string, string> {
+  const out = new Map<string, string>();
+  try {
+    const fp = join(config.session.dataDir, 'bots-info.json');
+    if (!existsSync(fp)) return out;
+    const entries = JSON.parse(readFileSync(fp, 'utf8')) as Array<{ larkAppId?: string; botName?: string | null }>;
+    if (!Array.isArray(entries)) return out;
+    for (const e of entries) {
+      if (typeof e?.larkAppId === 'string' && typeof e?.botName === 'string' && e.botName.trim()) {
+        out.set(e.larkAppId, e.botName.trim());
+      }
+    }
+  } catch { /* best-effort */ }
+  return out;
+}
+
 function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
+  // Persisted Feishu-probed names, so an OFFLINE bot still shows its friendly
+  // name in the agent dropdown instead of falling back to the raw appId. The
+  // live registry only knows online bots; bots-info.json is written when a bot
+  // is probed and survives across restarts. Built once per deps construction.
+  const persistedBotNames = readPersistedBotNames();
   return {
     readSnapshot: readVcMeetingConsumerProfiles,
     updateSnapshot: updateVcMeetingConsumerProfiles,
     loadBotConfigs,
     effectiveDefaultWorkingDir,
-    onlineBotName: appId => registry.getByAppId(appId)?.botName,
+    onlineBotName: appId => registry.getByAppId(appId)?.botName ?? persistedBotNames.get(appId),
     isOnline: appId => !!registry.getByAppId(appId),
     adapterReliableTurnTerminal: (cliId, cliPathOverride) => {
       if (!cliId) return false;

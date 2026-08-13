@@ -1469,13 +1469,15 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_tracked_global_off')).toBe(false);
   });
 
-  it('global listener bot selection blocks new meetings for non-selected apps', async () => {
+  it('a legacy global-listener pin is ignored: every enabled bot handles its own invite', async () => {
     registerBot({
       larkAppId: OTHER_APP_ID,
       larkAppSecret: 'secret',
       cliId: 'claude-code',
       vcMeetingAgent: { enabled: true },
     });
+    // Even with a legacy pin pointing at APP_ID, OTHER_APP_ID must start its own
+    // meeting now — the pin is retired and no longer routes/blocks.
     __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(APP_ID);
 
     await __vcMeetingAgentTest.handlePush({
@@ -1486,7 +1488,7 @@ describe('VC meeting daemon session lifecycle', () => {
       meeting: { id: 'm_global_listener_other', meetingNo: '123456789', topic: 'Wrong listener' },
       raw: { event: { meeting: { id: 'm_global_listener_other', meeting_no: '123456789' } } },
     });
-    expect(__vcMeetingAgentTest.hasSession(OTHER_APP_ID, 'm_global_listener_other')).toBe(false);
+    expect(__vcMeetingAgentTest.hasSession(OTHER_APP_ID, 'm_global_listener_other')).toBe(true);
 
     await __vcMeetingAgentTest.handlePush({
       larkAppId: APP_ID,
@@ -1511,7 +1513,7 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_global_listener_selected')).toBe(true);
   });
 
-  it('global listener bot selection does not interrupt already tracked meetings on old apps', async () => {
+  it('a legacy global-listener pin set mid-stream never interrupts any bot\'s tracked meeting', async () => {
     await __vcMeetingAgentTest.handlePush({
       larkAppId: APP_ID,
       kind: 'meeting_activity',

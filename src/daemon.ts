@@ -1827,16 +1827,38 @@ const vcMeetingClosingConsumerSessions = new Map<string, {
 }>();
 let vcMeetingAgentGlobalEnabledOverrideForTest: boolean | undefined;
 let vcMeetingAgentGlobalListenerBotAppIdOverrideForTest: string | undefined | null;
+let vcMeetingListenerPinDeprecationWarned = false;
 
 function vcMeetingAgentGlobalEnabled(): boolean {
   return vcMeetingAgentGlobalEnabledOverrideForTest ?? isVcMeetingAgentGloballyEnabled();
 }
 
+/**
+ * RETIRED (2026-08): the global VC listener pin is gone — every bot with
+ * `vcMeetingAgent.enabled` now handles the meeting events IT receives, so a
+ * meeting can run multiple bots (each with its own presets) instead of routing
+ * everything through one designated listener. Always returns undefined so the
+ * `listenerAppId &&` guards at every call site short-circuit to the
+ * every-bot-handles-its-own behaviour (which was already the semantics when
+ * `listenerBotAppId` was unset). A legacy `vcMeetingAgent.listenerBotAppId`
+ * still in config is ignored with a one-time warning.
+ *
+ * The test override is retained ONLY so the test harness can still call the
+ * setter without a signature change; it no longer re-pins routing.
+ */
 function vcMeetingAgentGlobalListenerAppId(): string | undefined {
-  if (vcMeetingAgentGlobalListenerBotAppIdOverrideForTest !== undefined) {
-    return vcMeetingAgentGlobalListenerBotAppIdOverrideForTest ?? undefined;
+  const legacyPin = vcMeetingAgentGlobalListenerBotAppIdOverrideForTest !== undefined
+    ? (vcMeetingAgentGlobalListenerBotAppIdOverrideForTest ?? undefined)
+    : vcMeetingAgentGlobalListenerBotAppId();
+  if (legacyPin && !vcMeetingListenerPinDeprecationWarned) {
+    vcMeetingListenerPinDeprecationWarned = true;
+    logger.warn(
+      `[vc-agent] vcMeetingAgent.listenerBotAppId=${legacyPin} is deprecated and ignored: `
+      + 'every bot with vcMeetingAgent.enabled now handles its own meeting invites. '
+      + 'Remove this field from the global config.',
+    );
   }
-  return vcMeetingAgentGlobalListenerBotAppId();
+  return undefined;
 }
 
 function vcMeetingPushIsTrackedLifecycleEvent(ctx: VcMeetingPushContext): boolean {
