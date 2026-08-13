@@ -96,6 +96,8 @@ export interface CliAdapter {
     model?: string;
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Release-frozen CLI feature gates for managed Candidate sessions. */
+    disabledFeatures?: string[];
     /** Optional session-scoped skill plugin/root prepared by botmux. */
     skillPluginDir?: string;
     /** True when this session runs under per-bot read isolation (the worker
@@ -172,6 +174,8 @@ export interface CliAdapter {
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
+    /** Durable positive proof; omission means only the PTY write is known. */
+    confirmation?: 'transcript' | 'native_rpc';
     /** Non-transient reason when the adapter knows submission is impossible
      *  without waiting for transcript confirmation (for example an unsupported
      *  terminal keybinding). Worker surfaces this immediately. */

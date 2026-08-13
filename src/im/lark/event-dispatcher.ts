@@ -1487,6 +1487,14 @@ export interface EventHandlers {
   /** Check if this bot owns an active session anchored at the given id
    *  (rootMessageId for thread-scope, chatId for chat-scope). */
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
+  /** Durable Candidate receipt lookup used only to hold Candidate messages
+   * behind canonical session restoration. The daemon handlers revalidate the
+   * same identity immediately before CLI dispatch. */
+  resolveCandidateConversation?: (input: {
+    larkAppId: string;
+    chatId: string;
+    rootMessageId?: string;
+  }) => { kind: 'not_candidate' | 'identity_gap' | 'identity_conflict' | 'candidate' };
   /** Resolve a persisted topic reply alias back to its owning chat-scope session. */
   resolveReplyThreadAlias?: (rootId: string, chatId: string, larkAppId: string) => { chatId: string; sessionId: string; anchor?: string } | null;
   /** Fired when the dispatcher detects that a chat with a live chat-scope
@@ -2154,6 +2162,17 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const chatId = message.chat_id;
       const chatType = (message.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
       const messageId = message.message_id;
+      const candidateConversation = handlers.resolveCandidateConversation?.({
+        larkAppId,
+        chatId,
+        rootMessageId: message.root_id && message.thread_id ? message.root_id : undefined,
+      });
+      if (candidateConversation && candidateConversation.kind !== 'not_candidate') {
+        // The WS connection is live before restoreActiveSessions finishes. A
+        // Candidate reply received in that window must wait for the canonical
+        // Session instead of being dropped or falling into new-session routing.
+        await sessionsReady;
+      }
 
       // Bot-originated messages — bots historically only post inside threads
       // (their own thread replies). With chat-scope sessions a bot can also

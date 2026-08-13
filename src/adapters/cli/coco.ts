@@ -127,8 +127,11 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.trae/cli', '~/.cache/coco'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, model, disableCliBypass }) {
+    buildArgs({ sessionId, resume, model, disableCliBypass, disabledFeatures }) {
       const args: string[] = [];
+      for (const feature of disabledFeatures ?? []) {
+        args.push('--disable', feature);
+      }
       if (resume) {
         args.push('--resume', sessionId);
       } else {
@@ -230,7 +233,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       // silently mask a real submit failure on a new install.
       if (!existsSync(HISTORY_PATH) && baseByte === 0) {
         if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 1200)) {
-          return undefined;
+          return { submitted: true, confirmation: 'transcript' };
         }
         if (!existsSync(HISTORY_PATH)) {
           return undefined;
@@ -242,12 +245,12 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
 
       for (let attempt = 0; attempt < 3; attempt++) {
         if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 800)) {
-          return undefined;
+          return { submitted: true, confirmation: 'transcript' };
         }
         if (!trySendEnter()) return { submitted: false };
       }
       if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 800)) {
-        return undefined;
+        return { submitted: true, confirmation: 'transcript' };
       }
       // In-band budget exhausted. Hand the worker a recheck closure: a slow
       // CoCo (cold start, large initial prompt, heavy hooks) may still

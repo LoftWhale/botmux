@@ -89,6 +89,12 @@ import {
 } from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
+import {
+  CandidateRcaSessionRestorePendingError,
+  launchCandidateRcaFromDaemon,
+} from './candidate-rca-launch-entry.js';
+import { candidateRcaSessionsReady } from './candidate-rca-readiness.js';
+import { isCandidateRcaLaunchRequest } from '../services/candidate-rca-launch.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
@@ -1543,6 +1549,47 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
     return jsonRes(res, status, result);
   } catch (e: any) {
     return jsonRes(res, 500, { ok: false, errorCode: 'trigger_failed', error: e?.message ?? String(e) });
+  }
+});
+
+ipcRoute('POST', '/api/candidate-rca/launch', async (req, res) => {
+  if (!cachedLarkAppId) {
+    return jsonRes(res, 503, { ok: false, reason: 'identity_gap', error: 'larkAppId_not_set' });
+  }
+  const activeSessions = getActiveSessionsRegistry();
+  if (!activeSessions) {
+    return jsonRes(res, 503, { ok: false, reason: 'identity_gap', error: 'active session registry unavailable' });
+  }
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, reason: 'identity_gap', error: 'invalid JSON body' });
+  }
+  if (!isCandidateRcaLaunchRequest(body)) {
+    return jsonRes(res, 400, { ok: false, reason: 'identity_gap', error: 'invalid Candidate launch request' });
+  }
+  try {
+    const result = await launchCandidateRcaFromDaemon(body, {
+      dataDir: config.session.dataDir,
+      larkAppId: cachedLarkAppId,
+      activeSessions,
+      sessionsReady: candidateRcaSessionsReady(),
+    });
+    return jsonRes(res, result.ok ? 200 : result.reason === 'identity_gap' ? 422 : 409, result);
+  } catch (error) {
+    if (error instanceof CandidateRcaSessionRestorePendingError) {
+      return jsonRes(res, 503, {
+        ok: false,
+        reason: 'session_restore_pending',
+        error: error.message,
+      });
+    }
+    return jsonRes(res, 500, {
+      ok: false,
+      reason: 'identity_conflict',
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
 });
 

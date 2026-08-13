@@ -8,15 +8,17 @@ import {
   resolveMergedCardContent,
 } from '../im/lark/message-parser.js';
 import { logger } from '../utils/logger.js';
-import {
-  notifyRcaCandidateAccepted,
-  rcaShadowTokenFromEnv,
-} from './rca-shadow-notifier.js';
+import { rcaShadowTokenFromEnv } from './rca-shadow-notifier.js';
+import type { CandidateTurnReceipt } from './candidate-turn-durability.js';
 
 export interface RcaShadowMirrorConfig {
   url: string;
   token: string;
   botAppIds: string[];
+  /** Candidate bot identities must never feed their own output back into RCA mirroring. */
+  candidateBotAppIds?: string[];
+  /** Chats used for Candidate replay/Shadow output must never become mirror sources. */
+  shadowChatIds?: string[];
   timeoutMs: number;
   maxInFlight: number;
   maxQueued: number;
@@ -99,6 +101,16 @@ export const SOURCE_SNAPSHOT_CAPTURE_TIMEOUT_MS = 5_000;
 type FetchLike = typeof fetch;
 type LogLike = Pick<typeof logger, 'info' | 'warn'>;
 
+export class CandidateTurnReceiptDeliveryError extends Error {
+  readonly retryable: boolean;
+
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.name = 'CandidateTurnReceiptDeliveryError';
+    this.retryable = retryable;
+  }
+}
+
 function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -112,17 +124,36 @@ function nonNegativeInteger(value: string | undefined, fallback: number): number
 export function rcaShadowMirrorConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): RcaShadowMirrorConfig {
-  return {
+  const config: RcaShadowMirrorConfig = {
     url: env.BOTMUX_RCA_MIRROR_URL?.trim() || '',
     token: rcaShadowTokenFromEnv(env),
     botAppIds: (env.BOTMUX_RCA_MIRROR_BOT_APP_IDS || '')
       .split(',')
       .map((value) => value.trim())
       .filter(Boolean),
+    candidateBotAppIds: (env.BOTMUX_RCA_MIRROR_CANDIDATE_BOT_APP_IDS || '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean),
+    shadowChatIds: [...new Set([
+      env.BOTMUX_RCA_SHADOW_CHAT_ID || '',
+      ...(env.BOTMUX_RCA_MIRROR_SHADOW_CHAT_IDS || '').split(','),
+    ].map((value) => value.trim()).filter(Boolean))],
     timeoutMs: positiveInteger(env.BOTMUX_RCA_MIRROR_TIMEOUT_MS, 500),
     maxInFlight: positiveInteger(env.BOTMUX_RCA_MIRROR_MAX_IN_FLIGHT, 2),
     maxQueued: nonNegativeInteger(env.BOTMUX_RCA_MIRROR_MAX_QUEUED, 16),
   };
+  const enabled = Boolean(config.url && config.token && config.botAppIds.length > 0);
+  if (enabled && config.candidateBotAppIds!.length === 0) {
+    throw new Error('Candidate bot app exclusion is required when RCA Shadow mirroring is configured');
+  }
+  if (enabled && config.shadowChatIds!.length === 0) {
+    throw new Error('Shadow chat exclusion is required when RCA Shadow mirroring is configured');
+  }
+  if (config.candidateBotAppIds!.some(appId => !config.botAppIds.includes(appId))) {
+    throw new Error('Candidate bot app exclusion must also be present in the RCA mirror bot allowlist');
+  }
+  return config;
 }
 
 function opaqueKey(token: string, namespace: string, value: string): string {
@@ -136,7 +167,9 @@ export async function deliverRcaChampionResult(
   config: RcaShadowMirrorConfig = rcaShadowMirrorConfigFromEnv(),
   fetchImpl: FetchLike = fetch,
 ): Promise<'sent' | 'disabled'> {
-  if (!config.url || !config.token || !config.botAppIds.includes(input.larkAppId)) {
+  if (!config.url || !config.token
+    || !config.botAppIds.includes(input.larkAppId)
+    || config.candidateBotAppIds?.includes(input.larkAppId)) {
     return 'disabled';
   }
   const result = input.result.trim();
@@ -169,6 +202,90 @@ export async function deliverRcaChampionResult(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/** Project one durable Candidate turn transition into Search RCA's control
+ * plane. The BotMux receipt remains authoritative; a later transition or boot
+ * reconciliation may replay this idempotent callback after transport failure. */
+export async function deliverCandidateTurnReceipt(
+  receipt: CandidateTurnReceipt,
+  mirrorConfig: RcaShadowMirrorConfig = rcaShadowMirrorConfigFromEnv(),
+  fetchImpl: FetchLike = fetch,
+): Promise<'sent' | 'disabled'> {
+  if (!mirrorConfig.url || !mirrorConfig.token
+    || !mirrorConfig.botAppIds.includes(receipt.larkAppId)) {
+    return 'disabled';
+  }
+  if (!mirrorConfig.candidateBotAppIds?.includes(receipt.larkAppId)) {
+    throw new CandidateTurnReceiptDeliveryError(
+      'Candidate turn receipt app is missing from the Candidate bot exclusion',
+      false,
+    );
+  }
+  const transition = receipt.transitions.at(-1);
+  if (!transition) return 'disabled';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), mirrorConfig.timeoutMs);
+  timeout.unref();
+  try {
+    const response = await fetchImpl(
+      `${mirrorConfig.url.replace(/\/+$/, '')}/api/candidates/turns/receipts`,
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${mirrorConfig.token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          incidentKey: receipt.incidentKey,
+          candidateDispatchId: receipt.candidateDispatchId,
+          turnId: receipt.turnId,
+          sequence: receipt.sequence,
+          larkAppId: receipt.larkAppId,
+          chatId: receipt.chatId,
+          rootMessageId: receipt.rootMessageId,
+          botmuxSessionId: receipt.botmuxSessionId,
+          botmuxCommit: receipt.botmuxCommit,
+          botmuxArtifactSha256: receipt.botmuxArtifactSha256,
+          status: transition.status,
+          dispatchAttempt: transition.dispatchAttempt,
+          workerGeneration: transition.workerGeneration,
+          evidence: transition.evidence,
+          ...(transition.status === 'completed'
+            && typeof transition.evidence.output === 'string'
+            ? { result: transition.evidence.output }
+            : {}),
+          occurredAt: transition.occurredAt,
+        }),
+        signal: controller.signal,
+      },
+    );
+    if (!response.ok) {
+      throw new CandidateTurnReceiptDeliveryError(
+        `RCA Server returned HTTP ${response.status}`,
+        response.status !== 409 && response.status !== 422,
+      );
+    }
+    return 'sent';
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function deliverCandidateTurnReceiptHistory(
+  receipt: CandidateTurnReceipt,
+  mirrorConfig: RcaShadowMirrorConfig = rcaShadowMirrorConfigFromEnv(),
+  fetchImpl: FetchLike = fetch,
+): Promise<'sent' | 'disabled'> {
+  let result: 'sent' | 'disabled' = 'disabled';
+  for (let index = 0; index < receipt.transitions.length; index += 1) {
+    result = await deliverCandidateTurnReceipt(
+      { ...receipt, transitions: receipt.transitions.slice(0, index + 1) },
+      mirrorConfig,
+      fetchImpl,
+    );
+  }
+  return result;
 }
 
 function signalSource(content: string): string {
@@ -525,7 +642,9 @@ export class RcaShadowMirror {
     if (!this.config.url || !this.config.token || this.config.botAppIds.length === 0) {
       return 'disabled';
     }
-    if (!this.config.botAppIds.includes(turn.larkAppId)) return 'filtered';
+    if (!this.config.botAppIds.includes(turn.larkAppId)
+      || this.config.candidateBotAppIds?.includes(turn.larkAppId)
+      || this.config.shadowChatIds?.includes(turn.chatId)) return 'filtered';
     const canStartImmediately = this.inFlight < this.config.maxInFlight
       && !this.activeSessionIds.has(turn.sessionId);
     if (!canStartImmediately && this.queue.length >= this.config.maxQueued) {
@@ -632,17 +751,10 @@ export class RcaShadowMirror {
       if (!response.ok) {
         throw new Error(`RCA Server returned HTTP ${response.status}`);
       }
-      const result = await response.json().catch(() => null) as {
-        eventId?: unknown;
-        viewKey?: unknown;
-      } | null;
-      if (typeof result?.eventId === 'string' && result.eventId) {
-        notifyRcaCandidateAccepted(
-          result.eventId,
-          turn.larkAppId,
-          typeof result.viewKey === 'string' ? result.viewKey : '',
-        );
-      }
+      // Search RCA now launches the durable Candidate topic itself. The old
+      // notifier polled Search RCA run.status and posted a second top-level
+      // card into the Shadow chat, creating a competing conversation surface.
+      // A successful mirror response therefore has no follow-on UI side effect.
     } finally {
       clearTimeout(timeout);
     }

@@ -236,7 +236,11 @@ describe('triggerSessionTurn rootMessageId target', () => {
     );
 
     expect(res).toMatchObject({ ok: true, triggerId: 'vcd_stable_delivery_key', action: 'delivered' });
-    expect(beforeDispatch).toHaveBeenCalledWith({ sessionId: ds.session.sessionId, workerGeneration: 7 });
+    expect(beforeDispatch).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: ds.session.sessionId,
+      workerGeneration: 7,
+      prompt: expect.any(String),
+    }));
     expect(beforeDispatch.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]!);
     expect(ds.suppressedFinalOutputTurns?.has('vcd_stable_delivery_key')).toBe(true);
     expect(send).toHaveBeenCalledWith({
@@ -412,7 +416,11 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
     expect(res).toMatchObject({ ok: true, triggerId: 'vcd_dormant_session_delivery', action: 'queued' });
     expect(mockCreateSession).not.toHaveBeenCalled();
-    expect(beforeDispatch).toHaveBeenCalledWith({ sessionId: ds.session.sessionId, workerGeneration: 4 });
+    expect(beforeDispatch).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: ds.session.sessionId,
+      workerGeneration: 4,
+      prompt: expect.any(String),
+    }));
     expect(beforeDispatch.mock.invocationCallOrder[0]).toBeLessThan(mockForkWorker.mock.invocationCallOrder[0]!);
     expect(mockForkWorker).toHaveBeenCalledWith(
       ds,

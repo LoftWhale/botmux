@@ -128,6 +128,9 @@ export interface OutboundMessageOptions {
    * Lark deduplicates the message, but the local outbound hook is a separate
    * side effect and must not be fired twice. */
   suppressHook?: boolean;
+  /** Abort the underlying provider request after this deadline. Stable UUID
+   * retries use this to stay inside Feishu's one-hour dedupe window. */
+  requestTimeoutMs?: number;
 }
 
 export async function sendMessage(
@@ -144,15 +147,23 @@ export async function sendMessage(
 
   let res: any;
   try {
-    res = await c.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
+    const payload = {
+      params: { receive_id_type: 'chat_id' as const },
       data: {
         receive_id: chatId,
         msg_type: msgType as any,
         content: body,
         ...(uuid ? { uuid } : {}),
       },
-    });
+    };
+    res = options?.requestTimeoutMs
+      ? await c.request({
+        method: 'POST',
+        url: '/open-apis/im/v1/messages',
+        ...payload,
+        timeout: options.requestTimeoutMs,
+      })
+      : await c.im.v1.message.create(payload);
   } catch (err: any) {
     if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
       throw new MessageWithdrawnError(chatId);

@@ -27,6 +27,22 @@ import {
   stopCliRuntimeUpdateMonitor,
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
+import { resolveCandidateFeishuConversation } from './core/candidate-feishu-conversation.js';
+import {
+  acceptCandidateTurnFromDaemon,
+  settleCandidateTurnFromWorker,
+  submitCandidateTurnFromWorker,
+  type CandidateTurnEntryDeps,
+} from './core/candidate-turn-entry.js';
+import {
+  CandidateTurnDurability,
+  candidateTurnOutputUuid,
+  type CandidateTurnDispatch,
+  type CandidateTurnReceipt,
+} from './services/candidate-turn-durability.js';
+import { reconcileCandidateCocoTranscript } from './services/candidate-turn-transcript.js';
+import { deliverCandidateTurnReceiptHistory } from './services/rca-shadow-mirror.js';
+import { CandidateTurnReceiptReporter } from './services/candidate-turn-reporter.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { groupJoinSyntheticTurnId, resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
@@ -105,6 +121,11 @@ import {
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
 import { ipcRoute, isTrustedHostIpcRequest, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger } from './core/dashboard-ipc-server.js';
+import { markCandidateRcaSessionsReady } from './core/candidate-rca-readiness.js';
+import {
+  setCandidateLaunchTurnReceiptReporter,
+  setCandidateLaunchTurnRecovery,
+} from './core/candidate-rca-launch-entry.js';
 import { loadOrCreateDashboardSecret } from './dashboard/auth.js';
 import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
@@ -423,6 +444,311 @@ import {
 // ─── State ───────────────────────────────────────────────────────────────────
 
 const activeSessions = new Map<string, DaemonSession>();
+const candidateTurnRecoveryTimers = new Map<string, NodeJS.Timeout>();
+const candidateTurnFenceWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+
+const candidateTurnReceiptReporter = new CandidateTurnReceiptReporter({
+  dataDir: config.session.dataDir,
+  deliver: (receipt) => deliverCandidateTurnReceiptHistory(receipt),
+  onError(error) {
+    logger.warn(
+      `[candidate-rca] turn receipt callback retained for durable retry: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  },
+});
+
+function reportCandidateTurnReceipt(receipt: CandidateTurnReceipt): void {
+  candidateTurnReceiptReporter.report(receipt);
+}
+
+setCandidateLaunchTurnReceiptReporter(reportCandidateTurnReceipt);
+setCandidateLaunchTurnRecovery(recoverCandidateTurn);
+
+function candidateTurnRecoveryKey(receipt: Pick<CandidateTurnReceipt, 'candidateDispatchId' | 'turnId'>): string {
+  return `${receipt.candidateDispatchId}\0${receipt.turnId}`;
+}
+
+function clearCandidateTurnRecoveryTimer(
+  receipt: Pick<CandidateTurnReceipt, 'candidateDispatchId' | 'turnId'>,
+): void {
+  const key = candidateTurnRecoveryKey(receipt);
+  const timer = candidateTurnRecoveryTimers.get(key);
+  if (timer) clearInterval(timer);
+  candidateTurnRecoveryTimers.delete(key);
+}
+
+function scheduleCandidateTurnRecovery(
+  ds: DaemonSession,
+  receipt: CandidateTurnReceipt,
+  reason: string,
+): void {
+  const key = candidateTurnRecoveryKey(receipt);
+  if (candidateTurnRecoveryTimers.has(key)) return;
+  const timer = setTimeout(() => {
+    candidateTurnRecoveryTimers.delete(key);
+    void recoverCandidateTurn(ds, receipt).catch(error => logger.warn(
+      `[candidate-rca] ${reason} recovery failed: ${error instanceof Error ? error.message : String(error)}`,
+    ));
+  }, 1_000);
+  timer.unref();
+  candidateTurnRecoveryTimers.set(key, timer);
+}
+
+function dispatchCandidateTurn(ds: DaemonSession, turn: CandidateTurnDispatch): void {
+  if (turn.botmuxSessionId !== ds.session.sessionId
+    || turn.rootMessageId !== sessionAnchorId(ds)
+    || turn.chatId !== ds.chatId
+    || turn.larkAppId !== ds.larkAppId
+    || !ds.session.candidateRuntimeContract) {
+    throw new Error('Candidate turn dispatch identity conflict');
+  }
+  rememberLastCliInput(ds, turn.prompt, { content: turn.prompt });
+  sessionStore.updateSession(ds.session);
+  if (ds.worker && !ds.worker.killed) {
+    if (!sendWorkerInput(ds, turn.prompt, turn.turnId, { dispatchAttempt: turn.dispatchAttempt })) {
+      throw new Error('Candidate worker rejected durable turn dispatch');
+    }
+    return;
+  }
+  forkWorker(ds, turn.prompt, {
+    resume: ds.hasHistory,
+    turnId: turn.turnId,
+    dispatchAttempt: turn.dispatchAttempt,
+  });
+}
+
+function candidateTurnEntryDeps(
+  ds: DaemonSession,
+  workerGeneration: number,
+): CandidateTurnEntryDeps {
+  return {
+    dataDir: config.session.dataDir,
+    receiverBootId: getDaemonBootId(),
+    workerGeneration,
+    dispatch: (turn) => dispatchCandidateTurn(ds, turn),
+    onAmbiguousDispatch: (receipt) => scheduleCandidateTurnRecovery(ds, receipt, 'dispatch'),
+    onReceipt: (receipt) => reportCandidateTurnReceipt(receipt),
+  };
+}
+
+function candidateConversationForSession(ds: DaemonSession) {
+  return resolveCandidateFeishuConversation({
+    dataDir: config.session.dataDir,
+    larkAppId: ds.larkAppId,
+    chatId: ds.chatId,
+    rootMessageId: sessionAnchorId(ds),
+    activeSessions,
+  });
+}
+
+function candidateTurnFenceKey(sessionId: string, turnId: string, dispatchAttempt: number): string {
+  return `${sessionId}\0${turnId}\0${dispatchAttempt}`;
+}
+
+async function fenceCandidateTurn(ds: DaemonSession, receipt: CandidateTurnReceipt): Promise<void> {
+  if (!ds.worker || ds.worker.killed) forkWorker(ds, '', { resume: ds.hasHistory });
+  if (!ds.worker || ds.worker.killed) throw new Error('Candidate recovery worker is unavailable');
+  const key = candidateTurnFenceKey(ds.session.sessionId, receipt.turnId, receipt.dispatchAttempt);
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      candidateTurnFenceWaiters.delete(key);
+      reject(new Error('Candidate recovery fence acknowledgement timed out'));
+    }, 8_000);
+    timer.unref();
+    candidateTurnFenceWaiters.set(key, { resolve, reject, timer });
+    ds.worker!.send({
+      type: 'reset_ambiguous_receiver',
+      turnId: receipt.turnId,
+      dispatchAttempt: receipt.dispatchAttempt,
+    } as DaemonToWorker);
+  });
+}
+
+async function recoverCandidateTurn(ds: DaemonSession, original: CandidateTurnReceipt): Promise<void> {
+  const turns = new CandidateTurnDurability({ dataDir: config.session.dataDir });
+  let receipt = turns.get(original.candidateDispatchId, original.turnId);
+  if (!receipt || receipt.status === 'completed' || receipt.status === 'failed') {
+    clearCandidateTurnRecoveryTimer(original);
+    return;
+  }
+  const nativeSessionId = receipt.nativeSessionId
+    ?? ds.session.cliSessionId
+    ?? (ds.session.candidateRuntimeContract && ds.session.cliId === 'coco'
+      ? ds.session.sessionId
+      : undefined);
+  if (nativeSessionId) {
+    const transcript = reconcileCandidateCocoTranscript(receipt, nativeSessionId);
+    if (transcript.kind !== 'not_found' && receipt.status === 'accepted') {
+      receipt = await submitCandidateTurnFromWorker({
+        candidateDispatchId: receipt.candidateDispatchId,
+        turnId: receipt.turnId,
+        dispatchAttempt: receipt.dispatchAttempt,
+        workerGeneration: receipt.workerGeneration,
+        evidence: {
+          kind: 'cli_transcript',
+          nativeSessionId,
+          transcriptRef: transcript.kind === 'completed'
+            ? transcript.submitTranscriptRef
+            : transcript.transcriptRef,
+        },
+      }, candidateTurnEntryDeps(ds, ds.worker && !ds.worker.killed
+        ? (ds.workerGeneration ?? receipt.workerGeneration)
+        : (ds.workerGeneration ?? 0) + 1));
+    }
+    if (transcript.kind === 'completed') {
+      const outputUuid = candidateTurnOutputUuid(receipt.botmuxSessionId, receipt.turnId);
+      const outputClaim = await turns.claimOutputDelivery({
+        candidateDispatchId: receipt.candidateDispatchId,
+        turnId: receipt.turnId,
+        dispatchAttempt: receipt.dispatchAttempt,
+        workerGeneration: receipt.workerGeneration,
+        uuid: outputUuid,
+      });
+      if (outputClaim.kind === 'ambiguous') {
+        const dispatchingAt = Date.parse(receipt.outputDelivery?.updatedAt ?? receipt.updatedAt);
+        if (ds.worker && !ds.worker.killed
+          && Number.isFinite(dispatchingAt)
+          && Date.now() - dispatchingAt < 30_000) {
+          scheduleCandidateTurnRecovery(ds, receipt, 'output-ambiguity');
+          return;
+        }
+        await settleCandidateTurnFromWorker({
+          candidateDispatchId: receipt.candidateDispatchId,
+          turnId: receipt.turnId,
+          dispatchAttempt: receipt.dispatchAttempt,
+          workerGeneration: receipt.workerGeneration,
+          status: 'failed',
+          evidence: {
+            kind: 'runtime_terminal',
+            nativeSessionId,
+            transcriptRef: `${transcript.terminalTranscriptRef}#output_outcome_ambiguous`,
+          },
+        }, candidateTurnEntryDeps(ds, ds.workerGeneration ?? receipt.workerGeneration));
+        clearCandidateTurnRecoveryTimer(receipt);
+        return;
+      }
+      if (outputClaim.kind === 'send') {
+        let messageId: string;
+        try {
+          messageId = await sessionReply(
+            receipt.rootMessageId,
+            transcript.output,
+            'text',
+            receipt.larkAppId,
+            receipt.turnId,
+            { uuid: outputUuid, sourceSessionId: receipt.botmuxSessionId },
+          );
+          await turns.markOutputDelivered({
+            candidateDispatchId: receipt.candidateDispatchId,
+            turnId: receipt.turnId,
+            dispatchAttempt: receipt.dispatchAttempt,
+            workerGeneration: receipt.workerGeneration,
+            uuid: outputUuid,
+            messageId,
+            output: transcript.output,
+          });
+        } catch (error) {
+          await settleCandidateTurnFromWorker({
+            candidateDispatchId: receipt.candidateDispatchId,
+            turnId: receipt.turnId,
+            dispatchAttempt: receipt.dispatchAttempt,
+            workerGeneration: receipt.workerGeneration,
+            status: 'failed',
+            evidence: {
+              kind: 'runtime_terminal',
+              nativeSessionId,
+              transcriptRef: `${transcript.terminalTranscriptRef}#output_delivery_ambiguous`,
+            },
+          }, candidateTurnEntryDeps(ds, ds.workerGeneration ?? receipt.workerGeneration));
+          clearCandidateTurnRecoveryTimer(receipt);
+          return;
+        }
+      }
+      await settleCandidateTurnFromWorker({
+        candidateDispatchId: receipt.candidateDispatchId,
+        turnId: receipt.turnId,
+        dispatchAttempt: receipt.dispatchAttempt,
+        workerGeneration: receipt.workerGeneration,
+        status: 'completed',
+        evidence: {
+          kind: 'cli_transcript_terminal',
+          nativeSessionId,
+          transcriptRef: transcript.terminalTranscriptRef,
+          output: transcript.output,
+        },
+      }, candidateTurnEntryDeps(ds, ds.worker && !ds.worker.killed
+        ? (ds.workerGeneration ?? receipt.workerGeneration)
+        : (ds.workerGeneration ?? 0) + 1));
+      clearCandidateTurnRecoveryTimer(receipt);
+      return;
+    }
+    if (transcript.kind === 'submitted' || receipt.status === 'submitted') {
+      if (!ds.worker || ds.worker.killed) {
+        const submitTransition = receipt.transitions.find(entry => entry.status === 'submitted');
+        const transcriptRef = transcript.kind === 'submitted'
+          ? transcript.transcriptRef
+          : String(submitTransition?.evidence.transcriptRef || 'submitted_receipt');
+        await settleCandidateTurnFromWorker({
+          candidateDispatchId: receipt.candidateDispatchId,
+          turnId: receipt.turnId,
+          dispatchAttempt: receipt.dispatchAttempt,
+          workerGeneration: receipt.workerGeneration,
+          status: 'failed',
+          evidence: {
+            kind: 'runtime_terminal',
+            nativeSessionId,
+            transcriptRef: `${transcriptRef}#runtime_gone`,
+          },
+        }, candidateTurnEntryDeps(ds, (ds.workerGeneration ?? 0) + 1));
+        clearCandidateTurnRecoveryTimer(receipt);
+        return;
+      }
+      const key = candidateTurnRecoveryKey(receipt);
+      if (!candidateTurnRecoveryTimers.has(key)) {
+        const timer = setInterval(() => {
+          void recoverCandidateTurn(ds, receipt!).catch(error => logger.warn(
+            `[candidate-rca] transcript recovery retry failed: ${error instanceof Error ? error.message : String(error)}`,
+          ));
+        }, 2_000);
+        timer.unref();
+        candidateTurnRecoveryTimers.set(key, timer);
+      }
+      return;
+    }
+  }
+
+  const currentGeneration = ds.worker && !ds.worker.killed
+    ? (ds.workerGeneration ?? 1)
+    : (ds.workerGeneration ?? 0) + 1;
+  let fencedAttempt: number | undefined;
+  if (receipt.dispatchAttempt > 0) {
+    await fenceCandidateTurn(ds, receipt);
+    fencedAttempt = receipt.dispatchAttempt;
+  }
+  const claim = await turns.claimHead(receipt.candidateDispatchId, {
+    receiverBootId: getDaemonBootId(),
+    workerGeneration: ds.workerGeneration ?? currentGeneration,
+    ...(fencedAttempt !== undefined ? { fencedAttempt } : {}),
+  });
+  if (claim.kind === 'dispatch') dispatchCandidateTurn(ds, claim.dispatch);
+}
+
+async function recoverCandidateTurnsOnBoot(): Promise<void> {
+  const turns = new CandidateTurnDurability({ dataDir: config.session.dataDir });
+  candidateTurnReceiptReporter.recoverPending();
+  for (const receipt of turns.listHeads()) {
+    const ds = findActiveBySessionId(receipt.botmuxSessionId);
+    if (!ds || !ds.session.candidateRuntimeContract
+      || ds.larkAppId !== receipt.larkAppId
+      || ds.chatId !== receipt.chatId
+      || sessionAnchorId(ds) !== receipt.rootMessageId) {
+      logger.error(`[candidate-rca] recovery identity gap for turn=${receipt.turnId.slice(0, 12)}`);
+      continue;
+    }
+    await recoverCandidateTurn(ds, receipt);
+  }
+}
 const VC_MEETING_DELIVERY_LEASE_MS = 15 * 60_000;
 const VC_MEETING_DELIVERY_LEASE_SCAN_MS = 60_000;
 const VC_MEETING_RUNTIME_EXPIRY_ACK_TIMEOUT_MS = 3_000;
@@ -2531,6 +2857,11 @@ async function sessionReply(
     sessionId: ds.session.sessionId,
     scope: ds.scope,
     anchor: sessionAnchorId(ds),
+    ...(ds.session.candidateRuntimeContract ? {
+      chatId: ds.chatId,
+      rootId: sessionAnchorId(ds),
+      ...(turnId ? { turnId } : {}),
+    } : {}),
   } : undefined;
   const outboundOptions = opts?.suppressHook || ds?.session.vcMeetingReceiver
     ? { suppressHook: true }
@@ -14260,6 +14591,23 @@ function mergeVcMeetingApplicationContext(
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger } = ctx;
+  const candidateConversation = resolveCandidateFeishuConversation({
+    dataDir: config.session.dataDir,
+    larkAppId,
+    chatId,
+    rootMessageId: data?.message?.root_id && data?.message?.thread_id
+      ? data.message.root_id
+      : undefined,
+    activeSessions,
+  });
+  if (candidateConversation.kind !== 'not_candidate') {
+    logger.warn(
+      `[candidate-rca] rejected new-session routing in Candidate chat `
+      + `chat=${chatId.substring(0, 12)} message=${messageId.substring(0, 12)} `
+      + `identity=${candidateConversation.kind}`,
+    );
+    return;
+  }
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
@@ -14994,6 +15342,25 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
 
 async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger } = ctx;
+  const candidateConversation = resolveCandidateFeishuConversation({
+    dataDir: config.session.dataDir,
+    larkAppId,
+    chatId: ctxChatId,
+    rootMessageId: data?.message?.root_id && data?.message?.thread_id
+      ? data.message.root_id
+      : undefined,
+    activeSessions,
+  });
+  if (candidateConversation.kind !== 'not_candidate'
+    && (candidateConversation.kind !== 'candidate'
+      || candidateConversation.rootMessageId !== anchor)) {
+    logger.warn(
+      `[candidate-rca] rejected inbound before CLI dispatch `
+      + `chat=${ctxChatId.substring(0, 12)} anchor=${anchor.substring(0, 12)} `
+      + `identity=${candidateConversation.kind}`,
+    );
+    return;
+  }
   await resolveNonsupportMessage(data, larkAppId);
   const { parsed, resources } = parseEventMessage(data);
 
@@ -15755,6 +16122,23 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           codexAppApplicationContext,
           codexAppMessageContext,
         });
+    if (candidateConversation.kind === 'candidate') {
+      beginNewTurn(ds, parsed.content);
+      await acceptCandidateTurnFromDaemon({
+        incidentKey: candidateConversation.incidentKey,
+        candidateDispatchId: candidateConversation.candidateDispatchId,
+        larkAppId,
+        chatId: ctxChatId,
+        rootMessageId: candidateConversation.rootMessageId,
+        botmuxSessionId: candidateConversation.botmuxSessionId,
+        botmuxCommit: ds.session.candidateRuntimeContract!.botmuxCommit,
+        botmuxArtifactSha256: ds.session.candidateRuntimeContract!.botmuxArtifactSha256,
+        turnId: parsed.messageId,
+        prompt: cliInput.content,
+      }, candidateTurnEntryDeps(ds, ds.workerGeneration ?? 1));
+      await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId);
+      return;
+    }
     beginNewTurn(ds, parsed.content);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, cliInput);
@@ -15841,6 +16225,23 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // queuedPrompt + the current reply, whereas a structured turn could only
       // contain the reply and would silently discard the original task.
       logger.warn(`[${tag(ds)}] Legacy queued dashboard task has no clean-input text; using the full legacy activation prompt`);
+    }
+    if (candidateConversation.kind === 'candidate') {
+      beginNewTurn(ds, parsed.content);
+      await acceptCandidateTurnFromDaemon({
+        incidentKey: candidateConversation.incidentKey,
+        candidateDispatchId: candidateConversation.candidateDispatchId,
+        larkAppId,
+        chatId: ctxChatId,
+        rootMessageId: candidateConversation.rootMessageId,
+        botmuxSessionId: candidateConversation.botmuxSessionId,
+        botmuxCommit: ds.session.candidateRuntimeContract!.botmuxCommit,
+        botmuxArtifactSha256: ds.session.candidateRuntimeContract!.botmuxArtifactSha256,
+        turnId: parsed.messageId,
+        prompt: wrappedInput.content,
+      }, candidateTurnEntryDeps(ds, (ds.workerGeneration ?? 0) + 1));
+      await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId);
+      return;
     }
     await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     rememberLastCliInput(ds, promptContent, wrappedInput);
@@ -16502,7 +16903,116 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
-    onTurnTerminal(ds, terminal, context) {
+    async beforeTurnOutputDelivery(ds, output, context) {
+      const candidate = candidateConversationForSession(ds);
+      if (candidate.kind !== 'candidate') return { kind: 'send' };
+      if (output.dispatchAttempt === undefined) {
+        throw new Error('Candidate final output lacks dispatch attempt identity');
+      }
+      const turns = new CandidateTurnDurability({ dataDir: config.session.dataDir });
+      const uuid = candidateTurnOutputUuid(ds.session.sessionId, output.turnId);
+      const claim = await turns.claimOutputDelivery({
+        candidateDispatchId: candidate.candidateDispatchId,
+        turnId: output.turnId,
+        dispatchAttempt: output.dispatchAttempt,
+        workerGeneration: context.workerGeneration,
+        uuid,
+      });
+      return claim.kind === 'send'
+        ? { kind: 'send', uuid }
+        : { kind: 'skip', ...(claim.kind === 'already_delivered'
+          ? { messageId: claim.messageId }
+          : {}) };
+    },
+    async onTurnOutputDelivered(ds, output, delivery, context) {
+      const candidate = candidateConversationForSession(ds);
+      if (candidate.kind !== 'candidate') return;
+      if (output.dispatchAttempt === undefined) {
+        throw new Error('Candidate final output lacks dispatch attempt identity');
+      }
+      await new CandidateTurnDurability({ dataDir: config.session.dataDir }).markOutputDelivered({
+        candidateDispatchId: candidate.candidateDispatchId,
+        turnId: output.turnId,
+        dispatchAttempt: output.dispatchAttempt,
+        workerGeneration: context.workerGeneration,
+        uuid: delivery.uuid,
+        messageId: delivery.messageId,
+        output: output.content,
+      });
+    },
+    async onTurnSubmitted(ds, submitted, context) {
+      const candidate = candidateConversationForSession(ds);
+      if (candidate.kind !== 'candidate') return;
+      await submitCandidateTurnFromWorker({
+        candidateDispatchId: candidate.candidateDispatchId,
+        turnId: submitted.turnId,
+        dispatchAttempt: submitted.dispatchAttempt,
+        workerGeneration: context.workerGeneration,
+        evidence: {
+          kind: submitted.evidenceKind,
+          nativeSessionId: submitted.nativeSessionId,
+          transcriptRef: submitted.transcriptRef,
+        },
+      }, candidateTurnEntryDeps(ds, context.workerGeneration));
+    },
+    async onTurnTerminal(ds, terminal, context) {
+      const candidate = candidateConversationForSession(ds);
+      if (candidate.kind === 'candidate') {
+        const receipt = new CandidateTurnDurability({ dataDir: config.session.dataDir })
+          .get(candidate.candidateDispatchId, terminal.turnId);
+        if (terminal.status === 'ambiguous') {
+          if (receipt) scheduleCandidateTurnRecovery(ds, receipt, 'ambiguous-terminal');
+          return;
+        }
+        const candidateTerminalStatus = terminal.status === 'completed'
+          ? 'completed'
+          : terminal.status === 'failed' || terminal.status === 'cancelled'
+            ? 'failed'
+            : undefined;
+        if (candidateTerminalStatus === 'completed'
+          && receipt?.outputDelivery?.status === 'dispatching') {
+          logger.warn(
+            `[candidate-rca] terminal output outcome is ambiguous; keeping turn recoverable `
+            + `turn=${terminal.turnId.slice(0, 12)}`,
+          );
+          scheduleCandidateTurnRecovery(ds, receipt, 'output-delivery');
+          return;
+        }
+        if (terminal.dispatchAttempt === undefined
+          || !terminal.nativeSessionId || !terminal.transcriptRef
+          || !candidateTerminalStatus) {
+          logger.warn(
+            `[candidate-rca] terminal lacks durable evidence; receipt remains recoverable `
+            + `turn=${terminal.turnId.slice(0, 12)} status=${terminal.status}`,
+          );
+          if (receipt) scheduleCandidateTurnRecovery(ds, receipt, 'terminal-evidence');
+          return;
+        }
+        await settleCandidateTurnFromWorker({
+          candidateDispatchId: candidate.candidateDispatchId,
+          turnId: terminal.turnId,
+          dispatchAttempt: terminal.dispatchAttempt,
+          workerGeneration: context.workerGeneration,
+          status: candidateTerminalStatus,
+          evidence: {
+            kind: candidateTerminalStatus === 'completed'
+              ? 'cli_transcript_terminal'
+              : 'runtime_terminal',
+            nativeSessionId: terminal.nativeSessionId,
+            transcriptRef: terminal.transcriptRef,
+            ...(candidateTerminalStatus === 'completed'
+              && receipt?.outputDelivery?.status === 'delivered'
+              && receipt.outputDelivery.output
+              ? { output: receipt.outputDelivery.output }
+              : {}),
+          },
+        }, candidateTurnEntryDeps(ds, context.workerGeneration));
+        clearCandidateTurnRecoveryTimer({
+          candidateDispatchId: candidate.candidateDispatchId,
+          turnId: terminal.turnId,
+        });
+        return;
+      }
       const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);
       if (terminal.dispatchAttempt !== undefined && enqueued?.accepted) {
         logger.info(
@@ -16525,6 +17035,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
         );
       }
+      const candidate = candidateConversationForSession(_ds);
+      if (candidate.kind === 'candidate') {
+        const receipt = new CandidateTurnDurability({ dataDir: config.session.dataDir })
+          .listHeads()
+          .find(turn => turn.candidateDispatchId === candidate.candidateDispatchId);
+        if (receipt) scheduleCandidateTurnRecovery(_ds, receipt, 'CLI-exit');
+      }
     },
     onWorkerExit(_ds, context) {
       const result = handleVcMeetingWorkerGenerationExit(context, {
@@ -16546,8 +17063,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
         );
       }
+      const candidate = candidateConversationForSession(_ds);
+      if (candidate.kind === 'candidate') {
+        const receipt = new CandidateTurnDurability({ dataDir: config.session.dataDir })
+          .listHeads()
+          .find(turn => turn.candidateDispatchId === candidate.candidateDispatchId);
+        if (receipt) scheduleCandidateTurnRecovery(_ds, receipt, 'worker-exit');
+      }
     },
     onReceiverResetReady(_ds, context) {
+      if (_ds.session.candidateRuntimeContract) {
+        const key = candidateTurnFenceKey(context.sessionId, context.turnId, context.dispatchAttempt);
+        const waiter = candidateTurnFenceWaiters.get(key);
+        if (waiter) {
+          clearTimeout(waiter.timer);
+          candidateTurnFenceWaiters.delete(key);
+          waiter.resolve();
+        }
+        return;
+      }
       acknowledgeVcMeetingReceiverRecovery(vcMeetingReceiverRecoveryKey(
         context.sessionId,
         context.turnId,
@@ -16761,6 +17295,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       handleVcMeetingPush: (ctx) => handleVcMeetingPush(ctx),
       beforeSessionTurn: (data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(data, ctx),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
+      resolveCandidateConversation: ({ larkAppId, chatId, rootMessageId }) => (
+        resolveCandidateFeishuConversation({
+          dataDir: config.session.dataDir,
+          larkAppId,
+          chatId,
+          rootMessageId,
+          activeSessions,
+        })
+      ),
       resolveReplyThreadAlias: (rootId, chatId, appId) => findChatReplyAlias(rootId, chatId, appId),
       // Chat was converted 普通群 → 话题群 while we held a chat-scope session.
       // Evict it from the routing map so subsequent inbound messages can land
@@ -16803,6 +17346,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Restore active sessions from previous run
   await restoreActiveSessions(activeSessions);
+  markCandidateRcaSessionsReady();
+  await recoverCandidateTurnsOnBoot().catch(error => logger.error(
+    `[candidate-rca] boot recovery failed: ${error instanceof Error ? error.message : String(error)}`,
+  ));
 
   // Now that activeSessions is populated, release the forward-followup flush
   // barrier. Persisted seeds were loaded into the buffer at dispatcher startup

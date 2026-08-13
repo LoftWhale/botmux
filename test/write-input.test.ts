@@ -1330,8 +1330,9 @@ describe('coco writeInput submission confirmation', () => {
     const pty = makeCocoPasteTmuxPty();
     const result = await adapter.writeInput(pty, MULTILINE);
 
-    // Successful submit returns undefined (no warning needed)
-    expect(result).toBeUndefined();
+    // A durable transcript match is positive submit evidence for Candidate
+    // turn receipts; it also suppresses the legacy warning path.
+    expect(result).toEqual({ submitted: true, confirmation: 'transcript' });
     // tmux paste-buffer path: single pasteText with the whole content, then
     // exactly one Enter (no retries — the mock confirmed via history.jsonl).
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
@@ -1392,9 +1393,9 @@ describe('coco writeInput submission confirmation', () => {
     const adapter = createCocoAdapter('/bin/coco');
     const result = await adapter.writeInput(pty, angled);
 
-    // Success path: JSON-decode + startsWith finds the Go-escaped content,
-    // so writeInput returns undefined (no warning queued).
-    expect(result).toBeUndefined();
+    // Success path: JSON-decode + startsWith finds the Go-escaped content and
+    // returns the transcript-backed submit receipt.
+    expect(result).toEqual({ submitted: true, confirmation: 'transcript' });
   });
 
   it('skips verification on fresh install with no history.jsonl yet', async () => {
@@ -1445,8 +1446,8 @@ describe('coco writeInput submission confirmation', () => {
     const adapter = createCocoAdapter('/bin/coco');
     const result = await adapter.writeInput(pty, prompt);
 
-    // Confirmed → no warning, and no spurious retry Enters.
-    expect(result).toBeUndefined();
+    // Confirmed by the completed transcript line, with no spurious retry Enter.
+    expect(result).toEqual({ submitted: true, confirmation: 'transcript' });
     const enterCalls = (pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter').length;
     expect(enterCalls).toBe(1);
   });

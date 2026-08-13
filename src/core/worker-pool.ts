@@ -136,6 +136,10 @@ export interface WorkerSessionReplyOptions {
   sourceSessionId?: string;
 }
 
+export type WorkerTurnOutputDeliveryPlan =
+  | { kind: 'send'; uuid?: string }
+  | { kind: 'skip'; messageId?: string };
+
 export interface WorkerPoolCallbacks {
   sessionReply: (
     rootId: string,
@@ -157,6 +161,25 @@ export interface WorkerPoolCallbacks {
   onTurnTerminal?: (
     ds: DaemonSession,
     terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
+    context: { workerGeneration: number },
+  ) => void | Promise<void>;
+  /** Positive CLI submit evidence. A successful PTY write is deliberately not
+   * represented by this callback. */
+  onTurnSubmitted?: (
+    ds: DaemonSession,
+    submitted: Extract<WorkerToDaemon, { type: 'turn_submitted' }>,
+    context: { workerGeneration: number },
+  ) => void | Promise<void>;
+  /** Optional receipt-backed provider fence for Candidate output. */
+  beforeTurnOutputDelivery?: (
+    ds: DaemonSession,
+    output: Extract<WorkerToDaemon, { type: 'final_output' }>,
+    context: { workerGeneration: number },
+  ) => WorkerTurnOutputDeliveryPlan | Promise<WorkerTurnOutputDeliveryPlan>;
+  onTurnOutputDelivered?: (
+    ds: DaemonSession,
+    output: Extract<WorkerToDaemon, { type: 'final_output' }>,
+    delivery: { uuid: string; messageId: string },
     context: { workerGeneration: number },
   ) => void | Promise<void>;
   /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
@@ -429,10 +452,24 @@ function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliId ?? botCfg.cliId;
 }
 
-function sessionAgentConfig(
+export function sessionAgentConfig(
   ds: DaemonSession,
   botCfg: { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string },
 ): { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string } {
+  const candidate = ds.session.candidateRuntimeContract;
+  if (candidate) {
+    if (ds.session.cliId !== 'coco'
+      || ds.session.cliPathOverride !== candidate.executable.realpath
+      || ds.session.wrapperCli
+      || ds.session.workingDir !== candidate.workspaceSnapshot.realpath) {
+      throw new Error('Candidate Session launch fields conflict with its frozen runtime contract');
+    }
+    return {
+      cliId: 'coco',
+      cliPathOverride: candidate.executable.realpath,
+      model: candidate.model,
+    };
+  }
   // Freeze the agent launch config (cli / cliPath / wrapper / model) onto the
   // session the first time a worker forks, so later bot-level edits never
   // retroactively change a live session — same discipline as `sandbox`.
@@ -1922,6 +1959,7 @@ export function forkWorker(
   } else {
     resume = resumeOrTurnId;
   }
+  const candidateRuntimeContract = ds.session.candidateRuntimeContract;
 
   // Per-turn authority is never inferred from mutable session state. Human
   // message routes pass their accepted Lark message id explicitly; restore,
@@ -1933,7 +1971,11 @@ export function forkWorker(
   // A fork() whose cwd no longer exists emits an unhandled 'error' (spawn
   // ENOENT) that crashes the WHOLE daemon (→ pm2 crash-loop). Fall back to
   // home so a stale session workingDir can never take the daemon down.
-  const rawCwd = cb.getSessionWorkingDir(ds);
+  const rawCwd = candidateRuntimeContract?.workspaceSnapshot.realpath
+    ?? cb.getSessionWorkingDir(ds);
+  if (candidateRuntimeContract && (!rawCwd || !existsSync(rawCwd))) {
+    throw new Error(`Candidate workspace is unavailable: ${rawCwd || '(missing)'}`);
+  }
   const cwd = rawCwd && existsSync(rawCwd) ? rawCwd : homedir();
   if (cwd !== rawCwd) logger.warn(`[${t}] workingDir "${rawCwd}" does not exist — falling back to ${cwd}`);
 
@@ -1972,7 +2014,12 @@ export function forkWorker(
   // decision adopts the live bot flag; a restore (resume=true) with no recorded
   // decision predates the sandbox feature → stays NOT sandboxed.
   if (ds.session.sandbox === undefined) {
-    if (!resume) {
+    if (candidateRuntimeContract) {
+      ds.session.sandbox = false;
+      ds.session.sandboxHidePaths = [];
+      ds.session.sandboxReadonlyPaths = [];
+      ds.session.sandboxNetwork = true;
+    } else if (!resume) {
       ds.session.sandbox = botCfg.sandbox === true;
       ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
       ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
@@ -2118,19 +2165,19 @@ export function forkWorker(
     workingDir: cwd,
     cliId: agentCfg.cliId,
     cliPathOverride: agentCfg.cliPathOverride,
-    wrapperCli: agentCfg.wrapperCli,
-    launchShell: botCfg.launchShell,
+    wrapperCli: candidateRuntimeContract ? undefined : agentCfg.wrapperCli,
+    launchShell: candidateRuntimeContract ? undefined : botCfg.launchShell,
     model: agentCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
-    startupCommands: botCfg.startupCommands,
+    startupCommands: candidateRuntimeContract ? [] : botCfg.startupCommands,
     // Per-bot env (bots.json `env`) — injected into the CLI process only (e.g.
     // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
     // observed, not driven, so forkAdoptWorker intentionally omits it.
-    env: botCfg.env,
+    env: candidateRuntimeContract ? {} : botCfg.env,
     // Use the decision recorded on the session (above), NOT the live bot flag, so
     // historical sessions never get retroactively sandboxed on restart.
     sandbox: ds.session.sandbox === true,
@@ -2140,8 +2187,8 @@ export function forkWorker(
     // Per-bot local read isolation (enforced worker-side; the worker gates it).
     // Sibling data needs no app-id enumeration: per-bot dirs are denied wholesale
     // and per-bot session files by filename pattern (see buildV2DenyPaths).
-    readIsolation: botCfg.readIsolation === true,
-    readDenyExtraPaths: botCfg.readDenyExtraPaths ?? [],
+    readIsolation: candidateRuntimeContract ? false : botCfg.readIsolation === true,
+    readDenyExtraPaths: candidateRuntimeContract ? [] : (botCfg.readDenyExtraPaths ?? []),
     // Identifies THIS daemon lifetime. Stamped onto isolated panes so the worker
     // can tell a suspend→resume reattach (same boot id, still isolated) from a
     // stale pane surviving a daemon restart (different id → kill + cold-spawn).
@@ -2175,8 +2222,10 @@ export function forkWorker(
       ds.session,
       initAttributionTurnId,
     ),
-    pluginBindings: botCfg.plugins,
-    skillPolicy: botCfg.skills,
+    pluginBindings: candidateRuntimeContract ? [] : botCfg.plugins,
+    skillPolicy: candidateRuntimeContract ? {} : botCfg.skills,
+    candidateRuntimeContract,
+    workerGeneration: (ds.workerGeneration ?? 0) + 1,
   };
   worker.send(initMsg);
   if (initAttributionTurnId) {
@@ -2258,6 +2307,10 @@ function setupWorkerHandlers(
   const cb = requireCallbacks();
   const t = tag(ds);
   const workerGeneration = (ds.workerGeneration ?? 0) + 1;
+  const pendingCandidateOutputDeliveries = new Map<string, Promise<void>>();
+  const candidateOutputKey = (turnId: string, dispatchAttempt?: number): string => (
+    `${turnId}\0${dispatchAttempt ?? 0}`
+  );
   ds.workerGeneration = workerGeneration;
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
@@ -3209,6 +3262,14 @@ function setupWorkerHandlers(
           );
           break;
         }
+        if (ds.session.candidateRuntimeContract && msg.dispatchAttempt !== undefined) {
+          // The worker emits final_output before terminal for one transcript
+          // turn. Wait for the receipt-backed provider outcome so recovery
+          // cannot race that output under a second provider identity.
+          await pendingCandidateOutputDeliveries.get(
+            candidateOutputKey(msg.turnId, msg.dispatchAttempt),
+          );
+        }
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at
         // this exact terminal edge. Tuple-match prevents a late turn N event
@@ -3228,6 +3289,19 @@ function setupWorkerHandlers(
           await cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'terminal' });
         } catch (err: any) {
           logger.error(`[${t}] Failed to settle deferred schedule turn ${msg.turnId.substring(0, 8)}: ${err.message}`);
+        }
+        break;
+      }
+
+      case 'turn_submitted': {
+        if (ds.worker !== worker || msg.sessionId !== ds.session.sessionId) {
+          logger.warn(`[${t}] Dropped turn_submitted from stale or mismatched worker`);
+          break;
+        }
+        try {
+          await cb.onTurnSubmitted?.(ds, msg, { workerGeneration });
+        } catch (err: any) {
+          logger.error(`[${t}] Failed to persist turn_submitted for ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
         break;
       }
@@ -3340,7 +3414,16 @@ function setupWorkerHandlers(
         // Worker pops the turn off its queue right after emit, so it will
         // NOT re-send this payload on its own. Daemon owns retry on
         // transient Lark failures.
-        deliverFinalOutput(ds, msg, t, 0);
+        const delivery = deliverFinalOutput(ds, msg, t, 0);
+        if (ds.session.candidateRuntimeContract && msg.dispatchAttempt !== undefined) {
+          const key = candidateOutputKey(msg.turnId, msg.dispatchAttempt);
+          pendingCandidateOutputDeliveries.set(key, delivery);
+          void delivery.then(() => {
+            if (pendingCandidateOutputDeliveries.get(key) === delivery) {
+              pendingCandidateOutputDeliveries.delete(key);
+            }
+          });
+        }
         break;
       }
 
@@ -3524,12 +3607,13 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
  *  daemon owns retries on transient failures. After 3 attempts we log
  *  and give up — the user's answer is lost; better than leaking memory
  *  via an unbounded retry loop. */
-function deliverFinalOutput(
+async function deliverFinalOutput(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   t: string,
   attempt: number,
-): void {
+  deliveryPlan?: WorkerTurnOutputDeliveryPlan,
+): Promise<void> {
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   // Wait Mode / HTTP Sync Override:
   // If this turn is being waited for by an HTTP webhook request, intercept the
@@ -3570,15 +3654,18 @@ function deliverFinalOutput(
       ? { ...opts, sourceSessionId: ds.session.sessionId }
       : opts,
   );
-  setTimeout(async () => {
-    // Guard: if the user closed the session (or it was torn down for any
-    // other reason) between attempts, don't post a stale final answer to
-    // a closed thread.
-    if (ds.session.status === 'closed') {
-      logger.info(`[${t}] Bridge final_output abandoned — session closed (turn ${msg.turnId.substring(0, 8)})`);
-      return;
-    }
-    try {
+  let resolvedDeliveryPlan = deliveryPlan;
+  await new Promise<void>(resolve => {
+    setTimeout(resolve, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
+  });
+  // Guard: if the user closed the session (or it was torn down for any
+  // other reason) between attempts, don't post a stale final answer to
+  // a closed thread.
+  if (ds.session.status === 'closed') {
+    logger.info(`[${t}] Bridge final_output abandoned — session closed (turn ${msg.turnId.substring(0, 8)})`);
+    return;
+  }
+  try {
       // 文档评论入口分流：本轮若来自飞书文档评论（/watch-comment / /subscribe-lark-doc），把正文
       // 发表为文档评论（而非飞书卡片），状态卡/占位卡仍留在飞书会话起点。
       const docTurn = managedReceiver ? undefined : ds.docCommentTurns?.get(msg.turnId);
@@ -3768,6 +3855,19 @@ function deliverFinalOutput(
       // place. message.patch is silent (no Feishu notification / unread), which
       // used to swallow the answer; a brand-new message always pings.
       revalidateManagedSend();
+      resolvedDeliveryPlan ??= await cb.beforeTurnOutputDelivery?.(
+        ds,
+        msg,
+        { workerGeneration: ds.workerGeneration ?? 0 },
+      );
+      if (resolvedDeliveryPlan?.kind === 'skip') {
+        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+        logger.info(
+          `[${t}] Candidate final_output reused durable provider result `
+          + `(turn ${msg.turnId.substring(0, 8)})`,
+        );
+        return;
+      }
       const messageId = await scopedReply(
         canonicalOutput.content,
         canonicalOutput.msgType,
@@ -3782,8 +3882,18 @@ function deliverFinalOutput(
               // including the first attempt and crash reconciliation replay.
               suppressHook: true,
             }
-          : undefined,
+          : resolvedDeliveryPlan?.uuid
+            ? { uuid: resolvedDeliveryPlan.uuid, suppressHook: true }
+            : undefined,
       );
+      if (resolvedDeliveryPlan?.uuid) {
+        await cb.onTurnOutputDelivered?.(
+          ds,
+          msg,
+          { uuid: resolvedDeliveryPlan.uuid, messageId },
+          { workerGeneration: ds.workerGeneration ?? 0 },
+        );
+      }
       recordPrimaryOutput(messageId);
       if (preparedListenerReply?.kind === 'send' || preparedListenerReply?.kind === 'succeeded') {
         finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
@@ -3807,9 +3917,8 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next);
-    }
-  }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
+      await deliverFinalOutput(ds, msg, t, next, resolvedDeliveryPlan);
+  }
 }
 
 

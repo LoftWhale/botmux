@@ -16,6 +16,7 @@ import type { DaemonSession } from './types.js';
 import { sessionKey } from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import type { CliTurnPayload } from '../types.js';
+import type { CandidateRuntimeContract } from '../services/candidate-runtime-contract.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;
@@ -31,8 +32,8 @@ export interface TriggerSessionInternalOptions {
    *  Durable receivers use it to persist DISPATCHED with the exact worker
    *  generation. Throwing aborts the dispatch. */
   beforeDispatch?: (
-    context: { sessionId: string; workerGeneration: number },
-  ) => void | { dispatchAttempt: number };
+    context: { sessionId: string; workerGeneration: number; prompt: string },
+  ) => void | { dispatchAttempt: number; prompt?: string };
   /** Suppress daemon-rendered final_output while preserving turn_terminal.
    *  Used by analysis-only meeting consumers; explicit user IM turns do not
    *  set it. */
@@ -41,6 +42,9 @@ export interface TriggerSessionInternalOptions {
    *  of botmux's persisted Session.lastUserPrompt/lastCliInput fields; receipt
    *  recovery asks the hub to resend the frozen envelope instead. */
   persistInputHistory?: boolean;
+  /** Trusted, validated Search RCA release contract. Never accepted from the
+   * public trigger envelope. */
+  candidateRuntimeContract?: CandidateRuntimeContract;
 }
 
 function triggerTitle(req: TriggerRequest): string {
@@ -269,17 +273,28 @@ export async function triggerSessionTurn(
 ): Promise<TriggerResponse> {
   const stableTurnId = internal?.stableTurnId?.trim();
   const triggerId = stableTurnId || `trg_${randomUUID()}`;
-  const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
-    if (!stableTurnId || !internal?.beforeDispatch) return undefined;
+  const prepareStableDispatch = (
+    target: DaemonSession,
+    willFork: boolean,
+    rendered: string | CliTurnPayload,
+  ): { dispatchAttempt?: number; rendered: string | CliTurnPayload } => {
+    if (!stableTurnId || !internal?.beforeDispatch) return { rendered };
     const workerGeneration = willFork
       ? (target.workerGeneration ?? 0) + 1
       : (target.workerGeneration ?? 1);
-    const prepared = internal.beforeDispatch({ sessionId: target.session.sessionId, workerGeneration });
-    if (!prepared) return undefined;
+    const prepared = internal.beforeDispatch({
+      sessionId: target.session.sessionId,
+      workerGeneration,
+      prompt: typeof rendered === 'string' ? rendered : rendered.content,
+    });
+    if (!prepared) return { rendered };
     if (!Number.isSafeInteger(prepared.dispatchAttempt) || prepared.dispatchAttempt < 1) {
       throw new Error('beforeDispatch returned an invalid dispatchAttempt');
     }
-    return prepared.dispatchAttempt;
+    return {
+      dispatchAttempt: prepared.dispatchAttempt,
+      rendered: prepared.prompt ?? rendered,
+    };
   };
   const armFinalOutputSuppression = (target: DaemonSession, dispatchAttempt: number | undefined): void => {
     if (!stableTurnId || internal?.suppressFinalOutput !== true) return;
@@ -331,6 +346,15 @@ export async function triggerSessionTurn(
     }
     chatId = rootTarget.chatId;
     ds = deps.activeSessions.get(sessionKey(rootMessageId, larkAppId));
+  }
+  if (internal?.candidateRuntimeContract && ds
+    && JSON.stringify(ds.session.candidateRuntimeContract)
+      !== JSON.stringify(internal.candidateRuntimeContract)) {
+    return {
+      ok: false,
+      errorCode: 'trigger_failed',
+      error: 'Candidate Session runtime contract conflicts with the frozen release',
+    };
   }
 
   if (!chatId) {
@@ -394,10 +418,11 @@ export async function triggerSessionTurn(
           message: 'delivered to existing session and completed',
         }),
         () => {
-          const dispatchAttempt = prepareStableDispatch(ds!, false);
-          armFinalOutputSuppression(ds!, dispatchAttempt);
-          sendWorkerInput(ds!, content, triggerId, {
-            ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+          const prepared = prepareStableDispatch(ds!, false, content);
+          armFinalOutputSuppression(ds!, prepared.dispatchAttempt);
+          sendWorkerInput(ds!, prepared.rendered, triggerId, {
+            ...(prepared.dispatchAttempt !== undefined
+              ? { dispatchAttempt: prepared.dispatchAttempt } : {}),
           });
         },
       );
@@ -405,10 +430,11 @@ export async function triggerSessionTurn(
 
     if (req.options?.asyncReturnSessionId) {
       beginAsyncTrigger(ds, triggerId);
-      const dispatchAttempt = prepareStableDispatch(ds, false);
-      armFinalOutputSuppression(ds, dispatchAttempt);
-      sendWorkerInput(ds, content, triggerId, {
-        ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      const prepared = prepareStableDispatch(ds, false, content);
+      armFinalOutputSuppression(ds, prepared.dispatchAttempt);
+      sendWorkerInput(ds, prepared.rendered, triggerId, {
+        ...(prepared.dispatchAttempt !== undefined
+          ? { dispatchAttempt: prepared.dispatchAttempt } : {}),
       });
       return buildAsyncQueuedResponse(
         triggerId,
@@ -418,10 +444,11 @@ export async function triggerSessionTurn(
       );
     }
 
-    const dispatchAttempt = prepareStableDispatch(ds, false);
-    armFinalOutputSuppression(ds, dispatchAttempt);
-    sendWorkerInput(ds, content, stableTurnId ? triggerId : undefined, {
-      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    const prepared = prepareStableDispatch(ds, false, content);
+    armFinalOutputSuppression(ds, prepared.dispatchAttempt);
+    sendWorkerInput(ds, prepared.rendered, stableTurnId ? triggerId : undefined, {
+      ...(prepared.dispatchAttempt !== undefined
+        ? { dispatchAttempt: prepared.dispatchAttempt } : {}),
     });
     return {
       ok: true,
@@ -457,12 +484,13 @@ export async function triggerSessionTurn(
           message: 'delivered to existing session and completed',
         }),
         () => {
-          const dispatchAttempt = prepareStableDispatch(ds!, true);
-          armFinalOutputSuppression(ds!, dispatchAttempt);
-          forkWorker(ds!, content, {
+          const prepared = prepareStableDispatch(ds!, true, content);
+          armFinalOutputSuppression(ds!, prepared.dispatchAttempt);
+          forkWorker(ds!, prepared.rendered, {
             resume: ds!.hasHistory,
             turnId: triggerId,
-            ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+            ...(prepared.dispatchAttempt !== undefined
+              ? { dispatchAttempt: prepared.dispatchAttempt } : {}),
           });
         },
       );
@@ -470,12 +498,13 @@ export async function triggerSessionTurn(
 
     if (req.options?.asyncReturnSessionId) {
       beginAsyncTrigger(ds, triggerId);
-      const dispatchAttempt = prepareStableDispatch(ds, true);
-      armFinalOutputSuppression(ds, dispatchAttempt);
-      forkWorker(ds, content, {
+      const prepared = prepareStableDispatch(ds, true, content);
+      armFinalOutputSuppression(ds, prepared.dispatchAttempt);
+      forkWorker(ds, prepared.rendered, {
         resume: ds.hasHistory,
         turnId: triggerId,
-        ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+        ...(prepared.dispatchAttempt !== undefined
+          ? { dispatchAttempt: prepared.dispatchAttempt } : {}),
       });
       return buildAsyncQueuedResponse(
         triggerId,
@@ -485,12 +514,13 @@ export async function triggerSessionTurn(
       );
     }
 
-    const dispatchAttempt = prepareStableDispatch(ds, true);
-    armFinalOutputSuppression(ds, dispatchAttempt);
-    forkWorker(ds, content, {
+    const prepared = prepareStableDispatch(ds, true, content);
+    armFinalOutputSuppression(ds, prepared.dispatchAttempt);
+    forkWorker(ds, prepared.rendered, {
       resume: ds.hasHistory,
       turnId: triggerId,
-      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(prepared.dispatchAttempt !== undefined
+        ? { dispatchAttempt: prepared.dispatchAttempt } : {}),
     });
     return {
       ok: true,
@@ -501,7 +531,9 @@ export async function triggerSessionTurn(
     };
   }
 
-  const wd = resolveWorkingDir(larkAppId, chatId);
+  const wd = internal?.candidateRuntimeContract
+    ? { ok: true as const, workingDir: internal.candidateRuntimeContract.workspaceSnapshot.realpath, fromBotDefault: false }
+    : resolveWorkingDir(larkAppId, chatId);
   if (!wd.ok) {
     return { ok: false, errorCode: 'trigger_failed', error: wd.error };
   }
@@ -527,7 +559,16 @@ export async function triggerSessionTurn(
   if (shouldOpenOwnTopic && topicMessage === null) session.externalTriggerTopicless = true;
   session.lastMessageAt = new Date(now).toISOString();
   session.workingDir = wd.workingDir;
-  session.cliId = bot.config.cliId;
+  if (internal?.candidateRuntimeContract) {
+    session.cliId = 'coco';
+    session.cliPathOverride = internal.candidateRuntimeContract.executable.realpath;
+    session.wrapperCli = undefined;
+    session.model = internal.candidateRuntimeContract.model;
+    session.agentFrozen = true;
+    session.candidateRuntimeContract = structuredClone(internal.candidateRuntimeContract);
+  } else {
+    session.cliId = bot.config.cliId;
+  }
   sessionStore.updateSession(session);
 
   messageQueue.ensureQueue(anchor);
@@ -590,8 +631,8 @@ export async function triggerSessionTurn(
   const promptInput = buildNewTopicCliInput(
     prompt,
     session.sessionId,
-    bot.config.cliId,
-    bot.config.cliPathOverride,
+    session.cliId ?? bot.config.cliId,
+    session.cliPathOverride ?? bot.config.cliPathOverride,
     undefined,
     undefined,
     await getAvailableBots(larkAppId, chatId),
@@ -628,22 +669,22 @@ export async function triggerSessionTurn(
         message: 'queued new session turn and completed',
       }),
       () => {
-        const dispatchAttempt = prepareStableDispatch(newDs, true);
-        armFinalOutputSuppression(newDs, dispatchAttempt);
-        forkWorker(newDs, promptInput, dispatchAttempt === undefined
+        const prepared = prepareStableDispatch(newDs, true, promptInput);
+        armFinalOutputSuppression(newDs, prepared.dispatchAttempt);
+        forkWorker(newDs, prepared.rendered, prepared.dispatchAttempt === undefined
           ? triggerId
-          : { turnId: triggerId, dispatchAttempt });
+          : { turnId: triggerId, dispatchAttempt: prepared.dispatchAttempt });
       },
     );
   }
 
   if (req.options?.asyncReturnSessionId) {
     beginAsyncTrigger(newDs, triggerId);
-    const dispatchAttempt = prepareStableDispatch(newDs, true);
-    armFinalOutputSuppression(newDs, dispatchAttempt);
-    forkWorker(newDs, promptInput, dispatchAttempt === undefined
+    const prepared = prepareStableDispatch(newDs, true, promptInput);
+    armFinalOutputSuppression(newDs, prepared.dispatchAttempt);
+    forkWorker(newDs, prepared.rendered, prepared.dispatchAttempt === undefined
       ? triggerId
-      : { turnId: triggerId, dispatchAttempt });
+      : { turnId: triggerId, dispatchAttempt: prepared.dispatchAttempt });
     return buildAsyncQueuedResponse(
       triggerId,
       session.sessionId,
@@ -653,11 +694,11 @@ export async function triggerSessionTurn(
   }
 
   if (stableTurnId) {
-    const dispatchAttempt = prepareStableDispatch(newDs, true);
-    armFinalOutputSuppression(newDs, dispatchAttempt);
-    forkWorker(newDs, promptInput, dispatchAttempt === undefined
+    const prepared = prepareStableDispatch(newDs, true, promptInput);
+    armFinalOutputSuppression(newDs, prepared.dispatchAttempt);
+    forkWorker(newDs, prepared.rendered, prepared.dispatchAttempt === undefined
       ? triggerId
-      : { turnId: triggerId, dispatchAttempt });
+      : { turnId: triggerId, dispatchAttempt: prepared.dispatchAttempt });
   }
   else forkWorker(newDs, promptInput);
 

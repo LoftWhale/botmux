@@ -101,6 +101,11 @@ import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
+import { candidateCocoTranscriptEvidence } from './services/candidate-turn-transcript.js';
+import {
+  attestCandidateRuntimeSpawn,
+  prepareCandidateCocoHome,
+} from './services/candidate-runtime-contract.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
@@ -510,6 +515,15 @@ function refreshCliPluginGeneration(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   adapter: CliAdapter,
 ): void {
+  if (cfg.candidateRuntimeContract) {
+    cfg.pluginBindings = [];
+    cfg.skillPolicy = {};
+    cfg.skillPluginDir = undefined;
+    cfg.skillReadonlyRoots = [];
+    deferredPluginSkillCatalog = null;
+    log('Plugin generation skipped: Candidate Skills are pinned by the runtime contract');
+    return;
+  }
   let bot: Pick<BotConfig, 'larkAppId' | 'name' | 'plugins' | 'skills'> = {
     larkAppId: cfg.larkAppId,
     plugins: cfg.pluginBindings,
@@ -565,6 +579,10 @@ async function prepareCliPluginGenerationAndGateway(
   adapter: CliAdapter,
 ): Promise<SessionMcpRuntimeManifest | null> {
   refreshCliPluginGeneration(cfg, adapter);
+  if (cfg.candidateRuntimeContract) {
+    stopSessionMcpGatewayHost();
+    return null;
+  }
   const manifest = readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir);
   stopSessionMcpGatewayHost();
   if (adapter.mcpGateway && manifest?.entries.length) {
@@ -4721,6 +4739,9 @@ function scheduleSubmitFailureNotify(
           if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
         }
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
+        if (turnIdentity?.turnId && turnIdentity.dispatchAttempt !== undefined) {
+          emitTurnSubmitted(turnIdentity.turnId, turnIdentity.dispatchAttempt, 'transcript', msg);
+        }
         return;
       case 'suppress-usage-limit':
         dropBridgeMark();
@@ -5059,7 +5080,7 @@ async function flushPending(): Promise<void> {
           // machinery is bypassed. A throw here falls into the catch below and
           // surfaces as a normal submit-failure notice.
           await codexRpcEngine.sendTurn(msg, item.turnId);
-          result = { submitted: true };
+          result = { submitted: true, confirmation: 'native_rpc' };
         } else if (item.codexAppInput && cliAdapter.writeStructuredInput) {
           result = await cliAdapter.writeStructuredInput(backend, msg, item.codexAppInput);
         } else {
@@ -5099,6 +5120,10 @@ async function flushPending(): Promise<void> {
         // Late-attach now so subsequent assistant_final events get
         // attributed to this turn.
         if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
+      }
+      if (result?.submitted === true && result.confirmation && item.turnId
+        && item.dispatchAttempt !== undefined) {
+        emitTurnSubmitted(item.turnId, item.dispatchAttempt, result.confirmation, msg);
       }
       // `&& backend`: if the CLI exited during this write (pane gone → onExit
       // nulled backend) the user already got a "CLI exited" notice; don't also
@@ -6288,6 +6313,7 @@ async function spawnCli(
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     disableCliBypass: cfg.disableCliBypass === true,
+    disabledFeatures: cfg.candidateRuntimeContract?.disabledFeatures,
     skillPluginDir: cfg.skillPluginDir,
     readIsolation: willReadIsolate,
     // Set (as a pair) by the init handler when hybrid RPC input is engaged;
@@ -6298,7 +6324,7 @@ async function spawnCli(
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
-  const extra = (process.env.CLI_EXTRA_ARGS ?? '').trim();
+  const extra = cfg.candidateRuntimeContract ? '' : (process.env.CLI_EXTRA_ARGS ?? '').trim();
   if (extra) args.push(...extra.split(/\s+/).filter(Boolean));
 
   // Claude Code 在 root/sudo 下会拒绝 --dangerously-skip-permissions 并立即 exit。
@@ -6436,6 +6462,18 @@ async function spawnCli(
     if (claudeDataDir) childEnv.CLAUDE_CONFIG_DIR = claudeDataDir; // = <BOT_HOME>/claude
     else childEnv.CODEX_HOME = isolatedCodexHome!;
   }
+  if (cfg.candidateRuntimeContract) {
+    if (!process.env.SESSION_DATA_DIR) {
+      throw new Error('Candidate runtime requires SESSION_DATA_DIR');
+    }
+    const runtimeHome = prepareCandidateCocoHome({
+      contract: cfg.candidateRuntimeContract,
+      dataDir: process.env.SESSION_DATA_DIR,
+      sessionId: cfg.sessionId,
+    });
+    childEnv.HOME = runtimeHome.home;
+    childEnv.TRAE_HOME = runtimeHome.traeHome;
+  }
 
   // Per-bot env (bots.json `env`): extra vars for THIS bot's CLI only — e.g.
   // ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN to run a bot on GLM/a 3rd-party
@@ -6444,6 +6482,10 @@ async function spawnCli(
   // `/usr/bin/env` prefix and never into the shared backing-server global env,
   // keeping it from leaking across bots. Re-sanitized here (crossed IPC).
   const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
+  if (cfg.candidateRuntimeContract) {
+    perBotInjectEnv.HOME = childEnv.HOME!;
+    perBotInjectEnv.TRAE_HOME = childEnv.TRAE_HOME!;
+  }
   const perBotInjectKeys = Object.keys(perBotInjectEnv);
   if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
   const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';
@@ -6809,6 +6851,29 @@ async function spawnCli(
     }
   }
 
+  if (cfg.candidateRuntimeContract && !willReattachPersistent) {
+    if (!process.env.SESSION_DATA_DIR || !cfg.workerGeneration) {
+      throw new Error('Candidate runtime attestation identity is incomplete');
+    }
+    attestCandidateRuntimeSpawn({
+      contract: cfg.candidateRuntimeContract,
+      phase: effectiveResume ? 'resume' : 'fresh',
+      sessionId: cfg.sessionId,
+      workerGeneration: cfg.workerGeneration,
+      bin: spawnBin,
+      args: spawnArgs,
+      cwd: spawnCwd,
+      env: childEnv,
+      dataDir: process.env.SESSION_DATA_DIR,
+    });
+  }
+  if (cfg.cliId === 'coco' && cfg.candidateRuntimeContract) {
+    // CoCo's native id is the explicit --session-id/--resume argument. Persist
+    // the binding before spawn so a kill between process creation and bridge
+    // attachment still reconciles the deterministic transcript instead of
+    // replaying the accepted turn.
+    persistCliSessionId(effectiveAdapterSessionId);
+  }
   backend.spawn(spawnBin, spawnArgs, {
     cwd: spawnCwd,
     cols: PTY_COLS,
@@ -8522,6 +8587,51 @@ if(!${isTmuxMode && !isPipeMode}){
 
 type TurnTerminalStatus = Extract<WorkerToDaemon, { type: 'turn_terminal' }>['status'];
 const emittedTurnTerminals = new TurnTerminalDeduper();
+const emittedTurnSubmissions = new TurnTerminalDeduper();
+
+function durableTranscriptEvidence(): { nativeSessionId: string; transcriptRef: string } | undefined {
+  if (sessionId && lastInitConfig?.cliId === 'coco' && lastInitConfig.candidateRuntimeContract) {
+    return candidateCocoTranscriptEvidence({
+      botmuxSessionId: sessionId,
+      cliSessionId: lastInitConfig.cliSessionId
+        ?? sessionStore.getSession(sessionId)?.cliSessionId,
+      transcriptRef: codexBridgeRolloutPath ?? bridgeJsonlPath ?? undefined,
+    });
+  }
+  const nativeSessionId = lastInitConfig?.cliSessionId
+    ?? (sessionId ? sessionStore.getSession(sessionId)?.cliSessionId : undefined);
+  const transcriptRef = codexBridgeRolloutPath ?? bridgeJsonlPath;
+  if (!nativeSessionId || !transcriptRef) return undefined;
+  return { nativeSessionId, transcriptRef };
+}
+
+function emitTurnSubmitted(
+  turnId: string,
+  dispatchAttempt: number,
+  confirmation: 'transcript' | 'native_rpc',
+  expectedContent: string,
+): void {
+  if (!sessionId || !turnId) return;
+  let evidence = durableTranscriptEvidence();
+  if (evidence && confirmation === 'transcript' && lastInitConfig?.candidateRuntimeContract) {
+    const expected = expectedContent.replace(/\r\n/g, '\n').trim();
+    const userEvent = drainCocoEvents(evidence.transcriptRef, 0).events.find(event => (
+      event.kind === 'user' && event.text.replace(/\r\n/g, '\n').trim() === expected
+    ));
+    evidence = userEvent
+      ? { nativeSessionId: evidence.nativeSessionId, transcriptRef: userEvent.uuid }
+      : undefined;
+  }
+  if (!evidence || !emittedTurnSubmissions.claim(sessionId, turnId, dispatchAttempt)) return;
+  send({
+    type: 'turn_submitted',
+    sessionId,
+    turnId,
+    dispatchAttempt,
+    evidenceKind: confirmation === 'native_rpc' ? 'native_rpc' : 'cli_transcript',
+    ...evidence,
+  });
+}
 
 /** Report CLI processing completion independently from user-visible output.
  *  Keep a bounded worker-local dedup set because transcript watchers and app
@@ -8550,6 +8660,7 @@ function emitTurnTerminal(
     status,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(errorCode ? { errorCode } : {}),
+    ...(durableTranscriptEvidence() ?? {}),
   });
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
@@ -9052,8 +9163,9 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'reset_ambiguous_receiver': {
-      const receiver = sessionId ? sessionStore.getSession(sessionId)?.vcMeetingReceiver : undefined;
-      if (!receiver) {
+      const durableSession = sessionId ? sessionStore.getSession(sessionId) : undefined;
+      const receiver = durableSession?.vcMeetingReceiver;
+      if (!receiver && !durableSession?.candidateRuntimeContract) {
         log('Ignored boot recovery reset for a non-receiver session');
         break;
       }
