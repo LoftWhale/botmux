@@ -18,6 +18,8 @@ export interface GoalChatRecord {
   title?: string;
   brief?: string;
   larkAppId?: string;
+  origin?: 'l1' | 'dashboard';
+  parentKind?: 'session' | 'dashboard';
   parentChatId?: string;
   parentRoot?: string;
   parentSessionId?: string;
@@ -28,6 +30,8 @@ export interface GoalChatRecord {
   reviveAttempts?: string[];
   closedAt?: string;
   closedBy?: string;
+  closeMutationId?: string;
+  closeReason?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -41,6 +45,8 @@ export interface RegisterGoalChatInput {
   brief?: string;
   now?: number;
   larkAppId?: string;
+  origin?: 'l1' | 'dashboard';
+  parentKind?: 'session' | 'dashboard';
   parentChatId?: string;
   parentRoot?: string;
   parentSessionId?: string;
@@ -56,6 +62,8 @@ export interface RegisterGoalChatInput {
 export interface CloseGoalChatInput {
   now?: number;
   closedBy?: string;
+  clientMutationId?: string;
+  reason?: string;
 }
 
 export type ClaimGoalReviveResult =
@@ -71,27 +79,71 @@ function storePath(): string {
   return join(config.session.dataDir, 'verified-delivery', 'goal-chats.json');
 }
 
+function isOptionalString(value: unknown): value is string | undefined {
+  return value === undefined || typeof value === 'string';
+}
+
+function isIsoDate(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && Number.isFinite(Date.parse(value));
+}
+
+function isGoalChatRecord(value: unknown): value is GoalChatRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Partial<GoalChatRecord>;
+  return typeof record.chatId === 'string'
+    && record.chatId.trim().length > 0
+    && isIsoDate(record.createdAt)
+    && isIsoDate(record.updatedAt)
+    && isOptionalString(record.title)
+    && isOptionalString(record.brief)
+    && isOptionalString(record.larkAppId)
+    && (record.origin === undefined || record.origin === 'l1' || record.origin === 'dashboard')
+    && (record.parentKind === undefined || record.parentKind === 'session' || record.parentKind === 'dashboard')
+    && isOptionalString(record.parentChatId)
+    && isOptionalString(record.parentRoot)
+    && isOptionalString(record.parentSessionId)
+    && isOptionalString(record.workingDir)
+    && isOptionalString(record.supervisorSessionId)
+    && (record.supervisorCreatedAt === undefined || isIsoDate(record.supervisorCreatedAt))
+    && (record.lastReviveAt === undefined || isIsoDate(record.lastReviveAt))
+    && (record.reviveAttempts === undefined
+      || (Array.isArray(record.reviveAttempts) && record.reviveAttempts.every(isIsoDate)))
+    && (record.closedAt === undefined || isIsoDate(record.closedAt))
+    && isOptionalString(record.closedBy)
+    && isOptionalString(record.closeMutationId)
+    && isOptionalString(record.closeReason);
+}
+
+function corruptGoalChatStore(error: unknown): Error {
+  logger.warn(`[goal-chat-store] registry is corrupt or unreadable: ${error instanceof Error ? error.message : String(error)}`);
+  return new Error('goal_chat_store_corrupt');
+}
+
 function readFile(path: string): GoalChatFile {
-  if (!existsSync(path)) return { goals: [] };
+  let raw: string;
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Partial<GoalChatFile>;
-    return {
-      goals: Array.isArray(parsed.goals)
-        ? parsed.goals
-          .filter((g): g is GoalChatRecord =>
-            !!g && typeof g.chatId === 'string' && typeof g.createdAt === 'string' && typeof g.updatedAt === 'string')
-          .map((g) => ({
-            ...g,
-            reviveAttempts: Array.isArray(g.reviveAttempts)
-              ? g.reviveAttempts.filter((v): v is string => typeof v === 'string')
-              : undefined,
-          }))
-        : [],
-    };
-  } catch (err) {
-    logger.warn(`[goal-chat-store] failed to read registry: ${err instanceof Error ? err.message : String(err)}`);
-    return { goals: [] };
+    raw = readFileSync(path, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return { goals: [] };
+    throw corruptGoalChatStore(error);
   }
+  try {
+    const parsed = JSON.parse(raw) as Partial<GoalChatFile> | null;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !Array.isArray(parsed.goals)) {
+      throw new Error('goals_not_array');
+    }
+    if (!parsed.goals.every(isGoalChatRecord)) throw new Error('goal_record_invalid');
+    const ids = new Set(parsed.goals.map(record => record.chatId));
+    if (ids.size !== parsed.goals.length) throw new Error('duplicate_goal_chat_id');
+    return { goals: parsed.goals };
+  } catch (error) {
+    throw corruptGoalChatStore(error);
+  }
+}
+
+/** Validate the authority registry before starting any external group side effect. */
+export function assertGoalChatStoreReadable(dataDir: string = config.session.dataDir): void {
+  readFile(join(dataDir, 'verified-delivery', 'goal-chats.json'));
 }
 
 function loadIfNeeded(): void {
@@ -116,7 +168,10 @@ function loadIfNeeded(): void {
 function writeFile(next: Map<string, GoalChatRecord>): void {
   const path = storePath();
   mkdirSync(join(config.session.dataDir, 'verified-delivery'), { recursive: true });
-  atomicWriteFileSync(path, JSON.stringify({ goals: [...next.values()] }, null, 2) + '\n');
+  atomicWriteFileSync(path, JSON.stringify({ goals: [...next.values()] }, null, 2) + '\n', {
+    durable: true,
+    followTargetSymlink: false,
+  });
   loadedFrom = null;
   loadIfNeeded();
 }
@@ -155,6 +210,8 @@ export function registerGoalChat(chatId: string, input: RegisterGoalChatInput = 
       title: input.title?.trim() || prev?.title,
       brief: input.brief ?? prev?.brief,
       larkAppId: input.larkAppId ?? prev?.larkAppId,
+      origin: input.origin ?? prev?.origin,
+      parentKind: input.parentKind ?? prev?.parentKind,
       parentChatId: input.parentChatId ?? prev?.parentChatId,
       parentRoot: input.parentRoot ?? prev?.parentRoot,
       parentSessionId: input.parentSessionId ?? prev?.parentSessionId,
@@ -165,6 +222,8 @@ export function registerGoalChat(chatId: string, input: RegisterGoalChatInput = 
       reviveAttempts: input.reviveAttempts ?? prev?.reviveAttempts,
       closedAt: input.reopen ? undefined : prev?.closedAt,
       closedBy: input.reopen ? undefined : prev?.closedBy,
+      closeMutationId: input.reopen ? undefined : prev?.closeMutationId,
+      closeReason: input.reopen ? undefined : prev?.closeReason,
       createdAt: prev?.createdAt ?? nowIso,
       updatedAt: nowIso,
     };
@@ -180,11 +239,14 @@ export function closeGoalChat(chatId: string | undefined, input: CloseGoalChatIn
   return mutateGoalChats((current) => {
     const prev = current.get(id);
     if (!prev) return { next: current, result: undefined };
+    if (prev.closedAt) return { next: current, result: prev };
     const nowIso = new Date(input.now ?? Date.now()).toISOString();
     const rec: GoalChatRecord = {
       ...prev,
       closedAt: nowIso,
       closedBy: input.closedBy?.trim() || prev.closedBy,
+      closeMutationId: input.clientMutationId?.trim() || prev.closeMutationId,
+      closeReason: input.reason?.trim() || prev.closeReason,
       updatedAt: nowIso,
     };
     const next = new Map(current);
@@ -214,7 +276,8 @@ export function claimGoalChatRevive(input: {
     if (prev.larkAppId && prev.larkAppId !== input.larkAppId) {
       return { next: current, result: { ok: false, errorCode: 'not_owner_daemon', error: `goal is owned by ${prev.larkAppId}` } };
     }
-    if (!prev.parentChatId) {
+    const dashboardManaged = prev.origin === 'dashboard' || prev.parentKind === 'dashboard';
+    if (!dashboardManaged && !prev.parentChatId) {
       return { next: current, result: { ok: false, errorCode: 'incomplete_goal_record', error: 'goal registry has no parentChatId' } };
     }
     const recent = (prev.reviveAttempts ?? []).filter((value) => {

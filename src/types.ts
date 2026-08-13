@@ -443,7 +443,9 @@ export interface Session {
   goalSupervisor?: {
     goalChatId: string;
     title: string;
-    parentChatId: string;
+    origin?: 'l1' | 'dashboard';
+    parentKind?: 'session' | 'dashboard';
+    parentChatId?: string;
     parentRoot?: string;
     parentSessionId?: string;
     createdAt: string;

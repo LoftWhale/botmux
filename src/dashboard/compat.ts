@@ -24,6 +24,7 @@ const DASHBOARD_MODULE_SPECS = {
   roles: { supported: true, route: '#/roles', capabilities: ['roles.read', 'roles.manage'] },
   monitoring: { supported: true, route: '#/monitoring', capabilities: ['monitoring.read'] },
   insights: { supported: true, route: '#/insights', capabilities: ['insights.read'] },
+  goals: { supported: true, route: '#/goals', capabilities: ['goals.read', 'goals.manage'] },
   schedules: { supported: true, route: '#/schedules', capabilities: ['schedules.read', 'schedules.manage'] },
   whiteboards: { supported: true, route: '#/whiteboards', capabilities: ['whiteboards.read', 'whiteboards.manage'] },
   office: { supported: true, route: '#/office', capabilities: ['office.read'] },

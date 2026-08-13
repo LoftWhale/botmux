@@ -48,6 +48,21 @@ function ds(input: {
 }
 
 describe('goal supervisor prompt', () => {
+  it('uses the ledger and Dashboard as the report surface for dashboard-managed goals', () => {
+    const prompt = buildGoalSupervisorPrompt({
+      chatId: 'oc_goal',
+      origin: 'dashboard',
+      parentKind: 'dashboard',
+      title: 'Desktop goal',
+      brief: '完成并验收。',
+    });
+
+    expect(prompt).toContain('Dashboard 管理的目标');
+    expect(prompt).toContain('botmux delivery list --goal oc_goal');
+    expect(prompt).toContain('不要运行 `botmux goal notify-parent`');
+    expect(prompt).not.toContain('L1 主群 chatId');
+  });
+
   it('pins L2 duties to goal chat, ledger and L1 callback coordinates', () => {
     const prompt = buildGoalSupervisorPrompt({
       chatId: 'oc_goal',

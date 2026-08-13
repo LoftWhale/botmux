@@ -72,6 +72,7 @@ import {
 } from './setup/cli-selection.js';
 import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
+import { validateWorkingDir } from './core/working-dir.js';
 import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
@@ -216,6 +217,8 @@ import {
   removeGoalNotificationRetry,
   retryGoalNotification,
 } from './services/goal-notification-retry-store.js';
+import { closeGoalChat, getGoalChat } from './services/goal-chat-store.js';
+import { validateDashboardGoalText } from './core/dashboard-goal-start.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 import {
   compatMachineIdForAuthenticatedRequest,
@@ -3919,6 +3922,106 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/whiteboards') {
       return jsonRes(res, 200, { enabled: whiteboardEnabled(), whiteboards: listWhiteboards() });
     }
+    if (req.method === 'POST' && url.pathname === '/api/goals/start') {
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = await readJsonBody(req) as Record<string, unknown>;
+      } catch {
+        return jsonRes(res, 400, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'bad_json', error: 'invalid JSON' });
+      }
+      const clientMutationId = typeof parsed.clientMutationId === 'string' ? parsed.clientMutationId.trim() : '';
+      const title = typeof parsed.title === 'string' ? parsed.title.trim() : '';
+      const brief = typeof parsed.brief === 'string' ? parsed.brief.trim() : undefined;
+      const supervisorLarkAppId = typeof parsed.supervisorLarkAppId === 'string'
+        ? parsed.supervisorLarkAppId.trim() : '';
+      const workingDirRaw = typeof parsed.workingDir === 'string' ? parsed.workingDir.trim() : '';
+      const workerLarkAppIds = Array.isArray(parsed.workerLarkAppIds)
+        ? Array.from(new Set(parsed.workerLarkAppIds.filter((id): id is string => typeof id === 'string' && !!id.trim()).map(id => id.trim())))
+        : [];
+      if (!/^[A-Za-z0-9._:-]{1,128}$/.test(clientMutationId)) {
+        return jsonRes(res, 400, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'invalid_client_mutation_id', error: 'clientMutationId must be 1-128 safe characters' });
+      }
+      if (!validateDashboardGoalText(title, brief)) {
+        return jsonRes(res, 400, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'invalid_goal_text', error: 'title is required (max 200); brief max is 50000' });
+      }
+      if (!supervisorLarkAppId || workerLarkAppIds.length === 0 || workerLarkAppIds.length > 50
+        || workerLarkAppIds.includes(supervisorLarkAppId)) {
+        return jsonRes(res, 400, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'invalid_selection', error: 'select one supervisor and 1-50 distinct workers' });
+      }
+      const workingDir = validateWorkingDir(workingDirRaw);
+      if (!workingDir.ok) {
+        return jsonRes(res, 400, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'invalid_working_dir', error: workingDir.error });
+      }
+      const supervisor = registry.getByAppId(supervisorLarkAppId);
+      if (!supervisor) {
+        return jsonRes(res, 503, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'supervisor_offline', error: 'the selected supervisor daemon is offline' });
+      }
+      let roster;
+      try {
+        roster = buildFederatedRoster(config.session.dataDir, undefined, undefined, undefined, liveBots());
+      } catch (error) {
+        return jsonRes(res, 503, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'roster_unavailable', error: error instanceof Error ? error.message : String(error) });
+      }
+      const byId = new Map(roster.bots.map(bot => [bot.larkAppId, bot] as const));
+      const selected = workerLarkAppIds.map(id => byId.get(id));
+      const invalidBotIds = workerLarkAppIds.filter((id, index) => {
+        const bot = selected[index];
+        return !bot || bot.larkTransportEnabled === false || bot.deployment.stale;
+      });
+      const supervisorRoster = byId.get(supervisorLarkAppId);
+      const supervisorUnavailable = !supervisorRoster
+        || supervisorRoster.larkTransportEnabled === false || supervisorRoster.deployment.stale;
+      if (invalidBotIds.length > 0 || supervisorUnavailable) {
+        return jsonRes(res, 409, {
+          ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'bots_unavailable',
+          error: 'one or more selected bots are unavailable for Feishu group collaboration',
+          invalidBotIds: supervisorUnavailable ? [...invalidBotIds, supervisorLarkAppId] : invalidBotIds,
+        });
+      }
+      const allowed = supervisor.resolvedAllowedUsers ?? [];
+      const userOpenIds = allowed.filter(id => id.startsWith('ou_'));
+      const ownerUnionIds = allowed.filter(id => id.startsWith('on_'));
+      try {
+        const upstream = await fetchDaemonIpc(supervisor.ipcPort, '/api/goals/start-local', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            clientMutationId,
+            title,
+            brief,
+            supervisorLarkAppId,
+            workingDir: workingDir.resolvedPath,
+            workers: selected.map(bot => ({
+              larkAppId: bot!.larkAppId,
+              name: bot!.name,
+              cliId: bot!.cliId,
+              unionId: bot!.botUnionId,
+              botmuxVersion: bot!.botmuxVersion,
+              a2aCapabilities: bot!.a2aCapabilities,
+              local: bot!.deployment.local,
+            })),
+            userOpenIds,
+            ownerUnionIds,
+            transferOwnerTo: userOpenIds[0],
+            notifyOwnerOpenId: userOpenIds[0],
+          }),
+        });
+        const text = await upstream.text();
+        let body: any = null;
+        try { body = text ? JSON.parse(text) : null; } catch { /* keep raw failure */ }
+        if (body?.chatId) groupsMatrixSnapshot.invalidate();
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(body ? JSON.stringify(body) : JSON.stringify({
+          ok: false, outcome: 'unknown', stage: 'proxy', errorCode: 'invalid_daemon_response', error: text || 'empty response',
+        }));
+        return;
+      } catch (error) {
+        return jsonRes(res, 502, {
+          ok: false, outcome: 'unknown', stage: 'proxy', errorCode: 'start_proxy_failed',
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
     if (req.method === 'GET' && url.pathname === '/api/goals') {
       return jsonRes(res, 200, buildGoalBoard());
     }
@@ -3930,6 +4033,74 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/goal-notification-retries') {
       return jsonRes(res, 200, { records: listGoalNotificationRetries() });
+    }
+    const mGoalClose = url.pathname.match(/^\/api\/goals\/([^/]+)\/close$/);
+    if (req.method === 'POST' && mGoalClose) {
+      const goalChatId = decodeURIComponent(mGoalClose[1]);
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = await readJsonBody(req) as Record<string, unknown>;
+      } catch {
+        return jsonRes(res, 400, { ok: false, errorCode: 'bad_json', error: 'invalid JSON' });
+      }
+      const clientMutationId = typeof parsed.clientMutationId === 'string' ? parsed.clientMutationId.trim() : '';
+      const reason = typeof parsed.reason === 'string' ? parsed.reason.replace(/\s+/g, ' ').trim().slice(0, 500) : '';
+      if (!/^[A-Za-z0-9._:-]{1,128}$/.test(clientMutationId) || !reason) {
+        return jsonRes(res, 400, { ok: false, errorCode: 'invalid_close_request', error: 'clientMutationId and reason are required' });
+      }
+      let before: ReturnType<typeof getGoalChat>;
+      let closedRecord: ReturnType<typeof closeGoalChat>;
+      try {
+        before = getGoalChat(goalChatId);
+        if (!before) return jsonRes(res, 404, { ok: false, errorCode: 'goal_not_registered', error: 'goal is not registered' });
+        closedRecord = closeGoalChat(goalChatId, {
+          closedBy: 'dashboard',
+          clientMutationId,
+          reason,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return jsonRes(res, 503, {
+          ok: false,
+          errorCode: message === 'goal_chat_store_corrupt' ? 'goal_registry_corrupt' : 'goal_close_unavailable',
+          error: message,
+        });
+      }
+      const alreadyClosed = !!before.closedAt;
+      // The tombstone above is the authoritative lifecycle boundary. Fanout is
+      // compensating cleanup only: a failed/offline daemon may keep a worker
+      // briefly, but watchdog/start paths can no longer revive the goal.
+      const cleanup = await Promise.all(registry.list().map(async daemon => {
+        try {
+          const upstream = await fetchDaemonIpc(
+            daemon.ipcPort,
+            `/api/goal/${encodeURIComponent(goalChatId)}/cleanup-local`,
+            { method: 'POST', signal: AbortSignal.timeout(5_000) },
+          );
+          const body = await upstream.json().catch(() => null) as { closed?: number; error?: string } | null;
+          return {
+            larkAppId: daemon.larkAppId,
+            ok: upstream.ok,
+            closedSessions: typeof body?.closed === 'number' ? body.closed : 0,
+            ...(upstream.ok ? {} : { error: body?.error ?? `HTTP ${upstream.status}` }),
+          };
+        } catch (error) {
+          return {
+            larkAppId: daemon.larkAppId,
+            ok: false,
+            closedSessions: 0,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }));
+      return jsonRes(res, 200, {
+        ok: true,
+        goalChatId,
+        closed: !!closedRecord?.closedAt,
+        alreadyClosed,
+        closedAt: closedRecord?.closedAt,
+        cleanup,
+      });
     }
     const mGoalWatchdog = url.pathname.match(/^\/api\/goals\/([^/]+)\/watchdog$/);
     if (req.method === 'POST' && mGoalWatchdog) {

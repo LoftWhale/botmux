@@ -37,7 +37,7 @@ describe('dashboard desktop compat manifest', () => {
         'dashboard-modules',
         'dashboard-capabilities',
       ]),
-      routes: expect.arrayContaining(['#/', '#/sessions', '#/groups', '#/schedules', '#/settings']),
+      routes: expect.arrayContaining(['#/', '#/sessions', '#/groups', '#/goals', '#/schedules', '#/settings']),
     });
     expect(manifest.runtimeIdentity).toBeUndefined();
   });
@@ -50,6 +50,7 @@ describe('dashboard desktop compat manifest', () => {
       sessions: { supported: true, route: '#/sessions' },
       monitoring: { supported: true, route: '#/monitoring' },
       insights: { supported: true, route: '#/insights' },
+      goals: { supported: true, route: '#/goals' },
       bots: { supported: true, route: '#/bot-defaults' },
       schedules: { supported: true, route: '#/schedules' },
       settings: { supported: true, route: '#/settings' },
@@ -61,6 +62,8 @@ describe('dashboard desktop compat manifest', () => {
       'sessions.manage': true,
       'asks.answer': true,
       'monitoring.read': true,
+      'goals.read': true,
+      'goals.manage': true,
       'bots.configure': true,
       'schedules.manage': true,
       'settings.manage': true,

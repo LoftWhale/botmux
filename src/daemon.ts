@@ -444,7 +444,13 @@ import {
 } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
-import { notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js';
+import { ensureGoalSupervisorFromRegistry, notifyGoalParent, startGoalSupervisor } from './core/goal-supervisor.js';
+import {
+  resolveDashboardGoalRepoBinding,
+  startDashboardGoal,
+  validateDashboardGoalText,
+  type DashboardGoalStartWorker,
+} from './core/dashboard-goal-start.js';
 import { emitGoalNarration } from './verified-delivery/narration.js';
 import { openLedger } from './verified-delivery/ledger.js';
 import {
@@ -3647,6 +3653,12 @@ async function reassignDeadGoalWorker(task: TaskView, goalChatId: string, now: n
 
 async function runGoalWatchdogForGoalOnThisDaemon(goalChatId: string, reason: string): Promise<GoalWatchdogResult[]> {
   if (isGoalPanelApp(currentDaemonLarkAppId)) return [];
+  const recovered = reason.startsWith('dashboard_attention')
+    ? await ensureGoalSupervisorFromRegistry(goalChatId, {
+      larkAppId: currentDaemonLarkAppId,
+      activeSessions,
+    })
+    : undefined;
   const results = await runGoalWatchdogForGoal({
     larkAppId: currentDaemonLarkAppId,
     activeSessions,
@@ -3660,6 +3672,16 @@ async function runGoalWatchdogForGoalOnThisDaemon(goalChatId: string, reason: st
         .catch((err: any) => logger.warn(`[goal-release] reconcile trigger failed: ${err?.message ?? err}`));
     },
   });
+  if (recovered?.ok && recovered.status === 'revived'
+    && !results.some(result => result.status === 'revived')) {
+    results.unshift({
+      goalChatId,
+      status: 'revived',
+      pendingTaskIds: [],
+      sessionId: recovered.supervisorSessionId,
+      reason: `explicit-watchdog:${reason}`,
+    });
+  }
   if (shouldRetryGoalWatchdog(results)) scheduleGoalWatchdogRetry(goalChatId, reason);
   const injected = countGoalWatchdogStatus(results, 'injected');
   const reconciled = countGoalWatchdogStatus(results, 'reconciled');
@@ -6572,6 +6594,120 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
   return jsonRes(res, 200, { ok: true });
 });
 
+// Dashboard-owned creation is kept inside the creator daemon so the
+// createChat→durable-chatId checkpoint boundary cannot be lost in an HTTP hop.
+ipcRoute('POST', '/api/goals/start-local', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'trusted_host_required', error: 'trusted host required' });
+  }
+  let raw: Record<string, unknown>;
+  try {
+    raw = await readJsonBody<Record<string, unknown>>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'bad_json', error: 'invalid JSON' });
+  }
+  const clientMutationId = typeof raw.clientMutationId === 'string' ? raw.clientMutationId.trim() : '';
+  const title = typeof raw.title === 'string' ? raw.title.trim() : '';
+  const brief = typeof raw.brief === 'string' ? raw.brief.trim() : undefined;
+  const supervisorLarkAppId = typeof raw.supervisorLarkAppId === 'string' ? raw.supervisorLarkAppId.trim() : '';
+  const workingDirRaw = typeof raw.workingDir === 'string' ? raw.workingDir.trim() : '';
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(clientMutationId)) {
+    return jsonRes(res, 400, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'invalid_client_mutation_id', error: 'clientMutationId must be 1-128 safe characters' });
+  }
+  if (!validateDashboardGoalText(title, brief)) {
+    return jsonRes(res, 400, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'invalid_goal_text', error: 'title is required (max 200); brief max is 50000' });
+  }
+  if (!supervisorLarkAppId || supervisorLarkAppId !== currentDaemonLarkAppId) {
+    return jsonRes(res, 409, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'wrong_supervisor_daemon', error: 'the target daemon does not own the requested supervisor' });
+  }
+  const workingDir = validateWorkingDir(workingDirRaw, localeForBot(supervisorLarkAppId));
+  if (!workingDir.ok) {
+    return jsonRes(res, 400, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'invalid_working_dir', error: workingDir.error });
+  }
+  if (!Array.isArray(raw.workers) || raw.workers.length === 0 || raw.workers.length > 50) {
+    return jsonRes(res, 400, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'invalid_workers', error: 'workers must contain 1-50 entries' });
+  }
+  const workers: DashboardGoalStartWorker[] = [];
+  const workerIds = new Set<string>();
+  for (const value of raw.workers) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return jsonRes(res, 400, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'invalid_worker', error: 'each worker must be an object' });
+    }
+    const worker = value as Record<string, unknown>;
+    const larkAppId = typeof worker.larkAppId === 'string' ? worker.larkAppId.trim() : '';
+    const name = typeof worker.name === 'string' ? worker.name.trim() : '';
+    if (!larkAppId || !name || larkAppId === supervisorLarkAppId || workerIds.has(larkAppId)) {
+      return jsonRes(res, 400, { ok: false, outcome: 'rejected', stage: 'validate', errorCode: 'invalid_worker_identity', error: 'workers must be unique and cannot include the supervisor' });
+    }
+    workerIds.add(larkAppId);
+    workers.push({
+      larkAppId,
+      name,
+      cliId: typeof worker.cliId === 'string' && worker.cliId.trim() ? worker.cliId.trim() : undefined,
+      unionId: typeof worker.unionId === 'string' && worker.unionId.trim() ? worker.unionId.trim() : undefined,
+      botmuxVersion: typeof worker.botmuxVersion === 'string' && worker.botmuxVersion.trim() ? worker.botmuxVersion.trim() : undefined,
+      a2aCapabilities: Array.isArray(worker.a2aCapabilities)
+        ? worker.a2aCapabilities.filter((item): item is string => typeof item === 'string')
+        : undefined,
+      local: worker.local === true,
+    });
+  }
+  const inspectedRepo = await inspectLocalRepoAsync(workingDir.resolvedPath);
+  const repoBinding = resolveDashboardGoalRepoBinding(workers, inspectedRepo);
+  if (!repoBinding.ok) {
+    return jsonRes(res, 400, {
+      ok: false,
+      outcome: 'rejected',
+      stage: 'validate',
+      errorCode: 'remote_workers_require_repo',
+      error: repoBinding.error,
+    });
+  }
+  const strings = (value: unknown, prefix: string): string[] => Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item.startsWith(prefix))
+    : [];
+  try {
+    const result = await startDashboardGoal({
+      clientMutationId,
+      title,
+      brief,
+      supervisorLarkAppId,
+      workers,
+      workingDir: workingDir.resolvedPath,
+      requiredRepo: repoBinding.requiredRepo,
+      userOpenIds: strings(raw.userOpenIds, 'ou_'),
+      ownerUnionIds: strings(raw.ownerUnionIds, 'on_'),
+      transferOwnerTo: typeof raw.transferOwnerTo === 'string' && raw.transferOwnerTo.startsWith('ou_')
+        ? raw.transferOwnerTo : undefined,
+      notifyOwnerOpenId: typeof raw.notifyOwnerOpenId === 'string' && raw.notifyOwnerOpenId.startsWith('ou_')
+        ? raw.notifyOwnerOpenId : undefined,
+    }, {
+      dataDir: config.session.dataDir,
+      ownerBootId: getDaemonBootId(),
+      createGroup: input => createGroupWithBots(input),
+      probeMembership: (larkAppId, chatId) => probeChatBotMembership(larkAppId, chatId),
+      startSupervisor: input => startGoalSupervisor(input, {
+        larkAppId: supervisorLarkAppId,
+        activeSessions,
+      }),
+    });
+    return jsonRes(res, result.status, result.body);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const mutationCorrupt = message === 'goal_start_mutation_store_corrupt';
+    const registryCorrupt = message === 'goal_chat_store_corrupt';
+    return jsonRes(res, 503, {
+      ok: false,
+      outcome: 'unknown',
+      stage: registryCorrupt ? 'registry_preflight' : 'claim',
+      errorCode: registryCorrupt
+        ? 'goal_registry_corrupt'
+        : mutationCorrupt ? 'idempotency_store_corrupt' : 'goal_start_unavailable',
+      error: message,
+    });
+  }
+});
+
 // ─── goal supervise IPC route (internal: start an L2 supervisor in goal chat) ─
 //
 // Lark self-messages are deliberately ignored before routing, so the main bot
@@ -6625,6 +6761,8 @@ ipcRoute('POST', '/api/goal/supervise', async (req, res) => {
     workingDir?: unknown;
     parentSessionId?: unknown;
     larkAppId?: unknown;
+    origin?: unknown;
+    parentKind?: unknown;
     originCapability?: unknown;
     originTurnId?: unknown;
     originDispatchAttempt?: unknown;
@@ -6645,6 +6783,8 @@ ipcRoute('POST', '/api/goal/supervise', async (req, res) => {
     raw.parentChatId = parent.chatId;
     raw.parentRoot = parent.session.scope === 'chat' ? undefined : parent.session.rootMessageId;
     raw.larkAppId = parent.larkAppId;
+    raw.origin = 'l1';
+    raw.parentKind = 'session';
     // A session capability proves the caller's current session, but it must not
     // let that caller ask the host daemon to open an unrelated filesystem path.
     // Keep the child supervisor inside the project already granted to the L1.
@@ -6668,20 +6808,24 @@ ipcRoute('POST', '/api/goal/supervise', async (req, res) => {
   const parentChatId = typeof raw.parentChatId === 'string' ? raw.parentChatId.trim() : '';
   const title = typeof raw.title === 'string' ? raw.title.trim() : '';
   const targetLarkAppId = typeof raw.larkAppId === 'string' ? raw.larkAppId.trim() : '';
+  const dashboardManaged = isTrustedHostIpcRequest(req)
+    && (raw.origin === 'dashboard' || raw.parentKind === 'dashboard');
   if (!chatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_chatId', error: 'chatId is required' });
-  if (!parentChatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_parentChatId', error: 'parentChatId is required' });
+  if (!dashboardManaged && !parentChatId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_parentChatId', error: 'parentChatId is required' });
   if (!title) return jsonRes(res, 400, { ok: false, errorCode: 'missing_title', error: 'title is required' });
   if (!targetLarkAppId) return jsonRes(res, 400, { ok: false, errorCode: 'missing_larkAppId', error: 'larkAppId is required' });
 
   const result = await startGoalSupervisor({
     chatId,
-    parentChatId,
+    origin: dashboardManaged ? 'dashboard' : 'l1',
+    parentKind: dashboardManaged ? 'dashboard' : 'session',
+    parentChatId: parentChatId || undefined,
     parentRoot: typeof raw.parentRoot === 'string' && raw.parentRoot.trim() ? raw.parentRoot.trim() : undefined,
     title,
     brief: typeof raw.brief === 'string' && raw.brief.trim() ? raw.brief : undefined,
     workingDir: typeof raw.workingDir === 'string' && raw.workingDir.trim() ? raw.workingDir.trim() : undefined,
     parentSessionId: typeof raw.parentSessionId === 'string' && raw.parentSessionId.trim() ? raw.parentSessionId.trim() : undefined,
-    reopenClosed: true,
+    reopenClosed: !dashboardManaged,
   }, { larkAppId: targetLarkAppId, activeSessions });
   if (!result.ok) {
     const status = result.errorCode === 'bot_not_in_chat' ? 404 : 400;

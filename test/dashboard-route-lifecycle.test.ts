@@ -22,6 +22,11 @@ describe('dashboard route lifecycle', () => {
     expect(source).toMatch(/id: 'goals',[\s\S]*?manage: true,/);
   });
 
+  it('routes a typed goals chatId deep link to the goals page', async () => {
+    const routes = await import('../src/dashboard/web/dashboard-routes.js');
+    expect(routes.findDashboardRoute('#/goals?chatId=oc_goal')?.id).toBe('goals');
+  });
+
   it('does not run a stale lazy route renderer after a newer route commits', async () => {
     const state = createDashboardRouteState();
     const root = { textContent: '' } as unknown as HTMLElement;

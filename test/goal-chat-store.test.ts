@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { config } from '../src/config.js';
@@ -67,6 +67,60 @@ describe('goal chat store', () => {
     const exhausted = claimGoalChatRevive({ ...options, now: options.now + 2 * options.cooldownMs + 2 });
     expect(second).toMatchObject({ ok: true });
     expect(exhausted).toMatchObject({ ok: false, errorCode: 'revive_budget_exhausted' });
+  });
+
+  it('allows a dashboard-managed goal to revive without fake L1 coordinates', () => {
+    registerGoalChat('oc_dashboard_goal', {
+      larkAppId: 'cli_main',
+      origin: 'dashboard',
+      parentKind: 'dashboard',
+      title: 'Desktop goal',
+      now: 1_000,
+    });
+
+    expect(claimGoalChatRevive({
+      chatId: 'oc_dashboard_goal', larkAppId: 'cli_main', now: 100_000,
+      cooldownMs: 60_000, windowMs: 10 * 60_000, maxAttempts: 2,
+    })).toMatchObject({
+      ok: true,
+      record: { origin: 'dashboard', parentKind: 'dashboard' },
+    });
+  });
+
+  it('keeps the first close tombstone stable across repeated close mutations', () => {
+    registerGoalChat('oc_dashboard_goal', {
+      larkAppId: 'cli_main', origin: 'dashboard', parentKind: 'dashboard', now: 1_000,
+    });
+    const first = closeGoalChat('oc_dashboard_goal', {
+      closedBy: 'dashboard', clientMutationId: 'close-1', reason: 'user stopped goal', now: 2_000,
+    });
+    const repeated = closeGoalChat('oc_dashboard_goal', {
+      closedBy: 'dashboard', clientMutationId: 'close-2', reason: 'duplicate request', now: 3_000,
+    });
+
+    expect(first).toMatchObject({
+      closedAt: new Date(2_000).toISOString(),
+      closeMutationId: 'close-1',
+      closeReason: 'user stopped goal',
+    });
+    expect(repeated).toEqual(first);
+    expect(claimGoalChatRevive({
+      chatId: 'oc_dashboard_goal', larkAppId: 'cli_main', now: 100_000,
+      cooldownMs: 60_000, windowMs: 10 * 60_000, maxAttempts: 2,
+    })).toMatchObject({ ok: false, errorCode: 'goal_closed' });
+  });
+
+  it('fails closed without overwriting a malformed lifecycle registry', () => {
+    const registryDir = join(dir, 'verified-delivery');
+    const registryPath = join(registryDir, 'goal-chats.json');
+    mkdirSync(registryDir, { recursive: true });
+    const malformed = JSON.stringify({ goals: [{ chatId: 'oc_existing', createdAt: 'not-a-date' }] });
+    writeFileSync(registryPath, malformed);
+
+    expect(() => registerGoalChat('oc_new', {
+      larkAppId: 'cli_main', origin: 'dashboard', parentKind: 'dashboard', now: 1_000,
+    })).toThrow('goal_chat_store_corrupt');
+    expect(readFileSync(registryPath, 'utf8')).toBe(malformed);
   });
 
   it('serializes registry mutations with a stale-recoverable shared lock', () => {

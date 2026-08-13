@@ -13,7 +13,10 @@ import { logger } from '../utils/logger.js';
 
 export interface GoalSuperviseRequest {
   chatId: string;
-  parentChatId: string;
+  /** Legacy/L1 is the default for persisted callers that predate origin. */
+  origin?: 'l1' | 'dashboard';
+  parentKind?: 'session' | 'dashboard';
+  parentChatId?: string;
   parentRoot?: string;
   title: string;
   brief?: string;
@@ -27,7 +30,7 @@ export interface GoalSuperviseResponse {
   ok: true;
   goalChatId: string;
   supervisorSessionId: string;
-  parent: { chatId: string; rootMessageId?: string };
+  parent?: { chatId: string; rootMessageId?: string };
 }
 
 export interface GoalNotifyParentRequest {
@@ -88,6 +91,19 @@ export type EnsureGoalSupervisorResult =
 
 export function buildGoalSupervisorPrompt(req: GoalSuperviseRequest): string {
   const brief = req.brief?.trim();
+  if (req.origin === 'dashboard' || req.parentKind === 'dashboard') {
+    return [
+      `你是 goal 群里的 L2 监管 agent。goal: ${req.title.trim() || req.chatId}`,
+      '',
+      '职责：',
+      `1. 先按需创建/读取本 goal 群的 charter：\`botmux goal charter current --goal ${req.chatId} --create\`，再 \`botmux goal charter read --goal ${req.chatId} --json\`。`,
+      `2. 派发和验收前先运行 \`botmux delivery list --goal ${req.chatId}\`；交付账本是真相源，聊天只是提醒和上下文。`,
+      '3. 在本 goal 群用 `botmux dispatch --chat-id <本 goal 群 chatId>` 派发，要求 worker 用 `botmux report --task ...` 交证据。',
+      '4. 验收只认 evidence；accept/reject 必须记录 evidenceChecked / ranCommands / reason。',
+      '5. 这是 Dashboard 管理的目标：进度、风险和完成状态写入 charter / delivery ledger，由 Dashboard 投影。不要运行 `botmux goal notify-parent`，也不要虚构 L1 主群。',
+      ...(brief ? ['', 'Dashboard 给你的初始 brief：', brief] : []),
+    ].join('\n');
+  }
   const parentRootLine = req.parentRoot
     ? `- L1 主话题 rootMessageId: ${req.parentRoot}`
     : '- L1 主群没有指定 rootMessageId；完成通知发到主群顶层即可。';
@@ -132,6 +148,8 @@ function findGoalSupervisorByGoal(activeSessions: Map<string, DaemonSession>, la
 export function findGoalParentSession(activeSessions: Map<string, DaemonSession>, larkAppId: string, supervisor: DaemonSession): DaemonSession | undefined {
   const meta = supervisor.session.goalSupervisor;
   if (!meta) return undefined;
+  if (meta.origin === 'dashboard' || meta.parentKind === 'dashboard') return undefined;
+  if (!meta.parentChatId) return undefined;
   const bySession = findActiveBySessionId(activeSessions, meta.parentSessionId);
   if (bySession && bySession.larkAppId === larkAppId) return bySession;
 
@@ -193,6 +211,10 @@ export async function notifyGoalParent(
   if (!supervisor || supervisor.larkAppId !== deps.larkAppId || !supervisor.session.goalSupervisor) {
     return { ok: false, errorCode: 'supervisor_not_found', error: 'active goal supervisor session not found' };
   }
+  if (supervisor.session.goalSupervisor.origin === 'dashboard'
+    || supervisor.session.goalSupervisor.parentKind === 'dashboard') {
+    return { ok: false, errorCode: 'dashboard_managed_goal', error: 'this goal reports through the delivery ledger and Dashboard' };
+  }
 
   const parent = findGoalParentSession(deps.activeSessions, deps.larkAppId, supervisor);
   if (!parent) {
@@ -205,7 +227,7 @@ export async function notifyGoalParent(
     parentSessionId: parent.session.sessionId,
     goalChatId: supervisor.session.goalSupervisor.goalChatId,
     goalTitle: supervisor.session.goalSupervisor.title,
-    parentChatId: supervisor.session.goalSupervisor.parentChatId,
+    parentChatId: supervisor.session.goalSupervisor.parentChatId ?? parent.chatId,
     parentRoot: supervisor.session.goalSupervisor.parentRoot,
     supervisorSessionId: supervisor.session.sessionId,
     taskId: req.taskId,
@@ -237,9 +259,13 @@ async function startGoalSupervisorInner(
 ): Promise<GoalSuperviseResponse | GoalSuperviseError> {
   const larkAppId = deps.larkAppId;
   const chatId = req.chatId.trim();
-  const parentChatId = req.parentChatId.trim();
+  const dashboardManaged = req.origin === 'dashboard' || req.parentKind === 'dashboard';
+  const parentChatId = req.parentChatId?.trim() ?? '';
   if (!chatId) return { ok: false, errorCode: 'missing_chatId', error: 'chatId is required' };
-  if (!parentChatId) return { ok: false, errorCode: 'missing_parentChatId', error: 'parentChatId is required' };
+  if (!dashboardManaged && !parentChatId) return { ok: false, errorCode: 'missing_parentChatId', error: 'parentChatId is required' };
+  if (!req.reopenClosed && getGoalChat(chatId)?.closedAt) {
+    return { ok: false, errorCode: 'goal_closed', error: 'goal chat is closed' };
+  }
 
   const existing = findGoalSupervisorByGoal(deps.activeSessions, larkAppId, chatId);
   if (existing?.session.goalSupervisor) {
@@ -247,6 +273,8 @@ async function startGoalSupervisorInner(
       registerGoalChat(chatId, {
         reopen: true,
         larkAppId,
+        origin: existing.session.goalSupervisor.origin,
+        parentKind: existing.session.goalSupervisor.parentKind,
         parentChatId: existing.session.goalSupervisor.parentChatId,
         parentRoot: existing.session.goalSupervisor.parentRoot,
         parentSessionId: existing.session.goalSupervisor.parentSessionId,
@@ -257,10 +285,10 @@ async function startGoalSupervisorInner(
       ok: true,
       goalChatId: chatId,
       supervisorSessionId: existing.session.sessionId,
-      parent: {
+      ...(!dashboardManaged && existing.session.goalSupervisor.parentChatId ? { parent: {
         chatId: existing.session.goalSupervisor.parentChatId,
         rootMessageId: existing.session.goalSupervisor.parentRoot,
-      },
+      } } : {}),
     };
   }
 
@@ -280,7 +308,9 @@ async function startGoalSupervisorInner(
       title,
       brief: req.brief,
       larkAppId,
-      parentChatId,
+      origin: dashboardManaged ? 'dashboard' : 'l1',
+      parentKind: dashboardManaged ? 'dashboard' : 'session',
+      parentChatId: parentChatId || undefined,
       parentRoot: req.parentRoot,
       parentSessionId: req.parentSessionId,
       workingDir: wd.workingDir,
@@ -307,7 +337,9 @@ async function startGoalSupervisorInner(
   session.goalSupervisor = {
     goalChatId: chatId,
     title,
-    parentChatId,
+    origin: dashboardManaged ? 'dashboard' : 'l1',
+    parentKind: dashboardManaged ? 'dashboard' : 'session',
+    parentChatId: parentChatId || undefined,
     parentRoot: req.parentRoot,
     parentSessionId: req.parentSessionId,
     createdAt: new Date(now).toISOString(),
@@ -317,7 +349,9 @@ async function startGoalSupervisorInner(
     title,
     brief: req.brief,
     larkAppId,
-    parentChatId,
+    origin: dashboardManaged ? 'dashboard' : 'l1',
+    parentKind: dashboardManaged ? 'dashboard' : 'session',
+    parentChatId: parentChatId || undefined,
     parentRoot: req.parentRoot,
     parentSessionId: req.parentSessionId,
     workingDir: wd.workingDir,
@@ -378,7 +412,7 @@ async function startGoalSupervisorInner(
     ok: true,
     goalChatId: chatId,
     supervisorSessionId: session.sessionId,
-    parent: { chatId: parentChatId, rootMessageId: req.parentRoot },
+    ...(!dashboardManaged ? { parent: { chatId: parentChatId, rootMessageId: req.parentRoot } } : {}),
   };
 }
 
@@ -424,7 +458,8 @@ export async function ensureGoalSupervisorFromRegistry(
   if (rec.larkAppId && rec.larkAppId !== deps.larkAppId) {
     return { ok: false, goalChatId, errorCode: 'not_owner_daemon', error: `goal is owned by ${rec.larkAppId}` };
   }
-  if (!rec.parentChatId) {
+  const dashboardManaged = rec.origin === 'dashboard' || rec.parentKind === 'dashboard';
+  if (!dashboardManaged && !rec.parentChatId) {
     return { ok: false, goalChatId, errorCode: 'incomplete_goal_record', error: 'goal registry has no parentChatId' };
   }
 
@@ -447,7 +482,9 @@ export async function ensureGoalSupervisorFromRegistry(
 
   const revived = await startGoalSupervisor({
     chatId: claimed.chatId,
-    parentChatId: claimed.parentChatId!,
+    origin: dashboardManaged ? 'dashboard' : 'l1',
+    parentKind: dashboardManaged ? 'dashboard' : 'session',
+    parentChatId: claimed.parentChatId,
     parentRoot: claimed.parentRoot,
     parentSessionId: claimed.parentSessionId,
     title: claimed.title ?? claimed.chatId,

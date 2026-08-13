@@ -50,6 +50,14 @@ interface BoardGoal {
 interface GoalBoard { goals: BoardGoal[] }
 interface RetryBoard { records: GoalNotificationRetryRecord[] }
 
+/** Typed deep-link projection. Unknown/empty values keep the legacy all-goals view. */
+export function goalChatIdFromHash(hash: string): string | undefined {
+  const query = hash.indexOf('?');
+  if (query < 0 || hash.slice(0, query) !== '#/goals') return undefined;
+  const value = new URLSearchParams(hash.slice(query + 1)).get('chatId')?.trim();
+  return value || undefined;
+}
+
 // ── Operator View attention band — cross-goal "what needs me now" rollup ──────
 // Consumed from GET /api/goals/attention (verified-delivery/attention.ts
 // buildGoalAttentionBoard + daemon IPC live-health enrichment). The browser hits
@@ -570,6 +578,7 @@ export function renderGoalsPage(root: HTMLElement): () => void {
   let selTask: string | null = null;
   let disposed = false;
   let lastJson = ''; // skip re-render when a poll returns identical data (no flicker)
+  const goalChatIdFilter = goalChatIdFromHash(window.location.hash);
 
   const goalOf = (id: string | null) => board.goals.find(g => g.goalChatId === id) ?? null;
 
@@ -792,7 +801,7 @@ export function renderGoalsPage(root: HTMLElement): () => void {
   async function load(): Promise<void> {
     try {
       const [res, retryRes] = await Promise.all([
-        fetch('/api/goals/attention'),
+        fetch(`/api/goals/attention${goalChatIdFilter ? `?chatId=${encodeURIComponent(goalChatIdFilter)}` : ''}`),
         fetch('/api/goal-notification-retries'),
       ]);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -804,7 +813,10 @@ export function renderGoalsPage(root: HTMLElement): () => void {
       lastJson = combinedText;
       attn = JSON.parse(text) as AttentionBoard;
       board = { goals: attn.perGoal ?? [] }; // perGoal feeds the existing drill-down (browser hits only /api/goals/attention)
-      retries = JSON.parse(retryText) as RetryBoard;
+      const loadedRetries = JSON.parse(retryText) as RetryBoard;
+      retries = goalChatIdFilter
+        ? { records: loadedRetries.records.filter(record => record.goalChatId === goalChatIdFilter) }
+        : loadedRetries;
       // keep selection if still present; else default to first goal / first task
       if (!goalOf(selGoal)) { selGoal = board.goals[0]?.goalChatId ?? null; selTask = null; }
       const g = goalOf(selGoal);
