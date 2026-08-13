@@ -89,19 +89,22 @@ function cleanBotmuxBuildFixture(): {
   const workerPath = join(dist, 'worker.js');
   writeFileSync(entryPath, 'export const daemonBuild = "release-a";\n');
   writeFileSync(workerPath, 'export const workerBuild = "release-a";\n');
+  const files = [entryPath, workerPath].map(file => ({
+    path: file.slice(dist.length + 1),
+    sha256: sha256(readFileSync(file)),
+  }));
+  const treeSha256 = sha256(JSON.stringify(files));
   const manifestPath = join(dist, 'botmux-build-manifest.json');
   writeFileSync(manifestPath, `${JSON.stringify({
     schemaVersion: 1,
     botmuxCommit: commit,
-    files: [entryPath, workerPath].map(file => ({
-      path: file.slice(dist.length + 1),
-      sha256: sha256(readFileSync(file)),
-    })),
+    treeSha256,
+    files,
   })}\n`);
   return {
     checkout,
     commit,
-    artifactSha256: sha256(readFileSync(manifestPath)),
+    artifactSha256: treeSha256,
     workerPath,
   };
 }
@@ -243,6 +246,10 @@ describe('Candidate RCA recursion isolation', () => {
 
   it('rejects Candidate launch when ignored dist diverges from its clean BotMux HEAD', async () => {
     const build = cleanBotmuxBuildFixture();
+    expect(runtimeContractModule.candidateBotmuxBuildIdentity(build.checkout)).toEqual({
+      commit: build.commit,
+      artifactSha256: build.artifactSha256,
+    });
     writeFileSync(build.workerPath, 'export const workerBuild = "drifted";\n');
     const sendTopic = vi.fn();
     const contract = {
