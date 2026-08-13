@@ -1187,6 +1187,113 @@ describe('codex-app-runner app-server protocol integration', () => {
     }
   });
 
+  it('settles when a canonical completion is buffered and the racing tryAdmitSteer steer is then definitely rejected (accepted.length===1)', async () => {
+    // REGRESSION REPRO for the tryAdmitSteer definite-rejection branch: a
+    // steerable root proves canonical via exact turn/started; the first follow-up
+    // steers via tryAdmitSteer. On that steer the fixture emits the CANONICAL
+    // turn/completed AND a definite steer rejection in ONE stdout chunk. The
+    // runner buffers the completion (steerInFlight set) then hits the rejection
+    // catch — where accepted.length is STILL 1 (the first steer never appended),
+    // so inGroupMode is false. The rejection branch must settle the buffered
+    // canonical completion directly; a resume path gated on inGroupMode would
+    // strand it and hang the session forever (busy never returns to false).
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-admit-reject-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-admit-reject-buffered', control.bootstrap.path);
+
+    const send = (text: string, replyTurnId: string) => {
+      const encoded = encodeRunnerInput(
+        `legacy:${text}`,
+        { text, clientUserMessageId: replyTurnId },
+        replyTurnId,
+        true,
+      );
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_ar_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      // Follow-up steers into the proven-canonical root via tryAdmitSteer.
+      send('follow', 'om_ar_follow');
+      // The turn MUST settle. A hang here (session stuck busy) is the regression:
+      // the rejection catch at line ~1700 is the SOLE settle point for the
+      // buffered canonical completion (accepted.length===1 → inGroupMode false).
+      await waitFor(harness, () => control.states.filter(state => state.busy === false).length >= 2);
+
+      const requests = readRequests(logPath);
+      expect(requests.filter(r => r.method === 'turn/steer')).toHaveLength(1);
+      // The buffered canonical completion settled the root directly (no history
+      // reconcile, no identity error): the root's real answer is rebuilt from the
+      // canonical completion's items. The rejected follow-up then starts its own
+      // serial turn.
+      const diagnostics = control.markers.filter(
+        m => m.kind === 'diagnostic' && m.payload.code === 'native_turn_identity_conflict',
+      );
+      expect(diagnostics).toHaveLength(0);
+      const rootFinal = control.finals.find(f => f.turnId === 'om_ar_root');
+      expect(rootFinal?.content).toBe('buffered canonical answer');
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed (never trusts foreign text) when the buffered completion is NON-canonical and the racing tryAdmitSteer steer is rejected', async () => {
+    // codex's reported blocker: the PR broadened terminalCompletion to also hold
+    // NON-canonical completions. The tryAdmitSteer rejection branch must NOT
+    // blindly hand a non-canonical completion to settleSteeredCompletion — with
+    // no full items that path would trust existing streamed text and mis-attribute
+    // a foreign turn's answer. It must route to bounded-history reconcile and,
+    // finding no full-group match, fail closed with an identity conflict.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-admit-reject-nc-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-admit-reject-noncanon', control.bootstrap.path);
+
+    const send = (text: string, replyTurnId: string) => {
+      const encoded = encodeRunnerInput(
+        `legacy:${text}`,
+        { text, clientUserMessageId: replyTurnId },
+        replyTurnId,
+        true,
+      );
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_nc_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      send('follow', 'om_nc_follow');
+      // Must settle (no hang) AND fail closed: an identity-conflict diagnostic,
+      // never a final carrying a foreign turn's model text.
+      await waitFor(harness, () => control.markers.some(
+        m => m.kind === 'diagnostic' && m.payload.code === 'native_turn_identity_conflict',
+      ));
+      await waitFor(harness, () => control.states.filter(state => state.busy === false).length >= 2);
+      const rootFinal = control.finals.find(f => f.turnId === 'om_nc_root');
+      expect(rootFinal?.content).toContain('identity conflict');
+      // A bounded-history reconcile ran (proof it did NOT blindly settle).
+      expect(readRequests(logPath).some(r => r.method === 'thread/turns/list')).toBe(true);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed when a steered group terminal turn omits a member (B5 group-aware identity defense)', async () => {
     // B5: when the canonical completion carries itemsView:'full', EVERY steered
     // member that sent a clientId must appear exactly once in strictly-increasing

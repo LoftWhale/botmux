@@ -1697,7 +1697,24 @@ async function tryAdmitSteer(): Promise<void> {
       // once this native turn completes the head starts its own turn.
       turn.steeringClosed = true;
       emitLifecycle({ kind: 'steer_rejected_fallback', appTurnId: expectedTurnId, category: 'definite_rejection' });
-      if (turn.completionSeen && turn.terminalCompletion) settleSteeredCompletion(turn, turn.terminalCompletion);
+      // A completion buffered while this steer was in flight must settle now.
+      // terminalCompletion may be non-canonical (PR broadened it), so route by
+      // identity exactly like resumeBufferedGroupCompletion — but WITHOUT its
+      // inGroupMode guard: this rejected steer never appended, so accepted.length
+      // is still 1 and inGroupMode is false here. Blindly calling
+      // settleSteeredCompletion would trust a foreign turn's items (wrong
+      // attribution); the helper would instead no-op and strand the completion
+      // (hang). Canonical → settle directly; non-canonical → bounded reconcile.
+      if (turn.completionSeen && turn.terminalCompletion) {
+        const bufferedId = typeof turn.terminalCompletion.id === 'string'
+          ? turn.terminalCompletion.id
+          : undefined;
+        if (bufferedId !== undefined && bufferedId === turn.canonicalNativeTurnId) {
+          settleSteeredCompletion(turn, turn.terminalCompletion);
+        } else {
+          void reconcileSteeredGroupFromHistory(turn, bufferedId);
+        }
+      }
       return;
     }
     // Unknown outcome (transport/timeout/generic rpc/protocol): fence — never

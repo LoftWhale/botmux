@@ -441,6 +441,52 @@ function handle(request) {
       }
       return;
     }
+    if (behavior === 'steer-admit-reject-buffered' || behavior === 'steer-admit-reject-noncanon') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      // The race this repro pins: the turn actually COMPLETED at the exact moment
+      // tryAdmitSteer's steer RPC lands. Emit turn/completed AND a definite steer
+      // rejection in ONE stdout chunk. The runner buffers the completion while
+      // steerInFlight is set, then the rejection catch (line ~1700) must settle
+      // it — accepted.length is still 1 here (first steer never appended), so any
+      // inGroupMode-gated resume path would strand it (hang).
+      const { threadId, turnId } = activeTurn;
+      // The follow-up steer is being definitively REJECTED, so it never joins the
+      // turn: the canonical completion's full items carry ONLY the accepted root's
+      // user item (protocol fact), not the rejected follow-up's.
+      // noncanon: a DIFFERENT native id with NO full items. The rejection branch
+      // must NOT blindly trust it (that would attribute foreign/streamed text);
+      // it must route to bounded-history reconcile and fail closed (no match).
+      const completion = behavior === 'steer-admit-reject-noncanon'
+        ? {
+            method: 'turn/completed',
+            params: { threadId, turn: { id: 'turn-foreign-nc', status: 'completed' } },
+          }
+        : {
+            method: 'turn/completed',
+            params: {
+              threadId,
+              turn: {
+                id: turnId,
+                status: 'completed',
+                itemsView: 'full',
+                error: null,
+                items: [
+                  { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+                  { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'buffered canonical answer' },
+                ],
+              },
+            },
+          };
+      writeBatch([
+        completion,
+        { id: request.id, error: { code: -32601, message: 'active turn not steerable' } },
+      ]);
+      activeTurn = undefined;
+      return;
+    }
     if (behavior === 'steer-group-mismatch') {
       if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
         reject(request.id, -32602, 'expectedTurnId does not match active turn');
@@ -796,6 +842,22 @@ function handle(request) {
     });
     // The original turn/start is answered later — as an explicit RPC error — from
     // the turn/steer handler, after the steer is accepted.
+    return;
+  }
+  if ((behavior === 'steer-admit-reject-buffered' || behavior === 'steer-admit-reject-noncanon') && turnAttempt === 1) {
+    // Case A (canonical proven by the START RESPONSE, not an exact turn/started):
+    // respond to turn/start with the canonical id and emit only a BARE
+    // turn/started (no exact-client items), then HOLD the turn open. This keeps
+    // identityProof === 'start_response', so runTurn has no delayed-response
+    // backstop — the tryAdmitSteer rejection catch is the SOLE settle point for
+    // the buffered canonical completion. The follow-up (turnAttempt 2) that falls
+    // back after the rejection completes normally through completeTurn.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
+    groupClientIds = [request.params.clientUserMessageId ?? null];
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
     return;
   }
   completeTurn(request);
