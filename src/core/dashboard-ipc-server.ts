@@ -3619,6 +3619,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
+    apiTaskFullAccess: getBot(cachedLarkAppId).config.apiTaskFullAccess === true,
     sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
     readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
     // Full enforceability (adapter support + no wrapperCli + macOS) — the UI
