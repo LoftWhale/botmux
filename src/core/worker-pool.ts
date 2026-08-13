@@ -291,6 +291,7 @@ import {
   sessionAnchorId,
   storedSessionAnchorId,
   isDocNativeSession,
+  isHttpVirtualSession,
   larkTransportEnabled,
   riffRetirementAdmissionPhase,
   type DaemonSession,
@@ -6802,6 +6803,8 @@ export function forkWorker(
   const runtimeIdentity = runtimeBuildIdentity();
   const feedbackPolicy = resolveFeedbackPolicyForDelivery({ dataDir: config.session.dataDir, larkAppId: ds.larkAppId, chatId: ds.chatId, bot: botCfg });
   ds.feedbackPolicy = feedbackPolicy;
+  const apiTaskFullAccess = isHttpVirtualSession(ds.chatId)
+    && ds.session.apiTaskFullAccess === true;
   initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
@@ -6841,11 +6844,13 @@ export function forkWorker(
     // full bots.json / sibling BOT_HOME / send-cred / lark-cli store — a model
     // that deletes/forges the ancestry marker or bypasses the CLI still cannot
     // build ANY (sibling) Lark client. The pid-marker gate is only friendly
-    // early-reject; THIS is the fail-closed boundary. Reuses the existing unified
-    // fs-policy (mac+Linux fail-closed); a backend that can't isolate locally
-    // refuses to spawn rather than leak creds.
+    // early-reject; THIS is the fail-closed boundary. The only opt-out is the
+    // trusted per-bot decision already frozen onto a fresh HTTP virtual session;
+    // callers cannot request it. Explicit bot readIsolation, session sandbox,
+    // and host/global sandbox policy remain higher-priority boundaries.
     readIsolation: botCfg.readIsolation === true
-      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }),
+      || (!apiTaskFullAccess
+        && !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })),
     readDenyExtraPaths: botCfg.readDenyExtraPaths ?? [],
     // Identifies THIS daemon lifetime. Stamped onto isolated panes so the worker
     // can tell a suspend→resume reattach (same boot id, still isolated) from a
