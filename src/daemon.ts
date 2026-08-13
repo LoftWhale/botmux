@@ -66,6 +66,7 @@ import {
   setResolvedAllowedUsersRepublishHook,
   setAllowedUsersResolveRetryHook,
   vcMeetingAgentConfigActive,
+  botAcceptsSlashFromBots,
   type BotConfig,
   type BotState,
   type OncallChat,
@@ -17183,7 +17184,14 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
 
   // Intercept daemon commands in new topics (no session needed for some commands)
-  const invocation = parseSlashCommandInvocation(cmdContent);
+  // acceptSlashFromBots gate: a bot sender's slash command is only routed as a
+  // command when this bot opts in (default on). When off, fall through to
+  // ordinary message handling — the peer bot can still talk, it just can't drive
+  // /clear /model /close … into this bot. Human senders are never gated here.
+  const senderIsBotForSlashGate = isBotSenderType || isForeignBotSender;
+  const invocation = (senderIsBotForSlashGate && !botAcceptsSlashFromBots(larkAppId))
+    ? null
+    : parseSlashCommandInvocation(cmdContent);
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, cmd);
@@ -18496,7 +18504,12 @@ async function handleThreadReplyAdmitted(
   }
 
   // Intercept daemon commands
-  const invocation = parseSlashCommandInvocation(cmdContent);
+  // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
+  // slash is only routed as a command when this bot opts in (default on); when
+  // off it falls through to ordinary message handling. Human senders unaffected.
+  const invocation = ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))
+    ? null
+    : parseSlashCommandInvocation(cmdContent);
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
     const existingDs = activeSessions.get(sessionKey(anchor, larkAppId));
