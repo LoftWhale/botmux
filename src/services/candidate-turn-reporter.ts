@@ -85,7 +85,10 @@ export class CandidateTurnReceiptReporter {
       nextAttemptAt,
     });
     try {
-      await this.deliver(pending);
+      const outcome = await this.deliver(pending);
+      if (outcome === 'disabled') {
+        throw new Error('Candidate turn receipt delivery is disabled');
+      }
       await this.turns.markControlPlaneDelivered({ candidateDispatchId, turnId, transitionCount });
       const key = this.key(candidateDispatchId, turnId);
       const timer = this.timers.get(key);

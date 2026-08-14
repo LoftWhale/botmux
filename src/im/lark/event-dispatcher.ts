@@ -62,6 +62,7 @@ import {
 } from '../../vc-agent/push-source.js';
 import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agent/types.js';
 import type { VcMeetingImTurnOrigin } from '../../types.js';
+import type { CandidateFeishuConversationResolution } from '../../core/candidate-feishu-conversation.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -1494,7 +1495,7 @@ export interface EventHandlers {
     larkAppId: string;
     chatId: string;
     rootMessageId?: string;
-  }) => { kind: 'not_candidate' | 'identity_gap' | 'identity_conflict' | 'candidate' };
+  }) => CandidateFeishuConversationResolution;
   /** Resolve a persisted topic reply alias back to its owning chat-scope session. */
   resolveReplyThreadAlias?: (rootId: string, chatId: string, larkAppId: string) => { chatId: string; sessionId: string; anchor?: string } | null;
   /** Fired when the dispatcher detects that a chat with a live chat-scope
@@ -2162,17 +2163,33 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const chatId = message.chat_id;
       const chatType = (message.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
       const messageId = message.message_id;
-      const candidateConversation = handlers.resolveCandidateConversation?.({
+      const candidateInput = {
         larkAppId,
         chatId,
-        rootMessageId: message.root_id && message.thread_id ? message.root_id : undefined,
-      });
+        rootMessageId: typeof message.root_id === 'string' && message.root_id
+          ? message.root_id
+          : undefined,
+      };
+      let candidateConversation = handlers.resolveCandidateConversation?.(candidateInput);
       if (candidateConversation && candidateConversation.kind !== 'not_candidate') {
         // The WS connection is live before restoreActiveSessions finishes. A
         // Candidate reply received in that window must wait for the canonical
         // Session instead of being dropped or falling into new-session routing.
         await sessionsReady;
+        candidateConversation = handlers.resolveCandidateConversation?.(candidateInput)
+          ?? candidateConversation;
+        if (candidateConversation.kind !== 'candidate') {
+          logger.warn(
+            `[candidate-rca] rejected inbound before routing chat=${chatId.substring(0, 12)} ` +
+            `message=${messageId.substring(0, 12)} identity=${candidateConversation.kind}`,
+          );
+          return;
+        }
       }
+      const candidateRootMessageId = candidateConversation?.kind === 'candidate'
+        ? candidateConversation.rootMessageId
+        : undefined;
+      const candidateContinuation = candidateRootMessageId !== undefined;
 
       // Bot-originated messages — bots historically only post inside threads
       // (their own thread replies). With chat-scope sessions a bot can also
@@ -2401,6 +2418,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         anchor: decision.anchor,
       };
       let routingSource = decision.source;
+      if (candidateRootMessageId) {
+        // Generic Lark routing must continue to require thread_id: root_id by
+        // itself can be a regular-group quote bubble. Candidate is the narrow
+        // exception because this root was matched to one durable launch receipt
+        // and its canonical active Session before routing reaches this point.
+        routing.scope = 'thread';
+        routing.anchor = candidateRootMessageId;
+        routingSource = 'real-thread';
+      }
       let replyRootId: string | undefined;
       const explicitlyMentionedThisBot = isBotMentioned(larkAppId, message, senderOpenId);
       // Cheap in-memory gate FIRST: skip the getChatMode roundtrip and the
@@ -2537,7 +2563,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // /t / /topic in 普通群: flip routing to thread-scope so the bot's
       // first reply seeds a fresh Lark thread, even if a chat-scope session
       // is currently active in this chat.
-      const forceTopicApplied = substituteTrigger ? false : maybeApplyForceTopicOverride(routing, message, messageId);
+      const forceTopicApplied = substituteTrigger || candidateContinuation
+        ? false
+        : maybeApplyForceTopicOverride(routing, message, messageId);
       if (forceTopicApplied) {
         logger.info(`[/t] Force-topic override: msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
       }
@@ -2547,13 +2575,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const ownsThreadSessionBeforeFold = routing.scope === 'thread'
         ? (handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false)
         : false;
-      const foldedReplyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
-        larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot: explicitlyMentionedThisBot, ownsThreadSession: ownsThreadSessionBeforeFold,
-      });
+      const foldedReplyRootId = candidateContinuation
+        ? undefined
+        : await maybeFoldMentionedRegularGroupThreadToChat({
+          larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot: explicitlyMentionedThisBot, ownsThreadSession: ownsThreadSessionBeforeFold,
+        });
       if (foldedReplyRootId) {
         replyRootId = foldedReplyRootId;
         ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
-      } else {
+      } else if (!candidateContinuation) {
         const seedReplyRootId = await maybeApplySharedTopicSeed({
           larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied,
         });
@@ -2617,7 +2647,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // stays in the buffer and flushes on its original timer. Paired seeds
       // only arise under never/ambient modes, where a legitimate merge always
       // requires isAllowed anyway.
-      if (senderOpenId && isAllowed && message.root_id && !isControlCommand) {
+      if (!candidateContinuation && senderOpenId && isAllowed && message.root_id && !isControlCommand) {
         await seedRoutingGates.get(message.root_id)?.ready;
         const pairingInput = {
           larkAppId,
@@ -2730,6 +2760,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 不在此单独加 clause，以免 isAllowed=false 时绕过权限检查。
         const relax = (!!replyRootId && isAllowed)
           || (!!substituteTrigger && isAllowed)
+          || (candidateContinuation && ownsSession && isAllowed)
           || (isAllowed && mentionMode === 'never')
           || (isAllowed && mentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message))
           || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsAnotherMember(larkAppId, message))

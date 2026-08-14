@@ -506,6 +506,39 @@ describe('Candidate RCA launch identity', () => {
     expect(activeSessions.size).toBe(1);
   });
 
+  it('the daemon production fast path rejects a dispatch reused by another incident', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-candidate-identity-conflict-'));
+    const activeSessions = new Map();
+
+    await expect(launchCandidateRcaFromDaemon(request(), {
+      dataDir: root,
+      larkAppId: 'cli_candidate',
+      activeSessions,
+      sessionsReady: true,
+      observeBotmuxIdentity,
+    })).resolves.toMatchObject({
+      ok: true,
+      incidentKey: request().incidentKey,
+      candidateDispatchId: request().candidateDispatchId,
+      rootMessageId: 'om_production_root',
+      botmuxSessionId: 'botmux-production-session',
+    });
+
+    await expect(launchCandidateRcaFromDaemon(request({ incidentKey: 'argos:other-alarm' }), {
+      dataDir: root,
+      larkAppId: 'cli_candidate',
+      activeSessions,
+      sessionsReady: true,
+      observeBotmuxIdentity,
+    })).resolves.toEqual({ ok: false, reason: 'identity_conflict' });
+
+    expect(productionMocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(productionMocks.createSession).toHaveBeenCalledTimes(1);
+    expect(productionMocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect([...activeSessions.values()].map(session => session.session.sessionId))
+      .toEqual(['botmux-production-session']);
+  });
+
   it('waits for canonical restore, then reuses the persisted Session after a mid-dispatch restart', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-candidate-restart-'));
     const activeSessions = new Map();

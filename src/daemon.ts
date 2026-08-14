@@ -14595,7 +14595,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     dataDir: config.session.dataDir,
     larkAppId,
     chatId,
-    rootMessageId: data?.message?.root_id && data?.message?.thread_id
+    rootMessageId: typeof data?.message?.root_id === 'string' && data.message.root_id
       ? data.message.root_id
       : undefined,
     activeSessions,
@@ -15346,7 +15346,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     dataDir: config.session.dataDir,
     larkAppId,
     chatId: ctxChatId,
-    rootMessageId: data?.message?.root_id && data?.message?.thread_id
+    rootMessageId: typeof data?.message?.root_id === 'string' && data.message.root_id
       ? data.message.root_id
       : undefined,
     activeSessions,

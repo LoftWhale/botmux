@@ -155,10 +155,16 @@ export async function launchCandidateRcaFromDaemon(
     )
     : undefined;
   if (existingLaunchTurn && existingSession) {
+    const receipt = readCandidateRcaLaunchReceipt(deps.dataDir, request.candidateDispatchId);
+    if (receipt && (receipt.incidentKey !== request.incidentKey
+      || receipt.candidateDispatchId !== request.candidateDispatchId
+      || receipt.larkAppId !== request.larkAppId
+      || receipt.chatId !== request.chatId)) {
+      return { ok: false, reason: 'identity_conflict' };
+    }
     if ((!existingSession.worker || existingSession.worker.killed) && launchTurnRecovery) {
       await launchTurnRecovery(existingSession, existingLaunchTurn);
     }
-    const receipt = readCandidateRcaLaunchReceipt(deps.dataDir, request.candidateDispatchId);
     if (receipt?.rootMessageId && receipt.botmuxSessionId) {
       return { ok: true, ...receipt, status: 'launched' };
     }

@@ -114,7 +114,10 @@ function hashFile(file: string): string {
 }
 
 function describeTree(target: string, base = target): Array<{ path: string; sha256: string }> {
-  const info = statSync(target);
+  const info = lstatSync(target);
+  if (info.isSymbolicLink()) {
+    throw new Error(`Candidate runtime tree contains a symbolic link: ${target}`);
+  }
   if (info.isFile()) return [{ path: relative(base, target) || '.', sha256: hashFile(target) }];
   if (!info.isDirectory()) throw new Error(`Unsupported Candidate runtime entry: ${target}`);
   return readdirSync(target, { withFileTypes: true })

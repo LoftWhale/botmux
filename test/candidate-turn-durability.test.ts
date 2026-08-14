@@ -88,6 +88,66 @@ describe('Candidate durable continuation', () => {
       .toEqual(['accepted', 'submitted', 'completed']);
   });
 
+  it('hands a failed busy-successor dispatch to exact-attempt recovery', async () => {
+    const { dataDir, turns } = fixture();
+    const dispatched: Array<{ turnId: string; dispatchAttempt: number }> = [];
+    const ambiguous: Array<{ turnId: string; dispatchAttempt: number; error: string }> = [];
+    const deps = {
+      dataDir,
+      receiverBootId: 'boot-a',
+      workerGeneration: 4,
+      dispatch(turn: CandidateTurnDispatch) {
+        dispatched.push({ turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt });
+        if (turn.turnId === 'om_turn_2') throw new Error('worker died during successor IPC');
+      },
+      onAmbiguousDispatch(receipt: { turnId: string; dispatchAttempt: number }, error: unknown) {
+        ambiguous.push({
+          turnId: receipt.turnId,
+          dispatchAttempt: receipt.dispatchAttempt,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    };
+
+    await acceptCandidateTurnFromDaemon(input('om_turn_1'), deps);
+    await acceptCandidateTurnFromDaemon(input('om_turn_2'), deps);
+    await submitCandidateTurnFromWorker({
+      candidateDispatchId: 'cand_alarm_42',
+      turnId: 'om_turn_1',
+      dispatchAttempt: 1,
+      workerGeneration: 4,
+      evidence: { kind: 'cli_transcript', nativeSessionId: 'coco-a', transcriptRef: 'events:10' },
+    }, deps);
+
+    await expect(settleCandidateTurnFromWorker({
+      candidateDispatchId: 'cand_alarm_42',
+      turnId: 'om_turn_1',
+      dispatchAttempt: 1,
+      workerGeneration: 4,
+      status: 'completed',
+      evidence: {
+        kind: 'cli_transcript_terminal',
+        nativeSessionId: 'coco-a',
+        transcriptRef: 'events:20',
+        output: 'turn one conclusion',
+      },
+    }, deps)).rejects.toThrow(/successor IPC/);
+
+    expect(dispatched).toEqual([
+      { turnId: 'om_turn_1', dispatchAttempt: 1 },
+      { turnId: 'om_turn_2', dispatchAttempt: 1 },
+    ]);
+    expect(ambiguous).toEqual([{
+      turnId: 'om_turn_2',
+      dispatchAttempt: 1,
+      error: 'worker died during successor IPC',
+    }]);
+    expect(turns.get('cand_alarm_42', 'om_turn_2')).toMatchObject({
+      status: 'accepted',
+      dispatchAttempt: 1,
+    });
+  });
+
   it('recovers an accepted turn after kill with the same identity and one replay attempt', async () => {
     const { dataDir } = fixture();
     const dispatched: CandidateTurnDispatch[] = [];
@@ -466,6 +526,42 @@ describe('Candidate durable continuation', () => {
     expect(turns.get('cand_alarm_42', 'om_fresh_coco')?.transitions.map(item => item.status))
       .toEqual(['accepted', 'submitted', 'completed']);
     expect(dispatched).toEqual([]);
+  });
+
+  it('keeps disabled control-plane delivery pending for restart replay', async () => {
+    const { dataDir, turns } = fixture();
+    const accepted = await turns.accept(input('om_disabled_callback'));
+    const scheduled: Array<() => void> = [];
+    const disabledReporter = new CandidateTurnReceiptReporter({
+      dataDir,
+      deliver: async () => 'disabled',
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return { unref() {} } as NodeJS.Timeout;
+      },
+    });
+
+    disabledReporter.report(accepted.receipt);
+    await disabledReporter.flush();
+
+    expect(turns.get('cand_alarm_42', 'om_disabled_callback')?.controlPlaneDelivery)
+      .toMatchObject({ acknowledgedTransitions: 0, attempts: 1 });
+    expect(scheduled).toHaveLength(1);
+
+    let replayed = 0;
+    const restartedReporter = new CandidateTurnReceiptReporter({
+      dataDir,
+      deliver: async () => {
+        replayed += 1;
+        return 'sent';
+      },
+    });
+    restartedReporter.recoverPending();
+    await restartedReporter.flush();
+
+    expect(replayed).toBe(1);
+    expect(turns.get('cand_alarm_42', 'om_disabled_callback')?.controlPlaneDelivery)
+      .toMatchObject({ acknowledgedTransitions: 1, attempts: 2 });
   });
 
   it('retries a failed terminal callback in the same daemon from its durable pending marker', async () => {

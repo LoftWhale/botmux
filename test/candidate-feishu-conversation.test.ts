@@ -9,11 +9,27 @@ const mocks = vi.hoisted(() => ({
   getChatMode: vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p'),
   addReaction: vi.fn(async () => 'reaction-1'),
   notifyCandidateAccepted: vi.fn(),
+  eventHandlers: {} as Record<string, (data: any) => unknown>,
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }
-  return { Client: FakeClient };
+  class FakeEventDispatcher {
+    register(handlers: Record<string, (data: any) => unknown>) {
+      mocks.eventHandlers = handlers;
+      return this;
+    }
+  }
+  class FakeWsClient {
+    start = vi.fn(async () => {});
+    getConnectionStatus = vi.fn(() => ({ state: 'connected', reconnectAttempts: 0 }));
+  }
+  return {
+    Client: FakeClient,
+    EventDispatcher: FakeEventDispatcher,
+    WSClient: FakeWsClient,
+    LoggerLevel: { info: 2 },
+  };
 });
 
 vi.mock('../src/im/lark/client.js', async () => {
@@ -45,10 +61,17 @@ import {
   resolveCandidateFeishuConversation,
 } from '../src/core/candidate-feishu-conversation.js';
 import {
+  __resetEventClaimsForTest,
+  markForwardFollowupsSessionsReady,
+  startLarkEventDispatcher,
+  type EventHandlers,
+} from '../src/im/lark/event-dispatcher.js';
+import {
   candidateRcaLaunchReceiptPath,
   type CandidateRcaLaunchReceipt,
 } from '../src/services/candidate-rca-launch.js';
 import { RcaShadowMirror } from '../src/services/rca-shadow-mirror.js';
+import { CandidateTurnDurability } from '../src/services/candidate-turn-durability.js';
 import * as sessionStore from '../src/services/session-store.js';
 
 const APP = 'cli_candidate_conversation';
@@ -132,19 +155,28 @@ function inboundEvent(rootMessageId = ROOT) {
   };
 }
 
+async function flushEventWork(): Promise<void> {
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setTimeout(resolve, 0));
+}
+
 beforeEach(async () => {
   vi.clearAllMocks();
+  mocks.eventHandlers = {};
+  __resetEventClaimsForTest();
   activeSessions.clear();
   dataDir = await mkdtemp(`${tmpdir()}/botmux-candidate-conversation-`);
   config.session.dataDir = dataDir;
+  config.daemon.forwardFollowupWaitMs = 0;
   sessionStore.init(APP);
-  registerBot({
+  const bot = registerBot({
     larkAppId: APP,
     larkAppSecret: 'secret',
     cliId: 'coco',
-    allowedUsers: [],
+    allowedUsers: ['ou_operator'],
     disableStreamingCard: false,
   });
+  bot.botOpenId = 'ou_candidate_bot';
 });
 
 describe('Candidate Feishu single conversation', () => {
@@ -200,6 +232,46 @@ describe('Candidate Feishu single conversation', () => {
     expect(ds.session.quoteTargetId).toBe('om_user_followup');
     expect(activeSessions.get(sessionKey(ROOT, APP))?.session.sessionId)
       .toBe(ds.session.sessionId);
+  });
+
+  it('continues the launched Session from the durable root when thread_id is absent', async () => {
+    const ds = await seedCandidateSession();
+    const event: any = inboundEvent();
+    delete event.message.thread_id;
+    const dispatcherHandlers: EventHandlers = {
+      handleCardAction: vi.fn(async () => ({})),
+      handleNewTopic,
+      handleThreadReply,
+      isSessionOwner: (anchor, larkAppId) => activeSessions.has(sessionKey(anchor, larkAppId)),
+      resolveCandidateConversation: input => resolveCandidateFeishuConversation({
+        ...input,
+        dataDir,
+        activeSessions,
+      }),
+    };
+    startLarkEventDispatcher(APP, 'secret', dispatcherHandlers);
+    markForwardFollowupsSessionsReady(APP);
+
+    await mocks.eventHandlers['im.message.receive_v1']!(event);
+    await flushEventWork();
+
+    expect(activeSessions.size).toBe(1);
+    await vi.waitFor(() => {
+      expect(ds.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'message',
+        turnId: event.message.message_id,
+      }));
+    });
+    expect(activeSessions.get(sessionKey(ROOT, APP))?.session.sessionId)
+      .toBe(ds.session.sessionId);
+    expect(new CandidateTurnDurability({ dataDir }).get(DISPATCH, event.message.message_id))
+      .toMatchObject({
+        larkAppId: APP,
+        chatId: CHAT,
+        rootMessageId: ROOT,
+        botmuxSessionId: ds.session.sessionId,
+        turnId: event.message.message_id,
+      });
   });
 
   it('fails closed at the production handlers for a missing or foreign Candidate root', async () => {

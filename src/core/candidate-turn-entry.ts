@@ -80,6 +80,13 @@ export async function settleCandidateTurnFromWorker(input: {
     receiverBootId: deps.receiverBootId,
     workerGeneration: deps.workerGeneration,
   });
-  if (next.kind === 'dispatch') await deps.dispatch(next.dispatch);
+  if (next.kind === 'dispatch') {
+    try {
+      await deps.dispatch(next.dispatch);
+    } catch (error) {
+      await deps.onAmbiguousDispatch?.(next.receipt, error);
+      throw error;
+    }
+  }
   return receipt;
 }

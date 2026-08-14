@@ -268,6 +268,40 @@ process.exit(result.status ?? 1);
     expect(dispatchTurn).not.toHaveBeenCalled();
   });
 
+  it('rejects a release Skills symlink escape at the production launch boundary', async () => {
+    const { root, contract } = fixture();
+    const hostPoison = join(root, 'host-poison-skill.md');
+    writeFileSync(hostPoison, 'HOST_POISON_SKILL\n');
+    symlinkSync(hostPoison, join(contract.skillsRoot, 'host-poison'));
+    contract.skillsSha256 = createHash('sha256').update(JSON.stringify([
+      { path: 'host-poison', sha256: sha256(hostPoison) },
+      {
+        path: 'release-only/SKILL.md',
+        sha256: sha256(join(contract.skillsRoot, 'release-only', 'SKILL.md')),
+      },
+    ])).digest('hex');
+    const sendTopic = vi.fn();
+    const dispatchTurn = vi.fn();
+
+    await expect(launchCandidateRca({
+      incidentKey: contract.incidentKey,
+      candidateDispatchId: contract.candidateDispatchId,
+      larkAppId: contract.shadowTarget.larkAppId,
+      chatId: contract.shadowTarget.chatId,
+      topicMessage: 'Candidate runtime Skills boundary',
+      launchContext: contract,
+    }, {
+      dataDir: root,
+      ...botmuxIdentity(contract),
+      sendTopic,
+      findTopicByDispatch: vi.fn(),
+      findSessionByRoot: vi.fn(),
+      dispatchTurn,
+    })).rejects.toThrow(/symbolic link/i);
+    expect(sendTopic).not.toHaveBeenCalled();
+    expect(dispatchTurn).not.toHaveBeenCalled();
+  });
+
   it('keeps Release A after the bot default changes to B and the Session is restored', () => {
     const { contract } = fixture();
     const restored = JSON.parse(JSON.stringify({
