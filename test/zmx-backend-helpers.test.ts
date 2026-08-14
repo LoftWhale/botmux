@@ -616,7 +616,9 @@ describe('zmx backend pure helpers', () => {
       env: { PATH: '/usr/bin:/bin', HOME: root },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const exitPromise = waitForExit(child, 8000);
+    // Starts at spawn: 5s readiness + 3s history grace + 2s execution/scheduler slack.
+    // The outer 12s test deadline leaves roughly 2s for assertions and cleanup.
+    const exitPromise = waitForExit(child, 10_000);
     try {
       await waitForFileContent(readyPath, `${readyNonce}\n`, 5000);
       writeFileSync(releaseTempPath, `${releaseToken}\n`, { mode: 0o600, flag: 'wx' });
@@ -630,5 +632,5 @@ describe('zmx backend pure helpers', () => {
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     }
-  }, 10_000);
+  }, 12_000);
 });
