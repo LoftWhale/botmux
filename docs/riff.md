@@ -54,7 +54,7 @@ bytedcli auth login  # bytedcli 用 auth login 子命令
 - **Linux**：`~/.config/<cli>/…`（kaboo-cli / aiden-cli / cjadk）、`~/.cjadk/…`、`~/.aipaas/…`，以及 bytedcli 的 `~/.local/share/bytedcli/data/…`
 - **macOS**：`~/Library/Application Support/<cli>/…`（kaboo-cli / aiden-cli / cjadk）；⚠️ 注意 **bytedcli 在 macOS 上仍走 `~/.local/share/bytedcli/data/…`**（不落 Application Support）
 - config 系（kaboo-cli / aiden-cli / cjadk）尊重 `$XDG_CONFIG_HOME`；**bytedcli 不读 `$XDG_DATA_HOME`**（固定 `~/.local/share`，已实测确认）
-- **AIME 工作区**：bytedcli 在设置了 `AIME_WORKSPACE_PATH` + `AIME_CURRENT_USER` 时，会把存储根切到 `<AIME_WORKSPACE_PATH>/<用户名>/.local/share/bytedcli/data/…`，botmux 也会自动探测该位置
+- **AIME 工作区**：bytedcli 在设置了 `AIME_WORKSPACE_PATH` + `AIME_CURRENT_USER` 时，会把存储根切到 `<AIME_WORKSPACE_PATH>/<用户名>/.local/share/bytedcli/data/…`，botmux 也会自动探测该位置。⚠️ 与 bytedcli 一致：**两个变量都齐全时只认 AIME 根、不回落到宿主 `~/.local/share`**（避免跨 AIME 用户身份误读他人 token）；只设其一则按普通环境处理。
 
 多个位置同时命中时，botmux 会解析各 token 的过期时间（JWT `exp`），跳过已过期者、优先选用有效期最新的一个，避免旧工具残留的过期 token 遮住另一工具的有效 token。
 

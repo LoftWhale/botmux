@@ -70,7 +70,7 @@ describe('bytecloudKeychainCandidates — cross-platform path generation', () =>
     expect(c).not.toContain(join('/custom/data', 'bytedcli', 'data', LEAF));
   });
 
-  it('adds the AIME workspace bytedcli path when AIME_WORKSPACE_PATH + AIME_CURRENT_USER are both set', () => {
+  it('uses ONLY the AIME workspace path for bytedcli when both AIME vars are set (no plain-HOME fallback)', () => {
     const env = {
       AIME_WORKSPACE_PATH: '/aime/ws',
       AIME_CURRENT_USER: 'alice',
@@ -78,9 +78,16 @@ describe('bytecloudKeychainCandidates — cross-platform path generation', () =>
     const c = bytecloudKeychainCandidates(HOME, env);
     const aime = join('/aime/ws', 'alice', '.local', 'share', 'bytedcli', 'data', LEAF);
     expect(c).toContain(aime);
-    // AIME path ranks before the plain ~/.local/share bytedcli fallback.
-    const plain = join(HOME, '.local', 'share', 'bytedcli', 'data', LEAF);
-    expect(c.indexOf(aime)).toBeLessThan(c.indexOf(plain));
+    // Mirror bytedcli's fail-closed behaviour: in a full AIME runtime it does NOT
+    // fall back to the real HOME, so neither may we (else we'd risk reading a
+    // different identity's token). No plain / macOS bytedcli candidate here.
+    expect(c).not.toContain(join(HOME, '.local', 'share', 'bytedcli', 'data', LEAF));
+    expect(c).not.toContain(join(HOME, 'Library', 'Application Support', 'bytedcli', 'data', LEAF));
+  });
+
+  it('keeps the plain-HOME bytedcli candidate when NOT a full AIME runtime', () => {
+    const c = bytecloudKeychainCandidates(HOME, {} as NodeJS.ProcessEnv);
+    expect(c).toContain(join(HOME, '.local', 'share', 'bytedcli', 'data', LEAF));
   });
 
   it('does NOT add an AIME path when only one of the two AIME vars is set', () => {
@@ -249,6 +256,59 @@ describe('readBytecloudKeychainJwt — expiry-aware selection (stale must not sh
     writeKeychain(join('.config', 'kaboo-cli'), { bytecloud_jwt: live });
     writeKeychain(join('.local', 'share', 'bytedcli', 'data'), { bytecloud_jwt: 'opaque-later' });
     expect(readBytecloudKeychainJwt(home, bare, nowMs)).toBe(live);
+  });
+});
+
+describe('readBytecloudKeychainJwt — AIME fail-closed identity isolation', () => {
+  let home: string;
+  const NOW = 1_000_000;
+  const nowMs = NOW * 1000;
+  const WS = () => join(home, 'aime-ws');
+  const aimeEnv = () => ({ AIME_WORKSPACE_PATH: WS(), AIME_CURRENT_USER: 'alice' }) as NodeJS.ProcessEnv;
+
+  const writeKeychain = (relRoot: string, body: unknown) => {
+    const dir = join(home, relRoot, 'bytecloud-auth', 'keychain', 'auth', 'cn');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'default'), JSON.stringify(body), 'utf-8');
+  };
+  const writeAimeKeychain = (body: unknown) => {
+    const dir = join(WS(), 'alice', '.local', 'share', 'bytedcli', 'data',
+      'bytecloud-auth', 'keychain', 'auth', 'cn');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'default'), JSON.stringify(body), 'utf-8');
+  };
+
+  beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'riff-keychain-aime-')); });
+  afterEach(() => { rmSync(home, { recursive: true, force: true }); });
+
+  it('AIME wins even when a plain ~/.local/share token has a LATER expiry (no cross-identity leak)', () => {
+    // The exp-aware selector must NOT let a longer-lived plain-HOME token beat
+    // the AIME-scoped one: in a full AIME runtime, plain HOME is not a candidate.
+    writeAimeKeychain({ bytecloud_jwt: makeJwt(NOW + 3600) });                         // AIME: +1h
+    writeKeychain(join('.local', 'share', 'bytedcli', 'data'), { bytecloud_jwt: makeJwt(NOW + 7200) }); // plain: +2h
+    expect(readBytecloudKeychainJwt(home, aimeEnv(), nowMs)).toBe(makeJwt(NOW + 3600));
+  });
+
+  it('returns null when AIME keychain is absent, even if plain HOME has a valid bytedcli token', () => {
+    // fail-closed: do not fall back to another identity's HOME token.
+    writeKeychain(join('.local', 'share', 'bytedcli', 'data'), { bytecloud_jwt: makeJwt(NOW + 7200) });
+    expect(readBytecloudKeychainJwt(home, aimeEnv(), nowMs)).toBeNull();
+  });
+
+  it('still allows plain HOME bytedcli when only ONE AIME var is set (not a full AIME runtime)', () => {
+    const live = makeJwt(NOW + 3600);
+    writeKeychain(join('.local', 'share', 'bytedcli', 'data'), { bytecloud_jwt: live });
+    const onlyWs = { AIME_WORKSPACE_PATH: WS() } as NodeJS.ProcessEnv;
+    const onlyUser = { AIME_CURRENT_USER: 'alice' } as NodeJS.ProcessEnv;
+    expect(readBytecloudKeychainJwt(home, onlyWs, nowMs)).toBe(live);
+    expect(readBytecloudKeychainJwt(home, onlyUser, nowMs)).toBe(live);
+  });
+
+  it('in a full AIME runtime, config-style CLIs (kaboo/aiden/cjadk) are still consulted', () => {
+    // AIME only scopes the bytedcli data base; the config-dir CLIs are unaffected.
+    const live = makeJwt(NOW + 3600);
+    writeKeychain(join('.config', 'kaboo-cli'), { bytecloud_jwt: live });
+    expect(readBytecloudKeychainJwt(home, aimeEnv(), nowMs)).toBe(live);
   });
 });
 

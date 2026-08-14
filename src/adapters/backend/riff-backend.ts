@@ -342,15 +342,21 @@ export function bytecloudKeychainCandidates(
     join(home, 'Library', 'Application Support'),
   ]);
   // Home bases under which bytedcli keeps `bytedcli/data/bytecloud-auth/...`.
-  // bytedcli ignores $XDG_DATA_HOME, so we only vary the home base: the real
-  // home, its AIME override (workspace/user), and the macOS spelling as a
-  // belt-and-suspenders fallback. AIME goes first — inside an AIME workspace it
-  // is the authoritative location.
-  const bytedcliHomes = dedupe([
-    aimeDataHome(env) ?? '',
-    join(home, '.local', 'share'),
-    join(home, 'Library', 'Application Support'),
-  ]);
+  // bytedcli ignores $XDG_DATA_HOME, so we never key it off that. It ALSO does
+  // not fall back to the real HOME when in an AIME workspace: bytedcliBaseDir
+  // returns the AIME root and stops. We mirror that exactly — otherwise a
+  // token belonging to a DIFFERENT identity under the plain ~/.local/share
+  // could be picked up (worse: the exp-aware selector below would let it win on
+  // a later expiry), crossing AIME user identities. So: inside a full AIME
+  // runtime, the ONLY bytedcli base is the AIME root; outside it, the real home
+  // plus the macOS spelling as a belt-and-suspenders fallback.
+  const aimeHome = aimeDataHome(env);
+  const bytedcliHomes = aimeHome
+    ? [aimeHome]
+    : dedupe([
+        join(home, '.local', 'share'),
+        join(home, 'Library', 'Application Support'),
+      ]);
   const roots: string[] = [];
   // Config-dir CLIs.
   for (const base of configHomes) {
