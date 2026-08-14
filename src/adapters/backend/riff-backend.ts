@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -272,6 +273,83 @@ export function hashUrlForLog(u: string): string {
   return createHash('sha256').update(u).digest('hex').slice(0, 8);
 }
 
+/** The keychain leaf under a ByteCloud tool's storage root:
+ *  `<root>/bytecloud-auth/keychain/auth/cn/default`, whose JSON holds the
+ *  `bytecloud_jwt` field. `cn` is ByteCloud CN (riff is an internal CN
+ *  service). NOTE the sibling `bytecloud-auth/auth/cn/credentials.json` (no
+ *  `keychain/` segment) carries only metadata (app_id / expires_at / user) and
+ *  NO `bytecloud_jwt` — we deliberately never read it. */
+const BYTECLOUD_KEYCHAIN_LEAF = join('bytecloud-auth', 'keychain', 'auth', 'cn', 'default');
+
+/**
+ * Every directory that may hold a ByteCloud tool's `bytecloud-auth/` store,
+ * across the CLIs botmux users log into (kaboo-cli / aiden-cli / cjadk /
+ * bytedcli) and across platforms. Empirically verified on Linux + macOS:
+ *   - kaboo-cli / aiden-cli nest under the XDG *config* dir
+ *     (Linux `~/.config/<cli>`, macOS `~/Library/Application Support/<cli>`).
+ *   - cjadk uses a home dot-dir `~/.cjadk`; aipaas uses `~/.aipaas`.
+ *   - bytedcli nests under the XDG *data* dir with an extra `data/` segment
+ *     (`~/.local/share/bytedcli/data`) — confirmed to hold `bytecloud_jwt` on
+ *     BOTH Linux and macOS: bytedcli honours $XDG_DATA_HOME / `~/.local/share`
+ *     even on macOS rather than using `~/Library/Application Support`.
+ * We cast a wide net: non-existent candidates simply fail the read and are
+ * skipped, so listing extra plausible locations is cheap and future-proofs
+ * against a tool switching its base dir. $XDG_CONFIG_HOME / $XDG_DATA_HOME
+ * overrides are honoured first. The ordering below is the read priority.
+ */
+export function bytecloudKeychainCandidates(
+  home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const dedupe = (xs: string[]): string[] => [...new Set(xs.filter(Boolean))];
+  const xdgConfig = env.XDG_CONFIG_HOME?.trim();
+  const xdgData = env.XDG_DATA_HOME?.trim();
+  // Bases that hold `<cli>/bytecloud-auth/...` (config-style tools).
+  const configHomes = dedupe([
+    xdgConfig ?? '',
+    join(home, '.config'),
+    join(home, 'Library', 'Application Support'),
+  ]);
+  // Bases that hold `bytedcli/data/bytecloud-auth/...` (data-style tool).
+  const dataHomes = dedupe([
+    xdgData ?? '',
+    join(home, '.local', 'share'),
+    join(home, 'Library', 'Application Support'),
+  ]);
+  const roots: string[] = [];
+  // Config-dir CLIs.
+  for (const base of configHomes) {
+    for (const cli of ['kaboo-cli', 'aiden-cli', 'cjadk']) roots.push(join(base, cli));
+  }
+  // Home dot-dir layouts (Linux-observed; harmless as extra candidates elsewhere).
+  roots.push(join(home, '.cjadk'));
+  roots.push(join(home, '.aipaas'));
+  // Data-dir CLI (bytedcli) — the extra `data/` segment is part of its layout.
+  for (const base of dataHomes) roots.push(join(base, 'bytedcli', 'data'));
+  return dedupe(roots).map((root) => join(root, BYTECLOUD_KEYCHAIN_LEAF));
+}
+
+/**
+ * Read the ByteCloud JWT from the first keychain candidate that both exists and
+ * carries a non-empty `bytecloud_jwt`. Pure + injectable (home/env) so it is
+ * unit-testable without touching the real HOME. Returns null when no candidate
+ * yields a token. Never throws — unreadable/malformed candidates are skipped.
+ */
+export function readBytecloudKeychainJwt(
+  home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  for (const path of bytecloudKeychainCandidates(home, env)) {
+    try {
+      const raw = readFileSync(path, 'utf-8');
+      const data = JSON.parse(raw) as Record<string, unknown>;
+      const jwt = data['bytecloud_jwt'];
+      if (typeof jwt === 'string' && jwt.length > 0) return jwt;
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
 function defaultRunGit(cwd: string): (args: string[]) => string | null {
   return (args: string[]) => {
     try {
@@ -454,7 +532,7 @@ export class RiffBackend implements SessionBackend {
     const fromEnv = process.env[envKey];
     if (fromEnv) return fromEnv;
 
-    // Fallback: try ByteCloud Auth SDK keychain (kaboo-cli / aiden-cli / cjadk)
+    // Fallback: try ByteCloud Auth SDK keychain (kaboo-cli / aiden-cli / cjadk / bytedcli)
     const fromKeychain = this.readJwtFromBytecloudKeychain();
     if (fromKeychain) {
       logger.info(`[riff] JWT loaded from ByteCloud keychain`);
@@ -466,21 +544,7 @@ export class RiffBackend implements SessionBackend {
   }
 
   private readJwtFromBytecloudKeychain(): string | null {
-    const home = process.env.HOME ?? '~';
-    const candidates = [
-      `${home}/.config/kaboo-cli/bytecloud-auth/keychain/auth/cn/default`,
-      `${home}/.config/aiden-cli/bytecloud-auth/keychain/auth/cn/default`,
-      `${home}/.cjadk/bytecloud-auth/keychain/auth/cn/default`,
-    ];
-    for (const path of candidates) {
-      try {
-        const raw = readFileSync(path, 'utf-8');
-        const data = JSON.parse(raw) as Record<string, unknown>;
-        const jwt = data['bytecloud_jwt'] as string | undefined;
-        if (jwt) return jwt;
-      } catch { /* try next */ }
-    }
-    return null;
+    return readBytecloudKeychainJwt();
   }
 
   spawn(_bin: string, _args: string[], _opts: SpawnOpts): void {

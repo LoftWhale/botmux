@@ -41,18 +41,31 @@ riff API 使用 ByteCloud JWT 鉴权。botmux 每次调用 riff 时按以下优�
 
 ### 留空（推荐）该怎么做
 
-在**运行 botmux daemon 的机器**上，安装并登录任意一个 ByteCloud 系 CLI（`kaboo-cli` / `aiden-cli` / `cjadk`），登录一次即可：
+在**运行 botmux daemon 的机器**上，安装并登录任意一个 ByteCloud 系 CLI（`kaboo-cli` / `aiden-cli` / `cjadk` / `bytedcli`），登录一次即可：
 
 ```bash
 # 任选其一，首次运行会拉起 SSO 浏览器授权
-kaboo-cli   # 或 cjadk / aiden-cli
+kaboo-cli            # 或 cjadk / aiden-cli
+bytedcli auth login  # bytedcli 用 auth login 子命令
 ```
 
-登录态（含 `bytecloud_jwt`）写入本机 keychain（如 `~/.config/kaboo-cli/bytecloud-auth/keychain/auth/cn/default`）。botmux **每次调用 riff 时实时读取**——无需配置任何字段、无需重启 daemon。
+登录态（含 `bytecloud_jwt`）写入本机 keychain。botmux 会跨平台、跨工具自动探测这些位置（命中即用，无需配置任何字段、无需重启 daemon）：
+
+- **Linux**：`~/.config/<cli>/…`（kaboo-cli / aiden-cli / cjadk）、`~/.cjadk/…`、`~/.aipaas/…`，以及 bytedcli 的 `~/.local/share/bytedcli/data/…`
+- **macOS**：`~/Library/Application Support/<cli>/…`；⚠️ 注意 **bytedcli 在 macOS 上仍走 XDG 风格 `~/.local/share/bytedcli/data/…`**（不落 Application Support）
+- 均尊重 `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` 覆盖
+
+keychain 文件的完整叶路径形如 `<root>/bytecloud-auth/keychain/auth/cn/default`，其 JSON 含 `bytecloud_jwt` 字段。（同级的 `bytecloud-auth/auth/cn/credentials.json` 只有元数据、**不含** `bytecloud_jwt`，botmux 不会误读。）
 
 ### 手动获取 JWT（只有走方式 ①/② 才需要）
 
-登录上述任一 CLI 后，从 keychain 取出 token：
+装了 `bytedcli` 时，最简单的方式是让它直接吐 token：
+
+```bash
+bytedcli auth get-bytecloud-jwt-token --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["jwt"])'
+```
+
+或从 kaboo/cjadk 的 keychain 直接取（Linux 示例）：
 
 ```bash
 python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/kaboo-cli/bytecloud-auth/keychain/auth/cn/default')))['bytecloud_jwt'])"
