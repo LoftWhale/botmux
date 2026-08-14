@@ -282,20 +282,51 @@ export function hashUrlForLog(u: string): string {
 const BYTECLOUD_KEYCHAIN_LEAF = join('bytecloud-auth', 'keychain', 'auth', 'cn', 'default');
 
 /**
+ * Reproduce bytedcli's `sanitizeFilenamePart` + AIME base-dir assembly EXACTLY
+ * (from `@bytedance-dev/bytedcli` dist/bytedcli-core.js, verified against
+ * 0.124.0): a username path segment keeps only `[a-zA-Z0-9._-]` (every other
+ * char → `_`), then a lone `.` → `_` and a lone `..` → `__`. Must match
+ * byte-for-byte or the AIME keychain path we build won't line up with where
+ * bytedcli actually wrote the token.
+ */
+function sanitizeAimeUser(user: string): string {
+  return user.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.$/, '_').replace(/^\.\.$/, '__');
+}
+
+/**
+ * bytedcli's data-home base when running inside an AIME workspace. bytedcli
+ * uses it (in place of `os.homedir()`) ONLY when both `AIME_WORKSPACE_PATH` and
+ * `AIME_CURRENT_USER` are set (trimmed non-empty); it then stores under
+ * `<workspace>/<sanitizedUser>/.local/share/bytedcli/data/…`. We return the
+ * `<workspace>/<sanitizedUser>/.local/share` prefix (parallel to the plain
+ * `~/.local/share` data-home, so the shared `join(base,'bytedcli','data')`
+ * below lands on the right leaf), or null when this is not an AIME runtime.
+ */
+function aimeDataHome(env: NodeJS.ProcessEnv): string | null {
+  const workspace = env.AIME_WORKSPACE_PATH?.trim();
+  const user = env.AIME_CURRENT_USER?.trim();
+  if (!workspace || !user) return null;
+  return join(workspace, sanitizeAimeUser(user), '.local', 'share');
+}
+
+/**
  * Every directory that may hold a ByteCloud tool's `bytecloud-auth/` store,
  * across the CLIs botmux users log into (kaboo-cli / aiden-cli / cjadk /
- * bytedcli) and across platforms. Empirically verified on Linux + macOS:
+ * bytedcli) and across platforms. Empirically verified on Linux + macOS
+ * (strace of the real binaries + on-disk layout):
  *   - kaboo-cli / aiden-cli nest under the XDG *config* dir
- *     (Linux `~/.config/<cli>`, macOS `~/Library/Application Support/<cli>`).
+ *     (Linux `~/.config/<cli>`, macOS `~/Library/Application Support/<cli>`),
+ *     honouring `$XDG_CONFIG_HOME`.
  *   - cjadk uses a home dot-dir `~/.cjadk`; aipaas uses `~/.aipaas`.
- *   - bytedcli nests under the XDG *data* dir with an extra `data/` segment
- *     (`~/.local/share/bytedcli/data`) — confirmed to hold `bytecloud_jwt` on
- *     BOTH Linux and macOS: bytedcli honours $XDG_DATA_HOME / `~/.local/share`
- *     even on macOS rather than using `~/Library/Application Support`.
+ *   - bytedcli stores under `~/.local/share/bytedcli/data` on BOTH Linux and
+ *     macOS. It does NOT honour `$XDG_DATA_HOME` (verified: bytedcli ignores it
+ *     and always uses `~/.local/share`), so we do NOT key bytedcli off it.
+ *     Inside an AIME workspace bytedcli swaps the home base for
+ *     `$AIME_WORKSPACE_PATH/<sanitized $AIME_CURRENT_USER>` — covered here.
  * We cast a wide net: non-existent candidates simply fail the read and are
  * skipped, so listing extra plausible locations is cheap and future-proofs
- * against a tool switching its base dir. $XDG_CONFIG_HOME / $XDG_DATA_HOME
- * overrides are honoured first. The ordering below is the read priority.
+ * against a tool switching its base dir. The ordering below is the read
+ * priority.
  */
 export function bytecloudKeychainCandidates(
   home: string = homedir(),
@@ -303,16 +334,20 @@ export function bytecloudKeychainCandidates(
 ): string[] {
   const dedupe = (xs: string[]): string[] => [...new Set(xs.filter(Boolean))];
   const xdgConfig = env.XDG_CONFIG_HOME?.trim();
-  const xdgData = env.XDG_DATA_HOME?.trim();
-  // Bases that hold `<cli>/bytecloud-auth/...` (config-style tools).
+  // Bases that hold `<cli>/bytecloud-auth/...` (config-style tools). These DO
+  // honour $XDG_CONFIG_HOME.
   const configHomes = dedupe([
     xdgConfig ?? '',
     join(home, '.config'),
     join(home, 'Library', 'Application Support'),
   ]);
-  // Bases that hold `bytedcli/data/bytecloud-auth/...` (data-style tool).
-  const dataHomes = dedupe([
-    xdgData ?? '',
+  // Home bases under which bytedcli keeps `bytedcli/data/bytecloud-auth/...`.
+  // bytedcli ignores $XDG_DATA_HOME, so we only vary the home base: the real
+  // home, its AIME override (workspace/user), and the macOS spelling as a
+  // belt-and-suspenders fallback. AIME goes first — inside an AIME workspace it
+  // is the authoritative location.
+  const bytedcliHomes = dedupe([
+    aimeDataHome(env) ?? '',
     join(home, '.local', 'share'),
     join(home, 'Library', 'Application Support'),
   ]);
@@ -325,29 +360,71 @@ export function bytecloudKeychainCandidates(
   roots.push(join(home, '.cjadk'));
   roots.push(join(home, '.aipaas'));
   // Data-dir CLI (bytedcli) — the extra `data/` segment is part of its layout.
-  for (const base of dataHomes) roots.push(join(base, 'bytedcli', 'data'));
+  for (const base of bytedcliHomes) roots.push(join(base, 'bytedcli', 'data'));
   return dedupe(roots).map((root) => join(root, BYTECLOUD_KEYCHAIN_LEAF));
 }
 
 /**
- * Read the ByteCloud JWT from the first keychain candidate that both exists and
- * carries a non-empty `bytecloud_jwt`. Pure + injectable (home/env) so it is
- * unit-testable without touching the real HOME. Returns null when no candidate
- * yields a token. Never throws — unreadable/malformed candidates are skipped.
+ * Decode a JWT's `exp` (seconds since epoch) from its payload without verifying
+ * the signature — we only need the expiry to prefer a live token over a stale
+ * one. Returns null for anything we cannot confidently parse as an expiry
+ * (opaque/non-JWT strings, malformed base64, missing/!number `exp`).
+ */
+export function decodeJwtExp(jwt: string): number | null {
+  const parts = jwt.split('.');
+  if (parts.length < 2) return null;
+  try {
+    const payload = Buffer.from(parts[1]!, 'base64url').toString('utf-8');
+    const obj = JSON.parse(payload) as Record<string, unknown>;
+    const exp = obj['exp'];
+    return typeof exp === 'number' && Number.isFinite(exp) ? exp : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the ByteCloud JWT from the keychain candidates, preferring a live token.
+ * Pure + injectable (home/env/now) so it is unit-testable without touching the
+ * real HOME. Never throws — unreadable/malformed candidates are skipped.
+ *
+ * Selection (fixes the stale-token-shadows-valid-token hazard: an expired token
+ * from an earlier-listed tool must not mask a valid token from a later one):
+ *   1. Collect every candidate's non-empty `bytecloud_jwt`, in candidate order.
+ *   2. Drop tokens whose decoded `exp` is already past `now`.
+ *   3. Among the survivors, pick the one with the greatest `exp` (freshest);
+ *      candidates whose `exp` we cannot parse (opaque values) rank BELOW any
+ *      parseable live token and are used only as a last-resort fallback when no
+ *      parseable-live token exists — so a broken/opaque old value can never
+ *      shadow a clearly-valid newer token.
+ * Returns null when nothing yields a usable token.
  */
 export function readBytecloudKeychainJwt(
   home: string = homedir(),
   env: NodeJS.ProcessEnv = process.env,
+  nowMs: number = Date.now(),
 ): string | null {
+  const nowSec = nowMs / 1000;
+  let bestLive: { jwt: string; exp: number } | null = null; // parseable, unexpired, freshest
+  let opaqueFallback: string | null = null;                 // first exp-less, non-expired-unknown token
   for (const path of bytecloudKeychainCandidates(home, env)) {
+    let jwt: string;
     try {
-      const raw = readFileSync(path, 'utf-8');
-      const data = JSON.parse(raw) as Record<string, unknown>;
-      const jwt = data['bytecloud_jwt'];
-      if (typeof jwt === 'string' && jwt.length > 0) return jwt;
-    } catch { /* try next */ }
+      const data = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+      const v = data['bytecloud_jwt'];
+      if (typeof v !== 'string' || v.length === 0) continue;
+      jwt = v;
+    } catch { continue; }
+    const exp = decodeJwtExp(jwt);
+    if (exp === null) {
+      // Cannot parse expiry — keep only the first as a last-resort fallback.
+      if (opaqueFallback === null) opaqueFallback = jwt;
+      continue;
+    }
+    if (exp <= nowSec) continue; // clearly expired — never select.
+    if (!bestLive || exp > bestLive.exp) bestLive = { jwt, exp };
   }
-  return null;
+  return bestLive?.jwt ?? opaqueFallback;
 }
 
 function defaultRunGit(cwd: string): (args: string[]) => string | null {
