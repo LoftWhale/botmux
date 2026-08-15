@@ -4536,7 +4536,6 @@ export async function transferSession(
     runtimeWorkingDir: ds.workingDir,
     runtimeAdoptedFrom: ds.adoptedFrom,
   });
-  if (ds.session.vcMeetingReceiver) return { ok: false, error: 'vc_receiver_not_relayable' };
   if (hasProtectedSessionMutationOwnership(ds)) {
     return { ok: false, error: 'codex_app_dispatch_pending' };
   }
@@ -4690,7 +4689,6 @@ export async function transferSession(
     item.sessionId !== ds.session.sessionId
     && item.status === 'active'
     && (!item.larkAppId || item.larkAppId === ds.larkAppId)
-    && !item.vcMeetingReceiver
     && (item.scope === 'chat' ? item.chatId : item.rootMessageId) === targetAnchor
     && !runtimeIds.has(item.sessionId),
   );
@@ -4964,7 +4962,6 @@ export async function forkSession(
 
   // ── Front guards (mirror transferSession; a fork needs a clean, complete
   //    source node exactly as a relay does) ──
-  if (ds.session.vcMeetingReceiver) return { ok: false, error: 'vc_receiver_not_forkable' };
   if (ds.pendingRepo) return { ok: false, error: 'not_started_yet' };
   if (!isRelayableRealSession(ds)) return { ok: false, error: 'not_started_yet' };
   if (ds.session.adoptedFrom) return { ok: false, error: 'adopt_not_forkable' };

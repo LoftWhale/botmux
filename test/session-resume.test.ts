@@ -253,7 +253,12 @@ describe('resumeSession', () => {
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
     });
 
-    it('rejects manual resume for a closed dedicated VC receiver without mutating its state or routing map', async () => {
+    it('Plan B: a closed meeting-agent session resumes as an ordinary chat session (no vc_receiver_managed refusal)', async () => {
+      // Under Plan B a meeting agent is an ordinary chat-scope session, so a
+      // closed one is resumable like any chat session — the vc_receiver_managed
+      // refusal is gone. Here the chat anchor is already held by a live ordinary
+      // chat, so the resume correctly falls through to the ordinary
+      // anchor-occupancy guard instead of a VC-specific refusal.
       const receiver = makeClosedSession({
         chatId: 'oc_listener',
         rootMessageId: 'oc_listener',
@@ -281,7 +286,10 @@ describe('resumeSession', () => {
 
       const r = await resumeSession(receiver.sessionId, map);
 
-      expect(r).toEqual({ ok: false, error: 'vc_receiver_managed' });
+      // No VC-specific refusal — the ordinary anchor-occupancy guard wins because
+      // a live chat session already owns this chat's slot.
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toBe('anchor_occupied');
       expect(sessionStore.getSession(receiver.sessionId)?.status).toBe('closed');
       expect(map.size).toBe(1);
       expect(map.get(ordinaryChatKey)).toBe(ordinaryChat);
