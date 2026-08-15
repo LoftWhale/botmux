@@ -267,8 +267,13 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     // so a silent responseMode (which only gates listener auto-post) does NOT block
     // in-meeting speech — the hub still applies capability + text/voiceOutputPolicy.
     const block = region(daemonSource, 'let effectiveVerified = verified;', 'if (!effectiveVerified.ok) return jsonRes');
-    // Fallback only when there is NO live origin and a claimed delivery origin.
-    expect(block).toContain('!ds.managedTurnOrigin');
+    // The fallback runs whenever live verification failed — including while a
+    // delivery turn is still executing. Live verification proves origin via the
+    // rotating worker capability only, and non-sandboxed sessions have no
+    // origin-channel transport for it, so gating the fallback on "live origin
+    // cleared" (the old `!ds.managedTurnOrigin` guard) hard-bricked in-turn
+    // speech from non-sandboxed meeting agents (idle-gap gate #5).
+    expect(block).not.toContain('!ds.managedTurnOrigin');
     expect(block).toContain('claimedAttempt !== undefined');
     expect(block).toContain('evaluateVcMeetingManagedSend(config.session.dataDir, {');
     expect(block).toContain('allowTerminalReceipt: true');

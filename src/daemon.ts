@@ -1877,7 +1877,11 @@ const DEFAULT_VC_MEETING_FLUSH_INTERVAL_MS = 30_000;
 const DEFAULT_VC_MEETING_TIME_ZONE = 'Asia/Shanghai';
 const DEFAULT_VC_MEETING_CONSUMER_SELECTION_TIMEOUT_MS = 20_000;
 const DEFAULT_VC_MEETING_CONSUMER_INJECT_INTERVAL_MS = 30_000;
-const DEFAULT_VC_MEETING_CONSUMER_MIN_BATCH_CHARS = 400;
+// Effectively no char-accumulation gate: with minBatchItems=1 a single
+// finalized transcript segment already qualifies, and the operator explicitly
+// asked for no "wait until enough text piles up" behavior (esp. at meeting
+// start). Kept as a config knob for bots that want to raise it.
+const DEFAULT_VC_MEETING_CONSUMER_MIN_BATCH_CHARS = 1;
 const VC_MEETING_CONSUMER_DELIVERY_MAX_ITEMS = 100;
 const VC_MEETING_CONSUMER_DELIVERY_MAX_RENDERED_CHARS = 20_000;
 // By default, keep the selected agent as fresh as the listener group: one new
@@ -2107,14 +2111,15 @@ function defaultVcMeetingTextOutputPolicy(cfg?: VcMeetingAgentConfig): VcMeeting
 }
 
 function defaultVcMeetingVoiceOutputPolicy(cfg: VcMeetingAgentConfig): VcMeetingOutputPolicy {
-  // Voice stays hard-denied unless realtime voice is enabled for the bot. When
-  // enabled it defaults to per-utterance approval (voice is intrusive); an
-  // operator may relax it to 'allow' — or tighten back to 'deny' — via
-  // meetingConsumer.voiceOutputPolicy.
+  // Voice stays hard-denied unless realtime voice is enabled for the bot.
+  // Enabling realtimeVoice is itself the explicit opt-in, so once enabled the
+  // default matches text: send without per-utterance approval. An operator may
+  // tighten back to 'approval' or 'deny' via meetingConsumer.voiceOutputPolicy
+  // (dashboard-editable).
   if (cfg.realtimeVoice?.enabled !== true) return 'deny';
   const configured = cfg.meetingConsumer?.voiceOutputPolicy;
   if (configured === 'approval' || configured === 'deny' || configured === 'allow') return configured;
-  return 'approval';
+  return 'allow';
 }
 
 function vcMeetingOutputReviewTimeoutMs(channel: VcMeetingOutputChannel): number {
@@ -6550,9 +6555,18 @@ ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
   // dispatched/completed, the projection must still be active, and a silent
   // delivery is refused. This never authorizes anything the receipt itself
   // wouldn't, so it does not weaken the boundary; it only survives the idle gap.
+  //
+  // The fallback intentionally does NOT require the live origin to be absent:
+  // live verification proves origin via the rotating worker capability only,
+  // and non-sandboxed sessions have no origin-channel transport for that
+  // capability (managedOriginChannelRequired is darwin-isolate/credential-only
+  // bwrap), so their live check ALWAYS fails — including while the delivery
+  // turn is still executing. Gating the fallback on "live origin cleared"
+  // hard-bricked exactly that case (in-turn speech from a non-sandboxed
+  // meeting agent). The durable receipt check is the same strength either way,
+  // so the fallback runs whenever live verification failed.
   let effectiveVerified = verified;
   if (!verified.ok
-    && !ds.managedTurnOrigin
     && typeof body.originTurnId === 'string'
     && body.originTurnId.trim()
     && claimedAttempt !== undefined) {
@@ -10198,7 +10212,11 @@ function vcMeetingConsumerHasFastSignal(
       : item.type === 'transcript_received'
         ? item.speaker
         : undefined;
-    if (isInstructionSource(actor) && /[?？]/.test(text)) return true;
+    // Any speech/chat from an instruction source (the authorizing user) is a
+    // fast signal — not only questions. Waiting out the regular flush tick on
+    // the operator's own words made the agent feel unresponsive in-meeting;
+    // other participants still batch on the normal cadence.
+    if (isInstructionSource(actor)) return true;
   }
   return false;
 }

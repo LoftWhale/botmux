@@ -8197,6 +8197,73 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(triggerSessionCalls[0].req.envelope.rawText).toContain('@用户 这个问题需要马上看一下');
   });
 
+  it('treats any instruction-source speech as a fast signal (no question mark required)', async () => {
+    // The authorizing user speaking plain statements used to wait out the
+    // regular flush tick (only "@" chats or instruction-source questions were
+    // fast) — the operator's own words now inject immediately.
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          minBatchChars: 1_000,
+          minBatchItems: 10,
+          maxInjectIntervalMs: 60_000,
+          agentCandidates: [
+            { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
+          ],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_operator_fast',
+      meeting: { id: 'm_operator_fast', meetingNo: '555555561', topic: 'Operator speech fast signal' },
+      raw: { event: { meeting: { id: 'm_operator_fast', meeting_no: '555555561' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_operator_fast_activity',
+      meeting: { id: 'm_joined_555555561', meetingNo: '555555561', topic: 'Operator speech fast signal' },
+      raw: {
+        event: {
+          meeting_actitivty_items: [
+            {
+              activity_event_type: 'chat_received',
+              meeting: { id: 'm_joined_555555561', meeting_no: '555555561', topic: 'Operator speech fast signal' },
+              chat_received_items: [
+                {
+                  message_id: 'msg_operator_fast_1',
+                  sender: { open_id: TARGET_OPEN_ID, user_name: 'Operator' },
+                  text: '先把上周的进展同步一下',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 2));
+
+    expect(triggerSessionCalls).toHaveLength(1);
+    expect(triggerSessionCalls[0].req.envelope.rawText).toContain('先把上周的进展同步一下');
+  });
+
   it('temporarily authorizes in-meeting instruction sources without expanding output approval', async () => {
     registerConsumerAgentBot();
     registerBot({
@@ -9014,6 +9081,7 @@ describe('VC meeting daemon session lifecycle', () => {
           enabled: true,
         },
         meetingConsumer: {
+          voiceOutputPolicy: 'approval', // approval workflow under test; default is now 'allow'
           enabled: true,
           defaultMode: 'listenOnly',
           agentCandidates: [
@@ -9090,6 +9158,7 @@ describe('VC meeting daemon session lifecycle', () => {
           attentionTargetOpenId: TARGET_OPEN_ID,
           realtimeVoice: { enabled: true },
           meetingConsumer: {
+            voiceOutputPolicy: 'approval', // voice half of this test exercises review; default is now 'allow'
             enabled: true,
             textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
             defaultMode: 'listenOnly',
@@ -9372,6 +9441,7 @@ describe('VC meeting daemon session lifecycle', () => {
           enabled: true,
         },
         meetingConsumer: {
+          voiceOutputPolicy: 'approval', // approval workflow under test; default is now 'allow'
           enabled: true,
           defaultMode: 'listenOnly',
           agentCandidates: [
@@ -9436,6 +9506,7 @@ describe('VC meeting daemon session lifecycle', () => {
           enabled: true,
         },
         meetingConsumer: {
+          voiceOutputPolicy: 'approval', // approval workflow under test; default is now 'allow'
           enabled: true,
           defaultMode: 'listenOnly',
           agentCandidates: [
@@ -9499,6 +9570,7 @@ describe('VC meeting daemon session lifecycle', () => {
           enabled: true,
         },
         meetingConsumer: {
+          voiceOutputPolicy: 'approval', // approval workflow under test; default is now 'allow'
           enabled: true,
           defaultMode: 'listenOnly',
           agentCandidates: [
@@ -10019,6 +10091,7 @@ describe('VC meeting daemon session lifecycle', () => {
           enabled: true,
         },
         meetingConsumer: {
+          voiceOutputPolicy: 'approval', // approval workflow under test; default is now 'allow'
           enabled: true,
           defaultMode: 'listenOnly',
           agentCandidates: [
