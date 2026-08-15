@@ -667,6 +667,42 @@ describe('resumeSession', () => {
       expect(sessionStore.getSession(meetingB.sessionId)?.status).toBe('closed');
     });
 
+    it('Plan B: a lone legacy meeting row restores at the ordinary chat key with its marker intact', async () => {
+      // Migration compat: a legacy dedicated-receiver row with no competing chat
+      // session at its listener chat must restore cleanly into the ordinary
+      // (chatId, appId) slot (no vc-receiver: key), keeping vcMeetingReceiver as
+      // delivery metadata so the meeting lifecycle + ledger still resolve it by
+      // sessionId. No hard hash migration is needed — the sessionId is stable
+      // across the key change.
+      const s = sessionStore.createSession('oc_solo_listener', 'oc_solo_listener', 'meeting solo', 'group');
+      s.larkAppId = 'app_test';
+      s.scope = 'chat';
+      s.cliId = 'claude-code';
+      s.workingDir = '/tmp/proj';
+      s.vcMeetingReceiver = {
+        listenerAppId: 'listener_app',
+        meetingId: 'meeting-solo',
+        memberId: 'member-solo',
+        memberEpoch: 3,
+      };
+      sessionStore.updateSession(s);
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('oc_solo_listener', 'app_test'));
+      expect(restored?.session.sessionId).toBe(s.sessionId);
+      expect([...map.keys()].some(k => k.includes('vc-receiver:'))).toBe(false);
+      // Marker retained as delivery metadata (not stripped) so meeting delivery
+      // still targets this exact session by id.
+      expect(restored?.session.vcMeetingReceiver).toMatchObject({
+        meetingId: 'meeting-solo',
+        memberId: 'member-solo',
+        memberEpoch: 3,
+      });
+      expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
+    });
+
     it('keeps the row closed when a concurrent close cancels resume registration', async () => {
       const closed = makeClosedSession({ rootMessageId: 'om_cancel_resume' });
       // resumeSession registers via the synchronous setActiveSessionIfActive
