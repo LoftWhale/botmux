@@ -40,6 +40,7 @@ import type { BackendType } from '../adapters/backend/types.js';
 import * as persistentBackend from './persistent-backend.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
+import { claimPromptContext } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { normalizeCliRuntimeConfig, type CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
@@ -194,6 +195,8 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
@@ -207,6 +210,7 @@ import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './typ
 import { isRiffBackendSession } from './persistent-backend.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
+import { isSessionGroup } from '../services/session-groups-store.js';
 import {
   commitDeviceIsolationActivation,
   DEVICE_ISOLATION_COMMIT_PATH,
@@ -639,6 +643,10 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename)$/.test(pathname)) return true;
+  // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
+  // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
+  // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/prompt-ctx\/claim$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
   // A sandboxed report cannot read the host HMAC secret. This narrow route
@@ -1048,6 +1056,48 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
   });
 });
 
+/**
+ * Host-side atomic claim/pop for the UserPromptSubmit hook（#794 方向 B）。
+ *
+ * 沙箱内的 `botmux user-prompt-hook` 不能在 read-only 的 `prompt-ctx/<sid>` 里
+ * unlink（HIGH-2），同正文多轮也不能靠 FIFO 猜（HIGH-1：某轮漏 claim 会串轮到
+ * 后续轮）。hook 把 (session 凭据 + fingerprint) 提交到这里，宿主按
+ * **managedTurnOrigin.turnId 权威 turn 绑定**精确取该轮的 envelope，先删再返回。
+ * 漏 claim 只孤儿化自己那条，不污染后续轮；上一轮的 stale sidecar 永远不会被返回。
+ *
+ * 鉴权与 /close、/slash 同构：trusted-host HMAC，或本会话 rotating per-turn
+ * capability（沙箱内读 host secret 失败时的回退）。任何未命中/失败 → 404/403，
+ * hook 端空输出 exit 0（fail-open：reminder 丢失 < 卡住 prompt）。
+ */
+ipcRoute('POST', '/api/sessions/:sessionId/prompt-ctx/claim', async (req, res, params) => {
+  const body = await readJsonBody<{
+    fingerprint?: unknown;
+    prefix?: unknown;
+  } & Record<string, unknown>>(req).catch(() => ({}) as {
+    fingerprint?: unknown;
+    prefix?: unknown;
+  } & Record<string, unknown>);
+  const ds = findActiveBySessionId(params.sessionId);
+  // claim 只读 daemon 自有本轮非凭证上下文（reminder/whiteboard），receiver 会话
+  // 也允许（allowReceiver: true）；close/slash/cd 等 managed action 仍默认拒绝。
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body, { allowReceiver: true });
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  const fingerprint = typeof body?.fingerprint === 'string' ? body.fingerprint : '';
+  if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_fingerprint' });
+  }
+  // 权威 turnId：daemon 当前这轮的 turnId（worker 发布的 managed_turn_origin）。
+  // hook 不需要、也不应自己提供 turnId——daemon 只认自己的权威值，避免 FIFO 串轮。
+  const turnId = ds?.managedTurnOrigin?.turnId;
+  if (!turnId) return jsonRes(res, 404, { ok: false, error: 'no_active_turn' });
+  const prefix = typeof body?.prefix === 'string' && body.prefix.length > 0
+    ? body.prefix.slice(0, 64)
+    : undefined;
+  const envelope = claimPromptContext(params.sessionId, turnId, fingerprint, prefix);
+  if (!envelope) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  jsonRes(res, 200, { ok: true, envelope });
+});
+
 // `botmux list` zombie pruning is maintenance, not explicit abandon. Serialize
 // against inbound admission and refuse if any backend-neutral durable owner
 // became unsettled after the CLI took its liveness snapshot.
@@ -1289,6 +1339,7 @@ function sessionCliIpcAuth(
   ds: DaemonSession | undefined,
   sessionId: string,
   body: Record<string, unknown> | undefined,
+  opts: { allowReceiver?: boolean } = {},
 ): { ok: true } | { ok: false; error: string } {
   const claimedAttempt = typeof body?.originDispatchAttempt === 'number'
     && Number.isSafeInteger(body.originDispatchAttempt)
@@ -1299,7 +1350,9 @@ function sessionCliIpcAuth(
     trustedHost: isTrustedHostIpcRequest(req),
     sessionExists: !!ds,
     receiverSession: !!ds?.session.vcMeetingReceiver,
-    allowReceiver: false,
+    // close/slash/cd 是 managed action，默认拒绝 receiver；claim 只读 daemon 自有
+    // 本轮非凭证上下文（reminder/whiteboard），读自己本轮 reminder 非提权，单独放开。
+    allowReceiver: opts.allowReceiver === true,
     sessionId,
     liveOrigin: ds?.managedTurnOrigin,
     claimedCapability: typeof body?.originCapability === 'string' ? body.originCapability : undefined,
@@ -2815,7 +2868,17 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
       const observedBotNames = observedBotsStore
         .listObservedBots(config.session.dataDir, cachedLarkAppId, c.chatId)
         .map(b => b.name);
-      return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole, hasMessageListener, observedBotNames };
+      return {
+        ...c,
+        oncallChat: oncall ?? null,
+        firstSeenAt: seenMap.get(c.chatId) ?? null,
+        hasRole,
+        hasMessageListener,
+        observedBotNames,
+        // 会话群分型（p2pMode=group 自动创建）：dashboard 群面板据此把它们
+        // 收进独立折叠区，避免淹没需要人工管理的常驻群。
+        ...(isSessionGroup(c.chatId) ? { sessionGroup: true } : {}),
+      };
     });
     jsonRes(res, 200, { chats: enriched });
   } catch (e) {
@@ -3434,8 +3497,13 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   const { defaultOncall, autoboundChats } = oncallStore.getBotDefaultOncall(cachedLarkAppId);
   const cardPrefs = cardPrefsStore.getBotCardPrefs(cachedLarkAppId);
   const grantPrefs = grantPrefsStore.getBotGrantPrefs(cachedLarkAppId);
-  let p2pMode: 'thread' | 'chat' = 'chat';
-  try { if (getBot(cachedLarkAppId).config.p2pMode === 'thread') p2pMode = 'thread'; } catch { /* default chat */ }
+  let p2pMode: 'thread' | 'chat' | 'group' = 'chat';
+  try {
+    const configured = getBot(cachedLarkAppId).config.p2pMode;
+    if (configured === 'thread' || configured === 'group') p2pMode = configured;
+  } catch { /* default chat */ }
+  let envelopeInjection: 'auto' | 'off' = 'off';
+  try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
   let skillInjection: 'global' | 'prompt' | 'off' | null = null;
   // How this bot's CLI delivers botmux skills, so the dashboard can render the
   // control correctly: 'dynamic' = per-session --plugin-dir (claude-family, not
@@ -3583,6 +3651,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
+    envelopeInjection,
     skillInjection,
     skillInjectionSupport,
     // Resolved machine-wide default → the dashboard shows it as the pre-selected
@@ -4098,9 +4167,89 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   });
 });
 
-// Per-bot 私聊单聊模式 p2pMode。Body `{ p2pMode: 'chat' | 'thread' }`:
+// ─── 会话群标签授权（feed-group OAuth，Dashboard 一站式流程）────────────────
+// POST /api/oauth-callback {url} — dashboard 的 /oauth/callback 接收页把回调
+// URL 广播给各 daemon；state 在本进程 pendingLogins 里的那个完成 code→token
+// 交换，其它 daemon 返回 matched:false 让 dashboard 继续尝试下一个。
+ipcRoute('POST', '/api/oauth-callback', async (req, res) => {
+  let body: { url?: unknown };
+  try { body = await readJsonBody<{ url?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof body.url !== 'string' || !body.url.trim()) {
+    return jsonRes(res, 400, { ok: false, error: 'url_required' });
+  }
+  const result = await tryHandleCallbackUrl(body.url.trim());
+  if (!result) return jsonRes(res, 200, { ok: false, matched: false, message: 'not a callback url' });
+  jsonRes(res, 200, { ok: result.ok, matched: result.matched, message: result.message });
+});
+
+// POST /api/session-group-tag-auth — 生成带 feed-group scope 的授权链接。
+// state 存本 daemon 进程内存，回调必须经由上面的 /api/oauth-callback 回到
+// 同一进程完成，故链接生成与回调处理都放 IPC 侧。
+ipcRoute('POST', '/api/session-group-tag-auth', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    const { authUrl } = generateAuthUrl(
+      cfg.larkAppId,
+      cfg.larkAppSecret,
+      normalizeBrand(cfg.brand),
+      FEED_GROUP_OAUTH_SCOPES,
+    );
+    jsonRes(res, 200, { ok: true, authUrl });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
+});
+
+// GET /api/session-group-tag-status — 标签授权状态（Dashboard 徽标）。
+ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand));
+    jsonRes(res, 200, { ok: true, ...status, tagMode: cfg.sessionGroup?.tag?.mode ?? 'chat-tag' });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
+});
+
+// PUT /api/session-group-tag-config — 会话群标签模式（Dashboard tag mode
+// selector，PR review：授权行必须与实际 tagMode 一致）。Body `{ mode }`：
+// 'chat-tag'（默认，应用租户身份，无需用户授权）| 'feed-group'（个人侧边栏
+// 分组，需一次 OAuth）| 'off'。写 bots.json 的 sessionGroup.tag.mode 并热更
+// 内存注册表，与 /botconfig 同一持久化通道。
+ipcRoute('PUT', '/api/session-group-tag-config', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { mode?: unknown };
+  try { body = await readJsonBody<{ mode?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const mode = body.mode === 'chat-tag' || body.mode === 'feed-group' || body.mode === 'off'
+    ? body.mode : undefined;
+  if (!mode) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  try {
+    const bot = getBot(cachedLarkAppId);
+    const r = await rmwBotEntry(cachedLarkAppId, (entry: any) => {
+      if (!entry.sessionGroup || typeof entry.sessionGroup !== 'object') entry.sessionGroup = {};
+      if (!entry.sessionGroup.tag || typeof entry.sessionGroup.tag !== 'object') entry.sessionGroup.tag = {};
+      entry.sessionGroup.tag.mode = mode;
+      return { write: true, result: mode };
+    });
+    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    bot.config.sessionGroup = {
+      ...(bot.config.sessionGroup ?? {}),
+      tag: { ...(bot.config.sessionGroup?.tag ?? {}), mode },
+    };
+    jsonRes(res, 200, { ok: true, tagMode: mode });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
+});
+
+// Per-bot 私聊单聊模式 p2pMode。Body `{ p2pMode: 'chat' | 'thread' | 'group' }`:
 //   • 'chat'（默认）    → 私聊走扁平连续 chat-scope 会话
 //   • 'thread'          → 显式回到每条 DM 独立 thread-scope 会话
+//   • 'group'           → 每条顶层 DM 自动建专属会话群并把会话落进去
 // 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径），保证一致。
 ipcRoute('PUT', '/api/bot-p2p-mode', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
@@ -4110,11 +4259,30 @@ ipcRoute('PUT', '/api/bot-p2p-mode', async (req, res) => {
 
   const spec = findConfigField('p2pMode');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
-  // 只有 'thread' 有意义；其它（含 'chat'，新默认)一律清回默认，bots.json 保持干净。
-  const value = body.p2pMode === 'thread' ? 'thread' : null;
+  // 只有 'thread' / 'group' 有意义；其它（含 'chat'，新默认)一律清回默认，bots.json 保持干净。
+  const value = body.p2pMode === 'thread' ? 'thread' : body.p2pMode === 'group' ? 'group' : null;
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, p2pMode: value ?? 'chat' });
+});
+
+// Per-bot 每轮上下文注入方式 envelopeInjection（#794）。Body `{ envelopeInjection: 'auto'|'off'|'' }`:
+//   • 'auto' → 支持的 CLI（claude-code）把 reminder/whiteboard 经 UserPromptSubmit
+//     hook 注入为 system-reminder，user turn 只留消息本身；不支持的自动回退内联
+//   • 'off'/其它 → 内联 envelope（历史行为，默认）
+// 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径），下一个 follow-up turn 生效。
+ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { envelopeInjection?: unknown };
+  try { body = await readJsonBody<{ envelopeInjection?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('envelopeInjection');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const value = body.envelopeInjection === 'auto' ? 'auto' : null;
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, envelopeInjection: value ?? 'off' });
 });
 
 // Per-bot 内置技能注入模式 skillInjection。Body `{ skillInjection: 'global'|'prompt'|'off'|'' }`:

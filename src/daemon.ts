@@ -231,6 +231,7 @@ import {
   rememberLastCliInput,
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
+  resumeSession,
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
@@ -470,6 +471,9 @@ import {
 } from './vc-agent/realtime/index.js';
 import { createGroupWithBots } from './services/group-creator.js';
 import { addBotToChat, isInChat } from './services/groups-store.js';
+import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
+import { maybeBirthSessionGroup } from './core/session-group-birth.js';
+import { scheduleSessionGroupTitle } from './services/session-group-title.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
 import {
   hasVcMeetingEndedTombstone,
@@ -4437,6 +4441,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       botCliPathOverride: botCfg.cliPathOverride,
       sender,
       mode: 'live',
+      turnId,
     });
     rememberLastCliInput(ds, promptContent, cliInput);
     sessionStore.updateSession(ds.session);
@@ -4454,6 +4459,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       botIdentity: { name: bot.botName, openId: bot.botOpenId },
       sender,
       mode: 'refork',
+      turnId,
     });
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
@@ -16342,6 +16348,10 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
     const bot = getBot(ds.larkAppId);
     const cliId = ds.session.cliId ?? bot.config.cliId;
     const rawCodexText = (ds.pendingCodexAppFollowUps ?? []).join('\n\n');
+    const bufferedTurnIds = ds.pendingFollowUpTurnIds ?? [];
+    const turnId = bufferedTurnIds[bufferedTurnIds.length - 1]
+      ?? ds.currentReplyTarget?.turnId
+      ?? `queued-activation-followup-${randomUUID()}`;
     const followUp = buildFollowUpCliInput(
       buffered.join('\n\n'),
       ds.session.sessionId,
@@ -16353,16 +16363,14 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
         chatId: ds.chatId,
         whiteboardId: ds.session.whiteboardId,
         codexAppText: rawCodexText || buffered.join('\n\n'),
+        sessionBackendType: ds.session.backendType,
+        turnId,
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
         codexAppMessageContext: (ds.pendingCodexAppFollowUpContexts ?? [])
           .filter(Boolean)
           .join('\n\n'),
       },
     );
-    const bufferedTurnIds = ds.pendingFollowUpTurnIds ?? [];
-    const turnId = bufferedTurnIds[bufferedTurnIds.length - 1]
-      ?? ds.currentReplyTarget?.turnId
-      ?? `queued-activation-followup-${randomUUID()}`;
     const reservation = reserveQueuedActivationTailAdmission(ds);
     const bufferedGateDecisions = ds.pendingCodexAppFollowUpGateAccepted ?? [];
     // Runtime buffers are rolling-upgrade compatibility only. If they carry an
@@ -17042,10 +17050,57 @@ function computeCodexAppSteerable(facts: {
 
 async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger, messageListener } = ctx;
+  // Session-group birth re-homes the turn into the new group: replies/quotes
+  // anchor on the in-group intro message, while `messageId` (the ORIGINAL
+  // inbound message) keeps serving resource downloads / merge-forward
+  // expansion / dedup — their keys belong to the source message.
+  const replyAnchorId = ctx.replyAnchorMessageId ?? messageId;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
   let anchor = ctx.anchor;
+
+  // ─── p2pMode='group'：会话群出生 ────────────────────────────────────────
+  // group 模式下，顶层 DM 消息在任何会话机制启动前先改道：建一个专属会话群
+  //（bot 保留群主），把本轮 context 重写到新群（chat-scope）后递归。返回 null
+  // 表示跳过/失败（斜杠命令、建群失败已私聊提示），落回旧的 DM 话题行为。
+  // sessionGroupBirth 防递归；scope/anchor 形状约束保证只有全新顶层种子会出生
+  //（回复旧 DM 话题的消息仍归原会话）。thread_id 检查兜住「话题内发送 + 同时
+  // 发送到会话」的消息形态：它的事件 root_id 为空（顶层形态）但携带 thread_id
+  // ——语境属于既有话题，绝不能当全新会话去建群；放行后按旧 thread 行为在
+  // 原 DM 落话题（用户实测反馈的误建群场景）。
+  if (
+    chatType === 'p2p'
+    && getBot(larkAppId).config.p2pMode === 'group'
+    && !ctx.sessionGroupBirth
+    && !substituteTrigger
+    && scope === 'thread'
+    && anchor === messageId
+    && !data?.message?.thread_id
+  ) {
+    const reborn = await maybeBirthSessionGroup(data, ctx);
+    if (reborn) return handleNewTopic(data, reborn);
+  }
+
+  // ─── 会话群同群续聊 ─────────────────────────────────────────────────────
+  // 会话群里的新消息发现登记的会话已关闭时，自动 resume 原会话（与话题内续聊
+  // 同款体验），而不是新开 CLI。恢复失败则照常走全新会话。
+  if (chatType === 'group' && scope === 'chat' && !ctx.sessionGroupBirth) {
+    const sgEntry = getSessionGroup(chatId);
+    if (sgEntry?.lastSessionId) {
+      const prevSession = sessionStore.getSession(sgEntry.lastSessionId);
+      if (prevSession?.status === 'closed') {
+        const resumed = await resumeSession(sgEntry.lastSessionId, activeSessions);
+        if (resumed.ok) {
+          touchSessionGroup(chatId);
+          logger.info(`[session-group] resumed session=${sgEntry.lastSessionId.substring(0, 8)} in chat=${chatId.substring(0, 12)}`);
+          return handleThreadReply(data, ctx);
+        }
+        logger.warn(`[session-group] resume failed (${resumed.error}) chat=${chatId.substring(0, 12)}; spawning fresh session`);
+      }
+    }
+  }
+
   const numberer = createImgNumberer();
   let forwardSeedContent = '';
   let forwardSeedResources: MessageResource[] = [];
@@ -17412,7 +17467,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       } else if (cmdDs.pendingRepo) {
         stageClaimedPendingRepoSetup(activeSessions, cmdDs, {
           mode: 'picker',
-          turnId: messageId,
+          // Turn identity unified on the reply anchor (slash commands never
+          // birth a session group, so this always equals messageId today).
+          turnId: replyAnchorId,
         });
       }
       // Pass mention-stripped content so /command argument parsing works.
@@ -17560,9 +17617,16 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // disconnect click silently no-ops.
   // For chat-scope, rootMessageId stores the seed message_id (audit only);
   // routing keys off chatId via sessionAnchorId(), so any value works.
-  const rootIdForStore = scope === 'thread' ? anchor : messageId;
+  // Session-group births store the in-group intro (reply anchor) here so the
+  // audit trail points at a message that actually lives in the session's chat.
+  const rootIdForStore = scope === 'thread' ? anchor : replyAnchorId;
   const initialTurnTitle = (messageListener?.replyCardTitle ?? (ctx.forwardSeedData ? followupContent : content)).substring(0, 50);
   const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType);
+  // Session-group registry: point the group at its (new) resident session so
+  // same-group resume and the async AI title can find it.
+  if (chatType === 'group' && isSessionGroup(chatId)) {
+    touchSessionGroup(chatId, session.sessionId);
+  }
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
   const groupChatName = await groupChatNamePromise;
@@ -17579,7 +17643,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // `botmux send` can --mention-back / 引用 the triggering message (chat scope).
   // Without this the first reply hits hasQuoteTargetSender=false (exit 2) and
   // chat-scope首条不引用. Use the event's sender open_id (correct app scope).
-  session.quoteTargetId = parsed.messageId;
+  // Keyed off the REPLY anchor (== messageId except for session-group births,
+  // where it is the in-group intro message so quotes stay in the group instead
+  // of leaking to the source DM — while messageId itself keeps serving
+  // resource/merge-forward lookups against the original inbound message).
+  session.quoteTargetId = replyAnchorId;
   session.quoteTargetSenderOpenId = senderOpenId;
   session.quoteTargetSenderIsBot = isForeignBotSender || parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();
@@ -17615,7 +17683,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     initialStartPending: true,
     pendingRepo: !pinnedWorkingDir || autoWt,
     pendingPrompt: promptContent,
-    pendingTurnId: messageId,
+    // Turn identity must equal the reply anchor so current-turn provenance
+    // (quoteTargetId === marker.turnId) holds on session-group first turns.
+    // Outside a birth replyAnchorId === messageId, so plain paths are unchanged.
+    pendingTurnId: replyAnchorId,
     pendingCodexAppText: codexAppVisibleText,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
@@ -17663,7 +17734,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // exact same set (a race-losing scratch's seed @s must not vanish).
   const newTopicPostAt = collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
   const newTopicWindow = buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name, newTopicPostAt);
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete });
+  // Turn key is the reply anchor (== messageId outside session-group births) so
+  // the per-turn reply context and currentReplyTarget.turnId line up with the
+  // worker's turn id — current-turn provenance requires that equality.
+  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -17694,7 +17768,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     stageClaimedPendingRepoSetup(activeSessions, ds, {
       mode: autoWt ? 'auto_worktree' : 'picker',
       ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
-      turnId: messageId,
+      // Persisted turn identity feeds the eventual fork's turnId; it must be the
+      // reply anchor so provenance (quoteTargetId === marker.turnId) holds on
+      // session-group first turns that go through the repo picker / worktree.
+      turnId: replyAnchorId,
     });
   }
   messageQueue.ensureQueue(anchor);
@@ -17726,7 +17803,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageId,
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
-    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
+    // (5th arg) is the reply anchor so provenance holds on session-group births.
+    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     forkReservedInitialSession(ds, availableBots);
     // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
     markIngressAdmitted(ctx);
@@ -17775,7 +17854,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageId,
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
-    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
+    // (5th arg) is the reply anchor so provenance holds on session-group births.
+    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     forkReservedInitialSession(ds, availableBots);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
@@ -18366,6 +18447,16 @@ async function handleThreadReplyAdmitted(
   }
 
   if (!prepared) learnFromMentions(larkAppId, parsed.mentions);
+
+  // 会话群自愈命名：出生时 AI 命名失败（CLI 抖动/超时/当时无模板）的群会停在
+  // 截断占位名——任意后续文本消息触发一次补跑（title 服务内 in-flight 去重 +
+  // titled 标记幂等），把偶发失败自动治愈，而不是永远留疤。
+  if (ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
+    const sgEntry = getSessionGroup(ctxChatId);
+    if (sgEntry && !sgEntry.titled && parsed.content.trim() && !parsed.content.trim().startsWith('/')) {
+      scheduleSessionGroupTitle({ larkAppId, chatId: ctxChatId, userText: parsed.content });
+    }
+  }
 
   // Foreign bot @mention prefix: when sender is another botmux bot，把内容包成
   // [来自 X 的 @mention]\n<原文> 喂给 worker，让 CLI 知道这是另一个 bot 发的——
@@ -19006,6 +19097,8 @@ async function handleThreadReplyAdmitted(
         codexAppText: parsed.content,
         codexAppApplicationContext,
         codexAppMessageContext,
+      sessionBackendType: ds.session.backendType,
+      turnId: parsed.messageId,
       });
       // R5-B1-1: freeze the admission-time steer authorization onto this earliest
       // (initialStartPending follower) tail entry — the strip-proof admit rebuild
@@ -19144,6 +19237,8 @@ async function handleThreadReplyAdmitted(
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
+        sessionBackendType: ds.session.backendType,
+        turnId: parsed.messageId,
         });
         ds.session.queuedPrompt ??= ds.pendingPrompt;
         ds.session.queuedCodexAppText ??= ds.pendingCodexAppText;
@@ -19539,6 +19634,8 @@ async function handleThreadReplyAdmitted(
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
+        sessionBackendType: ds.session.backendType,
+        turnId: parsed.messageId,
         });
     beginNewTurn(ds, parsed.content, parsed.messageId);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -19629,6 +19726,8 @@ async function handleThreadReplyAdmitted(
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
+        sessionBackendType: ds.session.backendType,
+        turnId: parsed.messageId,
         });
         // R4-B1: freeze the admission-time steer authorization onto the queued
         // opening payload so the worker-null re-fork path carries it exactly like
@@ -19745,35 +19844,12 @@ async function handleThreadReplyAdmitted(
     // its normal `--resume` instead of being cold-spawned over.
     const hadPriorCliInput = !!(ds.lastCliInput ?? ds.session.lastCliInput);
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
-    const builtReforkInput = buildReforkCliInput(ds, reforkContent, {
-      attachments: queuedHasDurableTail ? undefined : attachments,
-      mentions: queuedHasDurableTail ? undefined : parsed.mentions,
-      cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
-      cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
-      selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
-      sender: queuedHasDurableTail ? undefined : reforkSender,
-      substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
-      codexAppText: reforkCodexApp.text,
-      codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,
-      codexAppMessageContext: reforkCodexApp.messageContext,
-    });
-    let wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
-      queued: queuedDashboardTurn,
-      queuedText: queuedCodexAppText,
-    });
-    if (wrappedInput !== builtReforkInput && dsBotCfgForFork.codexAppCleanInput === true) {
-      // Backlog sessions persisted before clean-input have no raw queued text.
-      // Keep this activation entirely legacy: reforkContent already contains
-      // queuedPrompt + the current reply, whereas a structured turn could only
-      // contain the reply and would silently discard the original task.
-      logger.warn(`[${tag(ds)}] Legacy queued dashboard task has no clean-input text; using the full legacy activation prompt`);
-    }
+    // 先选 builder：opening 轮用 buildNewTopicCliInput，非 opening 才 buildRefork。
+    // 不能无条件先跑 buildRefork——它现在有副作用（写 follow-up sidecar），opening 时
+    // 结果会被 buildNewTopicCliInput 覆盖丢弃，但 sidecar 已写入 opening 的 turnId，
+    // opening 的 hook 会领到这份从没发出去的 speculative reminder → 双注入。
+    let wrappedInput: CliTurnPayload;
     if (openingTurn) {
-      // Replace the follow-up envelope built above with the real opening. The
-      // discarded build is pure string assembly (no side effects) — keeping the
-      // refork statement unconditional keeps the queued/substitute wiring, and
-      // its guard test, on a single code path. (openingTurn is mutually
-      // exclusive with queuedDashboardTurn/queuedHasDurableTail.)
       wrappedInput = buildNewTopicCliInput(
         reforkContent,
         ds.session.sessionId,
@@ -19796,6 +19872,31 @@ async function handleThreadReplyAdmitted(
           codexAppMessageContext: reforkCodexApp.messageContext,
         },
       );
+    } else {
+      const builtReforkInput = buildReforkCliInput(ds, reforkContent, {
+        attachments: queuedHasDurableTail ? undefined : attachments,
+        mentions: queuedHasDurableTail ? undefined : parsed.mentions,
+        cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
+        cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+        selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
+        sender: queuedHasDurableTail ? undefined : reforkSender,
+        substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
+        codexAppText: reforkCodexApp.text,
+        codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,
+        codexAppMessageContext: reforkCodexApp.messageContext,
+        turnId: parsed.messageId,
+      });
+      wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
+        queued: queuedDashboardTurn,
+        queuedText: queuedCodexAppText,
+      });
+      if (wrappedInput !== builtReforkInput && dsBotCfgForFork.codexAppCleanInput === true) {
+        // Backlog sessions persisted before clean-input have no raw queued text.
+        // Keep this activation entirely legacy: reforkContent already contains
+        // queuedPrompt + the current reply, whereas a structured turn could only
+        // contain the reply and would silently discard the original task.
+        logger.warn(`[${tag(ds)}] Legacy queued dashboard task has no clean-input text; using the full legacy activation prompt`);
+      }
     }
     if (!queuedHasDurableTail) {
       await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -20188,6 +20289,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
           botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
           sender,
           mode: 'live',
+          turnId,
         });
         beginNewTurn(ds, text, turnId);
         (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
@@ -20230,6 +20332,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
         botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
         sender,
         mode: 'refork',
+        turnId,
       });
       (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
       rememberLastCliInput(ds, promptContent, wrappedInput);
@@ -20736,6 +20839,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   sessionStore.init(cfg.larkAppId);
   chatFirstSeenStore.init(cfg.larkAppId);
+  initSessionGroups(cfg.larkAppId);
   const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
     config.session.dataDir,
     { receiverBootId: getDaemonBootId(), agentAppId: cfg.larkAppId },
