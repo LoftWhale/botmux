@@ -106,6 +106,21 @@ export interface VcMeetingConsumerConfig {
   minBatchItems?: number;
   /** Maximum time to hold a non-empty meeting delta before injecting to the agent. Defaults in daemon. */
   maxInjectIntervalMs?: number;
+  /**
+   * In-meeting TEXT output policy for the selected agent. `allow` sends managed
+   * text into the meeting without per-message human approval; `approval` (the
+   * pre-2026-08 behavior) requires the operator to approve each send via card;
+   * `deny` blocks it. Defaults to `allow` when unset. Voice stays gated on
+   * realtimeVoice regardless of this field.
+   */
+  textOutputPolicy?: 'deny' | 'approval' | 'allow';
+  /**
+   * In-meeting VOICE output policy. Only takes effect when realtimeVoice is
+   * enabled (otherwise voice is always denied). `approval` (default when
+   * enabled) reviews each utterance; `allow` speaks without approval; `deny`
+   * blocks voice even while realtimeVoice is on.
+   */
+  voiceOutputPolicy?: 'deny' | 'approval' | 'allow';
   /** Legacy allowlist. Omitted or [] dynamically shows usable online bots. */
   agentCandidates?: VcMeetingConsumerAgentConfig[];
 }

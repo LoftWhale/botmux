@@ -139,11 +139,13 @@ describe('API-only bot mode — runtime Feishu transport gates (source lock)', (
     // bot-registry.test.ts), which returns undefined for apiOnly.
     const block = region(daemonSource, 'function effectiveVcMeetingAgentConfig(', 'function configuredVcMeetingListenerChatId(');
     expect(block).toContain('vcMeetingAgentConfigActive(getBot(larkAppId)?.config)');
-    // The predicate itself fail-closes apiOnly BEFORE the enabled check.
+    // The predicate itself fail-closes apiOnly BEFORE any enabled logic.
     const pred = region(registrySource, 'export function vcMeetingAgentConfigActive(', 'export function registerBot(');
     expect(pred).toContain('if (cfg.apiOnly === true) return undefined;');
+    // Bot-agnostic join (2026-08): VC is active by default; enabled:false is the
+    // per-bot opt-out. apiOnly must still short-circuit BEFORE that opt-out check.
     expect(pred.indexOf('apiOnly === true) return undefined'))
-      .toBeLessThan(pred.indexOf('vcMeetingAgent?.enabled === true'));
+      .toBeLessThan(pred.indexOf('vcMeetingAgent?.enabled === false'));
   });
 });
 
@@ -190,6 +192,26 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
   it('worker-pool suppresses ALL aux UI for no-transport sessions at managedAuxUiSuppressed', () => {
     const block = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
     expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
+  });
+
+  it('managedAuxUiSuppressed lets an opted-in VC receiver surface the streaming card (else suppressed)', () => {
+    // VC receiver aux UI (streaming card / reactions) is suppressed by default,
+    // but exposeReceiverStreamingCard opts the card in. The gate delegates to the
+    // single shared predicate so it stays in lockstep with the post/patch guards
+    // — a blanket `return true` here would defeat the opt-in (the earlier bug:
+    // the card was un-suppressed at the post site but this gate still hard-broke).
+    const block = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
+    expect(block).toContain('if (ds.session.vcMeetingReceiver) return vcReceiverStreamingCardSuppressed(ds);');
+    expect(block).not.toContain('if (ds.session.vcMeetingReceiver) return true;');
+  });
+
+  it('VC delivery dispatch arms the streaming-card turn (beginNewTurn) only for opted-in receivers', () => {
+    // triggerSessionTurn (the VC dispatch route) never calls beginNewTurn, so the
+    // receiver card lifecycle was never armed. Arm it here, gated on the opt-in.
+    const block = region(daemonSource, 'dispatchTurn: (request, context) => {', 'return triggerSessionTurn(');
+    expect(block).toContain("config.vcMeetingAgent?.exposeReceiverStreamingCard === true");
+    expect(block).toContain('beginNewTurn(target, title, context.stableTurnId)');
+    expect(block).toContain('target?.session.vcMeetingReceiver');
   });
 
   it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {

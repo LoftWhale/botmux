@@ -307,6 +307,7 @@ function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | und
   if (stabilizeMs !== undefined) out.stabilizeMs = stabilizeMs;
   if (flushIntervalMs !== undefined) out.flushIntervalMs = flushIntervalMs;
   if (realtimeVoice) out.realtimeVoice = realtimeVoice;
+  if (entry.exposeReceiverStreamingCard === true) out.exposeReceiverStreamingCard = true;
   if (meetingConsumer) out.meetingConsumer = meetingConsumer;
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -327,6 +328,12 @@ function normalizeVcMeetingConsumerConfig(raw: unknown): VcMeetingConsumerConfig
   if (minBatchChars !== undefined) out.minBatchChars = minBatchChars;
   if (minBatchItems !== undefined) out.minBatchItems = minBatchItems;
   if (maxInjectIntervalMs !== undefined) out.maxInjectIntervalMs = maxInjectIntervalMs;
+  if (entry.textOutputPolicy === 'allow' || entry.textOutputPolicy === 'approval' || entry.textOutputPolicy === 'deny') {
+    out.textOutputPolicy = entry.textOutputPolicy;
+  }
+  if (entry.voiceOutputPolicy === 'allow' || entry.voiceOutputPolicy === 'approval' || entry.voiceOutputPolicy === 'deny') {
+    out.voiceOutputPolicy = entry.voiceOutputPolicy;
+  }
 
   if (Object.prototype.hasOwnProperty.call(entry, 'defaultProfileBootstrap')) {
     const marker = entry.defaultProfileBootstrap;
@@ -1081,6 +1088,14 @@ export interface VcMeetingAgentConfig {
   flushIntervalMs?: number;
   /** Realtime voice v0. Disabled by default; requires realtime scope and meeting-side AI speaking permission. */
   realtimeVoice?: VcMeetingRealtimeVoiceConfig;
+  /**
+   * Surface the receiver session's live streaming card (a read-only web-terminal
+   * entry) in the listener chat. Off by default: a receiver terminal can carry
+   * meeting-derived private context, so exposing it means the operator accepts
+   * that context becomes visible through the card. See
+   * vcReceiverStreamingCardSuppressed in worker-pool.
+   */
+  exposeReceiverStreamingCard?: boolean;
   /** Optional listener-group consumer. Card choices are driven entirely by this bots.json block. */
   meetingConsumer?: VcMeetingConsumerConfig;
 }
@@ -1910,8 +1925,18 @@ export function vcMeetingAgentConfigActive(
   cfg: Pick<BotConfig, 'apiOnly' | 'vcMeetingAgent'> | undefined,
 ): VcMeetingAgentConfig | undefined {
   if (!cfg) return undefined;
+  // apiOnly (core-only) bots have no Feishu transport — a VC listener drives
+  // `lark-cli vc +meeting-events --as bot`, which breaks the zero-Feishu-network
+  // contract. This fail-close is the load-bearing invariant and must stay first.
   if (cfg.apiOnly === true) return undefined;
-  return cfg.vcMeetingAgent?.enabled === true ? cfg.vcMeetingAgent : undefined;
+  // Bot-agnostic join (2026-08): any invited bot should join, so VC is active by
+  // default for every Feishu-connected bot. `vcMeetingAgent.enabled: false` is
+  // the explicit per-bot opt-out; unset/absent now means active. A bot with no
+  // vcMeetingAgent block at all gets an empty effective config so downstream
+  // reads (listenerChatId auto-create, profile provision, consumer defaults)
+  // work off their own fallbacks. Fleet-wide off remains the global switch.
+  if (cfg.vcMeetingAgent?.enabled === false) return undefined;
+  return cfg.vcMeetingAgent ?? {};
 }
 
 export function registerBot(cfg: BotConfig): BotState {

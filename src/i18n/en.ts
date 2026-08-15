@@ -266,6 +266,7 @@ export const messages: Record<string, string> = {
   'cmd.card.fail': '⚠️ Operation failed: {reason}',
   'cmd.card.usage': 'Usage: /card (summon) | /card off (suppress for this chat) | /card on (restore)',
   'cmd.card.not_ready': 'Terminal not ready yet — the streaming card will appear once the session is up.',
+  'cmd.card.vc_receiver': '📻 This is a meeting-receiver session; by design it has no streaming card. It processes meeting transcripts in the background — its output goes to the listener chat (set the role preset\'s output mode to "Reply in listener chat") or managed in-meeting speech, not a live card here.',
   'cmd.card.private_not_ready': '🔒 Terminal not ready yet — send /card again once the session is up.',
   'cmd.card.private_not_group': '🔒 Private cards only work in regular group chats — topic groups / DMs are unsupported (Feishu limitation).',
   'cmd.card.private_no_audience': '🔒 No audience: this bot has no owner configured (allowedUsers is empty).',

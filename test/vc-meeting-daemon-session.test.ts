@@ -2584,6 +2584,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           consumerProfiles: [{
             id: 'self-speaker',
@@ -2825,6 +2826,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           selectionTimeoutMs: 20_000,
           consumerProfiles: [
@@ -8201,6 +8203,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           minBatchChars: 1_000,
           minBatchItems: 10,
@@ -9082,6 +9085,7 @@ describe('VC meeting daemon session lifecycle', () => {
           realtimeVoice: { enabled: true },
           meetingConsumer: {
             enabled: true,
+            textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
             defaultMode: 'listenOnly',
             agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Claude Loopy' }],
           },
@@ -9208,6 +9212,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Claude Loopy' }],
         },
@@ -9573,6 +9578,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9647,6 +9653,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9705,6 +9712,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9772,6 +9780,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9844,6 +9853,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9896,6 +9906,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -9948,6 +9959,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },
@@ -10068,6 +10080,7 @@ describe('VC meeting daemon session lifecycle', () => {
         attentionTargetOpenId: TARGET_OPEN_ID,
         meetingConsumer: {
           enabled: true,
+          textOutputPolicy: 'approval', // these tests exercise the approval workflow; default is now 'allow'
           defaultMode: 'listenOnly',
           agentCandidates: [
             { larkAppId: AGENT_APP_ID, label: 'Claude Loopy' },

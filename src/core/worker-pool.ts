@@ -635,6 +635,21 @@ function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
   } catch { return false; }
 }
 
+// VC meeting-receiver sessions suppress the live streaming card by default:
+// their terminal can carry meeting-derived private context, so we never publish
+// one into the listener chat as a side channel. A bot MAY opt in per-config
+// (`vcMeetingAgent.exposeReceiverStreamingCard: true`) to surface the card as a
+// read-only web-terminal entry — the operator then accepts that meeting context
+// becomes visible through it. Read fresh from the registry so a dashboard toggle
+// takes effect without a daemon restart. Single predicate shared by every
+// card-posting/patching site so the gate and the opt-in never drift apart.
+function vcReceiverStreamingCardSuppressed(ds: DaemonSession): boolean {
+  if (!ds.session.vcMeetingReceiver) return false;
+  try {
+    return getBot(ds.larkAppId).config.vcMeetingAgent?.exposeReceiverStreamingCard !== true;
+  } catch { return true; }
+}
+
 function silentTurnReactions(ds: DaemonSession): boolean {
   try {
     return getBot(ds.larkAppId).config.silentTurnReactions === true;
@@ -733,7 +748,7 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
 /** PATCH the live card when the executor reports a different active runtime.
  * Runtime identity stays attached to the streaming usage line. */
 function scheduleActiveRuntimePatch(ds: DaemonSession): void {
-  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+  if (vcReceiverStreamingCardSuppressed(ds) || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
     ds.pendingActiveRuntimeCardRefresh = undefined;
     return;
   }
@@ -785,7 +800,7 @@ function flushPendingActiveRuntimePatch(ds: DaemonSession): void {
 
 /** PATCH a live card when rollout settings change, even if the PTY is static. */
 function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
-  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+  if (vcReceiverStreamingCardSuppressed(ds) || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
     ds.pendingCodexTierCardRefresh = undefined;
     return;
   }
@@ -1191,8 +1206,9 @@ export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefine
 function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
   // Dedicated VC receivers keep limit state for dashboard/audit only. A timer
   // must never revive or mutate an old/manual Lark card after the synchronous
-  // screen_update path has already suppressed auxiliary UI.
-  if (ds.session.vcMeetingReceiver) return;
+  // screen_update path has already suppressed auxiliary UI. (Opt-in bots that
+  // expose the receiver card still get it via the main post path.)
+  if (vcReceiverStreamingCardSuppressed(ds)) return;
   if (ds.lastScreenStatus !== 'limited') return;
   if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) return;
 
@@ -1381,7 +1397,7 @@ export async function postTurnStartingCard(
   if (!ds.streamCardPending || ds.streamCardPendingTurnId !== turnId) return false;
   if (riffRetirementAdmissionPhase(ds)) return false;
   if (ds.streamCardId === CARD_POSTING_SENTINEL) return false;
-  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds, turnId)) return false;
+  if (vcReceiverStreamingCardSuppressed(ds) || streamingCardDisabled(ds, turnId)) return false;
   if (!workerHasInitialized(ds)) return false;
   if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return false;
 
@@ -1505,8 +1521,9 @@ export async function postFreshStreamingCard(
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>,
 ): Promise<boolean> {
   // Receiver terminals can contain meeting-derived private context. Never
-  // publish one into the listener chat as a streaming-card side channel.
-  if (ds.session.vcMeetingReceiver) return false;
+  // publish one into the listener chat as a streaming-card side channel —
+  // unless the bot explicitly opts in (exposeReceiverStreamingCard).
+  if (vcReceiverStreamingCardSuppressed(ds)) return false;
   if (isDocNativeSession(ds)) return false;
   if (!workerHasInitialized(ds)) return false;
   const botCfg = getBot(ds.larkAppId).config;
@@ -7257,7 +7274,12 @@ function setupWorkerHandlers(
     // still updated before these guards, so the terminal view is unaffected.
     if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return true;
     if (isSilentScheduledTurn(ds, turnId)) return true;
-    if (ds.session.vcMeetingReceiver) return true;
+    // VC receiver sessions suppress auxiliary UI (streaming card / reactions) by
+    // default — their terminal can carry meeting-derived private context. When
+    // the bot opts in (exposeReceiverStreamingCard), let the streaming card
+    // through so the receiver surfaces a read-only web-terminal entry; the
+    // single opt-in predicate keeps this in lockstep with the post/patch guards.
+    if (ds.session.vcMeetingReceiver) return vcReceiverStreamingCardSuppressed(ds);
     return ordinaryManagedSuppression(turnId, dispatchAttempt);
   };
   /** final_output is the sole exception: listener_thread and exact IM replies

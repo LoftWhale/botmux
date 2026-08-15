@@ -327,6 +327,13 @@ vi.mock('../src/core/worker-pool.js', () => ({
   // /term payload. Default to the in-chat visible-to-you channel; tests override
   // per-scenario (dm / failed / not_ready).
   deliverWritableTerminalCardTo: vi.fn(async () => 'ephemeral'),
+  // /card show path. postFreshStreamingCard returns false for sessions that
+  // structurally can't post a live card (VC meeting-receiver among them); the
+  // handler then picks an accurate reason. Default false so /card show tests
+  // exercise the not-ready / vc-receiver branch; override per-scenario.
+  postFreshStreamingCard: vi.fn(async () => false),
+  postPrivateSnapshotCard: vi.fn(async () => ({ notReady: false, sent: 1, total: 1 })),
+  resolvePrivateCardAudience: vi.fn(() => ['ou_owner']),
 }));
 
 vi.mock('../src/utils/daemon-discovery.js', () => ({
@@ -495,7 +502,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+import { closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, withActiveSessionKeyLock, postFreshStreamingCard } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -5875,6 +5882,41 @@ describe('/card — operator / canOperate gate', () => {
     expect(setCardMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('已恢复');
+  });
+
+  it('/card show on a VC meeting-receiver session: accurate reason, not "terminal not ready"', async () => {
+    // postFreshStreamingCard structurally returns false for a VC receiver
+    // session (it never posts a live card). The handler must explain WHY —
+    // "this is a meeting-receiver session" — instead of the misleading
+    // generic not-ready text, which reads as "no session / terminal down"
+    // even though the session is up and processing delivery turns.
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, privateCard: false },
+    })) as any);
+    vi.mocked(postFreshStreamingCard).mockResolvedValue(false);
+    const ds = makeDaemonSession({ session: makeSession({ vcMeetingReceiver: true }) });
+    const deps = makeDeps(ds);
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('会议接收会话');
+    expect(reply).not.toContain('终端尚未就绪');
+  });
+
+  it('/card show on an ordinary session that cannot post keeps the generic not-ready notice', async () => {
+    // Mutation guard: a non-VC session must still get the generic text, so the
+    // VC branch is gated on vcMeetingReceiver and does not swallow every failure.
+    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+      botName: 'Claude',
+      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, privateCard: false },
+    })) as any);
+    vi.mocked(postFreshStreamingCard).mockResolvedValue(false);
+    const ds = makeDaemonSession({ session: makeSession({ vcMeetingReceiver: undefined }) });
+    const deps = makeDeps(ds);
+    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card', deps);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('终端尚未就绪');
+    expect(reply).not.toContain('会议接收会话');
   });
 });
 

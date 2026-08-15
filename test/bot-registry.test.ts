@@ -493,8 +493,52 @@ describe('parseBotConfigsFromText — brand', () => {
     });
   });
 
-  it('keeps meetingConsumer disabled/listenOnly configuration explicit', () => {
+  it('parses meetingConsumer in/out policies + exposeReceiverStreamingCard opt-in', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        vcMeetingAgent: {
+          enabled: true,
+          exposeReceiverStreamingCard: true,
+          realtimeVoice: { enabled: true },
+          meetingConsumer: {
+            enabled: true,
+            defaultMode: 'agents',
+            textOutputPolicy: 'approval',
+            voiceOutputPolicy: 'allow',
+          },
+        },
+      },
+    ]));
+    expect(cfg.vcMeetingAgent?.exposeReceiverStreamingCard).toBe(true);
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.textOutputPolicy).toBe('approval');
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.voiceOutputPolicy).toBe('allow');
+  });
+
+  it('drops invalid in/out policy values and omits exposeReceiverStreamingCard when not exactly true', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        vcMeetingAgent: {
+          enabled: true,
+          exposeReceiverStreamingCard: 'yes', // not boolean true → omitted
+          meetingConsumer: {
+            enabled: true,
+            defaultMode: 'agents',
+            textOutputPolicy: 'sometimes', // invalid → dropped
+            voiceOutputPolicy: 42, // invalid → dropped
+          },
+        },
+      },
+    ]));
+    expect(cfg.vcMeetingAgent?.exposeReceiverStreamingCard).toBeUndefined();
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.textOutputPolicy).toBeUndefined();
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.voiceOutputPolicy).toBeUndefined();
+  });
+
+  it('keeps meetingConsumer disabled/listenOnly configuration explicit', () => {    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {
         larkAppId: 'a',
         larkAppSecret: 's',
@@ -1745,10 +1789,15 @@ describe('vcMeetingAgentConfigActive — apiOnly bots never attend VC meetings',
       .toBeUndefined();
   });
 
-  it('returns undefined when VC is not enabled (normal bot)', () => {
+  it('is active by default for a Feishu bot; only enabled:false opts out', () => {
+    // Bot-agnostic join: any invited Feishu bot should join, so VC is active
+    // unless explicitly disabled. enabled:false is the per-bot opt-out.
     expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: { enabled: false } as any }))
       .toBeUndefined();
-    expect(mod.vcMeetingAgentConfigActive({})).toBeUndefined();
+    // Unset enabled / no vcMeetingAgent block → active with an effective config
+    // (empty object is fine; downstream reads fall back to their own defaults).
+    expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: {} as any })).toEqual({});
+    expect(mod.vcMeetingAgentConfigActive({})).toEqual({});
     expect(mod.vcMeetingAgentConfigActive(undefined)).toBeUndefined();
   });
 

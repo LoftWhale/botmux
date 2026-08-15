@@ -391,7 +391,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -2096,12 +2096,24 @@ function vcMeetingConsumerMaxInjectIntervalMs(cfg: VcMeetingAgentConfig): number
   return cfg.meetingConsumer?.maxInjectIntervalMs ?? DEFAULT_VC_MEETING_CONSUMER_MAX_INJECT_INTERVAL_MS;
 }
 
-function defaultVcMeetingTextOutputPolicy(): VcMeetingOutputPolicy {
-  return 'approval';
+function defaultVcMeetingTextOutputPolicy(cfg?: VcMeetingAgentConfig): VcMeetingOutputPolicy {
+  // In-meeting text now sends without per-message approval by default; an
+  // operator can restore the review gate per-bot via
+  // meetingConsumer.textOutputPolicy = 'approval' (or 'deny').
+  const configured = cfg?.meetingConsumer?.textOutputPolicy;
+  if (configured === 'approval' || configured === 'deny' || configured === 'allow') return configured;
+  return 'allow';
 }
 
 function defaultVcMeetingVoiceOutputPolicy(cfg: VcMeetingAgentConfig): VcMeetingOutputPolicy {
-  return cfg.realtimeVoice?.enabled === true ? 'approval' : 'deny';
+  // Voice stays hard-denied unless realtime voice is enabled for the bot. When
+  // enabled it defaults to per-utterance approval (voice is intrusive); an
+  // operator may relax it to 'allow' — or tighten back to 'deny' — via
+  // meetingConsumer.voiceOutputPolicy.
+  if (cfg.realtimeVoice?.enabled !== true) return 'deny';
+  const configured = cfg.meetingConsumer?.voiceOutputPolicy;
+  if (configured === 'approval' || configured === 'deny' || configured === 'allow') return configured;
+  return 'approval';
 }
 
 function vcMeetingOutputReviewTimeoutMs(channel: VcMeetingOutputChannel): number {
@@ -2549,6 +2561,19 @@ function vcMeetingDeliveryReceiverDeps(receiverAppId?: string): VcMeetingDeliver
     dispatchTurn: (request, context) => {
       const target = findActiveBySessionId(request.target.sessionId ?? '');
       if (target) target.vcMeetingImTurnOrigin = undefined;
+      // VC delivery turns dispatch straight through triggerSessionTurn, which
+      // (unlike the ordinary IM path) never calls beginNewTurn — so a receiver
+      // session's streaming-card lifecycle was never armed and no live card ever
+      // posted, regardless of the exposeReceiverStreamingCard opt-in. When the
+      // bot opted in, arm the turn's card here so the receiver surfaces a live
+      // card (a read-only web-terminal entry) for this delivery. Gated on the
+      // same opt-in predicate; a non-opted-in receiver stays card-free as before.
+      if (target?.session.vcMeetingReceiver
+        && getBot(target.larkAppId).config.vcMeetingAgent?.exposeReceiverStreamingCard === true
+        && context.stableTurnId) {
+        const title = target.currentTurnTitle || target.session.title || '会议监听';
+        beginNewTurn(target, title, context.stableTurnId);
+      }
       return triggerSessionTurn(
         request,
         { larkAppId: selfAppId, activeSessions },
@@ -6858,7 +6883,7 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     session.selectedAgentLabel = migratePreparedConsumer ? undefined : record.selectedAgentLabel;
     session.consumerPaused = migratePreparedConsumer ? false : record.consumerPaused;
     if (session.consumerMode === 'agent') session.consumerLastInjectedAtMs = undefined;
-    session.textOutputPolicy = record.textOutputPolicy ?? defaultVcMeetingTextOutputPolicy();
+    session.textOutputPolicy = record.textOutputPolicy ?? defaultVcMeetingTextOutputPolicy(cfg);
     session.voiceOutputPolicy = record.voiceOutputPolicy ?? defaultVcMeetingVoiceOutputPolicy(cfg);
     session.syncIntervalMs = record.syncIntervalMs;
     session.consumerSelectionExpiresAt = record.consumerSelectionExpiresAt;
@@ -7288,7 +7313,7 @@ function getOrCreateVcMeetingDaemonSession(
       monitoringStarted: false,
       ...(listenerChatId ? { listenerChatId } : {}),
       pendingItems: [],
-      textOutputPolicy: defaultVcMeetingTextOutputPolicy(),
+      textOutputPolicy: defaultVcMeetingTextOutputPolicy(cfg),
       voiceOutputPolicy: defaultVcMeetingVoiceOutputPolicy(cfg),
       pendingOutputRequests: {},
       consumerPendingItems: [],
@@ -7316,7 +7341,7 @@ function getOrCreateVcMeetingDaemonSession(
       session.listenerChatId = listenerChatId;
       session.state.notificationChatId = listenerChatId;
     }
-    session.textOutputPolicy ??= defaultVcMeetingTextOutputPolicy();
+    session.textOutputPolicy ??= defaultVcMeetingTextOutputPolicy(cfg);
     session.voiceOutputPolicy ??= defaultVcMeetingVoiceOutputPolicy(cfg);
     session.pendingOutputRequests ??= {};
     session.consumerPendingItems ??= [];
@@ -21565,6 +21590,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (!cfg.apiOnly) {
       checkRequiredScopes(cfg.larkAppId).catch(err => {
         logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
+      });
+      // Ensure VC meeting events are subscribed so ANY invited bot can receive
+      // meeting invites (bot-agnostic auto-join). Check-first + best-effort: a
+      // read-only probe over the cached web session, auto-subscribing only when
+      // events are missing. Never blocks boot; the fn itself skips VC-inactive
+      // bots via vcMeetingAgentConfigActive.
+      ensureVcMeetingEventsSubscribed(cfg.larkAppId).catch(err => {
+        logger.debug(`[${cfg.larkAppId}] VC event subscription check failed: ${err?.message ?? err}`);
       });
     }
 
