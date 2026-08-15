@@ -243,6 +243,19 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(block).toContain('target?.session.vcMeetingReceiver && context.stableTurnId');
   });
 
+  it('Plan B keeps in-meeting output: action-request still recognises the meeting agent via the retained marker', () => {
+    // The whole in-meeting text/voice output chain (request-output → action-request
+    // → managed-action) authorizes against the RETAINED vcMeetingReceiver marker +
+    // managedTurnOrigin/vcMeetingImTurnOrigin, all keyed by sessionId — never by the
+    // activeSessions map key that Stage 1 changed. This is why in-meeting output
+    // survives the normal-session refactor with no code change. Pin the entry guard
+    // so a future marker cleanup can't silently kill 会中发言.
+    const block = region(daemonSource, "ipcRoute('POST', '/api/vc-meetings/action-request'", 'const claimedAttempt =');
+    expect(block).toContain('findActiveBySessionId(receiverSessionId)');
+    expect(block).toContain('if (!ds?.session.vcMeetingReceiver) {');
+    expect(block).toContain("errorCode: 'not_receiver_session'");
+  });
+
   it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {
     const block = region(workerPoolSource, 'export function scheduleCardPatch(', 'if (streamingCardDisabled(ds, turnId)) return;');
     expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
