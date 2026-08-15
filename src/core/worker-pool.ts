@@ -635,21 +635,6 @@ function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
   } catch { return false; }
 }
 
-// VC meeting-receiver sessions suppress the live streaming card by default:
-// their terminal can carry meeting-derived private context, so we never publish
-// one into the listener chat as a side channel. A bot MAY opt in per-config
-// (`vcMeetingAgent.exposeReceiverStreamingCard: true`) to surface the card as a
-// read-only web-terminal entry — the operator then accepts that meeting context
-// becomes visible through it. Read fresh from the registry so a dashboard toggle
-// takes effect without a daemon restart. Single predicate shared by every
-// card-posting/patching site so the gate and the opt-in never drift apart.
-function vcReceiverStreamingCardSuppressed(ds: DaemonSession): boolean {
-  if (!ds.session.vcMeetingReceiver) return false;
-  try {
-    return getBot(ds.larkAppId).config.vcMeetingAgent?.exposeReceiverStreamingCard !== true;
-  } catch { return true; }
-}
-
 function silentTurnReactions(ds: DaemonSession): boolean {
   try {
     return getBot(ds.larkAppId).config.silentTurnReactions === true;
@@ -748,7 +733,7 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
 /** PATCH the live card when the executor reports a different active runtime.
  * Runtime identity stays attached to the streaming usage line. */
 function scheduleActiveRuntimePatch(ds: DaemonSession): void {
-  if (vcReceiverStreamingCardSuppressed(ds) || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+  if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
     ds.pendingActiveRuntimeCardRefresh = undefined;
     return;
   }
@@ -800,7 +785,7 @@ function flushPendingActiveRuntimePatch(ds: DaemonSession): void {
 
 /** PATCH a live card when rollout settings change, even if the PTY is static. */
 function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
-  if (vcReceiverStreamingCardSuppressed(ds) || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+  if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
     ds.pendingCodexTierCardRefresh = undefined;
     return;
   }
@@ -1204,11 +1189,6 @@ export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefine
 }
 
 function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
-  // Dedicated VC receivers keep limit state for dashboard/audit only. A timer
-  // must never revive or mutate an old/manual Lark card after the synchronous
-  // screen_update path has already suppressed auxiliary UI. (Opt-in bots that
-  // expose the receiver card still get it via the main post path.)
-  if (vcReceiverStreamingCardSuppressed(ds)) return;
   if (ds.lastScreenStatus !== 'limited') return;
   if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) return;
 
@@ -1397,7 +1377,7 @@ export async function postTurnStartingCard(
   if (!ds.streamCardPending || ds.streamCardPendingTurnId !== turnId) return false;
   if (riffRetirementAdmissionPhase(ds)) return false;
   if (ds.streamCardId === CARD_POSTING_SENTINEL) return false;
-  if (vcReceiverStreamingCardSuppressed(ds) || streamingCardDisabled(ds, turnId)) return false;
+  if (streamingCardDisabled(ds, turnId)) return false;
   if (!workerHasInitialized(ds)) return false;
   if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return false;
 
@@ -1520,10 +1500,6 @@ export async function postFreshStreamingCard(
   ds: DaemonSession,
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>,
 ): Promise<boolean> {
-  // Receiver terminals can contain meeting-derived private context. Never
-  // publish one into the listener chat as a streaming-card side channel —
-  // unless the bot explicitly opts in (exposeReceiverStreamingCard).
-  if (vcReceiverStreamingCardSuppressed(ds)) return false;
   if (isDocNativeSession(ds)) return false;
   if (!workerHasInitialized(ds)) return false;
   const botCfg = getBot(ds.larkAppId).config;
@@ -4027,7 +4003,13 @@ function failOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): voi
     + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
     + `attempts=${record.attempt} reason=${reason}`,
   );
-  if (record.ds.session.vcMeetingReceiver || isSilentScheduledTurn(record.ds, record.turnId)) return;
+  // Plan B: a meeting agent is an ordinary chat-scope session. This tracker only
+  // ever holds ORDINARY IM turns (durable transcript deliveries use the receipt
+  // path, not this map), so a plain user turn's delivery failure must be reported
+  // like any session — otherwise the user's message is silently dropped. Only a
+  // stamped meeting @mention follow-up stays fenced (isMeetingDrivenTurn); a
+  // silent scheduled turn stays suppressed as before.
+  if (isMeetingDrivenTurn(record.ds, record.turnId) || isSilentScheduledTurn(record.ds, record.turnId)) return;
   const loc = botLocale(getBot(record.ds.larkAppId).config);
   void requireCallbacks().sessionReply(
     sessionAnchorId(record.ds),
@@ -4141,7 +4123,12 @@ function shouldTrackOrdinaryImDelivery(
     && message.dispatchAttempt === undefined
     && (message.type !== 'init' || (!!message.prompt && !message.adoptMode))
     && !ds.adoptedFrom
-    && !ds.session.vcMeetingReceiver
+    // Plan B: a meeting agent is an ordinary chat-scope session. A plain user
+    // turn on it IS an ordinary IM delivery (track it for receipt-ACK + retry so
+    // its failure is reported). Only a meeting-driven turn — a stamped @mention
+    // follow-up here, since durable deliveries are already excluded by the
+    // dispatchAttempt===undefined guard above — stays on the receipt/lease path.
+    && !isMeetingDrivenTurn(ds, message.turnId, message.dispatchAttempt)
     && Number.isSafeInteger(ds.workerGeneration)
     && (ds.workerGeneration ?? 0) > 0
     && ds.session.workerGeneration === ds.workerGeneration;
@@ -6774,10 +6761,18 @@ export function forkWorker(
       reason: 'worker_fork_error',
       message: reason,
     });
-    // A dedicated VC receiver and a silent schedule have no auxiliary Lark
-    // output channel. Keep lifecycle/dashboard state above, but never leak a
-    // fork diagnostic into the chat.
-    if (ds.session.vcMeetingReceiver || isSilentScheduledTurn(ds, initAttributionTurnId)) {
+    // Plan B: a meeting agent is an ordinary chat-scope session. A fork
+    // diagnostic must stay out of the chat only for a genuinely meeting-driven
+    // opening — a durable transcript delivery (initDispatchAttempt set) or a
+    // stamped meeting @mention follow-up — because that path is fenced to the
+    // receipt/lease chain and could otherwise leak on a silent delivery. A plain
+    // user turn on this session gets its fork failure surfaced like any session
+    // (else the user's own turn fails silently). Silent scheduled turns stay
+    // suppressed as before.
+    const forkErrorMeetingDriven = !!ds.session.vcMeetingReceiver
+      && (initDispatchAttempt !== undefined
+        || resolveVcMeetingImTurnOrigin(ds.session, initAttributionTurnId) !== undefined);
+    if (forkErrorMeetingDriven || isSilentScheduledTurn(ds, initAttributionTurnId)) {
       logger.info(
         `[${t}] Managed/silent fork failure kept out of auxiliary Lark UI `
         + `turn=${initAttributionTurnId?.slice(0, 12) ?? '-'} attempt=${initDispatchAttempt}: ${reason}`,
@@ -6792,7 +6787,9 @@ export function forkWorker(
       'text',
       ds.larkAppId,
       fallbackTurnId(ds, initAttributionTurnId),
-      ds.session.vcMeetingReceiver
+      // A meeting-driven turn (listener_thread delivery) that DOES surface must
+      // still attribute to the meeting session so the send policy resolves it.
+      forkErrorMeetingDriven
         ? { sourceSessionId: ds.session.sessionId }
         : undefined,
     ).catch(replyErr => logger.error(`[${t}] Failed to deliver worker fork error to Lark: ${replyErr}`));
@@ -7174,6 +7171,27 @@ function invalidateTuiPrompt(
   publishAttentionPatch(ds);
 }
 
+/**
+ * Plan B: a VC meeting agent is an ordinary chat-scope session that hosts BOTH
+ * meeting transcript deliveries and plain user IM turns. A turn is
+ * "meeting-driven" only when it is a durable transcript delivery (dispatchAttempt
+ * set) or a stamped meeting @mention follow-up (vcMeetingImTurnOrigin). Only
+ * meeting-driven turns are subject to the durable silent/listener_thread output
+ * policy and the receipt-fenced auxiliary-UI suppression; a plain user turn on
+ * this session is an ordinary turn and must post / notify normally (else the
+ * user's own reply is silently swallowed — the "手动@机器人也不回复" bug). Shared
+ * across setupWorkerHandlers and deliverFinalOutput so every gate stays aligned.
+ */
+function isMeetingDrivenTurn(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): boolean {
+  if (!ds.session.vcMeetingReceiver) return false;
+  if (dispatchAttempt !== undefined) return true;
+  return resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined;
+}
+
 function setupWorkerHandlers(
   ds: DaemonSession,
   worker: ChildProcess,
@@ -7275,12 +7293,17 @@ function setupWorkerHandlers(
     // still updated before these guards, so the terminal view is unaffected.
     if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return true;
     if (isSilentScheduledTurn(ds, turnId)) return true;
-    // VC receiver sessions suppress auxiliary UI (streaming card / reactions) by
-    // default — their terminal can carry meeting-derived private context. When
-    // the bot opts in (exposeReceiverStreamingCard), let the streaming card
-    // through so the receiver surfaces a read-only web-terminal entry; the
-    // single opt-in predicate keeps this in lockstep with the post/patch guards.
-    if (ds.session.vcMeetingReceiver) return vcReceiverStreamingCardSuppressed(ds);
+    // Plan B: a VC meeting agent is an ordinary chat-scope session, so the live
+    // STREAMING CARD is no longer gated here at all — it surfaces through the
+    // normal post/patch path like any group session (that was the "看不到流式
+    // 卡片" report; those sites dropped their VC guard). What remains funnelled
+    // through managedAuxUiSuppressed is out-of-band auxiliary UI (startup-failure
+    // notices, usage-limit patches, exit UI): for a genuinely meeting-driven turn
+    // — a durable transcript delivery (dispatchAttempt set) or a stamped meeting
+    // @mention follow-up — that diagnostic stays fenced to the receipt/retry
+    // chain and must never leak out-of-band (a silent delivery especially). A
+    // plain user turn on this session has neither marker and notifies normally.
+    if (isMeetingDrivenTurn(ds, turnId, dispatchAttempt)) return true;
     return ordinaryManagedSuppression(turnId, dispatchAttempt);
   };
   /** final_output is the sole exception: listener_thread and exact IM replies
@@ -7291,13 +7314,16 @@ function setupWorkerHandlers(
   ): boolean => {
     if (isSilentScheduledTurn(ds, turnId)) return true;
     if (isTriggerFinalSuppressed(ds, turnId)) return true;
-    if (!ds.session.vcMeetingReceiver) {
+    // Only a genuinely meeting-driven turn is subject to the durable meeting-send
+    // policy; a plain user turn on this session posts through the ordinary path
+    // (see isMeetingDrivenTurn).
+    if (!isMeetingDrivenTurn(ds, turnId, dispatchAttempt)) {
       return ordinaryManagedSuppression(turnId, dispatchAttempt);
     }
     // Resolve every Lark-facing worker event against durable origin state. The
     // receipt freezes responseMode, so terminal→idle updates and daemon restore
     // cannot become loud merely because an in-memory suppression map was
-    // cleared/lost. Missing attribution on a dedicated receiver fails closed.
+    // cleared/lost. Missing attribution on a meeting-driven turn fails closed.
     const decision = evaluateVcMeetingManagedSend(config.session.dataDir, {
       receiverSessionId: ds.session.sessionId,
       receiverSession: true,
@@ -9695,9 +9721,11 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   if (!list || list.length === 0) return;
   // Detach the batch first so a second idle edge can't double-flip it.
   ds.pendingAckReactions = [];
-  // A dedicated receiver has no progress-reaction channel. Clear any stale
-  // in-memory entries restored from an older build without touching Lark.
-  if (ds.session.vcMeetingReceiver) return;
+  // Plan B: a meeting agent is an ordinary chat-scope session. Pending ack
+  // reactions only ever exist for a real inbound user message (the ✋ is placed
+  // when that message arrives — transcript deliveries have no inbound message to
+  // react to), so a non-empty list here always belongs to a plain user turn and
+  // must settle to ✅ like any session. No VC special-case.
   const silent = silentTurnReactions(ds);
   const doneEmoji = doneReactionEmojiFor(ds);
   for (const ack of list) {
@@ -9914,7 +9942,14 @@ function deliverFinalOutput(
       const imOrigin = msg.dispatchAttempt === undefined
         ? resolveVcMeetingImTurnOrigin(ds.session, msg.turnId)
         : undefined;
-      const managedDecision = ds.session.vcMeetingReceiver
+      // Plan B: the meeting agent is an ordinary chat-scope session, so it also
+      // delivers plain user turns. Apply the durable meeting-send policy ONLY to
+      // a genuinely meeting-driven turn (a durable transcript delivery, or a
+      // stamped meeting @mention follow-up). A plain user turn is not
+      // meeting-driven → managedDecision stays undefined → it delivers through
+      // the ordinary path. Without this gate a plain user reply resolves
+      // `origin_unproven` and is silently dropped (the "手动@机器人也不回复" bug).
+      const managedDecision = isMeetingDrivenTurn(ds, msg.turnId, msg.dispatchAttempt)
         ? evaluateVcMeetingManagedSend(config.session.dataDir, {
             receiverSessionId: ds.session.sessionId,
             receiverSession: true,
@@ -9934,7 +9969,7 @@ function deliverFinalOutput(
         return;
       }
       const revalidateManagedSend = (): void => {
-        if (!ds.session.vcMeetingReceiver) return;
+        if (!isMeetingDrivenTurn(ds, msg.turnId, msg.dispatchAttempt)) return;
         const current = evaluateVcMeetingManagedSend(config.session.dataDir, {
           receiverSessionId: ds.session.sessionId,
           receiverSession: true,

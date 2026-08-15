@@ -1235,13 +1235,7 @@ export async function handleCardCommand(
     ds.streamingCardForced = true;
     const posted = await postFreshStreamingCard(ds, deps.sessionReply);
     if (!posted) {
-      // A VC meeting-receiver session structurally never posts a streaming card
-      // (see postFreshStreamingCard / postTurnStartingCard, gated on
-      // `ds.session.vcMeetingReceiver`). Falling through to `not_ready` here is
-      // misleading — the terminal is usually up and processing delivery turns;
-      // it just routes output to the listener chat / in-meeting, not a card.
-      // Give the operator the accurate reason instead of "terminal not ready".
-      await reply(t(ds.session.vcMeetingReceiver ? 'cmd.card.vc_receiver' : 'cmd.card.not_ready', undefined, loc));
+      await reply(t('cmd.card.not_ready', undefined, loc));
     }
     return;
   }

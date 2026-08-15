@@ -5884,34 +5884,18 @@ describe('/card — operator / canOperate gate', () => {
     expect(reply).toContain('已恢复');
   });
 
-  it('/card show on a VC meeting-receiver session: accurate reason, not "terminal not ready"', async () => {
-    // postFreshStreamingCard structurally returns false for a VC receiver
-    // session (it never posts a live card). The handler must explain WHY —
-    // "this is a meeting-receiver session" — instead of the misleading
-    // generic not-ready text, which reads as "no session / terminal down"
-    // even though the session is up and processing delivery turns.
+  it('Plan B: /card on a VC meeting-agent session gets the ordinary not-ready notice (no special-casing)', async () => {
+    // Under Plan B a meeting agent is an ordinary chat-scope session, so /card
+    // behaves exactly like any other session — postFreshStreamingCard no longer
+    // structurally refuses it, and there is no meeting-receiver-specific reason.
+    // When a post genuinely can't happen yet, the operator sees the same generic
+    // not-ready text as every other session.
     vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
       botName: 'Claude',
       config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, privateCard: false },
     })) as any);
     vi.mocked(postFreshStreamingCard).mockResolvedValue(false);
     const ds = makeDaemonSession({ session: makeSession({ vcMeetingReceiver: true }) });
-    const deps = makeDeps(ds);
-    await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card', deps);
-    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-    expect(reply).toContain('会议接收会话');
-    expect(reply).not.toContain('终端尚未就绪');
-  });
-
-  it('/card show on an ordinary session that cannot post keeps the generic not-ready notice', async () => {
-    // Mutation guard: a non-VC session must still get the generic text, so the
-    // VC branch is gated on vcMeetingReceiver and does not swallow every failure.
-    vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
-      botName: 'Claude',
-      config: { larkAppId: id, larkAppSecret: 's', cliId: 'claude-code' as const, privateCard: false },
-    })) as any);
-    vi.mocked(postFreshStreamingCard).mockResolvedValue(false);
-    const ds = makeDaemonSession({ session: makeSession({ vcMeetingReceiver: undefined }) });
     const deps = makeDeps(ds);
     await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/card', deps);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;

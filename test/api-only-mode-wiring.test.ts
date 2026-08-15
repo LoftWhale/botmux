@@ -194,24 +194,53 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
   });
 
-  it('managedAuxUiSuppressed lets an opted-in VC receiver surface the streaming card (else suppressed)', () => {
-    // VC receiver aux UI (streaming card / reactions) is suppressed by default,
-    // but exposeReceiverStreamingCard opts the card in. The gate delegates to the
-    // single shared predicate so it stays in lockstep with the post/patch guards
-    // — a blanket `return true` here would defeat the opt-in (the earlier bug:
-    // the card was un-suppressed at the post site but this gate still hard-broke).
+  it('managedAuxUiSuppressed no longer special-cases a VC meeting agent (Plan B: ordinary chat session)', () => {
+    // Plan B: a VC meeting agent is an ordinary chat-scope session, so its
+    // streaming card / reactions flow through the ordinary suppression path just
+    // like any group session. The old `vcMeetingReceiver` branch (and the
+    // exposeReceiverStreamingCard opt-in it delegated to) is gone; the final
+    // group-posting policy (silent vs listener_thread) is enforced separately in
+    // managedFinalOutputSuppressed, not here.
     const block = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
-    expect(block).toContain('if (ds.session.vcMeetingReceiver) return vcReceiverStreamingCardSuppressed(ds);');
-    expect(block).not.toContain('if (ds.session.vcMeetingReceiver) return true;');
+    expect(block).not.toContain('vcMeetingReceiver');
+    expect(block).not.toContain('vcReceiverStreamingCardSuppressed');
+    expect(block).toContain('return ordinaryManagedSuppression(turnId, dispatchAttempt);');
   });
 
-  it('VC delivery dispatch arms the streaming-card turn (beginNewTurn) only for opted-in receivers', () => {
-    // triggerSessionTurn (the VC dispatch route) never calls beginNewTurn, so the
-    // receiver card lifecycle was never armed. Arm it here, gated on the opt-in.
+  it('managedFinalOutputSuppressed gates the VC durable policy to meeting-driven turns only (plain user turns post normally)', () => {
+    // Plan B: the meeting agent hosts BOTH transcript deliveries and plain user
+    // IM turns. The durable silent/listener_thread policy must apply only to a
+    // meeting-driven turn — a durable delivery (dispatchAttempt) or a stamped
+    // meeting @mention follow-up (isMeetingDrivenTurn). A plain user turn has
+    // neither and must fall to ordinaryManagedSuppression so the user's own reply
+    // is never wrongly suppressed.
+    const block = region(workerPoolSource, 'const managedFinalOutputSuppressed', 'const bot = getBot(ds.larkAppId);');
+    expect(block).toContain('if (!isMeetingDrivenTurn(ds, turnId, dispatchAttempt)) {');
+    expect(block).toContain('return ordinaryManagedSuppression(turnId, dispatchAttempt);');
+    // The durable send-policy check still runs for meeting-driven turns.
+    expect(block).toContain('evaluateVcMeetingManagedSend(config.session.dataDir, {');
+  });
+
+  it('isMeetingDrivenTurn distinguishes transcript deliveries / stamped follow-ups from plain user turns', () => {
+    // The shared module-level gate both managedAuxUiSuppressed /
+    // managedFinalOutputSuppressed (setupWorkerHandlers) and deliverFinalOutput
+    // consult. A non-meeting session is never meeting-driven; a delivery carries a
+    // dispatchAttempt; an @mention follow-up is recognised by its stamped origin.
+    const block = region(workerPoolSource, 'function isMeetingDrivenTurn(', 'function setupWorkerHandlers(');
+    expect(block).toContain('if (!ds.session.vcMeetingReceiver) return false;');
+    expect(block).toContain('if (dispatchAttempt !== undefined) return true;');
+    expect(block).toContain('return resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined;');
+  });
+
+  it('VC delivery dispatch arms the streaming-card turn (beginNewTurn) for every meeting-agent delivery', () => {
+    // triggerSessionTurn (the VC transcript-delivery route) never calls
+    // beginNewTurn, so the card lifecycle must be armed here — for every delivery
+    // turn now that the meeting agent is an ordinary session whose card should
+    // surface (no exposeReceiverStreamingCard opt-in gate anymore).
     const block = region(daemonSource, 'dispatchTurn: (request, context) => {', 'return triggerSessionTurn(');
-    expect(block).toContain("config.vcMeetingAgent?.exposeReceiverStreamingCard === true");
+    expect(block).not.toContain('exposeReceiverStreamingCard');
     expect(block).toContain('beginNewTurn(target, title, context.stableTurnId)');
-    expect(block).toContain('target?.session.vcMeetingReceiver');
+    expect(block).toContain('target?.session.vcMeetingReceiver && context.stableTurnId');
   });
 
   it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {

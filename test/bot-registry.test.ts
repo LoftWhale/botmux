@@ -493,14 +493,13 @@ describe('parseBotConfigsFromText — brand', () => {
     });
   });
 
-  it('parses meetingConsumer in/out policies + exposeReceiverStreamingCard opt-in', () => {
+  it('parses meetingConsumer in/out policies', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {
         larkAppId: 'a',
         larkAppSecret: 's',
         vcMeetingAgent: {
           enabled: true,
-          exposeReceiverStreamingCard: true,
           realtimeVoice: { enabled: true },
           meetingConsumer: {
             enabled: true,
@@ -511,19 +510,17 @@ describe('parseBotConfigsFromText — brand', () => {
         },
       },
     ]));
-    expect(cfg.vcMeetingAgent?.exposeReceiverStreamingCard).toBe(true);
     expect(cfg.vcMeetingAgent?.meetingConsumer?.textOutputPolicy).toBe('approval');
     expect(cfg.vcMeetingAgent?.meetingConsumer?.voiceOutputPolicy).toBe('allow');
   });
 
-  it('drops invalid in/out policy values and omits exposeReceiverStreamingCard when not exactly true', () => {
+  it('drops invalid in/out policy values', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {
         larkAppId: 'a',
         larkAppSecret: 's',
         vcMeetingAgent: {
           enabled: true,
-          exposeReceiverStreamingCard: 'yes', // not boolean true → omitted
           meetingConsumer: {
             enabled: true,
             defaultMode: 'agents',
@@ -533,7 +530,6 @@ describe('parseBotConfigsFromText — brand', () => {
         },
       },
     ]));
-    expect(cfg.vcMeetingAgent?.exposeReceiverStreamingCard).toBeUndefined();
     expect(cfg.vcMeetingAgent?.meetingConsumer?.textOutputPolicy).toBeUndefined();
     expect(cfg.vcMeetingAgent?.meetingConsumer?.voiceOutputPolicy).toBeUndefined();
   });

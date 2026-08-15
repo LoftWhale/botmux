@@ -307,7 +307,6 @@ function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | und
   if (stabilizeMs !== undefined) out.stabilizeMs = stabilizeMs;
   if (flushIntervalMs !== undefined) out.flushIntervalMs = flushIntervalMs;
   if (realtimeVoice) out.realtimeVoice = realtimeVoice;
-  if (entry.exposeReceiverStreamingCard === true) out.exposeReceiverStreamingCard = true;
   if (meetingConsumer) out.meetingConsumer = meetingConsumer;
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -1088,14 +1087,6 @@ export interface VcMeetingAgentConfig {
   flushIntervalMs?: number;
   /** Realtime voice v0. Disabled by default; requires realtime scope and meeting-side AI speaking permission. */
   realtimeVoice?: VcMeetingRealtimeVoiceConfig;
-  /**
-   * Surface the receiver session's live streaming card (a read-only web-terminal
-   * entry) in the listener chat. Off by default: a receiver terminal can carry
-   * meeting-derived private context, so exposing it means the operator accepts
-   * that context becomes visible through the card. See
-   * vcReceiverStreamingCardSuppressed in worker-pool.
-   */
-  exposeReceiverStreamingCard?: boolean;
   /** Optional listener-group consumer. Card choices are driven entirely by this bots.json block. */
   meetingConsumer?: VcMeetingConsumerConfig;
 }

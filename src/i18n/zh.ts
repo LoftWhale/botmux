@@ -267,7 +267,6 @@ export const messages: Record<string, string> = {
   'cmd.card.fail': '⚠️ 操作失败：{reason}',
   'cmd.card.usage': '用法：/card（召唤实时卡）| /card off（本群关流式卡）| /card on（恢复出卡）',
   'cmd.card.not_ready': '终端尚未就绪，等会话起好后流式卡片会自动出现。',
-  'cmd.card.vc_receiver': '📻 这是会议接收会话，按设计不提供流式卡片。它在后台处理会议字幕，产出走「会议监听群自动回帖」（需把该角色预设的输出方式设为「回复监听群」）或「会中受管发言」，不在这里出实时卡。',
   'cmd.card.private_not_ready': '🔒 终端尚未就绪，等会话起好后再发一次 /card。',
   'cmd.card.private_not_group': '🔒 私密卡片仅支持普通群聊，话题群 / 单聊无法发送（飞书限制）。',
   'cmd.card.private_no_audience': '🔒 没有可见对象：当前 bot 未配置 owner（allowedUsers 为空）。',

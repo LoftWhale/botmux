@@ -2589,16 +2589,15 @@ function vcMeetingDeliveryReceiverDeps(receiverAppId?: string): VcMeetingDeliver
     dispatchTurn: (request, context) => {
       const target = findActiveBySessionId(request.target.sessionId ?? '');
       if (target) target.vcMeetingImTurnOrigin = undefined;
-      // VC delivery turns dispatch straight through triggerSessionTurn, which
-      // (unlike the ordinary IM path) never calls beginNewTurn — so a receiver
-      // session's streaming-card lifecycle was never armed and no live card ever
-      // posted, regardless of the exposeReceiverStreamingCard opt-in. When the
-      // bot opted in, arm the turn's card here so the receiver surfaces a live
-      // card (a read-only web-terminal entry) for this delivery. Gated on the
-      // same opt-in predicate; a non-opted-in receiver stays card-free as before.
-      if (target?.session.vcMeetingReceiver
-        && getBot(target.larkAppId).config.vcMeetingAgent?.exposeReceiverStreamingCard === true
-        && context.stableTurnId) {
+      // VC transcript delivery turns dispatch straight through triggerSessionTurn,
+      // which (unlike the ordinary IM path) never calls beginNewTurn — so without
+      // this the meeting agent's streaming-card lifecycle would never arm and no
+      // live card would post for a transcript-driven turn. Under Plan B the
+      // meeting agent is an ordinary chat-scope session whose card should surface
+      // like any group session (the "看不到流式卡片" report), so arm it for every
+      // delivery turn. A silent-responseMode turn still suppresses only its final
+      // output (managedFinalOutputSuppressed), not the live card.
+      if (target?.session.vcMeetingReceiver && context.stableTurnId) {
         const title = target.currentTurnTitle || target.session.title || '会议监听';
         beginNewTurn(target, title, context.stableTurnId);
       }
@@ -3238,7 +3237,14 @@ export async function noteTurnReceived(
   // message — not a worker status edge — means type-ahead / busy-batched messages
   // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
   // the worker next goes idle.
-  if (ds.session.vcMeetingReceiver) return;
+  // Plan B: a meeting agent is an ordinary chat-scope session that hosts plain
+  // user turns. A plain user message should get the ✋→✅ progress reaction like
+  // any card-off session. Only a stamped meeting @mention follow-up stays
+  // reaction-free (it is meeting-driven and routes through the audited listener
+  // action, not the ordinary progress-reaction channel). Transcript deliveries
+  // never reach this inbound-message acceptance point at all.
+  if (ds.session.vcMeetingReceiver
+    && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined) return;
   // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
   // not to whichever turn most recently overwrote currentReplyTarget.
   if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
