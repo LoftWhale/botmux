@@ -331,8 +331,10 @@ function aimeDataHome(env: NodeJS.ProcessEnv): string | null {
 export function bytecloudKeychainCandidates(
   home: string = homedir(),
   env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): string[] {
   const dedupe = (xs: string[]): string[] => [...new Set(xs.filter(Boolean))];
+  const isMac = platform === 'darwin';
 
   // --- Full AIME runtime: fail-closed to the AIME identity domain ---------
   // When BOTH AIME vars are set, bytedcli swaps its storage root to
@@ -354,35 +356,33 @@ export function bytecloudKeychainCandidates(
   }
 
   // --- Ordinary (non-AIME) runtime ---------------------------------------
+  // Config-style CLIs (kaboo-cli / aiden-cli / cjadk) resolve their base via
+  // Go's os.UserConfigDir (verified against kaboo 1.3.77's embedded ByteCloud
+  // auth): on macOS that is `~/Library/Application Support`; everywhere else it
+  // is `$XDG_CONFIG_HOME` (falling back to `~/.config`). A single process only
+  // ever uses ONE of these — the current platform's. We must key off the actual
+  // platform, NOT list both: the exp-aware selector picks the globally-freshest
+  // token regardless of order, so a stale token under the *other* platform's
+  // root could otherwise shadow the authoritative one (a foreign-platform root
+  // is never a live location on this host anyway). `platform` is injectable so
+  // both spellings stay unit-testable.
   const xdgConfig = env.XDG_CONFIG_HOME?.trim();
-  // Bases that hold `<cli>/bytecloud-auth/...` (config-style tools). These
-  // honour $XDG_CONFIG_HOME, which per the XDG spec REPLACES `~/.config` when
-  // set (it is the config root, not an extra candidate). Listing both would
-  // create a phantom `~/.config` candidate the tool never writes to — and since
-  // the selector picks the globally-freshest token rather than respecting
-  // order, a stale token in one could shadow the override. So: XDG root when
-  // set, else `~/.config`; plus the macOS spelling as a separate platform slot.
-  const configHomes = dedupe([
-    xdgConfig || join(home, '.config'),
-    join(home, 'Library', 'Application Support'),
-  ]);
-  // Home bases under which bytedcli keeps `bytedcli/data/bytecloud-auth/...`.
-  // bytedcli ignores $XDG_DATA_HOME, so we never key it off that; the real home
-  // plus the macOS spelling as a belt-and-suspenders fallback.
-  const bytedcliHomes = dedupe([
-    join(home, '.local', 'share'),
-    join(home, 'Library', 'Application Support'),
-  ]);
+  const configHome = isMac
+    ? join(home, 'Library', 'Application Support')
+    : (xdgConfig || join(home, '.config'));
+  // bytedcli keeps `bytedcli/data/bytecloud-auth/...` under its data home. It
+  // ignores $XDG_DATA_HOME (verified) and uses `~/.local/share` on BOTH Linux
+  // and macOS — so there is no Application Support spelling to add; the single
+  // data home is correct on every platform.
+  const bytedcliHome = join(home, '.local', 'share');
   const roots: string[] = [];
-  // Config-dir CLIs.
-  for (const base of configHomes) {
-    for (const cli of ['kaboo-cli', 'aiden-cli', 'cjadk']) roots.push(join(base, cli));
-  }
+  // Config-dir CLIs (single platform-correct base).
+  for (const cli of ['kaboo-cli', 'aiden-cli', 'cjadk']) roots.push(join(configHome, cli));
   // Home dot-dir layouts (Linux-observed; harmless as extra candidates elsewhere).
   roots.push(join(home, '.cjadk'));
   roots.push(join(home, '.aipaas'));
   // Data-dir CLI (bytedcli) — the extra `data/` segment is part of its layout.
-  for (const base of bytedcliHomes) roots.push(join(base, 'bytedcli', 'data'));
+  roots.push(join(bytedcliHome, 'bytedcli', 'data'));
   return dedupe(roots).map((root) => join(root, BYTECLOUD_KEYCHAIN_LEAF));
 }
 
@@ -394,26 +394,37 @@ export function bytecloudKeychainCandidates(
  * base64, missing/non-number `exp`).
  *
  * A JWS compact JWT is EXACTLY three non-empty base64url segments
- * (`header.payload.signature`). We require that shape up front: a 2- or
- * 4-segment string, or one whose header/payload aren't base64url, is NOT a JWT
- * and must never be ranked as a live token where its (accidentally decodable)
- * `exp` could shadow a genuine JWT.
+ * (`header.payload.signature`) whose header and payload are JSON. We require
+ * that shape up front: a 2- or 4-segment string, a segment that isn't
+ * base64url (incl. the signature), or a header/payload that isn't a JSON
+ * object is NOT a JWT and must never be ranked as a live token where its
+ * (accidentally decodable) `exp` could shadow a genuine JWT. We do NOT verify
+ * the signature (that is riff's job) — only that the structure is a real JWT.
  */
 const BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
-export function decodeJwtExp(jwt: string): number | null {
-  const parts = jwt.split('.');
-  // Exactly three non-empty segments, header + payload strictly base64url.
-  if (parts.length !== 3) return null;
-  if (!parts[0] || !parts[1] || !parts[2]) return null;
-  if (!BASE64URL_RE.test(parts[0]!) || !BASE64URL_RE.test(parts[1]!)) return null;
+function decodeJoseJson(seg: string): Record<string, unknown> | null {
   try {
-    const payload = Buffer.from(parts[1]!, 'base64url').toString('utf-8');
-    const obj = JSON.parse(payload) as Record<string, unknown>;
-    const exp = obj['exp'];
-    return typeof exp === 'number' && Number.isFinite(exp) ? exp : null;
+    const obj = JSON.parse(Buffer.from(seg, 'base64url').toString('utf-8')) as unknown;
+    // A JOSE header / JWT payload is a JSON object (not an array, not a scalar).
+    if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
+    return obj as Record<string, unknown>;
   } catch {
     return null;
   }
+}
+export function decodeJwtExp(jwt: string): number | null {
+  const parts = jwt.split('.');
+  // Exactly three non-empty, strictly-base64url segments (header.payload.sig).
+  if (parts.length !== 3) return null;
+  if (!parts[0] || !parts[1] || !parts[2]) return null;
+  if (parts.some((p) => !BASE64URL_RE.test(p))) return null;
+  // Header must decode to a JSON object (confirms it's really JOSE, not just
+  // base64url-shaped noise); we don't require a specific `typ`/`alg`.
+  if (!decodeJoseJson(parts[0]!)) return null;
+  const payload = decodeJoseJson(parts[1]!);
+  if (!payload) return null;
+  const exp = payload['exp'];
+  return typeof exp === 'number' && Number.isFinite(exp) ? exp : null;
 }
 
 /**
@@ -432,15 +443,26 @@ export function decodeJwtExp(jwt: string): number | null {
  *      shadow a clearly-valid newer token.
  * Returns null when nothing yields a usable token.
  */
+/**
+ * Treat a token that expires within this many seconds as already expired. riff
+ * task creation reads the JWT once and does a single fetch; a 401 there throws
+ * and fails the whole turn (SSE reconnect only covers an ALREADY-created task),
+ * and a fresh sandbox cold-boot costs minutes — so a token about to expire
+ * mid-request is worse than skipping to a longer-lived candidate. Also absorbs
+ * small client/server clock skew.
+ */
+export const JWT_EXPIRY_SAFETY_WINDOW_SEC = 30;
+
 export function readBytecloudKeychainJwt(
   home: string = homedir(),
   env: NodeJS.ProcessEnv = process.env,
   nowMs: number = Date.now(),
+  platform: NodeJS.Platform = process.platform,
 ): string | null {
-  const nowSec = nowMs / 1000;
+  const cutoffSec = nowMs / 1000 + JWT_EXPIRY_SAFETY_WINDOW_SEC;
   let bestLive: { jwt: string; exp: number } | null = null; // parseable, unexpired, freshest
   let opaqueFallback: string | null = null;                 // first exp-less, non-expired-unknown token
-  for (const path of bytecloudKeychainCandidates(home, env)) {
+  for (const path of bytecloudKeychainCandidates(home, env, platform)) {
     let jwt: string;
     try {
       const data = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
@@ -454,7 +476,7 @@ export function readBytecloudKeychainJwt(
       if (opaqueFallback === null) opaqueFallback = jwt;
       continue;
     }
-    if (exp <= nowSec) continue; // clearly expired — never select.
+    if (exp <= cutoffSec) continue; // expired or about to expire — never select.
     if (!bestLive || exp > bestLive.exp) bestLive = { jwt, exp };
   }
   return bestLive?.jwt ?? opaqueFallback;
