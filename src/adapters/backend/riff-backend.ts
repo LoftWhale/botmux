@@ -310,23 +310,29 @@ function aimeDataHome(env: NodeJS.ProcessEnv): string | null {
 }
 
 /**
- * Every directory that may hold a ByteCloud tool's `bytecloud-auth/` store,
- * across the CLIs botmux users log into (kaboo-cli / aiden-cli / cjadk /
- * bytedcli) and across platforms. Empirically verified on Linux + macOS
- * (strace of the real binaries + on-disk layout):
- *   - kaboo-cli / aiden-cli nest under the XDG *config* dir
- *     (Linux `~/.config/<cli>`, macOS `~/Library/Application Support/<cli>`),
- *     honouring `$XDG_CONFIG_HOME`.
- *   - cjadk uses a home dot-dir `~/.cjadk`; aipaas uses `~/.aipaas`.
- *   - bytedcli stores under `~/.local/share/bytedcli/data` on BOTH Linux and
- *     macOS. It does NOT honour `$XDG_DATA_HOME` (verified: bytedcli ignores it
- *     and always uses `~/.local/share`), so we do NOT key bytedcli off it.
- *     Inside an AIME workspace bytedcli swaps the home base for
- *     `$AIME_WORKSPACE_PATH/<sanitized $AIME_CURRENT_USER>` — covered here.
- * We cast a wide net: non-existent candidates simply fail the read and are
- * skipped, so listing extra plausible locations is cheap and future-proofs
- * against a tool switching its base dir. The ordering below is the read
- * priority.
+ * The keychain candidates for a ByteCloud tool's `bytecloud-auth/` store, across
+ * the CLIs botmux users log into (kaboo-cli / aiden-cli / cjadk / bytedcli).
+ *
+ * ⚠️ This is NOT a "cast a wide net" list. The selector in
+ * `readBytecloudKeychainJwt` picks the globally-freshest token by `exp`
+ * REGARDLESS of order, so an extra candidate is not free: a stale/foreign token
+ * at a location the tool never actually writes could WIN and shadow the real
+ * one. Every entry must be a location the tool genuinely uses on THIS host:
+ *   - Config-style CLIs (kaboo-cli / aiden-cli / cjadk) resolve their base via
+ *     Go's os.UserConfigDir (verified against kaboo 1.3.77): macOS →
+ *     `~/Library/Application Support`, Windows → `%AppData%` (Go errors, does
+ *     NOT default to `~/AppData/Roaming`, when it is unset — so we emit no
+ *     config candidate then), otherwise → `$XDG_CONFIG_HOME` (else `~/.config`).
+ *     We list ONLY the current platform's root, never several — a
+ *     foreign-platform root is never live here and would only invite shadowing.
+ *   - cjadk also uses a home dot-dir `~/.cjadk`; aipaas uses `~/.aipaas`.
+ *   - bytedcli stores under `~/.local/share/bytedcli/data` on Linux, macOS AND
+ *     Windows: its `bytedcliBaseDir()` (bytedcli-core.js, 0.125.0) has no
+ *     platform branch and ignores `$XDG_DATA_HOME`. Inside an AIME workspace it
+ *     swaps the home base for `$AIME_WORKSPACE_PATH/<sanitized $AIME_CURRENT_USER>`
+ *     — see the fail-closed early return below.
+ * Order is otherwise NOT significant (selection is by `exp`, not position).
+ * Non-existent candidates simply fail the read and are skipped.
  */
 export function bytecloudKeychainCandidates(
   home: string = homedir(),
