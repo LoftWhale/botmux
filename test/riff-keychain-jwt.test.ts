@@ -48,6 +48,33 @@ describe('bytecloudKeychainCandidates — cross-platform path generation', () =>
     expect(c).toContain(join(HOME, '.aipaas', LEAF));
   });
 
+  it('on Windows, config-dir CLIs resolve under %AppData% (Roaming), not ~/.config', () => {
+    const env = { APPDATA: 'C:\\Users\\t\\AppData\\Roaming' } as NodeJS.ProcessEnv;
+    const c = bytecloudKeychainCandidates(HOME, env, 'win32');
+    for (const cli of ['kaboo-cli', 'aiden-cli', 'cjadk']) {
+      expect(c).toContain(join('C:\\Users\\t\\AppData\\Roaming', cli, LEAF));
+      expect(c).not.toContain(join(HOME, '.config', cli, LEAF));
+    }
+    // bytedcli has no platform branch (verified in bytedcli-core.js): it uses
+    // ~/.local/share/bytedcli on Windows too, so that candidate must be present.
+    expect(c).toContain(join(HOME, '.local', 'share', 'bytedcli', 'data', LEAF));
+  });
+
+  it('on Windows without %APPDATA%, emits NO config-style candidate (Go errors, does not default to Roaming)', () => {
+    const c = bytecloudKeychainCandidates(HOME, {} as NodeJS.ProcessEnv, 'win32');
+    // Go's os.UserConfigDir ERRORS when %AppData% is unset — it never falls back
+    // to ~/AppData/Roaming. Inventing that phantom path could let a stale token
+    // there shadow a real candidate, so we emit no config-style root at all.
+    for (const cli of ['kaboo-cli', 'aiden-cli', 'cjadk']) {
+      expect(c).not.toContain(join(HOME, 'AppData', 'Roaming', cli, LEAF));
+      expect(c).not.toContain(join(HOME, '.config', cli, LEAF));
+    }
+    // The other verified candidates still survive (fail-open on config only).
+    expect(c).toContain(join(HOME, '.local', 'share', 'bytedcli', 'data', LEAF));
+    expect(c).toContain(join(HOME, '.cjadk', LEAF));
+    expect(c).toContain(join(HOME, '.aipaas', LEAF));
+  });
+
   it('bytedcli uses ~/.local/share/bytedcli/data on BOTH platforms (never Application Support)', () => {
     // bytedcli uses ~/.local/share on Linux AND macOS (empirically confirmed);
     // it has no Application Support spelling, so that must not be a candidate.

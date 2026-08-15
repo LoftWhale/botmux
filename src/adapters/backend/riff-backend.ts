@@ -358,26 +358,42 @@ export function bytecloudKeychainCandidates(
   // --- Ordinary (non-AIME) runtime ---------------------------------------
   // Config-style CLIs (kaboo-cli / aiden-cli / cjadk) resolve their base via
   // Go's os.UserConfigDir (verified against kaboo 1.3.77's embedded ByteCloud
-  // auth): on macOS that is `~/Library/Application Support`; everywhere else it
-  // is `$XDG_CONFIG_HOME` (falling back to `~/.config`). A single process only
-  // ever uses ONE of these — the current platform's. We must key off the actual
-  // platform, NOT list both: the exp-aware selector picks the globally-freshest
-  // token regardless of order, so a stale token under the *other* platform's
-  // root could otherwise shadow the authoritative one (a foreign-platform root
-  // is never a live location on this host anyway). `platform` is injectable so
-  // both spellings stay unit-testable.
+  // auth). That maps per-platform: macOS → `~/Library/Application Support`;
+  // Windows → `%AppData%`; everything else → `$XDG_CONFIG_HOME` (falling back
+  // to `~/.config`). A single process only ever uses ONE of these — the current
+  // platform's. We must key off the actual platform, NOT list several: the
+  // exp-aware selector picks the globally-freshest token regardless of order,
+  // so a stale token under another platform's root could otherwise shadow the
+  // authoritative one (a foreign-platform root is never a live location on this
+  // host anyway). `platform` is injectable so every spelling stays testable.
+  //
+  // `configHome` is null when we cannot name the platform's real config root:
+  // on Windows Go ERRORS if `%AppData%` is unset (it does NOT default to
+  // `~/AppData/Roaming`), so with APPDATA absent we emit NO config-style
+  // candidate rather than invent a phantom path a stale token could shadow
+  // from. The other verified candidates (bytedcli, dot-dirs) are unaffected.
   const xdgConfig = env.XDG_CONFIG_HOME?.trim();
-  const configHome = isMac
-    ? join(home, 'Library', 'Application Support')
-    : (xdgConfig || join(home, '.config'));
-  // bytedcli keeps `bytedcli/data/bytecloud-auth/...` under its data home. It
-  // ignores $XDG_DATA_HOME (verified) and uses `~/.local/share` on BOTH Linux
-  // and macOS — so there is no Application Support spelling to add; the single
-  // data home is correct on every platform.
+  let configHome: string | null;
+  if (isMac) {
+    configHome = join(home, 'Library', 'Application Support');
+  } else if (platform === 'win32') {
+    configHome = env.APPDATA?.trim() || null;
+  } else {
+    configHome = xdgConfig || join(home, '.config');
+  }
+  // bytedcli keeps `bytedcli/data/bytecloud-auth/...` under its data home.
+  // `bytedcliBaseDir()` in `@bytedance-dev/bytedcli` (dist/bytedcli-core.js,
+  // 0.125.0) has NO platform branch: in the ordinary case it unconditionally
+  // uses `~/.local/share/bytedcli` on Linux, macOS AND Windows, and it ignores
+  // $XDG_DATA_HOME. So the single `~/.local/share` data home is correct on
+  // every platform — there is no Application Support / %AppData% spelling to
+  // add. (The AIME workspace override is the only base swap, handled above.)
   const bytedcliHome = join(home, '.local', 'share');
   const roots: string[] = [];
-  // Config-dir CLIs (single platform-correct base).
-  for (const cli of ['kaboo-cli', 'aiden-cli', 'cjadk']) roots.push(join(configHome, cli));
+  // Config-dir CLIs (single platform-correct base, when we can name one).
+  if (configHome) {
+    for (const cli of ['kaboo-cli', 'aiden-cli', 'cjadk']) roots.push(join(configHome, cli));
+  }
   // Home dot-dir layouts (Linux-observed; harmless as extra candidates elsewhere).
   roots.push(join(home, '.cjadk'));
   roots.push(join(home, '.aipaas'));
@@ -1299,11 +1315,14 @@ export class RiffBackend implements SessionBackend {
     payload: Record<string, unknown>,
     attachments: RiffAttachment[],
   ): Promise<string> {
+    // Assemble the request body FIRST (attachment reads can be slow on large
+    // files / slow disks), THEN resolve the JWT immediately before fetch. The
+    // keychain selector skips tokens expiring within a safety window, but that
+    // guarantee only holds if we read the token close to the request — reading
+    // it before a multi-second upload prep could hand off a token that expires
+    // mid-flight. createTimeout only bounds the fetch, not the prep before it.
     const headers: Record<string, string> = {};
-    const jwt = this.getJwt();
-    if (jwt) headers['x-jwt-token'] = jwt;
-
-    let resp: Response;
+    let body: BodyInit;
     if (attachments.length > 0) {
       const form = new FormData();
       form.append('payload', JSON.stringify(payload));
@@ -1315,11 +1334,17 @@ export class RiffBackend implements SessionBackend {
           logger.warn(`[riff] failed to read attachment ${att.path}: ${err}`);
         }
       }
-      resp = await fetch(url, { method: 'POST', headers, body: form, signal: AbortSignal.timeout(this.createTimeoutMs) });
+      body = form;
     } else {
       headers['Content-Type'] = 'application/json';
-      resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(this.createTimeoutMs) });
+      body = JSON.stringify(payload);
     }
+
+    // Resolve JWT last — right before the request — so the safety-window
+    // freshness check reflects the token that actually goes on the wire.
+    const jwt = this.getJwt();
+    if (jwt) headers['x-jwt-token'] = jwt;
+    const resp = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(this.createTimeoutMs) });
 
     if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
     const result = (await resp.json()) as RiffTaskResponse;
