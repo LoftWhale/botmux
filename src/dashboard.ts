@@ -6229,7 +6229,7 @@ async function maybeAnnounceHallPresence(): Promise<void> {
 }
 
 // Graceful shutdown
-function shutdown(): void {
+function shutdown(suppressPm2Restart: boolean): void {
   codexNotifierAbort.abort();
   for (const off of subs.values()) off();
   subs.clear();
@@ -6238,9 +6238,11 @@ function shutdown(): void {
   platformTunnel?.stop();
   debugTerminalManager.shutdown();
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
-  server.close(() => process.exit(gracefulProcessExitCode()));
+  server.close(() => process.exit(gracefulProcessExitCode(suppressPm2Restart)));
   // Hard-exit fallback after 5s
-  setTimeout(() => process.exit(gracefulProcessExitCode()), 5_000).unref();
+  setTimeout(() => process.exit(gracefulProcessExitCode(suppressPm2Restart)), 5_000).unref();
 }
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+// Botmux's fleet orchestrator uses SIGTERM for the dashboard; PM2 uses SIGINT
+// for rolling process management and must be allowed to autorestart it.
+process.on('SIGTERM', () => shutdown(true));
+process.on('SIGINT', () => shutdown(false));

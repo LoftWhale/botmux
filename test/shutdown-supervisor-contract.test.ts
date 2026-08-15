@@ -19,6 +19,7 @@ import { PM2_GRACEFUL_EXIT_CODE } from '../src/pm2-graceful-exit.js';
 
 const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
 const fleetShutdown = readFileSync(new URL('../src/cli/fleet-shutdown.ts', import.meta.url), 'utf8');
 const ipcServer = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
 const pm2Preflight = readFileSync(new URL('../src/cli/pm2-preflight.ts', import.meta.url), 'utf8');
@@ -43,11 +44,19 @@ describe('graceful shutdown supervisor contract', () => {
     expect(dashboardPolicy).toContain('stop_exit_codes: managedExit.stopExitCodes');
     expect(cli.match(/\.\.\.managedExit\.env/g)).toHaveLength(2);
 
-    const shutdownStart = daemon.indexOf('const shutdown = async () => {');
+    const shutdownStart = daemon.indexOf(
+      'const shutdown = async (suppressPm2Restart: boolean) => {',
+    );
     const shutdownEnd = daemon.indexOf("process.on('SIGTERM'", shutdownStart);
     const shutdown = daemon.slice(shutdownStart, shutdownEnd);
-    expect(shutdown).toContain('process.exit(gracefulProcessExitCode());');
+    expect(shutdown).toContain(
+      'process.exit(gracefulProcessExitCode(suppressPm2Restart));',
+    );
     expect(shutdown).not.toContain('process.exit(0);');
+    expect(daemon).toContain("process.on('SIGINT', () => { shutdown(false)");
+    expect(daemon).toContain('shutdown: () => shutdown(true)');
+    expect(dashboard).toContain("process.on('SIGTERM', () => shutdown(true));");
+    expect(dashboard).toContain("process.on('SIGINT', () => shutdown(false));");
     expect(cli).toContain('assertDaemonPm2GracefulExitPolicy(');
     expect(cli).toContain('`${operation}-handler-ready-pm2-policy`');
 
@@ -146,7 +155,9 @@ describe('graceful shutdown supervisor contract', () => {
   });
 
   it('takes one Riff snapshot, batch-persists, then generation-checks and commits before service stop', () => {
-    const start = daemon.indexOf('const shutdown = async () => {');
+    const start = daemon.indexOf(
+      'const shutdown = async (suppressPm2Restart: boolean) => {',
+    );
     const stop = daemon.indexOf('scheduler.stopScheduler();', start);
     const boundedGate = daemon.indexOf('tryWithBotTurnMutation(', start);
     const initialUnique = daemon.indexOf(

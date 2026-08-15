@@ -23698,7 +23698,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // forever (we'd accumulated 841 such orphans across daemon restarts,
   // consuming ~65 GB of RAM until manually SIGKILL'd).
   let shuttingDown = false;
-  const shutdown = async () => {
+  const shutdown = async (suppressPm2Restart: boolean) => {
     if (shuttingDown) return;
     shuttingDown = true;
     const shutdownDeadlineMs = Date.now() + DAEMON_SHUTDOWN_MAX_MS;
@@ -23940,7 +23940,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     flushIdentityCacheSync();
 
     removePidFile();
-    process.exit(gracefulProcessExitCode());
+    process.exit(gracefulProcessExitCode(suppressPm2Restart));
       },
     );
     if (!mutationResult.acquired) {
@@ -23952,8 +23952,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   };
 
-  process.on('SIGTERM', () => { shutdown().catch(err => { logger.error(`shutdown failed: ${err?.message ?? err}`); process.exit(1); }); });
-  process.on('SIGINT', () => { shutdown().catch(err => { logger.error(`shutdown failed: ${err?.message ?? err}`); process.exit(1); }); });
+  // PM2 uses SIGINT for rolling process management. Those signals must remain
+  // autorestartable; only the authenticated Botmux supervisor request below
+  // may use the stop_exit_codes sentinel to hold the row down for mutation.
+  process.on('SIGTERM', () => { shutdown(false).catch(err => { logger.error(`shutdown failed: ${err?.message ?? err}`); process.exit(1); }); });
+  process.on('SIGINT', () => { shutdown(false).catch(err => { logger.error(`shutdown failed: ${err?.message ?? err}`); process.exit(1); }); });
   // Capability publication is the final startup commit for supervisor-driven
   // shutdown. The early descriptor intentionally lacks it: a new CLI that
   // observes this daemon before both handlers/state closures exist must refuse
@@ -23965,7 +23968,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     larkAppId: cfg.larkAppId,
     bootInstanceId: desc.bootInstanceId,
     processStartIdentity: desc.processStartIdentity,
-    shutdown,
+    shutdown: () => shutdown(true),
   });
   desc.supervisorShutdownProtocol = SUPERVISOR_SHUTDOWN_PROTOCOL;
   desc.lastHeartbeat = Date.now();
