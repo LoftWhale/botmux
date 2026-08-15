@@ -563,6 +563,7 @@ import { VcMeetingTerminalReconciler } from './services/vc-meeting-terminal-reco
 import {
   resolveVcMeetingImTurnOrigin,
   verifyVcMeetingManagedOriginClaim,
+  evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import {
   ensureVcMeetingListenerTopicRoot,
@@ -6536,7 +6537,52 @@ ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
     claimedTurnId: typeof body.originTurnId === 'string' ? body.originTurnId : undefined,
     claimedDispatchAttempt: claimedAttempt,
   });
-  if (!verified.ok) return jsonRes(res, 403, verified);
+  // Plan B: the meeting agent is an ordinary chat-scope session that interleaves
+  // plain user IM turns with meeting deliveries and reaches idle between them.
+  // The in-memory managedTurnOrigin is cleared at each delivery turn's terminal
+  // edge, so a request-output the model runs AFTER the delivery turn goes idle
+  // (or after an intervening IM turn) finds no live origin and would fail
+  // `origin_unproven` — even though the durable delivery receipt still fully
+  // authorizes it. Fall back to the DURABLE receipt for a claimed delivery origin
+  // (turnId + dispatchAttempt): evaluateVcMeetingManagedSend re-derives authority
+  // from the on-disk receipt exactly as the final-output path does — receipt must
+  // exist for THIS receiver session, the attempt must match, its status must be
+  // dispatched/completed, the projection must still be active, and a silent
+  // delivery is refused. This never authorizes anything the receipt itself
+  // wouldn't, so it does not weaken the boundary; it only survives the idle gap.
+  let effectiveVerified = verified;
+  if (!verified.ok
+    && !ds.managedTurnOrigin
+    && typeof body.originTurnId === 'string'
+    && body.originTurnId.trim()
+    && claimedAttempt !== undefined) {
+    const claimedDeliveryTurnId = body.originTurnId.trim();
+    const durable = evaluateVcMeetingManagedSend(config.session.dataDir, {
+      receiverSessionId,
+      receiverSession: true,
+      turnId: claimedDeliveryTurnId,
+      dispatchAttempt: claimedAttempt,
+      allowTerminalReceipt: true,
+    });
+    if (durable.ok && durable.kind === 'listener_thread') {
+      logger.info(
+        `[vc-agent] request-output authorized via durable receipt fallback `
+        + `(live origin cleared at turn terminal) session=${receiverSessionId.slice(0, 8)} `
+        + `turn=${claimedDeliveryTurnId.slice(0, 12)} attempt=${claimedAttempt}`,
+      );
+      effectiveVerified = {
+        ok: true,
+        origin: {
+          receiverSessionId,
+          turnId: claimedDeliveryTurnId,
+          dispatchAttempt: claimedAttempt,
+          currentImTurnId: undefined,
+          currentImTurnOrigin: undefined,
+        },
+      };
+    }
+  }
+  if (!effectiveVerified.ok) return jsonRes(res, 403, effectiveVerified);
   const channel = body.channel === 'text' || body.channel === 'voice' ? body.channel : undefined;
   const content = sanitizeVcMeetingOutputContent(body.content, 'content');
   const reason = sanitizeVcMeetingOutputContent(body.reason, 'reason');
@@ -6548,13 +6594,13 @@ ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
     ? body.expectedListenerAppId.trim()
     : '';
   const expectedMeetingId = typeof body.expectedMeetingId === 'string' ? body.expectedMeetingId.trim() : '';
-  if (verified.origin.dispatchAttempt === undefined) {
-    const imOrigin = resolveVcMeetingImTurnOrigin(ds.session, verified.origin.turnId);
-    if (!verified.origin.turnId
-      || verified.origin.currentImTurnId !== verified.origin.turnId
+  if (effectiveVerified.origin.dispatchAttempt === undefined) {
+    const imOrigin = resolveVcMeetingImTurnOrigin(ds.session, effectiveVerified.origin.turnId);
+    if (!effectiveVerified.origin.turnId
+      || effectiveVerified.origin.currentImTurnId !== effectiveVerified.origin.turnId
       || !imOrigin
       || imOrigin.receiverSessionId !== receiverSessionId
-      || imOrigin.larkMessageId !== verified.origin.turnId) {
+      || imOrigin.larkMessageId !== effectiveVerified.origin.turnId) {
       return jsonRes(res, 409, {
         ok: false,
         errorCode: 'im_turn_origin_mismatch',
@@ -6587,14 +6633,14 @@ ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
     );
     return jsonRes(res, upstream.status, upstream.body);
   }
-  if (!verified.origin.turnId) {
+  if (!effectiveVerified.origin.turnId) {
     return jsonRes(res, 409, {
       ok: false,
       errorCode: 'delivery_origin_mismatch',
       error: 'durable delivery action has no stable turn id',
     });
   }
-  const lookup = findVcMeetingDeliveryByKey(config.session.dataDir, verified.origin.turnId, {
+  const lookup = findVcMeetingDeliveryByKey(config.session.dataDir, effectiveVerified.origin.turnId, {
     receiverSessionId,
   });
   if (!lookup) {
@@ -6628,8 +6674,8 @@ ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
       body: JSON.stringify({
         agentAppId: ds.larkAppId,
         receiverSessionId,
-        stableTurnId: verified.origin.turnId,
-        dispatchAttempt: verified.origin.dispatchAttempt,
+        stableTurnId: effectiveVerified.origin.turnId,
+        dispatchAttempt: effectiveVerified.origin.dispatchAttempt,
         channel,
         content,
         ...(reason ? { reason } : {}),

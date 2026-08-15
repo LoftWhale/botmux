@@ -256,6 +256,25 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(block).toContain("errorCode: 'not_receiver_session'");
   });
 
+  it('Plan B idle-gap: request-output falls back to the durable receipt when the live managedTurnOrigin was cleared', () => {
+    // A meeting agent reaches idle between the delivery turn (which armed
+    // ds.managedTurnOrigin) and the moment it runs request-output — the origin is
+    // cleared at the delivery turn's terminal edge, so the live-origin gate fails.
+    // The handler must fall back to re-deriving authority from the DURABLE delivery
+    // receipt (evaluateVcMeetingManagedSend) for a claimed delivery origin, which
+    // never authorizes anything the receipt itself wouldn't (attempt match +
+    // dispatched/completed status + active projection + not-silent).
+    const block = region(daemonSource, 'let effectiveVerified = verified;', 'if (!effectiveVerified.ok) return jsonRes');
+    // Fallback only when there is NO live origin and a claimed delivery origin.
+    expect(block).toContain('!ds.managedTurnOrigin');
+    expect(block).toContain('claimedAttempt !== undefined');
+    expect(block).toContain('evaluateVcMeetingManagedSend(config.session.dataDir, {');
+    expect(block).toContain('allowTerminalReceipt: true');
+    // Only a listener_thread durable decision synthesizes the verified origin.
+    expect(block).toContain("durable.ok && durable.kind === 'listener_thread'");
+    expect(block).toContain('dispatchAttempt: claimedAttempt');
+  });
+
   it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {
     const block = region(workerPoolSource, 'export function scheduleCardPatch(', 'if (streamingCardDisabled(ds, turnId)) return;');
     expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
