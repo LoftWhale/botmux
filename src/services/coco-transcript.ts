@@ -20,6 +20,8 @@ import { join } from 'node:path';
 import { cocoCacheRoot } from './coco-paths.js';
 import { scanJsonlFromOffset } from './jsonl-cursor.js';
 import { logger } from '../utils/logger.js';
+import { codexSessionIdFromRolloutPath } from './codex-transcript.js';
+import { drainTraexRollout, findTraexRolloutByPid } from './traex-transcript.js';
 
 const COCO_SESSIONS_ROOT = join(cocoCacheRoot(), 'sessions');
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -80,7 +82,13 @@ export function findCocoSessionByPid(
         const hit = matchCocoSessionPath(target);
         if (hit) return hit;
       }
-      return undefined;
+      // CoCo 0.200+ migrated from ~/.cache/coco/sessions/<sid>/events.jsonl
+      // to the Codex-shaped TRAE rollout store. Fall through to that finder
+      // when the process has no legacy CoCo session fd.
+      const rollout = findTraexRolloutByPid(pid);
+      return rollout
+        ? { sessionId: rollout.cliSessionId, eventsPath: rollout.path }
+        : undefined;
     }
   }
   let out: string;
@@ -98,7 +106,10 @@ export function findCocoSessionByPid(
     const hit = matchCocoSessionPath(target);
     if (hit) return hit;
   }
-  return undefined;
+  const rollout = findTraexRolloutByPid(pid);
+  return rollout
+    ? { sessionId: rollout.cliSessionId, eventsPath: rollout.path }
+    : undefined;
 }
 
 function matchCocoSessionPath(target: string): { sessionId: string; eventsPath: string } | undefined {
@@ -149,6 +160,12 @@ function parseCocoBridgeEvent(path: string, line: string, lineStart: number): Co
 
 /** Increment-read a CoCo events.jsonl from `fromOffset`. */
 export function drainCocoEvents(path: string, fromOffset: number): CocoDrainResult {
+  // CoCo 0.200+ writes Codex-shaped rollout JSONL under ~/.trae/cli/sessions.
+  // Keep the worker-facing API stable and dispatch by the canonical rollout
+  // filename, while legacy CoCo events.jsonl continues through the parser below.
+  if (codexSessionIdFromRolloutPath(path)) {
+    return drainTraexRollout(path, fromOffset);
+  }
   if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
   let size: number;
   try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }

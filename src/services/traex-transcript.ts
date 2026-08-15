@@ -19,6 +19,7 @@ import {
   closeSync,
   existsSync,
   openSync,
+  readFileSync,
   readSync,
   readdirSync,
   readlinkSync,
@@ -34,7 +35,7 @@ import {
   type CodexDrainResult,
   codexSessionIdFromRolloutPath,
 } from './codex-transcript.js';
-import { traeSessionsRoot } from './traex-paths.js';
+import { traeSessionIndexPath, traeSessionsRoot } from './traex-paths.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
 export { extractLastCodexTurn as extractLastTraexTurn };
@@ -239,6 +240,45 @@ export function findTraexRolloutBySessionId(cliSessionId: string): string | unde
         return full;
       }
     }
+  }
+  return undefined;
+}
+
+/** Resolve the newest live native session associated with a CoCo thread name.
+ *
+ * CoCo 0.200+ accepts botmux's UUID through the legacy `--session-id` flag as
+ * the thread name, but allocates a different native session UUID for rollout
+ * storage and `--resume`. The append-only session index is the durable link
+ * between those two ids. Walk newest-first and require an existing rollout so
+ * stale index entries cannot send the CLI into another failed-resume loop. */
+export function findTraexSessionIdByThreadName(threadName: string): string | undefined {
+  if (!threadName) return undefined;
+  const indexPath = traeSessionIndexPath();
+  if (!existsSync(indexPath)) return undefined;
+  let content: string;
+  try {
+    content = readFileSync(indexPath, 'utf8');
+  } catch {
+    return undefined;
+  }
+  const seen = new Set<string>();
+  const lines = content.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!entry || typeof entry !== 'object') continue;
+    const record = entry as { id?: unknown; thread_name?: unknown };
+    if (record.thread_name !== threadName || typeof record.id !== 'string' || seen.has(record.id)) {
+      continue;
+    }
+    seen.add(record.id);
+    if (findTraexRolloutBySessionId(record.id)) return record.id;
   }
   return undefined;
 }

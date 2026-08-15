@@ -127,10 +127,10 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.trae/cli', '~/.cache/coco'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, model, disableCliBypass }) {
+    buildArgs({ sessionId, resumeSessionId, resume, model, disableCliBypass }) {
       const args: string[] = [];
       if (resume) {
-        args.push('--resume', sessionId);
+        args.push('--resume', resumeSessionId ?? sessionId);
       } else {
         args.push('--session-id', sessionId);
       }
@@ -144,8 +144,8 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       return args;
     },
 
-    buildResumeCommand({ sessionId }) {
-      return `coco --resume ${sessionId}`;
+    buildResumeCommand({ sessionId, cliSessionId }) {
+      return `coco --resume ${cliSessionId ?? sessionId}`;
     },
 
     async writeInput(pty: PtyHandle, content: string) {

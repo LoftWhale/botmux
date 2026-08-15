@@ -75,3 +75,36 @@ describe('resolveFileBridgePath (grok)', () => {
     expect(resolveFileBridgePath('grok', { sessionId: 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee', cwd })).toBeUndefined();
   });
 });
+
+describe('resolveFileBridgePath (CoCo 0.200+)', () => {
+  const ROOT = join(tmpdir(), `botmux-coco-fbp-${process.pid}`);
+  const SID = '00000000-0000-7000-8000-000000000006';
+  const previousTraeHome = process.env.TRAE_HOME;
+
+  beforeEach(() => {
+    process.env.TRAE_HOME = ROOT;
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+  afterEach(() => {
+    rmSync(ROOT, { recursive: true, force: true });
+    if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+    else process.env.TRAE_HOME = previousTraeHome;
+  });
+
+  it('resolves the TRAE rollout by native id or its CoCo thread name', () => {
+    const rolloutDir = join(ROOT, 'cli', 'sessions', '2026', '07', '28');
+    mkdirSync(rolloutDir, { recursive: true });
+    const rollout = join(
+      rolloutDir,
+      `rollout-2026-07-28T02-00-00-${SID}.jsonl`,
+    );
+    writeFileSync(rollout, '');
+
+    expect(resolveFileBridgePath('coco', { sessionId: SID })).toBe(rollout);
+    writeFileSync(
+      join(ROOT, 'cli', 'session_index.jsonl'),
+      `${JSON.stringify({ id: SID, thread_name: 'botmux-thread' })}\n`,
+    );
+    expect(resolveFileBridgePath('coco', { sessionId: 'botmux-thread' })).toBe(rollout);
+  });
+});

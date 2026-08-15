@@ -112,7 +112,7 @@ import {
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, type CodexBridgeEvent } from './services/codex-transcript.js';
-import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
+import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexSessionIdByThreadName } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
@@ -2973,7 +2973,16 @@ function codexBridgeStartTimer(): void {
           pid: codexAdoptPendingPid,
         });
         if (path) {
-          if (codexAdoptPendingPid && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex')) {
+          if (
+            lastInitConfig?.cliId === 'coco'
+            || (
+              codexAdoptPendingPid
+              && (
+                lastInitConfig?.cliId === 'codex'
+                || lastInitConfig?.cliId === 'traex'
+              )
+            )
+          ) {
             const discoveredSessionId = codexSessionIdFromRolloutPath(path);
             if (discoveredSessionId) persistCliSessionId(discoveredSessionId);
           }
@@ -5458,10 +5467,18 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
     codexAdoptStartMs = adoptStartMs;
     codexBridgeQueue.setLocalTurns(true, adoptStartMs);
     let eventsPath: string | undefined;
-    if (cfg.cliSessionId) eventsPath = cocoEventsPathForSession(cfg.cliSessionId);
+    if (cfg.cliSessionId) {
+      const legacyEventsPath = cocoEventsPathForSession(cfg.cliSessionId);
+      eventsPath = existsSync(legacyEventsPath)
+        ? legacyEventsPath
+        : findTraexRolloutBySessionId(cfg.cliSessionId);
+    }
     if (!eventsPath && cfg.adoptCliPid) {
       const probed = findCocoSessionByPid(cfg.adoptCliPid);
-      if (probed) eventsPath = probed.eventsPath;
+      if (probed) {
+        eventsPath = probed.eventsPath;
+        persistCliSessionId(probed.sessionId);
+      }
     }
     if (eventsPath) {
       const sessionDir = dirname(eventsPath);
@@ -6288,6 +6305,29 @@ async function spawnCli(
   let effectiveResume = cfg.resume ?? false;
   let effectiveCliSessionId = cfg.cliSessionId;
   let effectiveAdapterSessionId = adapterSessionId;
+  // CoCo 0.200+ treats the legacy --session-id value as a thread name and
+  // creates a separate native UUID. Older sessions created before botmux
+  // learned to persist that UUID have no cliSessionId in the session store.
+  // Recover it from TRAE's durable index before building `--resume`; retain
+  // the deterministic legacy events path when running CoCo 0.120.x.
+  if (
+    cfg.cliId === 'coco'
+    && effectiveResume
+    && !willReattachPersistent
+    && (!effectiveCliSessionId || effectiveCliSessionId === effectiveAdapterSessionId)
+    && !existsSync(cocoEventsPathForSession(effectiveAdapterSessionId))
+  ) {
+    const recoveredCocoSessionId =
+      findTraexSessionIdByThreadName(effectiveAdapterSessionId);
+    if (recoveredCocoSessionId) {
+      effectiveCliSessionId = recoveredCocoSessionId;
+      persistCliSessionId(recoveredCocoSessionId);
+      log(
+        `Recovered CoCo native session id for resume: ` +
+        `${effectiveAdapterSessionId} → ${recoveredCocoSessionId}`,
+      );
+    }
+  }
   // Claude-family transcripts are scoped by cwd. `/cd` keeps the same Botmux /
   // CLI session id, so mirror the newest native transcript into the new cwd's
   // project directory before the adapter probes or launches `--resume`.
@@ -7408,7 +7448,33 @@ async function spawnCli(
     }
   } else if (cfg.cliId === 'coco') {
     const eventsPath = cocoEventsPathForSession(effectiveAdapterSessionId);
-    codexBridgeAttach(eventsPath, effectiveResume ? 'baseline-existing' : 'fresh-empty');
+    const mode = effectiveResume ? 'baseline-existing' : 'fresh-empty';
+    if (existsSync(eventsPath)) {
+      // Legacy CoCo (0.120.x): deterministic events.jsonl keyed by the
+      // botmux-provided session id.
+      codexBridgeAttach(eventsPath, mode);
+    } else {
+      // CoCo 0.200+ ignores the legacy events path and opens a Codex-shaped
+      // TRAE rollout with its own session id. It may already be visible here;
+      // otherwise leave the pid armed for the 1s poller below.
+      const knownRollout = effectiveCliSessionId
+        ? findTraexRolloutBySessionId(effectiveCliSessionId)
+        : undefined;
+      const discovered = !knownRollout && cliPid
+        ? findCocoSessionByPid(cliPid)
+        : undefined;
+      if (knownRollout) {
+        codexBridgeAttach(knownRollout, mode);
+      } else if (discovered) {
+        persistCliSessionId(discovered.sessionId);
+        codexBridgeAttach(discovered.eventsPath, mode);
+      } else if (cliPid) {
+        codexBridgePendingSessionId = effectiveAdapterSessionId;
+        codexAdoptPendingPid = cliPid;
+      } else {
+        codexBridgePendingSessionId = effectiveAdapterSessionId;
+      }
+    }
     codexBridgeStartTimer();
   } else if (cfg.cliId === 'mtr') {
     const mtrSessionId = effectiveCliSessionId ?? mtrSessionIdForBotmuxSession(effectiveAdapterSessionId);

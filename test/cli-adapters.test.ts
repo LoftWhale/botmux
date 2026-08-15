@@ -281,6 +281,18 @@ describe('coco buildArgs', () => {
     expect(args).not.toContain('--session-id');
   });
 
+  it('resume prefers the CLI-native session id when CoCo rotated it', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'botmux-session',
+      resumeSessionId: '019fa3bc-1095-7f63-83e5-92b4f1ce82cb',
+      resume: true,
+    });
+    expect(args.slice(0, 2)).toEqual([
+      '--resume',
+      '019fa3bc-1095-7f63-83e5-92b4f1ce82cb',
+    ]);
+  });
+
   it('disallows plan mode tools', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false });
     // CoCo uses repeated --disallowed-tool flags
@@ -1515,8 +1527,12 @@ describe('buildResumeCommand', () => {
       .toBe('aiden --resume sess-aiden');
   });
 
-  it('coco uses botmux sessionId', () => {
+  it('coco prefers cliSessionId and falls back to botmux sessionId', () => {
     const a = createCocoAdapter('/bin/coco');
+    expect(a.buildResumeCommand?.({
+      sessionId: 'sess-coco',
+      cliSessionId: '019fa3bc-1095-7f63-83e5-92b4f1ce82cb',
+    })).toBe('coco --resume 019fa3bc-1095-7f63-83e5-92b4f1ce82cb');
     expect(a.buildResumeCommand?.({ sessionId: 'sess-coco' }))
       .toBe('coco --resume sess-coco');
   });

@@ -10,7 +10,11 @@
  */
 import { existsSync } from 'node:fs';
 import { findCodexRolloutByPid, findCodexRolloutBySessionId } from './codex-transcript.js';
-import { findTraexRolloutByPid, findTraexRolloutBySessionId } from './traex-transcript.js';
+import {
+  findTraexRolloutByPid,
+  findTraexRolloutBySessionId,
+  findTraexSessionIdByThreadName,
+} from './traex-transcript.js';
 import { cocoEventsPathForSession, findCocoSessionByPid } from './coco-transcript.js';
 import { findPiTranscriptByPid, findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokSessionByPid, findGrokUpdatesBySessionId } from './grok-transcript.js';
@@ -44,7 +48,13 @@ function resolveBySessionId(cliId: string, sessionId: string, cwd?: string): str
   switch (cliId) {
     case 'coco': {
       const p = cocoEventsPathForSession(sessionId);
-      return existsSync(p) ? p : undefined;
+      if (existsSync(p)) return p;
+      const directRollout = findTraexRolloutBySessionId(sessionId);
+      if (directRollout) return directRollout;
+      const indexedSessionId = findTraexSessionIdByThreadName(sessionId);
+      return indexedSessionId
+        ? findTraexRolloutBySessionId(indexedSessionId)
+        : undefined;
     }
     case 'pi':
       return findPiTranscriptBySessionId(sessionId, cwd);

@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import {
   drainTraexRollout,
+  findTraexSessionIdByThreadName,
   traexRolloutHasUserInputSince,
 } from '../src/services/traex-transcript.js';
 
@@ -183,5 +184,34 @@ describe('traexRolloutHasUserInputSince', () => {
     expect(traexRolloutHasUserInputSince(path, baseline, 'same thread, later prompt')).toBe(true);
     expect(traexRolloutHasUserInputSince(path, baseline, 'same thread, old prompt')).toBe(false);
     expect(traexRolloutHasUserInputSince(path, baseline, 'same thread')).toBe(false);
+  });
+});
+
+describe('findTraexSessionIdByThreadName', () => {
+  it('returns the newest indexed native session whose rollout still exists', () => {
+    const previousTraeHome = process.env.TRAE_HOME;
+    process.env.TRAE_HOME = dir;
+    try {
+      const older = '00000000-0000-7000-8000-000000000002';
+      const latest = '00000000-0000-7000-8000-000000000003';
+      const missing = '00000000-0000-7000-8000-000000000004';
+      const rolloutDir = join(dir, 'cli', 'sessions', '2026', '07', '28');
+      mkdirSync(rolloutDir, { recursive: true });
+      writeFileSync(join(rolloutDir, `rollout-2026-07-28T00-00-00-${older}.jsonl`), '');
+      writeFileSync(join(rolloutDir, `rollout-2026-07-28T01-00-00-${latest}.jsonl`), '');
+      writeFileSync(join(dir, 'cli', 'session_index.jsonl'), [
+        line({ id: older, thread_name: 'botmux-thread', updated_at: '2026-07-28T00:00:00Z' }),
+        '{malformed\n',
+        line({ id: latest, thread_name: 'botmux-thread', updated_at: '2026-07-28T01:00:00Z' }),
+        line({ id: missing, thread_name: 'botmux-thread', updated_at: '2026-07-28T02:00:00Z' }),
+        line({ id: '00000000-0000-7000-8000-000000000005', thread_name: 'other-thread' }),
+      ].join(''));
+
+      expect(findTraexSessionIdByThreadName('botmux-thread')).toBe(latest);
+      expect(findTraexSessionIdByThreadName('unknown-thread')).toBeUndefined();
+    } finally {
+      if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousTraeHome;
+    }
   });
 });

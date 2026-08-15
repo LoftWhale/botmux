@@ -21,6 +21,12 @@ export function traeStateDbPath(): string {
   return join(traeHome(), 'cli', 'state_5.sqlite');
 }
 
+/** Append-only mapping maintained by TRAE/CoCo from native session id to the
+ *  user-visible thread name supplied through CoCo's legacy --session-id flag. */
+export function traeSessionIndexPath(): string {
+  return join(traeHome(), 'cli', 'session_index.jsonl');
+}
+
 /** Per-session rollout JSONL files live under dates here, e.g.
  *  sessions/2026/06/04/rollout-<timestamp>-<uuid>.jsonl. The threads table
  *  stores the absolute path per session. */

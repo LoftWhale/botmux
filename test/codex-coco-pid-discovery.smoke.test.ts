@@ -18,11 +18,13 @@ import { findCocoSessionByPid } from '../src/services/coco-transcript.js';
 
 const CODEX_SID = '019dd80d-d922-7a11-8339-0208d8c5b4ec';
 const COCO_SID = '8db7d911-96f3-4764-a310-e42ae4cb626f';
+const MODERN_COCO_SID = '019f63d2-9f37-7673-a304-1ad4062e667b';
 
 let dir: string;
 let codexRollout: string;
 let cocoSessionLog: string;
 let child: ChildProcessWithoutNullStreams;
+let modernCocoChild: ChildProcessWithoutNullStreams;
 
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), 'bmx-pid-disc-'));
@@ -38,6 +40,18 @@ beforeAll(async () => {
   mkdirSync(cocoDir, { recursive: true });
   cocoSessionLog = join(cocoDir, 'session.log');
   writeFileSync(cocoSessionLog, '');
+
+  // CoCo 0.200+ migrated to the TRAE/Codex rollout store and no longer opens
+  // ~/.cache/coco/sessions/<sid> files. Keep a second process with only that
+  // modern rollout open so discovery cannot accidentally pass via the legacy
+  // session.log fd above.
+  const modernCocoDir = join(dir, '.trae', 'cli', 'sessions', '2026', '07', '15');
+  mkdirSync(modernCocoDir, { recursive: true });
+  const modernCocoRollout = join(
+    modernCocoDir,
+    `rollout-2026-07-15T11-29-35-${MODERN_COCO_SID}.jsonl`,
+  );
+  writeFileSync(modernCocoRollout, '');
 
   child = spawn(
     process.execPath,
@@ -63,10 +77,35 @@ beforeAll(async () => {
     });
     child.once('error', reject);
   });
+
+  modernCocoChild = spawn(
+    process.execPath,
+    [
+      '-e',
+      `
+        const fs = require('fs');
+        fs.openSync(${JSON.stringify(modernCocoRollout)}, 'a');
+        process.stdout.write('ready\\n');
+        setTimeout(() => {}, 60000);
+      `,
+    ],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  ) as ChildProcessWithoutNullStreams;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('modern coco child not ready in 5s')), 5000);
+    modernCocoChild.stdout.once('data', (buf: Buffer) => {
+      if (buf.toString().includes('ready')) {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    modernCocoChild.once('error', reject);
+  });
 });
 
 afterAll(() => {
   if (child && !child.killed) child.kill('SIGKILL');
+  if (modernCocoChild && !modernCocoChild.killed) modernCocoChild.kill('SIGKILL');
   if (dir) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -101,6 +140,13 @@ describe('findCocoSessionByPid', () => {
     // vs Linux .cache）都接受。
     const tail = `coco/sessions/${COCO_SID}/events.jsonl`;
     expect(hit!.eventsPath.endsWith(tail)).toBe(true);
+  });
+
+  it('locates a CoCo 0.200+ TRAE rollout when legacy session files are absent', () => {
+    const hit = findCocoSessionByPid(modernCocoChild.pid!);
+    expect(hit).toBeDefined();
+    expect(hit!.sessionId).toBe(MODERN_COCO_SID);
+    expect(hit!.eventsPath.endsWith(`-${MODERN_COCO_SID}.jsonl`)).toBe(true);
   });
 
   it('returns undefined for a non-existent pid', () => {

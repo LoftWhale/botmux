@@ -54,6 +54,40 @@ describe('drainCocoEvents', () => {
     ]);
   });
 
+  it('drains CoCo 0.200+ Codex-shaped rollout events', () => {
+    path = join(
+      dir,
+      'rollout-2026-07-15T11-29-35-019f63d2-9f37-7673-a304-1ad4062e667b.jsonl',
+    );
+    writeFileSync(path, [
+      line({
+        timestamp: '2026-07-15T03:29:35.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '归因这个报警' }],
+        },
+      }),
+      line({
+        timestamp: '2026-07-15T03:30:35.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: '00000000-0000-7000-8000-000000000010',
+          last_agent_message: '归因完成',
+        },
+      }),
+    ].join(''));
+
+    const r = drainCocoEvents(path, 0);
+
+    expect(r.events.map(e => [e.kind, e.text])).toEqual([
+      ['user', '归因这个报警'],
+      ['assistant_final', '归因完成'],
+    ]);
+  });
+
   it('skips injected user system reminders', () => {
     writeFileSync(path,
       line(userMsg('<system-reminder>ignore</system-reminder>', { is_additional_context_input: true })) +
