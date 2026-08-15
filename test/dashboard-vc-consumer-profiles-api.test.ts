@@ -311,9 +311,18 @@ function makeDeps(over: Partial<VcMeetingConsumerProfilesApiDeps> = {}): VcMeeti
     managedSideEffectEligible: vi.fn(() => true),
     sandboxIsolated: vi.fn(() => true),
     reloadDaemons: vi.fn(async () => {}),
+    applyBotOutputPolicy: vi.fn(async () => ({ ok: true })),
     ...over,
   };
 }
+
+const DEFAULT_POLICY_FIELDS = {
+  textOutputPolicy: null,
+  voiceOutputPolicy: null,
+  realtimeVoiceEnabled: false,
+  effectiveTextOutputPolicy: 'allow',
+  effectiveVoiceOutputPolicy: 'deny',
+} as const;
 
 function putRequest(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -338,6 +347,7 @@ describe('buildVcMeetingAgentOptions', () => {
       reliableTurnTerminal: true,
       managedSideEffectEligible: true,
       sandboxIsolated: true,
+      ...DEFAULT_POLICY_FIELDS,
     }]);
   });
 
@@ -358,6 +368,7 @@ describe('buildVcMeetingAgentOptions', () => {
       reliableTurnTerminal: false,
       managedSideEffectEligible: true,
       sandboxIsolated: true,
+      ...DEFAULT_POLICY_FIELDS,
     }]);
   });
 
@@ -523,7 +534,7 @@ describe('handleVcMeetingConsumerProfilesGet', () => {
       templates: [
         { templateId: 'important-information-sync', version: 1, source: 'builtin' },
         { templateId: 'meeting-minutes', version: 2, source: 'builtin' },
-        { templateId: 'meeting-facilitator', version: 1, source: 'builtin' },
+        { templateId: 'meeting-facilitator', version: 2, source: 'builtin' },
         { templateId: 'solution-review-risk-challenge', version: 1, source: 'builtin' },
         { templateId: 'interview-requirement-insights', version: 1, source: 'builtin' },
       ],
@@ -640,5 +651,82 @@ describe('handleVcMeetingConsumerProfilesPut', () => {
     const deps = makeDeps({ reloadDaemons: vi.fn(async () => { throw new Error('ipc down'); }) });
     const out = await handleVcMeetingConsumerProfilesPut(putRequest(), deps);
     expect(out.status).toBe(200);
+  });
+
+  it('applies per-bot output-policy patches through the locked RMW dep and widens the reload set', async () => {
+    const deps = makeDeps();
+    const out = await handleVcMeetingConsumerProfilesPut(putRequest({
+      botOutputPolicies: [{
+        appId: 'app_agent',
+        textOutputPolicy: 'approval',
+        voiceOutputPolicy: null,
+        realtimeVoiceEnabled: true,
+      }],
+    }), deps);
+    expect(out.status).toBe(200);
+    expect(deps.applyBotOutputPolicy).toHaveBeenCalledWith({
+      appId: 'app_agent',
+      textOutputPolicy: 'approval',
+      voiceOutputPolicy: null,
+      realtimeVoiceEnabled: true,
+    });
+    expect(deps.reloadDaemons).toHaveBeenCalledWith(['app_listener', 'app_agent']);
+  });
+
+  it('422 rejects unknown appId / bad policy values in botOutputPolicies before writing anything', async () => {
+    const deps = makeDeps();
+    const out = await handleVcMeetingConsumerProfilesPut(putRequest({
+      botOutputPolicies: [
+        { appId: 'app_ghost', textOutputPolicy: 'allow', voiceOutputPolicy: null, realtimeVoiceEnabled: false },
+        { appId: 'app_agent', textOutputPolicy: 'shout', voiceOutputPolicy: null, realtimeVoiceEnabled: false },
+      ],
+    }), deps);
+    expect(out.status).toBe(422);
+    if (out.status !== 422) return;
+    expect(out.body.fieldErrors?.map(err => err.path)).toEqual([
+      'botOutputPolicies[0].appId',
+      'botOutputPolicies[1].textOutputPolicy',
+    ]);
+    expect(deps.updateSnapshot).not.toHaveBeenCalled();
+    expect(deps.applyBotOutputPolicy).not.toHaveBeenCalled();
+  });
+
+  it('503 bot_policy_write_failed when the locked RMW write fails (snapshot already committed, UI re-GETs)', async () => {
+    const deps = makeDeps({
+      applyBotOutputPolicy: vi.fn(async () => ({ ok: false, reason: 'bot_not_in_config' })),
+    });
+    const out = await handleVcMeetingConsumerProfilesPut(putRequest({
+      botOutputPolicies: [{
+        appId: 'app_agent',
+        textOutputPolicy: null,
+        voiceOutputPolicy: 'deny',
+        realtimeVoiceEnabled: false,
+      }],
+    }), deps);
+    expect(out.status).toBe(503);
+    if (out.status !== 503) return;
+    expect(out.body.error).toBe('bot_policy_write_failed');
+    // Reload still ran so daemons converge on whatever actually landed.
+    expect(deps.reloadDaemons).toHaveBeenCalledWith(['app_listener', 'app_agent']);
+  });
+
+  it('agent options expose configured + effective output policies (voice deny until realtimeVoice)', () => {
+    const bot = {
+      larkAppId: 'app_agent',
+      cliId: 'claude',
+      vcMeetingAgent: {
+        meetingConsumer: { textOutputPolicy: 'approval' },
+        realtimeVoice: { enabled: true },
+      },
+    } as unknown as BotConfig;
+    const deps = makeDeps({ loadBotConfigs: vi.fn(() => [bot]) });
+    const [option] = buildVcMeetingAgentOptions(deps);
+    expect(option).toMatchObject({
+      textOutputPolicy: 'approval',
+      voiceOutputPolicy: null,
+      realtimeVoiceEnabled: true,
+      effectiveTextOutputPolicy: 'approval',
+      effectiveVoiceOutputPolicy: 'allow',
+    });
   });
 });

@@ -48,6 +48,40 @@ interface DraftProfile extends VcMeetingConsumerProfileDto {
   isNew: boolean;
 }
 
+type OutputPolicyValue = 'allow' | 'approval' | 'deny';
+
+interface BotPolicyDraft {
+  appId: string;
+  label: string;
+  online: boolean;
+  textOutputPolicy: OutputPolicyValue | null;
+  voiceOutputPolicy: OutputPolicyValue | null;
+  realtimeVoiceEnabled: boolean;
+  /** Serialized loaded state — save only submits rows whose current values differ. */
+  baseline: string;
+}
+
+function policyBaseline(text: OutputPolicyValue | null, voice: OutputPolicyValue | null, rtv: boolean): string {
+  return `${text ?? ''}|${voice ?? ''}|${rtv ? '1' : '0'}`;
+}
+
+function toBotPolicyDrafts(agentOptions: VcMeetingAgentOptionDto[]): BotPolicyDraft[] {
+  return agentOptions.map(agent => {
+    const text = agent.textOutputPolicy ?? null;
+    const voice = agent.voiceOutputPolicy ?? null;
+    const rtv = agent.realtimeVoiceEnabled === true;
+    return {
+      appId: agent.appId,
+      label: agent.label || agent.appId,
+      online: agent.online,
+      textOutputPolicy: text,
+      voiceOutputPolicy: voice,
+      realtimeVoiceEnabled: rtv,
+      baseline: policyBaseline(text, voice, rtv),
+    };
+  });
+}
+
 interface CatalogState {
   /** 本 catalog 属于哪个 listener bot：save 用它而非当前下拉值，防跨 bot 写入。 */
   forBot: string;
@@ -57,6 +91,7 @@ interface CatalogState {
   defaultConsumerIds: string[];
   profiles: DraftProfile[];
   agentOptions: VcMeetingAgentOptionDto[];
+  botPolicies: BotPolicyDraft[];
   templateCatalog: VcMeetingConsumerProfileTemplateCatalog;
   migrationOffer?: 'enable_seeded_minutes_default';
 }
@@ -247,6 +282,7 @@ export function VcConsumerProfilesSection(props: {
           defaultConsumerIds: Array.isArray(body.defaultConsumerIds) ? body.defaultConsumerIds : [],
           profiles: (Array.isArray(body.profiles) ? body.profiles : []).map(toDraft),
           agentOptions: Array.isArray(body.agentOptions) ? body.agentOptions : [],
+          botPolicies: toBotPolicyDrafts(Array.isArray(body.agentOptions) ? body.agentOptions : []),
           templateCatalog: body.templateCatalog?.schemaVersion === 1
             && Array.isArray(body.templateCatalog.templates)
             ? body.templateCatalog
@@ -316,6 +352,14 @@ export function VcConsumerProfilesSection(props: {
           defaultMode: catalog.defaultMode,
           defaultConsumerIds: catalog.defaultConsumerIds,
           profiles: catalog.profiles.map(toDto),
+          botOutputPolicies: catalog.botPolicies
+            .filter(row => policyBaseline(row.textOutputPolicy, row.voiceOutputPolicy, row.realtimeVoiceEnabled) !== row.baseline)
+            .map(row => ({
+              appId: row.appId,
+              textOutputPolicy: row.textOutputPolicy,
+              voiceOutputPolicy: row.voiceOutputPolicy,
+              realtimeVoiceEnabled: row.realtimeVoiceEnabled,
+            })),
         }),
       });
       const body = await r.json().catch(() => ({}));
@@ -352,6 +396,7 @@ export function VcConsumerProfilesSection(props: {
         defaultConsumerIds: Array.isArray(body.defaultConsumerIds) ? body.defaultConsumerIds : [],
         profiles: (Array.isArray(body.profiles) ? body.profiles : []).map(toDraft),
         agentOptions: Array.isArray(body.agentOptions) ? body.agentOptions : [],
+        botPolicies: toBotPolicyDrafts(Array.isArray(body.agentOptions) ? body.agentOptions : []),
         templateCatalog: body.templateCatalog?.schemaVersion === 1
           && Array.isArray(body.templateCatalog.templates)
           ? body.templateCatalog
@@ -369,6 +414,17 @@ export function VcConsumerProfilesSection(props: {
       if (mountedRef.current) setSaving(false);
     }
   }, [catalog, saving, targetBot, tr]);
+
+  const updateBotPolicy = useCallback((appId: string, patch: Partial<Pick<BotPolicyDraft, 'textOutputPolicy' | 'voiceOutputPolicy' | 'realtimeVoiceEnabled'>>) => {
+    setCatalog(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        botPolicies: prev.botPolicies.map(row => (row.appId === appId ? { ...row, ...patch } : row)),
+      };
+    });
+    setDirty(true);
+  }, []);
 
   const botOptions = useMemo(() => options.map(bot => ({
     value: bot.larkAppId,
@@ -703,6 +759,78 @@ export function VcConsumerProfilesSection(props: {
               </div>
             </section>
           ) : null}
+          <section className="vc-profile-library-section vc-bot-policy-section">
+            <div className="vc-profile-list-heading">
+              <div>
+                <strong>{tr('settings.vcProfiles.botPolicies.title')}</strong>
+                <p>{tr('settings.vcProfiles.botPolicies.help')}</p>
+              </div>
+            </div>
+            <div className="vc-bot-policy-table" style={{ maxHeight: 320, overflowY: 'auto' }}>
+              {[...catalog.botPolicies]
+                .sort((a, b) => {
+                  const aConfigured = a.textOutputPolicy !== null || a.voiceOutputPolicy !== null || a.realtimeVoiceEnabled;
+                  const bConfigured = b.textOutputPolicy !== null || b.voiceOutputPolicy !== null || b.realtimeVoiceEnabled;
+                  if (aConfigured !== bConfigured) return aConfigured ? -1 : 1;
+                  if (a.online !== b.online) return a.online ? -1 : 1;
+                  return a.label.localeCompare(b.label);
+                })
+                .map(row => {
+                  const effectiveText = row.textOutputPolicy ?? 'allow';
+                  const effectiveVoice = !row.realtimeVoiceEnabled ? 'deny' : (row.voiceOutputPolicy ?? 'allow');
+                  const policyLabel = (value: OutputPolicyValue): string => tr(`settings.vcProfiles.botPolicies.${value}`);
+                  const renderSelect = (
+                    field: 'textOutputPolicy' | 'voiceOutputPolicy',
+                    value: OutputPolicyValue | null,
+                  ): React.JSX.Element => (
+                    <select
+                      className="vc-bot-policy-select"
+                      value={value ?? 'default'}
+                      disabled={!props.canWrite || saving || loading}
+                      onChange={(event) => {
+                        const raw = event.target.value;
+                        updateBotPolicy(row.appId, {
+                          [field]: raw === 'default' ? null : (raw as OutputPolicyValue),
+                        });
+                      }}
+                    >
+                      <option value="default">{tr('settings.vcProfiles.botPolicies.default')}</option>
+                      <option value="allow">{policyLabel('allow')}</option>
+                      <option value="approval">{policyLabel('approval')}</option>
+                      <option value="deny">{policyLabel('deny')}</option>
+                    </select>
+                  );
+                  return (
+                    <div key={row.appId} className="vc-bot-policy-row">
+                      <span className="vc-bot-policy-name" title={row.appId}>
+                        {row.online ? '' : '⚪ '}{row.label}
+                      </span>
+                      <label className="vc-bot-policy-cell">
+                        <span>{tr('settings.vcProfiles.botPolicies.text')}</span>
+                        {renderSelect('textOutputPolicy', row.textOutputPolicy)}
+                      </label>
+                      <label className="vc-bot-policy-cell">
+                        <span>{tr('settings.vcProfiles.botPolicies.voice')}</span>
+                        {renderSelect('voiceOutputPolicy', row.voiceOutputPolicy)}
+                      </label>
+                      <label className="vc-bot-policy-cell vc-bot-policy-rtv">
+                        <input
+                          type="checkbox"
+                          checked={row.realtimeVoiceEnabled}
+                          disabled={!props.canWrite || saving || loading}
+                          onChange={(event) => updateBotPolicy(row.appId, { realtimeVoiceEnabled: event.target.checked })}
+                        />
+                        <span>{tr('settings.vcProfiles.botPolicies.realtimeVoice')}</span>
+                      </label>
+                      <span className="vc-bot-policy-effective hint">
+                        {tr('settings.vcProfiles.botPolicies.effective')}
+                        {' '}{policyLabel(effectiveText)} / {policyLabel(effectiveVoice)}
+                      </span>
+                    </div>
+                  );
+                })}
+            </div>
+          </section>
           <div className="settings-field-row vc-profile-default-mode-row">
             <FieldTitle help={tr('settings.vcProfiles.defaultModeHelp')}>{tr('settings.vcProfiles.defaultMode')}</FieldTitle>
             <DropdownMenu

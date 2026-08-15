@@ -58,6 +58,26 @@ export interface VcMeetingAgentOptionDto {
   /** Is the managed sandbox boundary actually in force? false ⇒ the bot's Lark
    *  credential is exposed to untrusted meeting input (informed opt-out). */
   sandboxIsolated: boolean;
+  /** Configured per-bot in-meeting output policies (bots.json
+   *  vcMeetingAgent.meetingConsumer.*). null = unset → daemon default. */
+  textOutputPolicy: VcMeetingOutputPolicyValue | null;
+  voiceOutputPolicy: VcMeetingOutputPolicyValue | null;
+  /** vcMeetingAgent.realtimeVoice.enabled — hard gate for in-meeting voice. */
+  realtimeVoiceEnabled: boolean;
+  /** Effective values after daemon defaults (kept in sync with
+   *  defaultVcMeetingTextOutputPolicy / defaultVcMeetingVoiceOutputPolicy). */
+  effectiveTextOutputPolicy: VcMeetingOutputPolicyValue;
+  effectiveVoiceOutputPolicy: VcMeetingOutputPolicyValue;
+}
+
+export type VcMeetingOutputPolicyValue = 'allow' | 'approval' | 'deny';
+
+export interface VcMeetingBotOutputPolicyPatch {
+  appId: string;
+  /** null clears the override back to the daemon default. */
+  textOutputPolicy: VcMeetingOutputPolicyValue | null;
+  voiceOutputPolicy: VcMeetingOutputPolicyValue | null;
+  realtimeVoiceEnabled: boolean;
 }
 
 export interface VcMeetingConsumerProfilesGetBody {
@@ -80,6 +100,9 @@ export interface VcMeetingConsumerProfilesPutRequest {
   defaultMode: 'listenOnly' | 'agents';
   defaultConsumerIds: string[];
   profiles: VcMeetingConsumerProfileDto[];
+  /** Optional per-bot output-policy patches applied to bots.json via the
+   *  locked read-modify-write path after the snapshot update succeeds. */
+  botOutputPolicies?: VcMeetingBotOutputPolicyPatch[];
 }
 
 export type VcMeetingConsumerProfilesApiResult =
@@ -111,6 +134,9 @@ export interface VcMeetingConsumerProfilesApiDeps {
   sandboxIsolated(bot: BotConfig): boolean;
   /** Called after a successful PUT so the live daemon reloads the new catalog. */
   reloadDaemons(appIds: string[]): Promise<void>;
+  /** Locked read-modify-write of one bot's in-meeting output policies in
+   *  bots.json (vcMeetingAgent.meetingConsumer.* + realtimeVoice.enabled). */
+  applyBotOutputPolicy(patch: VcMeetingBotOutputPolicyPatch): Promise<{ ok: boolean; reason?: string }>;
 }
 
 const VC_MEETING_OUTPUT_CAPABILITY = 'meeting.output.request';
@@ -325,6 +351,10 @@ export function buildVcMeetingAgentOptions(
     } catch {
       workingDirReady = false;
     }
+    const vc = bot.vcMeetingAgent;
+    const textOutputPolicy = normalizeOutputPolicy(vc?.meetingConsumer?.textOutputPolicy);
+    const voiceOutputPolicy = normalizeOutputPolicy(vc?.meetingConsumer?.voiceOutputPolicy);
+    const realtimeVoiceEnabled = vc?.realtimeVoice?.enabled === true;
     return {
       appId: bot.larkAppId,
       label: bot.displayName || deps.onlineBotName(bot.larkAppId) || bot.name || bot.larkAppId,
@@ -334,8 +364,70 @@ export function buildVcMeetingAgentOptions(
       reliableTurnTerminal: deps.adapterReliableTurnTerminal(bot.cliId, bot.cliPathOverride),
       managedSideEffectEligible: deps.managedSideEffectEligible(bot),
       sandboxIsolated: deps.sandboxIsolated(bot),
+      textOutputPolicy,
+      voiceOutputPolicy,
+      realtimeVoiceEnabled,
+      // Mirrors daemon defaultVcMeetingTextOutputPolicy / defaultVcMeetingVoiceOutputPolicy.
+      effectiveTextOutputPolicy: textOutputPolicy ?? 'allow',
+      effectiveVoiceOutputPolicy: !realtimeVoiceEnabled ? 'deny' : (voiceOutputPolicy ?? 'allow'),
     };
   }).sort((a, b) => (a.appId === b.appId ? 0 : a.appId < b.appId ? -1 : 1));
+}
+
+function normalizeOutputPolicy(value: unknown): VcMeetingOutputPolicyValue | null {
+  return value === 'allow' || value === 'approval' || value === 'deny' ? value : null;
+}
+
+function parseBotOutputPolicyPatches(
+  raw: unknown,
+  knownAppIds: ReadonlySet<string>,
+): { ok: true; patches: VcMeetingBotOutputPolicyPatch[] } | { ok: false; fieldErrors: VcMeetingConsumerProfileFieldError[] } {
+  if (raw === undefined) return { ok: true, patches: [] };
+  if (!Array.isArray(raw)) {
+    return { ok: false, fieldErrors: [{ path: 'botOutputPolicies', message: 'botOutputPolicies 必须是数组' }] };
+  }
+  const fieldErrors: VcMeetingConsumerProfileFieldError[] = [];
+  const patches: VcMeetingBotOutputPolicyPatch[] = [];
+  const seen = new Set<string>();
+  raw.forEach((item, index) => {
+    const path = (field: string): string => `botOutputPolicies[${index}].${field}`;
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      fieldErrors.push({ path: `botOutputPolicies[${index}]`, message: '必须是对象' });
+      return;
+    }
+    const record = item as Record<string, unknown>;
+    const appId = typeof record.appId === 'string' ? record.appId.trim() : '';
+    if (!appId || !knownAppIds.has(appId)) {
+      fieldErrors.push({ path: path('appId'), message: '未知的 bot appId' });
+      return;
+    }
+    if (seen.has(appId)) {
+      fieldErrors.push({ path: path('appId'), message: '同一 bot 重复出现' });
+      return;
+    }
+    seen.add(appId);
+    const parsePolicy = (field: 'textOutputPolicy' | 'voiceOutputPolicy'): VcMeetingOutputPolicyValue | null | undefined => {
+      const value = record[field];
+      if (value === null) return null;
+      if (value === 'allow' || value === 'approval' || value === 'deny') return value;
+      fieldErrors.push({ path: path(field), message: '必须是 allow/approval/deny 或 null' });
+      return undefined;
+    };
+    const textOutputPolicy = parsePolicy('textOutputPolicy');
+    const voiceOutputPolicy = parsePolicy('voiceOutputPolicy');
+    if (typeof record.realtimeVoiceEnabled !== 'boolean') {
+      fieldErrors.push({ path: path('realtimeVoiceEnabled'), message: '必须是布尔值' });
+      return;
+    }
+    if (textOutputPolicy === undefined || voiceOutputPolicy === undefined) return;
+    patches.push({
+      appId,
+      textOutputPolicy,
+      voiceOutputPolicy,
+      realtimeVoiceEnabled: record.realtimeVoiceEnabled,
+    });
+  });
+  return fieldErrors.length > 0 ? { ok: false, fieldErrors } : { ok: true, patches };
 }
 
 function snapshotBody(
@@ -439,6 +531,20 @@ export async function handleVcMeetingConsumerProfilesPut(
     };
   }
 
+  let knownAppIds: ReadonlySet<string>;
+  try {
+    knownAppIds = new Set(deps.loadBotConfigs().map(bot => bot.larkAppId));
+  } catch {
+    knownAppIds = new Set();
+  }
+  const parsedPolicies = parseBotOutputPolicyPatches(request.botOutputPolicies, knownAppIds);
+  if (!parsedPolicies.ok) {
+    return {
+      status: 422,
+      body: { ok: false, error: 'validation_failed', fieldErrors: parsedPolicies.fieldErrors },
+    };
+  }
+
   // defaultConsumerIds 原样提交：未知/重复/agents-空组合由 store 严格拒绝，
   // 本层不做静默过滤（与 store 的 fail-loud 语义保持一致）。
   const updated = await deps.updateSnapshot(listenerBotAppId, {
@@ -467,10 +573,37 @@ export async function handleVcMeetingConsumerProfilesPut(
     return { status: 503, body: { ok: false, error: 'config_unavailable' } };
   }
 
+  // Per-bot output policies go to bots.json through the locked RMW path. The
+  // snapshot is already committed at this point; a policy failure is surfaced
+  // loudly (503) so the UI re-GETs and shows what actually landed.
+  const policyFailures: VcMeetingConsumerProfileFieldError[] = [];
+  for (const patch of parsedPolicies.patches) {
+    try {
+      const applied = await deps.applyBotOutputPolicy(patch);
+      if (!applied.ok) {
+        policyFailures.push({
+          path: `botOutputPolicies[${patch.appId}]`,
+          message: applied.reason ?? 'write_failed',
+        });
+      }
+    } catch (err) {
+      policyFailures.push({
+        path: `botOutputPolicies[${patch.appId}]`,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   try {
-    await deps.reloadDaemons([listenerBotAppId]);
+    await deps.reloadDaemons([listenerBotAppId, ...parsedPolicies.patches.map(patch => patch.appId)]);
   } catch {
     // 配置已落盘；reload 失败只影响热加载时效，下次 daemon 重启/重载自然收敛。
+  }
+  if (policyFailures.length > 0) {
+    return {
+      status: 503,
+      body: { ok: false, error: 'bot_policy_write_failed', fieldErrors: policyFailures },
+    };
   }
   return { status: 200, body: snapshotBody(updated.snapshot, buildVcMeetingAgentOptions(deps)) };
 }

@@ -27642,3 +27642,19 @@ button.skills-issue-badge:hover {
 .feedback-more { margin-top: 12px; }
 @media (max-width: 1100px) { .feedback-kpis { grid-template-columns: repeat(3, 1fr); } .feedback-deliveries > div { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 700px) { .feedback-kpis, .feedback-grid { grid-template-columns: 1fr; } }
+
+/* ── VC per-bot in-meeting output policy table ─────────────────────────── */
+.vc-bot-policy-table { display: flex; flex-direction: column; gap: 2px; }
+.vc-bot-policy-row {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 6px 8px; border-radius: 6px;
+}
+.vc-bot-policy-row:nth-child(odd) { background: color-mix(in srgb, currentColor 4%, transparent); }
+.vc-bot-policy-name {
+  flex: 1 1 160px; min-width: 140px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; font-weight: 500;
+}
+.vc-bot-policy-cell { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; opacity: .92; }
+.vc-bot-policy-select { font-size: 12px; padding: 2px 6px; border-radius: 4px; }
+.vc-bot-policy-rtv input { accent-color: var(--accent, #4c8dff); }
+.vc-bot-policy-effective { font-size: 11px; white-space: nowrap; }

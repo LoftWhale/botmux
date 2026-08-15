@@ -174,7 +174,7 @@ import {
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
 import { generateAuthUrl, handleCallbackUrl, isCallbackUrl } from './utils/user-token.js';
-import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
+import { findEntryIndex, readRawConfig, requireConfigPath, rmwBotEntry, writeRawConfigAtomic } from './services/config-store.js';
 import {
   emitCodexNotifierOutboxItem,
   installCodexNotifierHook,
@@ -874,6 +874,37 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
       return decision.ok && decision.isolated;
     },
     reloadDaemons: reloadVcMeetingBotConfigOnDaemons,
+    applyBotOutputPolicy: async (patch) => {
+      const res = await rmwBotEntry(patch.appId, (entry) => {
+        const vc = (entry.vcMeetingAgent && typeof entry.vcMeetingAgent === 'object' && !Array.isArray(entry.vcMeetingAgent))
+          ? entry.vcMeetingAgent
+          : {};
+        const consumer = (vc.meetingConsumer && typeof vc.meetingConsumer === 'object' && !Array.isArray(vc.meetingConsumer))
+          ? vc.meetingConsumer
+          : {};
+        if (patch.textOutputPolicy === null) delete consumer.textOutputPolicy;
+        else consumer.textOutputPolicy = patch.textOutputPolicy;
+        if (patch.voiceOutputPolicy === null) delete consumer.voiceOutputPolicy;
+        else consumer.voiceOutputPolicy = patch.voiceOutputPolicy;
+        if (Object.keys(consumer).length > 0) vc.meetingConsumer = consumer;
+        else delete vc.meetingConsumer;
+        const rtv = (vc.realtimeVoice && typeof vc.realtimeVoice === 'object' && !Array.isArray(vc.realtimeVoice))
+          ? vc.realtimeVoice
+          : {};
+        if (patch.realtimeVoiceEnabled) {
+          rtv.enabled = true;
+          vc.realtimeVoice = rtv;
+        } else if (Object.keys(rtv).length > 0) {
+          // Preserve other realtimeVoice settings (endpoints etc.); only flip
+          // the gate off instead of deleting operator-entered configuration.
+          rtv.enabled = false;
+          vc.realtimeVoice = rtv;
+        }
+        entry.vcMeetingAgent = vc;
+        return { write: true, result: undefined };
+      });
+      return res.ok ? { ok: true } : { ok: false, reason: res.reason };
+    },
   };
 }
 
