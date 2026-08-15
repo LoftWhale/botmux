@@ -333,30 +333,46 @@ export function bytecloudKeychainCandidates(
   env: NodeJS.ProcessEnv = process.env,
 ): string[] {
   const dedupe = (xs: string[]): string[] => [...new Set(xs.filter(Boolean))];
+
+  // --- Full AIME runtime: fail-closed to the AIME identity domain ---------
+  // When BOTH AIME vars are set, bytedcli swaps its storage root to
+  // `$AIME_WORKSPACE_PATH/<sanitized user>/.local/share/bytedcli/data` and,
+  // crucially, does NOT fall back to the host HOME (bytedcliBaseDir returns the
+  // AIME root and stops). `os.homedir()` here is still the HOST home — that is
+  // precisely WHY bytedcli needs the override — so EVERY host-HOME-derived
+  // keychain (the config-style CLIs under ~/.config or Application Support,
+  // ~/.cjadk, ~/.aipaas) belongs to a DIFFERENT identity. Reading any of them
+  // would cross AIME user identities, and the exp-aware selector below would
+  // happily prefer a longer-lived host token. The safe boundary is the
+  // identity domain, not the tool name: in a full AIME runtime the ONLY
+  // in-domain source is the AIME-scoped bytedcli store. If it holds no live
+  // token we return nothing here and the caller fails closed (the user logs in
+  // inside AIME) rather than silently authenticating as someone else.
+  const aimeHome = aimeDataHome(env);
+  if (aimeHome) {
+    return [join(aimeHome, 'bytedcli', 'data', BYTECLOUD_KEYCHAIN_LEAF)];
+  }
+
+  // --- Ordinary (non-AIME) runtime ---------------------------------------
   const xdgConfig = env.XDG_CONFIG_HOME?.trim();
-  // Bases that hold `<cli>/bytecloud-auth/...` (config-style tools). These DO
-  // honour $XDG_CONFIG_HOME.
+  // Bases that hold `<cli>/bytecloud-auth/...` (config-style tools). These
+  // honour $XDG_CONFIG_HOME, which per the XDG spec REPLACES `~/.config` when
+  // set (it is the config root, not an extra candidate). Listing both would
+  // create a phantom `~/.config` candidate the tool never writes to — and since
+  // the selector picks the globally-freshest token rather than respecting
+  // order, a stale token in one could shadow the override. So: XDG root when
+  // set, else `~/.config`; plus the macOS spelling as a separate platform slot.
   const configHomes = dedupe([
-    xdgConfig ?? '',
-    join(home, '.config'),
+    xdgConfig || join(home, '.config'),
     join(home, 'Library', 'Application Support'),
   ]);
   // Home bases under which bytedcli keeps `bytedcli/data/bytecloud-auth/...`.
-  // bytedcli ignores $XDG_DATA_HOME, so we never key it off that. It ALSO does
-  // not fall back to the real HOME when in an AIME workspace: bytedcliBaseDir
-  // returns the AIME root and stops. We mirror that exactly — otherwise a
-  // token belonging to a DIFFERENT identity under the plain ~/.local/share
-  // could be picked up (worse: the exp-aware selector below would let it win on
-  // a later expiry), crossing AIME user identities. So: inside a full AIME
-  // runtime, the ONLY bytedcli base is the AIME root; outside it, the real home
+  // bytedcli ignores $XDG_DATA_HOME, so we never key it off that; the real home
   // plus the macOS spelling as a belt-and-suspenders fallback.
-  const aimeHome = aimeDataHome(env);
-  const bytedcliHomes = aimeHome
-    ? [aimeHome]
-    : dedupe([
-        join(home, '.local', 'share'),
-        join(home, 'Library', 'Application Support'),
-      ]);
+  const bytedcliHomes = dedupe([
+    join(home, '.local', 'share'),
+    join(home, 'Library', 'Application Support'),
+  ]);
   const roots: string[] = [];
   // Config-dir CLIs.
   for (const base of configHomes) {
@@ -373,12 +389,23 @@ export function bytecloudKeychainCandidates(
 /**
  * Decode a JWT's `exp` (seconds since epoch) from its payload without verifying
  * the signature — we only need the expiry to prefer a live token over a stale
- * one. Returns null for anything we cannot confidently parse as an expiry
- * (opaque/non-JWT strings, malformed base64, missing/!number `exp`).
+ * one. Returns null for anything we cannot confidently parse as an expiry so it
+ * ranks below any parseable-live token (opaque/non-JWT strings, malformed
+ * base64, missing/non-number `exp`).
+ *
+ * A JWS compact JWT is EXACTLY three non-empty base64url segments
+ * (`header.payload.signature`). We require that shape up front: a 2- or
+ * 4-segment string, or one whose header/payload aren't base64url, is NOT a JWT
+ * and must never be ranked as a live token where its (accidentally decodable)
+ * `exp` could shadow a genuine JWT.
  */
+const BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
 export function decodeJwtExp(jwt: string): number | null {
   const parts = jwt.split('.');
-  if (parts.length < 2) return null;
+  // Exactly three non-empty segments, header + payload strictly base64url.
+  if (parts.length !== 3) return null;
+  if (!parts[0] || !parts[1] || !parts[2]) return null;
+  if (!BASE64URL_RE.test(parts[0]!) || !BASE64URL_RE.test(parts[1]!)) return null;
   try {
     const payload = Buffer.from(parts[1]!, 'base64url').toString('utf-8');
     const obj = JSON.parse(payload) as Record<string, unknown>;

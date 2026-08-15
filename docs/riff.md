@@ -54,7 +54,7 @@ bytedcli auth login  # bytedcli 用 auth login 子命令
 - **Linux**：`~/.config/<cli>/…`（kaboo-cli / aiden-cli / cjadk）、`~/.cjadk/…`、`~/.aipaas/…`，以及 bytedcli 的 `~/.local/share/bytedcli/data/…`
 - **macOS**：`~/Library/Application Support/<cli>/…`（kaboo-cli / aiden-cli / cjadk）；⚠️ 注意 **bytedcli 在 macOS 上仍走 `~/.local/share/bytedcli/data/…`**（不落 Application Support）
 - config 系（kaboo-cli / aiden-cli / cjadk）尊重 `$XDG_CONFIG_HOME`；**bytedcli 不读 `$XDG_DATA_HOME`**（固定 `~/.local/share`，已实测确认）
-- **AIME 工作区**：bytedcli 在设置了 `AIME_WORKSPACE_PATH` + `AIME_CURRENT_USER` 时，会把存储根切到 `<AIME_WORKSPACE_PATH>/<用户名>/.local/share/bytedcli/data/…`，botmux 也会自动探测该位置。⚠️ 与 bytedcli 一致：**两个变量都齐全时只认 AIME 根、不回落到宿主 `~/.local/share`**（避免跨 AIME 用户身份误读他人 token）；只设其一则按普通环境处理。
+- **AIME 工作区**：bytedcli 在设置了 `AIME_WORKSPACE_PATH` + `AIME_CURRENT_USER` 时，会把存储根切到 `<AIME_WORKSPACE_PATH>/<用户名>/.local/share/bytedcli/data/…`，botmux 也会自动探测该位置。⚠️ 为避免跨 AIME 用户身份误读他人 token：**两个变量都齐全时（完整 AIME 运行时），只认 AIME 身份域下的 keychain，宿主 HOME 派生的所有位置（`~/.config/*`、`~/.cjadk`、`~/.aipaas`、`~/.local/share`、Application Support 等）一律不探测**——此时 `os.homedir()` 仍是宿主 home、属于另一身份。若 AIME keychain 无有效 token，宁可返回空（请在 AIME 内重新登录），也不会退回宿主取到别人的 token。只设其一则按普通环境处理。
 
 多个位置同时命中时，botmux 会解析各 token 的过期时间（JWT `exp`），跳过已过期者、优先选用有效期最新的一个，避免旧工具残留的过期 token 遮住另一工具的有效 token。
 
