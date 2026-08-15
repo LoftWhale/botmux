@@ -3714,10 +3714,11 @@ function persistedActiveSessionKey(
   fallbackLarkAppId: string,
 ): string {
   const larkAppId = session.larkAppId ?? fallbackLarkAppId;
-  const anchor = session.vcMeetingReceiver
-    ? `vc-receiver:${session.sessionId}`
-    : storedSessionAnchorId(session);
-  return sessionKey(anchor, larkAppId);
+  // Plan B: a VC meeting agent is an ordinary chat-scope session keyed by its
+  // normal chat anchor — this must stay in lockstep with activeSessionKey()
+  // (core/types.ts) so a restored meeting row re-registers at the SAME slot the
+  // live path uses. The vcMeetingReceiver marker is delivery metadata only.
+  return sessionKey(storedSessionAnchorId(session), larkAppId);
 }
 
 /**

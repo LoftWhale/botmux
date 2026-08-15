@@ -2446,38 +2446,31 @@ async function ensureVcMeetingReceiverSession(
         `registered receiver session is not active or lacks managed side-effect isolation: ${existingSessionId}`,
       );
     }
+    // Plan B: the meeting agent is an ordinary chat-scope session, so a chat can
+    // legitimately host several meeting projections in one transcript. The old
+    // strict "one session ⇔ one exact meeting/member/epoch" identity check no
+    // longer holds. Only require that the resolved session is the right listener
+    // chat under the right agent app (verified via the resolver binding above)
+    // and stamp/refresh the delivery-identity metadata for this member epoch so
+    // later meeting-directed output (Stage 6) can find it. The marker is pure
+    // metadata now — it does not affect routing.
     const ds = [...activeSessions.values()].find(candidate =>
       candidate.session.sessionId === existingSessionId) ?? findActiveBySessionId(existingSessionId);
-    const identity = ds?.session.vcMeetingReceiver;
-    if (!identity
-      || identity.listenerAppId !== request.meeting.listenerAppId
-      || identity.meetingId !== request.meeting.meetingId
-      || identity.memberId !== request.member.memberId
-      || identity.memberEpoch !== request.member.epoch) {
-      throw new Error('registered receiver session is not dedicated to this meeting member epoch');
+    if (ds && ds.chatId === request.outputRoute.chatId) {
+      stampVcMeetingBinding(ds, request);
     }
     return existing;
   }
 
-  // A receiver session is a dedicated conversation. It deliberately shares
-  // the listener chat only as an output route; its activeSessions key is based
-  // on sessionId (activeSessionKey), so an ordinary chat-scope session or a
-  // second meeting/member cannot collapse into the same CLI transcript.
+  // Plan B core cut: a meeting agent is a normal chat-scope session in its
+  // listener group, keyed by the ordinary `(chatId, appId)` slot. Plain IM and
+  // meeting transcripts therefore fold into the SAME session (transcripts are
+  // delivered by target.sessionId; IM is routed by the chat anchor). Reuse an
+  // existing chat-scope session at that slot if present (whether it was opened
+  // by IM or by an earlier meeting), else create a cold `worker:null` session
+  // shaped exactly like an auto-created IM session so triggerSessionTurn's
+  // cold-fork path spawns it on first delivery.
   const chatId = request.outputRoute.chatId;
-  const matching = [...activeSessions.values()].find((candidate) => {
-    const identity = candidate.session.vcMeetingReceiver;
-    return candidate.larkAppId === selfAppId
-      && identity?.listenerAppId === request.meeting.listenerAppId
-      && identity.meetingId === request.meeting.meetingId
-      && identity.memberId === request.member.memberId
-      && identity.memberEpoch === request.member.epoch;
-  });
-  if (matching) {
-    const binding = resolveVcMeetingReceiverSession(matching.session.sessionId);
-    if (!binding) throw new Error('existing dedicated receiver session has an unsupported CLI adapter');
-    return binding;
-  }
-
   const bot = getBot(selfAppId);
   const isolation = vcMeetingConsumerIsolationForBot(bot.config);
   if (!isolation.decision.ok) {
@@ -2491,61 +2484,96 @@ async function ensureVcMeetingReceiverSession(
   // whose environment/working dir was never set up for bwrap, and the CLI would
   // fail to spawn or be unable to work (the "joined but never replies" bug).
   const receiverSandboxed = isolation.decision.isolated;
-  const rawWorkingDir = findOncallChat(selfAppId, chatId)?.workingDir
-    ?? effectiveDefaultWorkingDir(bot.config)
-    ?? bot.config.workingDir
-    ?? '~';
-  const workingDir = validateWorkingDir(rawWorkingDir, localeForBot(selfAppId));
-  if (!workingDir.ok) throw new Error(workingDir.error);
 
-  const session = sessionStore.createSession(
-    chatId,
-    chatId,
-    `[Meeting] ${request.meeting.meetingId}`.slice(0, 50),
-    'group',
-  );
-  const now = Date.now();
-  session.larkAppId = selfAppId;
-  session.scope = 'chat';
-  session.vcMeetingReceiver = {
+  const key = sessionKey(chatId, selfAppId);
+  const bound = await withActiveSessionKeyLock(activeSessions, key, () => {
+    const current = activeSessions.get(key);
+    if (current) {
+      // A chat-scope session already occupies this slot. Adopt it as the meeting
+      // agent by stamping the delivery-identity metadata; do NOT create a second
+      // universe. The session keeps whatever launch/sandbox decision it already
+      // froze — we never retroactively weaken or strengthen a live session here.
+      stampVcMeetingBinding(current, request);
+      return current;
+    }
+
+    const rawWorkingDir = findOncallChat(selfAppId, chatId)?.workingDir
+      ?? effectiveDefaultWorkingDir(bot.config)
+      ?? bot.config.workingDir
+      ?? '~';
+    const workingDir = validateWorkingDir(rawWorkingDir, localeForBot(selfAppId));
+    if (!workingDir.ok) throw new Error(workingDir.error);
+
+    const session = sessionStore.createSession(
+      chatId,
+      chatId,
+      `[Meeting] ${request.meeting.meetingId}`.slice(0, 50),
+      'group',
+    );
+    const now = Date.now();
+    session.larkAppId = selfAppId;
+    session.scope = 'chat';
+    session.vcMeetingReceiver = {
+      listenerAppId: request.meeting.listenerAppId,
+      meetingId: request.meeting.meetingId,
+      memberId: request.member.memberId,
+      memberEpoch: request.member.epoch,
+    };
+    session.lastMessageAt = new Date(now).toISOString();
+    session.workingDir = workingDir.resolvedPath;
+    session.cliId = bot.config.cliId;
+    // Freeze the security-critical launch decision at creation.  A later live
+    // Bot-config edit must neither weaken this session nor make an old
+    // unisolated session appear eligible retroactively. Under plan B the frozen
+    // value follows the bot's opt-in, not a hardcoded true.
+    session.sandbox = receiverSandboxed;
+    session.sandboxHidePaths = receiverSandboxed ? (bot.config.sandboxHidePaths ?? []) : [];
+    session.sandboxReadonlyPaths = receiverSandboxed ? (bot.config.sandboxReadonlyPaths ?? []) : [];
+    session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
+    session.backendType = isolation.backendType;
+    sessionStore.updateSession(session);
+
+    const ds: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: selfAppId,
+      chatId,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: Date.parse(session.createdAt) || now,
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: workingDir.resolvedPath,
+    };
+    activeSessions.set(key, ds);
+    return ds;
+  });
+
+  const binding = resolveVcMeetingReceiverSession(bound.session.sessionId);
+  if (!binding) throw new Error('meeting agent session has an unsupported CLI adapter');
+  return binding;
+}
+
+/** Stamp/refresh the VC meeting delivery-identity metadata onto an ordinary
+ * chat-scope session (Plan B). This binds the session as the delivery + future
+ * meeting-output target for this member epoch WITHOUT changing routing: the
+ * session is still keyed by its normal chat slot. The most-recent meeting/member
+ * epoch wins when one chat hosts several meetings, matching the transcript
+ * delivery model (targets pick the session by id, not by this marker). */
+function stampVcMeetingBinding(
+  ds: DaemonSession,
+  request: Parameters<VcMeetingDeliveryReceiverDeps['ensureMemberSession']>[0],
+): void {
+  ds.session.vcMeetingReceiver = {
     listenerAppId: request.meeting.listenerAppId,
     meetingId: request.meeting.meetingId,
     memberId: request.member.memberId,
     memberEpoch: request.member.epoch,
   };
-  session.lastMessageAt = new Date(now).toISOString();
-  session.workingDir = workingDir.resolvedPath;
-  session.cliId = bot.config.cliId;
-  // Freeze the security-critical launch decision at receiver creation.  A
-  // later live Bot-config edit must neither weaken this session nor make an
-  // old unisolated receiver appear eligible retroactively. Under plan B the
-  // frozen value follows the bot's opt-in, not a hardcoded true.
-  session.sandbox = receiverSandboxed;
-  session.sandboxHidePaths = receiverSandboxed ? (bot.config.sandboxHidePaths ?? []) : [];
-  session.sandboxReadonlyPaths = receiverSandboxed ? (bot.config.sandboxReadonlyPaths ?? []) : [];
-  session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
-  session.backendType = isolation.backendType;
-  sessionStore.updateSession(session);
-
-  const ds: DaemonSession = {
-    session,
-    worker: null,
-    workerPort: null,
-    workerToken: null,
-    larkAppId: selfAppId,
-    chatId,
-    chatType: 'group',
-    scope: 'chat',
-    spawnedAt: Date.parse(session.createdAt) || now,
-    cliVersion: getCurrentCliVersion(),
-    lastMessageAt: now,
-    hasHistory: false,
-    workingDir: workingDir.resolvedPath,
-  };
-  activeSessions.set(activeSessionKey(ds), ds);
-  const binding = resolveVcMeetingReceiverSession(session.sessionId);
-  if (!binding) throw new Error('created receiver session has an unsupported CLI adapter');
-  return binding;
+  sessionStore.updateSession(ds.session);
 }
 
 function vcMeetingDeliveryReceiverDeps(receiverAppId?: string): VcMeetingDeliveryReceiverDeps {
@@ -2827,7 +2855,13 @@ async function maybeCatchUpVcMeetingConsumerBeforeTurn(
       + `agent=${ctx.larkAppId} status=${caughtUp.catchUpStatus} error=${caughtUp.catchUpError ?? '-'}`,
     );
   }
-  return { anchorOverride: `vc-receiver:${caughtUp.candidate.receiverSessionId}` };
+  // Plan B: the meeting agent is an ordinary chat-scope session keyed by the
+  // normal `(chatId, appId)` slot, so the natural chat anchor already resolves
+  // it — no `vc-receiver:` anchor override is needed (or correct) anymore. This
+  // hook now only (a) blocks on ambiguous/undeliverable meeting context and
+  // (b) stamps vcMeetingImTurnOrigin so an @mention follow-up carries the
+  // meeting delivery identity for catch-up/echo purposes.
+  return;
 }
 
 async function pinVcMeetingConsumerChatReplyMode(

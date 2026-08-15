@@ -2649,8 +2649,11 @@ describe('VC meeting daemon session lifecycle', () => {
         memberEpoch: member!.memberEpoch,
       },
     });
-    expect(receiver?.activeKey).toContain(`vc-receiver:${member!.receiverSessionId}`);
-    expect(receiver?.activeKey).not.toBe(receiver?.ordinaryChatKey);
+    // Plan B: the meeting agent is an ordinary chat-scope session, so its
+    // active-map slot IS the normal (chatId, appId) key. Plain IM to this chat
+    // and meeting transcripts therefore fold into the SAME session.
+    expect(receiver?.activeKey).toBe(receiver?.ordinaryChatKey);
+    expect(receiver?.activeKey).not.toContain('vc-receiver:');
 
     const origin = {
       listenerAppId: member!.listenerAppId,
@@ -8048,9 +8051,12 @@ describe('VC meeting daemon session lifecycle', () => {
       AGENT_APP_ID,
       'oc_listener_1',
     );
-    expect(routed.result).toEqual({
-      anchorOverride: `vc-receiver:${member.receiverSessionId}`,
-    });
+    // Plan B: the meeting agent is an ordinary chat-scope session at the normal
+    // (chatId, appId) slot, so the natural chat anchor already resolves it — the
+    // hook no longer returns a `vc-receiver:` anchor override. It still stamps
+    // vcMeetingImTurnOrigin (below) so the @mention follow-up carries meeting
+    // delivery identity, and it does not itself trigger a session turn.
+    expect(routed.result).toBeUndefined();
     expect(routed.ctx).toMatchObject({
       vcMeetingContextMayLag: false,
       vcMeetingContextLifecycle: 'sealed',
