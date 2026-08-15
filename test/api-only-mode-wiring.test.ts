@@ -263,13 +263,17 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     // The handler must fall back to re-deriving authority from the DURABLE delivery
     // receipt (evaluateVcMeetingManagedSend) for a claimed delivery origin, which
     // never authorizes anything the receipt itself wouldn't (attempt match +
-    // dispatched/completed status + active projection + not-silent).
+    // dispatched/completed status + active projection). It uses forInMeetingOutput
+    // so a silent responseMode (which only gates listener auto-post) does NOT block
+    // in-meeting speech — the hub still applies capability + text/voiceOutputPolicy.
     const block = region(daemonSource, 'let effectiveVerified = verified;', 'if (!effectiveVerified.ok) return jsonRes');
     // Fallback only when there is NO live origin and a claimed delivery origin.
     expect(block).toContain('!ds.managedTurnOrigin');
     expect(block).toContain('claimedAttempt !== undefined');
     expect(block).toContain('evaluateVcMeetingManagedSend(config.session.dataDir, {');
     expect(block).toContain('allowTerminalReceipt: true');
+    // In-meeting output channel is silent-independent (decoupled from responseMode).
+    expect(block).toContain('forInMeetingOutput: true');
     // Only a listener_thread durable decision synthesizes the verified origin.
     expect(block).toContain("durable.ok && durable.kind === 'listener_thread'");
     expect(block).toContain('dispatchAttempt: claimedAttempt');

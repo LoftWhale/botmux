@@ -93,6 +93,46 @@ describe('evaluateVcMeetingManagedSend', () => {
     })).toMatchObject({ ok: false, errorCode: 'silent_delivery' });
   });
 
+  it('Plan B: authorizes a silent delivery for the IN-MEETING output channel (silent only gates listener auto-post)', () => {
+    // responseMode:silent means "do not auto-post to the listener group", NOT
+    // "cannot speak in the meeting". The in-meeting managed-output channel
+    // (request-output → hub managed-action) is authorized by capability +
+    // textOutputPolicy/voiceOutputPolicy at the hub, so forInMeetingOutput skips
+    // the silent veto while still proving receipt identity/liveness. A "会议主持"
+    // that is silent in the group must still be able to speak in the meeting.
+    seed('silent');
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+      forInMeetingOutput: true,
+    })).toMatchObject({ ok: true, kind: 'listener_thread' });
+    // Same delivery, default (listener auto-post) path stays suppressed.
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+    })).toMatchObject({ ok: false, errorCode: 'silent_delivery' });
+  });
+
+  it('Plan B: forInMeetingOutput still fails closed on a missing/mismatched receipt (no silent bypass of identity checks)', () => {
+    // The flag skips ONLY the silent veto — every identity/liveness check
+    // (receipt exists for this session, attempt matches, active projection,
+    // dispatched/completed) still applies, so it can never authorize output the
+    // receipt itself wouldn't.
+    seed('silent');
+    // Wrong dispatchAttempt → origin_mismatch even with forInMeetingOutput.
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 99,
+      forInMeetingOutput: true,
+    })).toMatchObject({ ok: false, errorCode: 'origin_mismatch' });
+    // Unknown turnId → receipt_not_found even with forInMeetingOutput.
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'no-such-delivery', dispatchAttempt: 1,
+      forInMeetingOutput: true,
+    })).toMatchObject({ ok: false, errorCode: 'receipt_not_found' });
+  });
+
   it('allows the exact durable origin for listener_thread mode', () => {
     seed('listener_thread');
     expect(evaluateVcMeetingManagedSend(dir, {

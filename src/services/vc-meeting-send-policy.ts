@@ -36,6 +36,17 @@ export interface VcMeetingManagedSendOrigin {
   /** Worker UI may need to patch/freeze an already-created card after terminal;
    * new botmux send/ask effects must leave this false. */
   allowTerminalReceipt?: boolean;
+  /** In-meeting managed output (request-output → managed-action) is a DIFFERENT
+   * channel from listener-group auto-post. `responseMode: silent` governs only
+   * whether the agent auto-posts to the listener group; it must NOT gate
+   * in-meeting speech, which is authorized downstream at the hub by
+   * capability + textOutputPolicy/voiceOutputPolicy (see vc-meeting-action-gate).
+   * Set true ONLY on the in-meeting-output authorization path so this evaluator
+   * still proves receipt identity/liveness (existence, attempt match, active
+   * projection, dispatched/completed status) but skips the silent veto. Listener
+   * auto-post callers (final_output / botmux send) leave it false so silent keeps
+   * suppressing group posts. */
+  forInMeetingOutput?: boolean;
 }
 
 export type VcMeetingManagedSendDecision =
@@ -241,7 +252,16 @@ export function evaluateVcMeetingManagedSend(
   // The policy is frozen on the receipt. Reading the current projection here
   // would let a later silent→listener_thread update retroactively authorize an
   // old silent attempt. Missing mode is an old WIP record and fails closed.
-  if ((lookup.receipt.responseMode ?? 'silent') === 'silent') {
+  //
+  // `responseMode: silent` governs ONLY the listener-group auto-post channel. The
+  // in-meeting managed-output channel (request-output → hub managed-action) is a
+  // separate channel authorized by capability + textOutputPolicy/voiceOutputPolicy
+  // at the hub, and must not be blocked by silent — a "silent in the listener
+  // group" facilitator still speaks in the meeting. So skip this veto when the
+  // caller is the in-meeting-output path (forInMeetingOutput); every other caller
+  // (final_output / botmux send to the listener group) keeps the suppression.
+  if (!origin.forInMeetingOutput
+    && (lookup.receipt.responseMode ?? 'silent') === 'silent') {
     return { ok: false, errorCode: 'silent_delivery', error: 'managed output is disabled for this silent delivery' };
   }
   return {

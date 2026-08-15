@@ -6563,6 +6563,11 @@ ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
       turnId: claimedDeliveryTurnId,
       dispatchAttempt: claimedAttempt,
       allowTerminalReceipt: true,
+      // In-meeting output channel: silent responseMode gates only listener-group
+      // auto-post, not in-meeting speech (the hub applies capability +
+      // textOutputPolicy/voiceOutputPolicy). Prove receipt identity/liveness here
+      // but do not apply the silent veto.
+      forInMeetingOutput: true,
     });
     if (durable.ok && durable.kind === 'listener_thread') {
       logger.info(
