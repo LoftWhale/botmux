@@ -45,7 +45,7 @@ import {
   isolationPanePolicyDigest,
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
-import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
+import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, resolveLarkCliLinuxStoreDir, larkCliChildDataRoot, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
@@ -13726,6 +13726,26 @@ async function spawnCli(
       }
       return out;
     };
+    // Canonicalize a path whose LEAF may not exist yet (e.g. a lark-cli keystore dir
+    // lark-cli will create on first write): realpath the DEEPEST EXISTING ancestor
+    // (resolving any symlinked prefix — symlinked $HOME, a symlinked data root) and
+    // re-append the non-existent tail. A plain full-path realpath THROWS on the
+    // missing leaf and returns the raw lexical value, so a symlinked ancestor would
+    // stay unresolved and the policy could anchor a DIFFERENT namespace than the one
+    // lark-cli opens after IT canonicalizes (a canonicalization TOCTOU). Input must already be
+    // lexically clean (no `..`); resolveLarkCliLinuxStoreDir Cleans it first.
+    const canonicalNearestAncestor = (p: string): string => {
+      if (!p.startsWith('/')) return p;
+      const segs = p.split('/').filter(Boolean);
+      for (let i = segs.length; i >= 0; i--) {
+        const prefix = '/' + segs.slice(0, i).join('/');
+        try {
+          const real = realpathSync(prefix);
+          return i === segs.length ? real : `${real}/${segs.slice(i).join('/')}`;
+        } catch { /* ancestor missing → try a shallower prefix */ }
+      }
+      return p; // not even '/' resolved (impossible) → lexical fallback
+    };
 
     // User three-tier lists: the new sandboxPaths field, or a pre-migration
     // session/config's legacy fields mapped through the SAME lossless mapping
@@ -13996,6 +14016,23 @@ async function spawnCli(
       // arbitrary parent dir (`/tmp`, `/etc`, a project root) and bricking the
       // core CLI (codex P1). Canonicalized so it shares the roots' namespace.
       loadedBotsConfigPath: cfg.loadedBotsConfigPath ? canonical(cfg.loadedBotsConfigPath) : undefined,
+      // Linux lark-cli keystore (holds every bot's appsecret ciphertext + the shared
+      // master key). Resolve it EXACTLY as the in-sandbox lark-cli will:
+      // `<clean(LARKSUITE_CLI_DATA_DIR)>/lark-cli` when that env var is a valid ABSOLUTE
+      // path (lexically Cleaned — `..`/`.`/`//` resolved, control chars rejected), else
+      // `$HOME/.local/share/lark-cli` — lark-cli does NOT read XDG_DATA_HOME (verified by
+      // strace on v1.0.76 + its keychain_other.go::StorageDir / SafeEnvDirPath). The
+      // Clean happens INSIDE resolveLarkCliLinuxStoreDir (a `..`-bearing value
+      // must be normalized here, or realpath throws on the nonexistent leaf, the raw `..`
+      // survives, normalizeFsPath rejects it, and the policy anchors the DEFAULT store
+      // while lark-cli opens the Clean'd real one → leak). canonicalNearestAncestor then
+      // resolves any SYMLINKED ancestor even when the store leaf does not exist yet (a
+      // full-path realpath would throw and skip symlink resolution → policy/CLI namespace
+      // divergence). bwrap has no --clearenv, so the child inherits this bot's
+      // LARKSUITE_CLI_DATA_DIR from the worker's own (frozen, non-agent-controllable)
+      // process.env, and sandbox.ts pins the child to the SAME cleaned resolution
+      // (--setenv/--unsetenv) so policy == CLI by construction. Ignored on darwin.
+      larkCliLinuxStore: canonicalNearestAncestor(resolveLarkCliLinuxStoreDir(process.env.LARKSUITE_CLI_DATA_DIR, lexicalHome)),
       redirectedCliData: willRedirectCliData,
       cliDataPaths: willRedirectCliData ? undefined : keepExisting([
         cliAdapter.claudeDataDir,
@@ -14125,6 +14162,25 @@ async function spawnCli(
         log(`Sandbox REATTACH (${cfg.cliId}): no on-disk sandbox tree — reattaching live pane as-is`);
       }
     } else {
+      // Canonical lark-cli data root pinned into the child so the in-sandbox lark-cli
+      // resolves the SAME physical keystore the policy denied/carved-out (avoiding a
+      // symlinked-data-root namespace split). fsPolicyCtx.larkCliLinuxStore is the FULLY-canonical store dir (leaf
+      // symlinks followed) — the physical location the policy protects. The child opens
+      // `<pin>/lark-cli`, so pin = dirname(store) is same-source ONLY when the canonical
+      // store's basename is still `lark-cli` (the common case, incl. a symlink that
+      // resolves to another `lark-cli` dir). If the `lark-cli` leaf was a symlink to a
+      // DIFFERENTLY-named dir (basename !== 'lark-cli'), dirname(store)+'/lark-cli' would
+      // NOT equal the canonical store → child would open an unbound path (auth breaks) OR
+      // a foreign one. There is no leak either way (the policy still denies the real dir,
+      // and both candidate stores are locked), so degrade SAFELY: pin nothing → child
+      // falls back to the default store (also locked), and log the exotic layout.
+      const canonStore = fsPolicyCtx.larkCliLinuxStore;
+      const childLarkDataRoot = larkCliChildDataRoot(canonStore);
+      if (canonStore && childLarkDataRoot === null) {
+        log(`[sandbox] lark-cli keystore ${canonStore} does not end in 'lark-cli' (symlinked leaf?) — `
+          + `not pinning a custom LARKSUITE_CLI_DATA_DIR into the sandbox; the in-sandbox lark-cli will `
+          + `use the default store. The real keystore is still denied/carve-out'd by policy (no leak).`);
+      }
       const sbx = prepareDirectSandbox({
         sessionId: cfg.sessionId,
         dataDir,
@@ -14135,6 +14191,7 @@ async function spawnCli(
         cliArgs: args,
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
+        larkCliDataDir: childLarkDataRoot,
       });
       if (!sbx) {
         // FAIL-SAFE: never silently run unsandboxed.
