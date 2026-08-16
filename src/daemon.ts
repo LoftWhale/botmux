@@ -6586,7 +6586,8 @@ ipcRoute('POST', '/api/vc-meetings/action-request', async (req, res) => {
     if (durable.ok && durable.kind === 'listener_thread') {
       logger.info(
         `[vc-agent] request-output authorized via durable receipt fallback `
-        + `(live origin cleared at turn terminal) session=${receiverSessionId.slice(0, 8)} `
+        + `(live origin ${ds.managedTurnOrigin ? 'present but unverifiable — no capability transport' : 'cleared at turn terminal'}) `
+        + `session=${receiverSessionId.slice(0, 8)} `
         + `turn=${claimedDeliveryTurnId.slice(0, 12)} attempt=${claimedAttempt}`,
       );
       effectiveVerified = {
