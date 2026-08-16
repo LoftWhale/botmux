@@ -3340,6 +3340,14 @@ function setupWorkerHandlers(
           logger.debug(`[${t}] final_output deduped (key ${dedupeKey.substring(0, 48)})`);
           break;
         }
+        if (msg.suppressedDelivery) {
+          // The CLI already posted this answer in-band (`botmux send`), so
+          // skip Lark delivery entirely. Commit the dedupe marker so a
+          // redrain cannot re-forward the same turn.
+          ds.lastBridgeEmittedUuid = dedupeKey;
+          logger.info(`[${t}] final_output observed without delivery for turn ${msg.turnId.substring(0, 8)} (CLI self-delivered)`);
+          break;
+        }
         // Worker pops the turn off its queue right after emit, so it will
         // NOT re-send this payload on its own. Daemon owns retry on
         // transient Lark failures.

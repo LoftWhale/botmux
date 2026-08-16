@@ -3426,6 +3426,19 @@ function emitReadyCodexTurns(): void {
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: turn.finalText }, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
+      // The CLI self-delivered this answer via `botmux send`, so the daemon
+      // must not post it again — but daemon-side observers of completed
+      // turns (e.g. result mirrors) still need the final text. Forward it
+      // flagged so the daemon records the dedupe marker without delivering.
+      send({
+        type: 'final_output',
+        ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
+        content: turn.finalText,
+        lastUuid: turn.turnId,
+        turnId: turn.turnId,
+        ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+        suppressedDelivery: true,
+      });
       continue;
     }
     if (turn.isLocal) {

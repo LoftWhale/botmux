@@ -650,6 +650,12 @@ export type WorkerToDaemon =
       /** Durable receiver attempt attribution. Final output suppression is
        *  attempt-scoped so a late attempt-N event cannot affect attempt N+1. */
       dispatchAttempt?: number;
+      /** The CLI already delivered this answer to the Lark thread in-band
+       *  (its own `botmux send` covered the final text), so the daemon must
+       *  not post the content again. The message is still forwarded so
+       *  daemon-side observers of completed turns (e.g. result mirrors) see
+       *  the final text; the daemon only commits the dedupe marker. */
+      suppressedDelivery?: boolean;
       // Discriminator for the daemon-side renderer. Default ('bridge' /
       // omitted) renders `content` through the regular markdown card. The
       // local-turn variants ship the user prompt as a separate field so

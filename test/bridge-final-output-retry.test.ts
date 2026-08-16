@@ -261,6 +261,39 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
   });
 
+  it('suppressedDelivery final_output commits dedup without delivering to Lark', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+      suppressedDelivery: true,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    // The CLI self-delivered in-band: no daemon-side Lark post, but the
+    // dedupe marker is committed so a redrain cannot re-forward the turn.
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
   it('records Hermes source binding and allows matching sourceHermesSessionId', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
