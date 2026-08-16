@@ -11912,16 +11912,16 @@ async function spawnCli(
   // The guard must ENTER the state machine whenever it could have anything to
   // decide, WITHOUT depending on provenance already being present for the live-
   // pane arms — else a no-transport pane whose best-effort isolation marker write
-  // was lost would (NEITHER file) skip the guard and warm-reattach still confined
-  // (codex R3 #1). Enter for:
+  // was lost would (NEITHER file) skip the guard and warm-reattach still confined.
+  // Enter for:
   //   · any policy-ON spawn (capability check runs on every persistent backend,
-  //     incl. credential-only zellij/herdr/zmx — codex R3 #2), OR
+  //     incl. credential-only zellij/herdr/zmx), OR
   //   · a policy-OFF no-transport tmux session (the file-sandbox migration scope), OR
   //   · ANY session (incl. transport-enabled, any backend) that has stale
   //     provenance on disk — so a dead pane's leftover marker/tombstone is cleared
   //     before cold-spawn on EVERY backend. Otherwise a transport chat that turned
   //     sandbox OFF leaves a matching marker that would later warm-reattach a fresh
-  //     UNisolated pane as "isolated" when sandbox is re-enabled (codex R4).
+  //     UNisolated pane as "isolated" when sandbox is re-enabled.
   const persistentPaneGuardApplies = appliedIsolationCapabilities.length > 0
     || (noTransportSession && isolationCapableBackend)
     || stalePaneMarkerPresent || policyOffTombstonePresent;

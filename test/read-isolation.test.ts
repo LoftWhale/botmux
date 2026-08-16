@@ -320,8 +320,8 @@ describe('isolatedPaneReattachSafe', () => {
 
 describe('evaluatePersistentPaneMigration — policy-on/off pane provenance state machine', () => {
   // Pure decision behind the worker's stale-pane guard (worker.ts). Covers the
-  // 2026-08 no-transport 放宽 upgrade path AND the crash/teardown-failure branches
-  // codex flagged. `isolationMarkerReattachSafe` is the caller's precomputed
+  // 2026-08 no-transport 放宽 upgrade path AND the crash/teardown-failure branches.
+  // `isolationMarkerReattachSafe` is the caller's precomputed
   // isolatedPaneReattachSafe() result (only meaningful under policy ON);
   // `policyOffTombstoneValid` is the caller's secure-read + schema check.
   const CAPS_ON = ['credential', 'read', 'write'] as const;
@@ -459,7 +459,7 @@ describe('evaluatePersistentPaneMigration — policy-on/off pane provenance stat
 
 describe('executePersistentPaneMigration — ordered, fail-closed IO seam', () => {
   // Behavioral (not source-lock): inject mock effects, observe call ORDER and the
-  // "not called" guarantees on each failure path — exactly what codex asked for.
+  // "not called" guarantees on each failure path.
   const makeEffects = () => {
     const calls: string[] = [];
     const eff = {

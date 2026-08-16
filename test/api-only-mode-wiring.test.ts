@@ -461,7 +461,7 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     // provenance on disk — so a dead pane's leftover marker/tombstone is cleared
     // before cold-spawn even for a transport-enabled chat that turned sandbox OFF
     // (else re-enabling sandbox warm-reattaches a fresh UNisolated pane as
-    // "isolated" against the stale matching marker — codex R4).
+    // "isolated" against the stale matching marker).
     expect(workerSource).toContain(
       'const persistentPaneGuardApplies = appliedIsolationCapabilities.length > 0\n'
       + '    || (noTransportSession && isolationCapableBackend)\n'
