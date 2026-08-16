@@ -456,9 +456,36 @@ export function policyOffTombstonePath(runtimeDataDir: string, sessionId: string
 }
 
 /** Tombstone body: a self-describing, version-stamped generation proof. Content
- *  is diagnostic only — presence (as a real 0600 file) is the signal. */
+ *  is diagnostic-bearing but its PRESENCE-as-valid (not equality to any live boot
+ *  id) is the reattach signal — a legitimate policy-off pane warm-reattaches
+ *  across daemon restarts, so binding to the current boot id would cold-spawn it
+ *  every restart. bootId is kept only for diagnostics. */
 export function policyOffTombstoneContent(bootId: string): string {
   return JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, policyOff: true, bootId });
+}
+
+/**
+ * Validate a policy-off tombstone body (already securely read from a real 0600
+ * file by the caller — see readManagedOriginAuthorityFile). Returns true only for
+ * a well-formed CURRENT-version `policyOff:true` record with a non-empty string
+ * bootId. bootId is NOT compared to the live daemon boot id (a legit policy-off
+ * pane must reattach across restarts); it only has to be present + a string, so a
+ * blank/garbage/structurally-wrong tombstone cannot authorize a warm reattach.
+ * Mirror of {@link isolatedPaneReattachSafe}'s fail-closed parse discipline, but
+ * for the opposite polarity: here VALID authorizes reattach.
+ */
+export function policyOffTombstoneValid(content: string | null | undefined): boolean {
+  try {
+    const parsed = JSON.parse(content ?? '') as {
+      version?: unknown; policyOff?: unknown; bootId?: unknown;
+    };
+    return parsed.version === ISOLATION_PANE_MARKER_VERSION
+      && parsed.policyOff === true
+      && typeof parsed.bootId === 'string'
+      && parsed.bootId.trim().length > 0;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -556,32 +583,48 @@ export function isolatedPaneReattachSafe(
  * BEST-EFFORT (its write is wrapped in try/catch and the spawn proceeds anyway),
  * so "no marker" does NOT prove the live process was never isolated — a sandboxed
  * pane whose stamp write lost a race/perm/disk error looks identical. Under
- * policy-OFF we therefore require POSITIVE proof (tombstone) to warm-reattach; any
- * other shape (isolation marker present, or NEITHER file) is treated as
+ * policy-OFF we therefore require POSITIVE, VALIDATED proof (a tombstone that
+ * passes secure-read + schema check) to warm-reattach; any other shape (isolation
+ * marker present, tombstone missing/invalid, or NEITHER file) is treated as
  * possibly-still-confined and killed. Absence is never trusted as safe.
  *
- * The decision is scoped to sessions whose backend can actually be isolated
- * (`isolationCapableBackend`, i.e. tmux — pty is never persistent; zellij/zmx/
- * herdr hard-error under sandbox so they can never carry a marker) AND, for the
- * migration arm, to `noTransport` sessions (the ONLY ones the removed rule ever
- * force-isolated). An ordinary transport-enabled chat was never force-isolated,
- * so it is never subjected to the tombstone requirement — no false kills.
+ * Scope is split by policy direction:
+ *   · policy ON (file sandbox OR credential-only `credential` cap): the exact-
+ *     capability/policy check runs on EVERY persistent backend — credential-only
+ *     panes exist on zellij/herdr/zmx too, so this must NOT be tmux-scoped.
+ *   · policy OFF migration arm: scoped to `noTransport && isolationCapableBackend`
+ *     (only no-transport tmux was ever file-force-isolated by the removed rule).
+ *     An ordinary transport chat / non-tmux backend is never subjected to the
+ *     tombstone requirement — no false kills — though a DEAD pane's stale
+ *     provenance is still cleared so it cannot mislead a later decision.
  *
  * Existence flags MUST come from no-follow existence probes (a planted/tampered
  * leaf that fails to parse still counts as present, so it can never be used to
- * force a silent reattach). Pane liveness is the caller's probe.
+ * force a silent reattach). `policyOffTombstoneValid` is the secure-read result.
+ * Pane liveness is the caller's probe.
  */
 export type PersistentPaneMigrationInput = {
-  /** Current-spawn isolation capabilities (empty ⇒ policy OFF this spawn). */
+  /** Current-spawn isolation capabilities (empty ⇒ policy OFF this spawn). May be
+   *  non-empty on ANY persistent backend — `credential` is pushed for enrolled
+   *  hosts independent of the file sandbox, and its wrapper applies to
+   *  tmux/zellij/herdr/zmx alike. So the policy-ON capability check below is NOT
+   *  scoped to tmux. */
   appliedIsolationCapabilities: readonly IsolationCapability[];
-  /** Backend can carry an isolation sandbox at all (tmux). */
+  /** Backend can carry a FILE sandbox (tmux). Scopes ONLY the policy-off
+   *  no-transport migration arm (the removed force-isolation rule only ever
+   *  file-sandboxed tmux); policy-ON capability checks run on every backend. */
   isolationCapableBackend: boolean;
   /** apiOnly bot OR HTTP-virtual chat — the sessions the old rule force-isolated. */
   noTransport: boolean;
-  /** `<sid>.boot` exists on disk (no-follow). */
+  /** `<sid>.boot` exists on disk (no-follow existence — planted/garbage counts). */
   isolationMarkerPresent: boolean;
-  /** `<sid>.policy-off` tombstone exists on disk (no-follow). */
+  /** `<sid>.policy-off` tombstone exists on disk (no-follow existence). Triggers
+   *  CLEANUP / conservative decisions; does NOT by itself authorize a reattach. */
   policyOffTombstonePresent: boolean;
+  /** The `<sid>.policy-off` tombstone passed secure-read + schema/version
+   *  validation ({@link policyOffTombstoneValid}). ONLY this authorizes a
+   *  policy-off warm reattach. */
+  policyOffTombstoneValid: boolean;
   /** The persistent pane is currently alive (caller's probe === 'exists'). */
   paneLive: boolean;
   /**
@@ -593,12 +636,12 @@ export type PersistentPaneMigrationInput = {
 };
 
 export type PersistentPaneMigrationDecision =
-  /** Guard does not apply (backend can't isolate, or nothing to evaluate). */
+  /** Guard does not apply (nothing to evaluate). */
   | { action: 'skip' }
   /** Live pane matches the current policy → keep the running process. */
   | { action: 'reattach' }
-  /** Live pane's provenance is wrong/unknown → kill, then cold-spawn. Marker +
-   *  tombstone must be cleared ONLY AFTER the kill is confirmed (see clearAfterKill). */
+  /** Live pane's provenance is wrong/unknown → kill, then cold-spawn. Provenance
+   *  files are cleared ONLY AFTER the kill is confirmed (clearAfterKill). */
   | { action: 'kill-then-cold-spawn'; clearAfterKill: boolean }
   /** No live pane, but stale provenance files linger → clear them (verified) then
    *  cold-spawn fresh, so a later restart doesn't misjudge the new pane. */
@@ -609,45 +652,114 @@ export function evaluatePersistentPaneMigration(
 ): PersistentPaneMigrationDecision {
   const {
     appliedIsolationCapabilities, isolationCapableBackend, noTransport,
-    isolationMarkerPresent, policyOffTombstonePresent, paneLive,
-    isolationMarkerReattachSafe,
+    isolationMarkerPresent, policyOffTombstonePresent, policyOffTombstoneValid: tombstoneValid,
+    paneLive, isolationMarkerReattachSafe,
   } = input;
   const policyOn = appliedIsolationCapabilities.length > 0;
-
-  // A backend that cannot be isolated never carries a marker and cannot have been
-  // confined, so the migration guard is irrelevant. (Callers also skip pty.)
-  if (!isolationCapableBackend) return { action: 'skip' };
+  const anyProvenance = isolationMarkerPresent || policyOffTombstonePresent;
 
   if (policyOn) {
-    // Policy ON: only a live pane stamped under the CURRENT policy may reattach;
-    // a legacy/mismatched one is killed. No live pane → nothing to guard.
-    if (!paneLive) return { action: 'skip' };
-    if (isolationMarkerReattachSafe) return { action: 'reattach' };
-    return { action: 'kill-then-cold-spawn', clearAfterKill: true };
+    // Policy ON (file sandbox OR credential-only): runs on EVERY persistent
+    // backend — credential-only panes on zellij/herdr/zmx carry a marker too, so
+    // this check must not be scoped to tmux (that would skip their capability
+    // validation and warm-reattach a stale/mismatched credential pane).
+    if (paneLive) {
+      // Only a live pane stamped under the CURRENT policy may reattach; a
+      // legacy/mismatched one is killed. (isolationMarkerReattachSafe already
+      // fail-closes on a missing/garbage marker.)
+      if (isolationMarkerReattachSafe) return { action: 'reattach' };
+      return { action: 'kill-then-cold-spawn', clearAfterKill: true };
+    }
+    // No live pane: nothing to reattach. A fresh policy-on spawn re-stamps its
+    // marker, but any stale tombstone from a prior policy-off generation must be
+    // cleared first, or a later flip back to policy-off could misread it.
+    if (anyProvenance) return { action: 'clear-stale-then-cold-spawn' };
+    return { action: 'skip' };
   }
 
-  // Policy OFF. Only no-transport sessions could ever have been force-isolated by
-  // the removed rule; an ordinary chat was never confined, so leave it untouched
-  // (no tombstone requirement, no probe, no false kill).
-  if (!noTransport) return { action: 'skip' };
-
-  const hasStaleFiles = isolationMarkerPresent || policyOffTombstonePresent;
+  // Policy OFF. The file-sandbox migration only ever confined no-transport tmux
+  // sessions, so the tombstone requirement is scoped to them; an ordinary chat
+  // (or a non-file-sandboxable backend) was never force-isolated and is left
+  // untouched — EXCEPT we still clear any stale provenance on a dead pane so a
+  // lingering file can't mislead a future decision.
+  const inMigrationScope = noTransport && isolationCapableBackend;
 
   if (paneLive) {
-    // Warm reattach is allowed ONLY with positive proof the live generation is a
-    // known policy-off pane: a tombstone present AND no isolation marker. Any
-    // other shape — isolation marker present, or NEITHER file (absence never
-    // proves "was never isolated", since the isolation stamp is best-effort) —
-    // is treated as possibly-still-confined and killed.
-    const provenPolicyOffGeneration = policyOffTombstonePresent && !isolationMarkerPresent;
+    if (!inMigrationScope) return { action: 'skip' };
+    // Warm reattach requires POSITIVE, VALIDATED proof the live generation is a
+    // known policy-off pane: a VALID tombstone AND no isolation marker. Any other
+    // shape — isolation marker present (dominates), tombstone missing/invalid, or
+    // NEITHER file (absence never proves "was never isolated", since the isolation
+    // stamp is best-effort) — is treated as possibly-still-confined and killed.
+    const provenPolicyOffGeneration = tombstoneValid && !isolationMarkerPresent;
     if (provenPolicyOffGeneration) return { action: 'reattach' };
     return { action: 'kill-then-cold-spawn', clearAfterKill: true };
   }
 
-  // No live pane. If stale provenance files linger they must be cleared (verified)
-  // before the fresh cold-spawn, or a later restart would misjudge the new pane.
-  if (hasStaleFiles) return { action: 'clear-stale-then-cold-spawn' };
+  // No live pane. Clear any lingering provenance (verified) before the fresh
+  // cold-spawn regardless of scope — a stale file must never survive to mislead a
+  // later restart.
+  if (anyProvenance) return { action: 'clear-stale-then-cold-spawn' };
   return { action: 'skip' };
+}
+
+/**
+ * Injectable side-effect seam for {@link executePersistentPaneMigration}. The
+ * worker supplies real implementations (backend kill, post-kill probe, verified
+ * provenance removal, backend re-selection); tests supply mocks to observe the
+ * ORDER of effects and the "not called" guarantees on each failure path — the
+ * part a pure truth-table cannot cover.
+ */
+export type PersistentPaneMigrationEffects = {
+  /** Kill the stale persistent pane. Throw on failure — caller must NOT proceed. */
+  killStalePane: () => void;
+  /** Probe AFTER the kill; throw (fail-closed) if termination cannot be confirmed. */
+  confirmPaneGone: () => void;
+  /** Remove BOTH provenance files, each verified-gone; throw if any cannot be
+   *  removed (fail-closed — a surviving file would mis-drive the next restart). */
+  clearProvenanceVerified: () => void;
+  /** Re-select the backend so a stale isReattach=true does not target the pane we
+   *  just destroyed. Only called after a confirmed kill + cleared provenance. */
+  reselectBackend: () => void;
+};
+
+/**
+ * Execute a {@link PersistentPaneMigrationDecision} with strict fail-closed
+ * ordering. Extracted from the worker so the ordering + "stop on failure"
+ * guarantees are unit-testable with injected effects:
+ *
+ *   kill-then-cold-spawn : killStalePane → confirmPaneGone → (clearAfterKill?
+ *                          clearProvenanceVerified) → reselectBackend.
+ *     Any throw from killStalePane or confirmPaneGone aborts BEFORE clearing
+ *     provenance (evidence is preserved for the retry) and BEFORE reselect. A
+ *     throw from clearProvenanceVerified aborts BEFORE reselect (never publish a
+ *     new generation while a stale proof lingers).
+ *   clear-stale-then-cold-spawn : clearProvenanceVerified only (no live pane to
+ *                          kill; a throw aborts the spawn).
+ *   reattach / skip : no effects.
+ *
+ * Returns the action taken so the caller can branch (e.g. set warm-reattach).
+ */
+export function executePersistentPaneMigration(
+  decision: PersistentPaneMigrationDecision,
+  effects: PersistentPaneMigrationEffects,
+): PersistentPaneMigrationDecision['action'] {
+  switch (decision.action) {
+    case 'reattach':
+    case 'skip':
+      return decision.action;
+    case 'clear-stale-then-cold-spawn':
+      effects.clearProvenanceVerified();
+      return decision.action;
+    case 'kill-then-cold-spawn':
+      effects.killStalePane();       // throws → stop (evidence preserved)
+      effects.confirmPaneGone();     // throws → stop (evidence preserved)
+      if (decision.clearAfterKill) {
+        effects.clearProvenanceVerified(); // throws → stop before reselect
+      }
+      effects.reselectBackend();
+      return decision.action;
+  }
 }
 
 function dedupe(xs: string[]): string[] {

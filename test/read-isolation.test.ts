@@ -10,6 +10,9 @@ import {
   isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
   evaluatePersistentPaneMigration,
+  executePersistentPaneMigration,
+  policyOffTombstoneContent,
+  policyOffTombstoneValid,
   isolationPaneMarkerContent,
   ISOLATION_PANE_MARKER_VERSION,
   isolationPanePolicyDigest,
@@ -319,26 +322,23 @@ describe('evaluatePersistentPaneMigration — policy-on/off pane provenance stat
   // Pure decision behind the worker's stale-pane guard (worker.ts). Covers the
   // 2026-08 no-transport 放宽 upgrade path AND the crash/teardown-failure branches
   // codex flagged. `isolationMarkerReattachSafe` is the caller's precomputed
-  // isolatedPaneReattachSafe() result (only meaningful under policy ON).
+  // isolatedPaneReattachSafe() result (only meaningful under policy ON);
+  // `policyOffTombstoneValid` is the caller's secure-read + schema check.
   const CAPS_ON = ['credential', 'read', 'write'] as const;
+  const CRED_ONLY = ['credential'] as const;
   const CAPS_OFF = [] as const;
   const base = {
     isolationCapableBackend: true,
     noTransport: true,
     isolationMarkerPresent: false,
     policyOffTombstonePresent: false,
+    policyOffTombstoneValid: false,
     paneLive: true,
     isolationMarkerReattachSafe: false,
   };
 
-  it('non-isolation-capable backend → skip (zellij/zmx/herdr can never carry a marker)', () => {
-    expect(evaluatePersistentPaneMigration({
-      ...base, appliedIsolationCapabilities: CAPS_OFF, isolationCapableBackend: false,
-      isolationMarkerPresent: true,
-    })).toEqual({ action: 'skip' });
-  });
-
-  // ── policy ON ──
+  // ── policy ON — runs on EVERY persistent backend (issue #2: credential-only on
+  //    zellij/herdr/zmx must still be capability-checked, NOT skipped as non-tmux) ──
   it('policy ON + live pane stamped under current policy → reattach', () => {
     expect(evaluatePersistentPaneMigration({
       ...base, appliedIsolationCapabilities: CAPS_ON,
@@ -353,42 +353,70 @@ describe('evaluatePersistentPaneMigration — policy-on/off pane provenance stat
     })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
   });
 
-  it('policy ON + no live pane → skip (nothing to guard; fresh spawn stamps)', () => {
+  it('policy ON credential-only on a NON-tmux backend + mismatched marker → kill (issue #2: not skipped)', () => {
+    // enrolled host, credential-only wrapper on zellij/herdr/zmx (isolationCapableBackend
+    // false because file sandbox is tmux-only). The capability check must STILL run.
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CRED_ONLY, isolationCapableBackend: false,
+      isolationMarkerPresent: true, isolationMarkerReattachSafe: false,
+    })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
+  });
+
+  it('policy ON credential-only on a NON-tmux backend + matching marker → reattach', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CRED_ONLY, isolationCapableBackend: false,
+      isolationMarkerPresent: true, isolationMarkerReattachSafe: true,
+    })).toEqual({ action: 'reattach' });
+  });
+
+  it('policy ON + no live pane + stale tombstone lingering → clear stale (else a later policy-off misreads it)', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_ON, paneLive: false,
+      policyOffTombstonePresent: true,
+    })).toEqual({ action: 'clear-stale-then-cold-spawn' });
+  });
+
+  it('policy ON + no live pane + no provenance → skip (fresh spawn stamps)', () => {
     expect(evaluatePersistentPaneMigration({
       ...base, appliedIsolationCapabilities: CAPS_ON, paneLive: false,
     })).toEqual({ action: 'skip' });
   });
 
-  // ── policy OFF, no-transport migration arm ──
-  it('policy OFF + live pane proven policy-off (tombstone, no isolation marker) → reattach', () => {
+  // ── policy OFF, no-transport tmux migration arm ──
+  it('policy OFF + live pane with VALID tombstone, no isolation marker → reattach', () => {
     expect(evaluatePersistentPaneMigration({
       ...base, appliedIsolationCapabilities: CAPS_OFF,
-      policyOffTombstonePresent: true, isolationMarkerPresent: false,
+      policyOffTombstonePresent: true, policyOffTombstoneValid: true, isolationMarkerPresent: false,
     })).toEqual({ action: 'reattach' });
   });
 
+  it('policy OFF + live pane with tombstone PRESENT but INVALID → kill (lstat-present is not proof; issue #3)', () => {
+    // Empty / dir / symlink / garbage tombstone lstat-exists but fails secure-read;
+    // must NOT authorize a warm reattach of a possibly-confined pane.
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF,
+      policyOffTombstonePresent: true, policyOffTombstoneValid: false,
+    })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
+  });
+
   it('policy OFF + live pane with legacy ISOLATION marker → kill + cold-spawn (the core regression)', () => {
-    // Old forced-isolation pane still alive & stamped; new policy OFF. Must kill,
-    // not warm-reattach the still-confined process.
     expect(evaluatePersistentPaneMigration({
       ...base, appliedIsolationCapabilities: CAPS_OFF,
       isolationMarkerPresent: true,
     })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
   });
 
-  it('policy OFF + live pane with NEITHER file → kill (absence never proves "never isolated")', () => {
-    // issue-3 root fix: the isolation stamp is best-effort, so "no marker" cannot
-    // be trusted as safe. Without positive tombstone proof the live pane is killed.
+  it('policy OFF + live pane with NEITHER file → kill (absence never proves "never isolated"; issue #3)', () => {
     expect(evaluatePersistentPaneMigration({
       ...base, appliedIsolationCapabilities: CAPS_OFF,
       isolationMarkerPresent: false, policyOffTombstonePresent: false,
     })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
   });
 
-  it('policy OFF + live pane with BOTH files (marker wins) → kill', () => {
+  it('policy OFF + live pane with valid tombstone AND isolation marker (marker dominates) → kill', () => {
     expect(evaluatePersistentPaneMigration({
       ...base, appliedIsolationCapabilities: CAPS_OFF,
-      isolationMarkerPresent: true, policyOffTombstonePresent: true,
+      isolationMarkerPresent: true, policyOffTombstonePresent: true, policyOffTombstoneValid: true,
     })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
   });
 
@@ -412,13 +440,113 @@ describe('evaluatePersistentPaneMigration — policy-on/off pane provenance stat
     })).toEqual({ action: 'skip' });
   });
 
-  it('policy OFF + TRANSPORT-ENABLED chat → skip even with a marker (never force-isolated, no false kill)', () => {
-    // Ordinary chats were never subject to the removed rule; the tombstone
-    // requirement must not touch them.
+  it('policy OFF + TRANSPORT-ENABLED chat + LIVE pane → skip even with a marker (never force-isolated, no false kill)', () => {
     expect(evaluatePersistentPaneMigration({
       ...base, appliedIsolationCapabilities: CAPS_OFF, noTransport: false,
       isolationMarkerPresent: true,
     })).toEqual({ action: 'skip' });
+  });
+
+  it('policy OFF + non-migration-scope + DEAD pane with stale marker → still clears (file must not linger)', () => {
+    // Even outside the migration scope, a dead pane's stale provenance is cleared
+    // so it cannot mislead a future decision.
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF, noTransport: false,
+      paneLive: false, isolationMarkerPresent: true,
+    })).toEqual({ action: 'clear-stale-then-cold-spawn' });
+  });
+});
+
+describe('executePersistentPaneMigration — ordered, fail-closed IO seam', () => {
+  // Behavioral (not source-lock): inject mock effects, observe call ORDER and the
+  // "not called" guarantees on each failure path — exactly what codex asked for.
+  const makeEffects = () => {
+    const calls: string[] = [];
+    const eff = {
+      killStalePane: () => { calls.push('kill'); },
+      confirmPaneGone: () => { calls.push('confirm'); },
+      clearProvenanceVerified: () => { calls.push('clear'); },
+      reselectBackend: () => { calls.push('reselect'); },
+    };
+    return { calls, eff };
+  };
+
+  it('reattach / skip → no side effects at all', () => {
+    for (const action of ['reattach', 'skip'] as const) {
+      const { calls, eff } = makeEffects();
+      executePersistentPaneMigration({ action }, eff);
+      expect(calls).toEqual([]);
+    }
+  });
+
+  it('kill-then-cold-spawn (clearAfterKill) → kill → confirm → clear → reselect, in order', () => {
+    const { calls, eff } = makeEffects();
+    executePersistentPaneMigration({ action: 'kill-then-cold-spawn', clearAfterKill: true }, eff);
+    expect(calls).toEqual(['kill', 'confirm', 'clear', 'reselect']);
+  });
+
+  it('kill FAILS → stops before confirm/clear/reselect (evidence preserved for retry)', () => {
+    const { calls, eff } = makeEffects();
+    eff.killStalePane = () => { calls.push('kill'); throw new Error('kill failed'); };
+    expect(() => executePersistentPaneMigration(
+      { action: 'kill-then-cold-spawn', clearAfterKill: true }, eff,
+    )).toThrow('kill failed');
+    expect(calls).toEqual(['kill']); // NOT clear, NOT reselect
+  });
+
+  it('post-kill confirm REJECTS → stops before clear/reselect (marker preserved)', () => {
+    const { calls, eff } = makeEffects();
+    eff.confirmPaneGone = () => { calls.push('confirm'); throw new Error('still alive'); };
+    expect(() => executePersistentPaneMigration(
+      { action: 'kill-then-cold-spawn', clearAfterKill: true }, eff,
+    )).toThrow('still alive');
+    expect(calls).toEqual(['kill', 'confirm']); // NOT clear, NOT reselect
+  });
+
+  it('provenance clear FAILS → stops before reselect (never publish a new generation)', () => {
+    const { calls, eff } = makeEffects();
+    eff.clearProvenanceVerified = () => { calls.push('clear'); throw new Error('unlink failed'); };
+    expect(() => executePersistentPaneMigration(
+      { action: 'kill-then-cold-spawn', clearAfterKill: true }, eff,
+    )).toThrow('unlink failed');
+    expect(calls).toEqual(['kill', 'confirm', 'clear']); // NOT reselect
+  });
+
+  it('clear-stale-then-cold-spawn → clear only (no kill of a dead pane, no reselect)', () => {
+    const { calls, eff } = makeEffects();
+    executePersistentPaneMigration({ action: 'clear-stale-then-cold-spawn' }, eff);
+    expect(calls).toEqual(['clear']);
+  });
+
+  it('clear-stale clear FAILS → throws, aborts the spawn', () => {
+    const { calls, eff } = makeEffects();
+    eff.clearProvenanceVerified = () => { calls.push('clear'); throw new Error('rmdir'); };
+    expect(() => executePersistentPaneMigration({ action: 'clear-stale-then-cold-spawn' }, eff))
+      .toThrow('rmdir');
+    expect(calls).toEqual(['clear']);
+  });
+});
+
+describe('policyOffTombstoneValid — secure-read schema/version check', () => {
+  it('accepts a well-formed current-version tombstone (bootId diagnostic, not compared)', () => {
+    expect(policyOffTombstoneValid(policyOffTombstoneContent('boot-xyz'))).toBe(true);
+    // A DIFFERENT bootId is still valid — legit panes reattach across daemon restarts.
+    expect(policyOffTombstoneValid(policyOffTombstoneContent('some-other-boot'))).toBe(true);
+  });
+
+  it('rejects empty / garbage / wrong-shape bodies (lstat-present must not authorize)', () => {
+    expect(policyOffTombstoneValid(null)).toBe(false);
+    expect(policyOffTombstoneValid(undefined)).toBe(false);
+    expect(policyOffTombstoneValid('')).toBe(false);
+    expect(policyOffTombstoneValid('   ')).toBe(false);
+    expect(policyOffTombstoneValid('not json')).toBe(false);
+    expect(policyOffTombstoneValid(JSON.stringify({ policyOff: true, bootId: 'x' }))).toBe(false); // no version
+    expect(policyOffTombstoneValid(JSON.stringify({ version: 1, policyOff: true, bootId: 'x' }))).toBe(false); // stale version
+    expect(policyOffTombstoneValid(JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, policyOff: false, bootId: 'x' }))).toBe(false);
+    expect(policyOffTombstoneValid(JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, policyOff: true }))).toBe(false); // no bootId
+    expect(policyOffTombstoneValid(JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, policyOff: true, bootId: '' }))).toBe(false);
+    // An isolation marker must NOT validate as a tombstone.
+    expect(policyOffTombstoneValid(isolationPaneMarkerContent('boot', ['credential']))).toBe(false);
   });
 });
 

@@ -154,9 +154,11 @@ describe('persistent backend cold-restart ordering', () => {
     expect(thunk).toBeGreaterThan(-1);
 
     // Each `killPersistentBackendTarget` / `ZmxBackend.killManagedSession` gate
-    // must be followed by a re-selection before the backend is used.
+    // must be followed by a re-selection before the backend is used. The
+    // read-isolation kill now lives in the migrationEffects closures; the mcp gate
+    // is still inline.
     const gates = [
-      workerSource.indexOf('[read-isolation] persistent pane provenance mismatch'),
+      workerSource.indexOf('const migrationEffects: PersistentPaneMigrationEffects = {'),
       workerSource.indexOf('if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length'),
     ];
     for (const gate of gates) {
@@ -191,7 +193,7 @@ describe('persistent backend cold-restart ordering', () => {
 
   it('limits inconclusive-probe startup rejection to ZMX in both persistent gates', () => {
     const readIsolationStart = workerSource.indexOf(
-      "if (persistentSessionName && effectiveBackendType !== 'pty' && persistentPaneMigrationEvidence) {",
+      "if (persistentSessionName && effectiveBackendType !== 'pty' && persistentPaneGuardApplies) {",
     );
     const readIsolationEnd = workerSource.indexOf('let willReattachPersistent', readIsolationStart);
     const mcpStart = workerSource.indexOf(
@@ -218,7 +220,7 @@ describe('persistent backend cold-restart ordering', () => {
   });
 
   it('verifies read-isolation teardown against the exact captured backend target', () => {
-    const start = workerSource.indexOf('[read-isolation] persistent pane provenance mismatch');
+    const start = workerSource.indexOf('const staleSessionName = persistentSessionName;');
     const end = workerSource.indexOf('let willReattachPersistent', start);
     const gate = workerSource.slice(start, end);
     const capture = gate.indexOf(
@@ -242,7 +244,7 @@ describe('persistent backend cold-restart ordering', () => {
   });
 
   it('refreshes the frozen ZMX probe before read-isolation re-selects the backend', () => {
-    const start = workerSource.indexOf('[read-isolation] persistent pane provenance mismatch');
+    const start = workerSource.indexOf('const migrationEffects: PersistentPaneMigrationEffects = {');
     const end = workerSource.indexOf('let willReattachPersistent', start);
     const gate = workerSource.slice(start, end);
     const postKillProbe = gate.indexOf('const postKillProbe =');

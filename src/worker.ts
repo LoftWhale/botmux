@@ -29,9 +29,12 @@ import {
   isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
   evaluatePersistentPaneMigration,
+  executePersistentPaneMigration,
+  type PersistentPaneMigrationEffects,
   isolationPaneMarkerPath,
   policyOffTombstonePath,
   policyOffTombstoneContent,
+  policyOffTombstoneValid,
   sendCredFilePath,
   botHomePath,
   buildCliExecutableReadCarveOuts,
@@ -11902,13 +11905,20 @@ async function spawnCli(
     || cfg.chatId?.startsWith('http_wait_') === true;
   const isolationCapableBackend = effectiveBackendType === 'tmux';
   // Existence via no-follow probes so a planted/tampered leaf still counts as
-  // present and can never be used to force a silent reattach.
+  // present (→ triggers cleanup / conservative kill) and can never be used to
+  // force a silent reattach.
   const stalePaneMarkerPresent = hostEntryExistsNoFollow(stalePaneMarkerPath);
   const policyOffTombstonePresent = hostEntryExistsNoFollow(policyOffTombstoneFilePath);
-  const persistentPaneMigrationEvidence = appliedIsolationCapabilities.length > 0
-    || (noTransportSession && isolationCapableBackend
-      && (stalePaneMarkerPresent || policyOffTombstonePresent));
-  if (persistentSessionName && effectiveBackendType !== 'pty' && persistentPaneMigrationEvidence) {
+  // The guard must ENTER the state machine whenever it could have anything to
+  // decide, WITHOUT depending on provenance already being present — else a
+  // no-transport pane whose best-effort isolation marker write was lost would
+  // (NEITHER file) skip the guard and warm-reattach still confined (codex R3 #1).
+  // Enter for: any policy-ON spawn (capability check runs on every persistent
+  // backend, incl. credential-only zellij/herdr/zmx — codex R3 #2), OR a
+  // policy-OFF no-transport tmux session (the file-sandbox migration scope).
+  const persistentPaneGuardApplies = appliedIsolationCapabilities.length > 0
+    || (noTransportSession && isolationCapableBackend);
+  if (persistentSessionName && effectiveBackendType !== 'pty' && persistentPaneGuardApplies) {
     const persistentTarget = selectedBackend.persistentBackendTarget;
     // ZMX ownership is verified against the frozen PID, not just the name — a
     // same-named session may belong to the user or to a newer generation.
@@ -11953,12 +11963,19 @@ async function spawnCli(
           policyDigest: managedOriginChannelPolicyDigest,
         } : {}),
       });
+    // Tombstone authorizes a policy-off warm reattach ONLY when it passes a SECURE
+    // read (real 0600 regular file, right owner) + schema/version validation — a
+    // bare lstat "present" (empty / dir / symlink / garbage) must NOT authorize.
+    // Presence (above) still drives cleanup; validity drives authorization.
+    const policyOffTombstoneIsValid = paneLive && policyOffTombstonePresent
+      && policyOffTombstoneValid(readManagedOriginAuthorityFile(policyOffTombstoneFilePath));
     const migration = evaluatePersistentPaneMigration({
       appliedIsolationCapabilities,
       isolationCapableBackend,
       noTransport: noTransportSession,
       isolationMarkerPresent: stalePaneMarkerPresent,
       policyOffTombstonePresent,
+      policyOffTombstoneValid: policyOffTombstoneIsValid,
       paneLive,
       isolationMarkerReattachSafe,
     });
@@ -11975,92 +11992,80 @@ async function spawnCli(
         );
       }
     };
+    // Capture the stale name/target BEFORE any re-selection below (reselect
+    // reassigns persistentSessionName and widens it back to string | undefined).
+    const staleSessionName = persistentSessionName;
+    const stalePersistentTarget = selectedBackend.persistentBackendTarget;
+    const migrationEffects: PersistentPaneMigrationEffects = {
+      killStalePane: () => {
+        try {
+          // ZMX keeps its own call here rather than going through the target
+          // helper: only this path holds the frozen PID, which makes the
+          // ownership check stricter than the name+label check.
+          if (effectiveBackendType === 'zmx') {
+            ZmxBackend.killManagedSession(staleSessionName, cfg.sessionId, resolvedZmxSessionPid);
+          } else if (stalePersistentTarget) {
+            killPersistentBackendTarget(stalePersistentTarget, cfg.sessionId);
+          } else {
+            killPersistentSession(effectiveBackendType as PersistentBackendType, staleSessionName, cfg.sessionId);
+          }
+        } catch (e) {
+          throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: could not kill stale persistent pane (${(e as Error).message})`);
+        }
+      },
+      confirmPaneGone: () => {
+        const postKillProbe = effectiveBackendType === 'zmx'
+          ? probeOwnedZmxSession(staleSessionName, cfg.sessionId).probe
+          : (stalePersistentTarget
+            ? probePersistentBackendTarget(stalePersistentTarget)
+            : probePersistentSession(effectiveBackendType as PersistentBackendType, staleSessionName));
+        if (shouldRejectPersistentPostKillProbe(effectiveBackendType as PersistentBackendType, postKillProbe)) {
+          throw new Error(
+            `[read-isolation] refusing to start session ${cfg.sessionId}: `
+            + `could not confirm stale ${effectiveBackendType} pane termination`,
+          );
+        }
+        if (effectiveBackendType === 'zmx') {
+          resolvedZmxSessionProbe = postKillProbe;
+          resolvedZmxSessionPid = undefined;
+        }
+      },
+      clearProvenanceVerified: () => {
+        // Clear BOTH files (verified). Order-independent — both must end absent.
+        if (stalePaneMarkerPresent) removeProvenanceOrThrow(stalePaneMarkerPath, 'isolation marker');
+        if (policyOffTombstonePresent) removeProvenanceOrThrow(policyOffTombstoneFilePath, 'policy-off tombstone');
+      },
+      reselectBackend: () => {
+        // ZMX backend selection consumes the frozen probe. Refresh it before
+        // re-selecting or the replacement keeps isReattach=true for the pane
+        // that this gate just proved was removed.
+        selectedBackend = selectBackend();
+        isTmuxMode = selectedBackend.isTmuxMode;
+        isPipeMode = selectedBackend.isPipeMode;
+        isZellijMode = selectedBackend.isZellijMode;
+        backend = selectedBackend.backend;
+        cliLifetimeNonce++;
+        persistentSessionName = selectedBackend.persistentSessionName;
+      },
+    };
     if (migration.action === 'reattach') {
       if (originChannelPolicyExpected) {
         persistentPaneOriginChannelId = isolatedPaneOriginChannel(marker);
       }
       // Pane matches the current policy (isolated pane stamped under it, or a
-      // no-transport pane positively proven to be a policy-off generation) →
-      // still valid on the running process across daemon restarts; warm reattach
-      // preserves resume/context + tmux idle-suspend.
+      // no-transport pane with a VALIDATED policy-off tombstone) → still valid on
+      // the running process across daemon restarts; warm reattach preserves
+      // resume/context + tmux idle-suspend.
       log(`[read-isolation] reattaching persistent pane under current policy (${cfg.sessionId})`);
     } else if (migration.action === 'clear-stale-then-cold-spawn') {
-      // No live pane, but stale provenance files linger (e.g. a prior kill whose
-      // cold-spawn crashed). Clear BOTH (verified) so the fresh spawn below is not
-      // misjudged on the next restart. Fail closed if a leaf cannot be removed.
       log(`[read-isolation] clearing stale provenance for dead pane before cold-spawn (${cfg.sessionId})`);
-      if (stalePaneMarkerPresent) removeProvenanceOrThrow(stalePaneMarkerPath, 'isolation marker');
-      if (policyOffTombstonePresent) removeProvenanceOrThrow(policyOffTombstoneFilePath, 'policy-off tombstone');
     } else if (migration.action === 'kill-then-cold-spawn') {
-      // Live pane whose provenance is wrong/unknown (legacy isolated marker, or a
-      // no-transport pane lacking a policy-off tombstone) → kill before publishing
-      // any new capability. Provenance files are cleared ONLY AFTER the kill is
-      // confirmed (below) — clearing before the kill would, if the kill/probe
-      // fails, leave the still-alive confined pane with no on-disk evidence, so a
-      // retry would warm-reattach it (codex R2).
       log(`[read-isolation] persistent pane provenance mismatch for ${cfg.sessionId} — killing + cold-spawning with current policy`);
-      // Capture the name before re-selection: `persistentSessionName` is
-      // reassigned from the new selection below and widens back to
-      // `string | undefined`, but the backing name we are tearing down is
-      // this one and does not change.
-      const staleSessionName = persistentSessionName;
-      const stalePersistentTarget = selectedBackend.persistentBackendTarget;
-      try {
-        // ZMX keeps its own call here rather than going through the target
-        // helper: only this path holds the frozen PID, which makes the
-        // ownership check stricter than the name+label check.
-        if (effectiveBackendType === 'zmx') {
-          ZmxBackend.killManagedSession(
-            persistentSessionName,
-            cfg.sessionId,
-            resolvedZmxSessionPid,
-          );
-        } else {
-          if (stalePersistentTarget) killPersistentBackendTarget(stalePersistentTarget, cfg.sessionId);
-          else killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName, cfg.sessionId);
-        }
-      } catch (e) {
-        throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: could not kill stale persistent pane (${(e as Error).message})`);
-      }
-      const postKillProbe = effectiveBackendType === 'zmx'
-        ? probeOwnedZmxSession(staleSessionName, cfg.sessionId).probe
-        : (stalePersistentTarget
-          ? probePersistentBackendTarget(stalePersistentTarget)
-          : probePersistentSession(
-              effectiveBackendType as PersistentBackendType,
-              staleSessionName,
-            ));
-      if (shouldRejectPersistentPostKillProbe(
-        effectiveBackendType as PersistentBackendType,
-        postKillProbe,
-      )) {
-        throw new Error(
-          `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
-          `could not confirm stale ${effectiveBackendType} pane termination`,
-        );
-      }
-      // Kill CONFIRMED — only now is it safe to drop the provenance files. Fail
-      // closed if either cannot be verifiably removed (else a policy-off restart
-      // would misjudge the fresh pane and mis-kill it every time).
-      if (migration.clearAfterKill) {
-        if (stalePaneMarkerPresent) removeProvenanceOrThrow(stalePaneMarkerPath, 'isolation marker');
-        if (policyOffTombstonePresent) removeProvenanceOrThrow(policyOffTombstoneFilePath, 'policy-off tombstone');
-      }
-      if (effectiveBackendType === 'zmx') {
-        resolvedZmxSessionProbe = postKillProbe;
-        resolvedZmxSessionPid = undefined;
-      }
-      // ZMX backend selection consumes the frozen probe. Refresh it before
-      // re-selecting or the replacement keeps isReattach=true for the pane
-      // that this gate just proved was removed.
-      selectedBackend = selectBackend();
-      isTmuxMode = selectedBackend.isTmuxMode;
-      isPipeMode = selectedBackend.isPipeMode;
-      isZellijMode = selectedBackend.isZellijMode;
-      backend = selectedBackend.backend;
-      cliLifetimeNonce++;
-      persistentSessionName = selectedBackend.persistentSessionName;
     }
+    // Ordered, fail-closed side effects (kill → confirm → clear → reselect) live
+    // in executePersistentPaneMigration so the ordering + stop-on-failure
+    // guarantees are unit-testable with injected mocks.
+    executePersistentPaneMigration(migration, migrationEffects);
   }
   readIsolationOriginChannelId = managedOriginChannelRequired
     ? (persistentPaneOriginChannelId ?? randomBytes(32).toString('hex'))
@@ -13246,6 +13251,10 @@ async function spawnCli(
   if (appliedIsolationCapabilities.length > 0 && persistentSessionName && !willReattachPersistent) {
     try {
       mkdirSync(join(isolationRuntimeDataDir, 'read-isolation'), { recursive: true });
+      // Mutual exclusivity: a policy-ON generation must not carry a stale
+      // policy-off tombstone (else a later flip to policy-off could read it as a
+      // no-sandbox generation). Best-effort like the marker write itself.
+      try { unlinkSync(policyOffTombstonePath(isolationRuntimeDataDir, cfg.sessionId)); } catch { /* absent */ }
       replaceManagedOriginCapabilityFile(
         isolationPaneMarkerPath(isolationRuntimeDataDir, cfg.sessionId),
         isolationPaneMarkerContent(
@@ -13271,6 +13280,15 @@ async function spawnCli(
     // than spawn a pane we cannot prove, FAIL CLOSED here.
     try {
       mkdirSync(join(isolationRuntimeDataDir, 'read-isolation'), { recursive: true });
+      // Mutual exclusivity: clear any stale isolation marker BEFORE recording the
+      // tombstone, so this policy-off generation is never seen as still-confined.
+      // Verified (fail-closed) — a lingering marker DOMINATES the tombstone in the
+      // guard, so leaving one would defeat the tombstone entirely.
+      const staleMarker = isolationPaneMarkerPath(isolationRuntimeDataDir, cfg.sessionId);
+      try { unlinkSync(staleMarker); } catch { /* absent */ }
+      if (hostEntryExistsNoFollow(staleMarker)) {
+        throw new Error(`stale isolation marker survived removal at ${staleMarker}`);
+      }
       replaceManagedOriginCapabilityFile(
         policyOffTombstonePath(isolationRuntimeDataDir, cfg.sessionId),
         policyOffTombstoneContent(cfg.daemonBootId ?? ''),
