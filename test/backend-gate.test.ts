@@ -156,7 +156,7 @@ describe('persistent backend cold-restart ordering', () => {
     // Each `killPersistentBackendTarget` / `ZmxBackend.killManagedSession` gate
     // must be followed by a re-selection before the backend is used.
     const gates = [
-      workerSource.indexOf('[read-isolation] legacy/unmarked persistent pane'),
+      workerSource.indexOf('[read-isolation] persistent pane provenance mismatch'),
       workerSource.indexOf('if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length'),
     ];
     for (const gate of gates) {
@@ -191,7 +191,7 @@ describe('persistent backend cold-restart ordering', () => {
 
   it('limits inconclusive-probe startup rejection to ZMX in both persistent gates', () => {
     const readIsolationStart = workerSource.indexOf(
-      'if (persistentPaneReattachGuardEngaged(appliedIsolationCapabilities, stalePaneMarkerPresent)',
+      "if (persistentSessionName && effectiveBackendType !== 'pty' && persistentPaneMigrationEvidence) {",
     );
     const readIsolationEnd = workerSource.indexOf('let willReattachPersistent', readIsolationStart);
     const mcpStart = workerSource.indexOf(
@@ -218,7 +218,7 @@ describe('persistent backend cold-restart ordering', () => {
   });
 
   it('verifies read-isolation teardown against the exact captured backend target', () => {
-    const start = workerSource.indexOf('[read-isolation] legacy/unmarked persistent pane');
+    const start = workerSource.indexOf('[read-isolation] persistent pane provenance mismatch');
     const end = workerSource.indexOf('let willReattachPersistent', start);
     const gate = workerSource.slice(start, end);
     const capture = gate.indexOf(
@@ -242,7 +242,7 @@ describe('persistent backend cold-restart ordering', () => {
   });
 
   it('refreshes the frozen ZMX probe before read-isolation re-selects the backend', () => {
-    const start = workerSource.indexOf('[read-isolation] legacy/unmarked persistent pane');
+    const start = workerSource.indexOf('[read-isolation] persistent pane provenance mismatch');
     const end = workerSource.indexOf('let willReattachPersistent', start);
     const gate = workerSource.slice(start, end);
     const postKillProbe = gate.indexOf('const postKillProbe =');

@@ -447,28 +447,39 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     expect(workerSource).toContain('no-transport suppressed');
   });
 
-  it('persistent-pane guard engages on policy-OFF migration and clears the stale marker before killing (no kill-loop)', () => {
-    // 2026-08 no-transport 放宽 migration: the reattach guard must be driven by
-    // persistentPaneReattachGuardEngaged (which engages when the policy is OFF but
-    // a boot marker survives on disk), NOT the old bare `capabilities.length > 0`
-    // gate that skipped policy-off entirely and warm-reattached a still-confined
-    // legacy pane. Behavioral truth table lives in read-isolation.test.ts.
-    expect(workerSource).toContain('const stalePaneMarkerPresent = hostEntryExistsNoFollow(stalePaneMarkerPath);');
-    expect(workerSource).toContain(
-      'if (persistentPaneReattachGuardEngaged(appliedIsolationCapabilities, stalePaneMarkerPresent)',
-    );
-    // The kill branch MUST unlink the on-disk marker before killing: a policy-off
-    // cold-spawn writes NO new marker (the stamp is still gated on capabilities>0),
-    // so a surviving marker would re-engage the guard every restart and kill the
-    // freshly-spawned pane forever. Assert the unlink precedes the kill.
+  it('persistent-pane guard is driven by evaluatePersistentPaneMigration and clears provenance only AFTER kill is confirmed', () => {
+    // 2026-08 no-transport 放宽 migration: the reattach guard delegates to the
+    // pure state machine evaluatePersistentPaneMigration; behavioral truth table
+    // (incl. the crash/teardown branches) lives in read-isolation.test.ts. Here we
+    // lock the WORKER WIRING that the pure fn cannot cover.
+    expect(workerSource).toContain('const migration = evaluatePersistentPaneMigration({');
+    // The gate enters for policy-ON, or a no-transport isolation-capable session
+    // with stale provenance — NOT the old bare `capabilities.length > 0`.
+    expect(workerSource).toContain('const persistentPaneMigrationEvidence = appliedIsolationCapabilities.length > 0');
+    expect(workerSource).not.toContain('persistentPaneReattachGuardEngaged');
+    // Provenance removal is VERIFIED (unlink → re-probe → throw if still present),
+    // so an un-removable leaf fails closed instead of looping kills.
+    const remover = region(workerSource,
+      'const removeProvenanceOrThrow =', 'if (migration.action === ');
+    expect(remover).toContain('hostEntryExistsNoFollow(path)');
+    expect(remover).toContain('could not remove stale');
+    // CRITICAL ORDER (codex R2): in the kill branch the provenance clear must come
+    // AFTER the post-kill probe confirmation, never before the kill — else a failed
+    // kill/probe leaves a live confined pane with no evidence and a retry reattaches
+    // it. Assert clearAfterKill runs after shouldRejectPersistentPostKillProbe.
     const killBlock = region(workerSource,
-      '[read-isolation] legacy/unmarked persistent pane',
-      'let willReattachPersistent');
-    const unlink = killBlock.indexOf('unlinkSync(stalePaneMarkerPath)');
-    const kill = killBlock.indexOf('killPersistentBackendTarget(stalePersistentTarget, cfg.sessionId)');
-    expect(unlink).toBeGreaterThan(-1);
-    expect(kill).toBeGreaterThan(-1);
-    expect(unlink).toBeLessThan(kill);
+      "if (migration.action === 'kill-then-cold-spawn')",
+      'selectedBackend = selectBackend();');
+    const killCall = killBlock.indexOf('could not kill stale persistent pane');
+    const postKillReject = killBlock.indexOf('shouldRejectPersistentPostKillProbe(');
+    const clear = killBlock.indexOf('if (migration.clearAfterKill) {');
+    expect(killCall).toBeGreaterThan(-1);
+    expect(postKillReject).toBeGreaterThan(killCall);
+    expect(clear).toBeGreaterThan(postKillReject);
+    // Policy-OFF cold-spawn of a no-transport isolation-capable pane MUST record a
+    // tombstone, and FAIL CLOSED if it cannot (else next restart mis-kills it).
+    expect(workerSource).toContain('policyOffTombstonePath(isolationRuntimeDataDir, cfg.sessionId)');
+    expect(workerSource).toContain('could not record policy-off generation tombstone');
   });
 
   it('daemon freezes the actual loaded bots-config path into the worker init message', () => {

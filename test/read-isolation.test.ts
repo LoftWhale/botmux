@@ -9,7 +9,7 @@ import {
   buildCredentialIsolationRules,
   isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
-  persistentPaneReattachGuardEngaged,
+  evaluatePersistentPaneMigration,
   isolationPaneMarkerContent,
   ISOLATION_PANE_MARKER_VERSION,
   isolationPanePolicyDigest,
@@ -315,35 +315,110 @@ describe('isolatedPaneReattachSafe', () => {
 
 // ─── cold-start migration: START-TIME env contract (bots.json EPERM fix) ──────
 
-describe('persistentPaneReattachGuardEngaged — policy-off migration re-evaluates stale isolated panes', () => {
-  // The worker's persistent-pane guard probes a live pane and, when its stamped
-  // marker does not match the current policy, kills it + cold-spawns. This helper
-  // is the ENTRY decision for that guard. Its correctness is the fix for the
-  // 2026-08 no-transport 放宽 upgrade path: an apiOnly / HTTP-virtual session that
-  // was FORCE-isolated by an older build leaves a live confined pane + boot marker;
-  // after upgrade the new policy is OFF, and without this the guard's outer gate
-  // (formerly `capabilities.length > 0`) skipped evaluation entirely and warm-
-  // reattached the still-confined process.
+describe('evaluatePersistentPaneMigration — policy-on/off pane provenance state machine', () => {
+  // Pure decision behind the worker's stale-pane guard (worker.ts). Covers the
+  // 2026-08 no-transport 放宽 upgrade path AND the crash/teardown-failure branches
+  // codex flagged. `isolationMarkerReattachSafe` is the caller's precomputed
+  // isolatedPaneReattachSafe() result (only meaningful under policy ON).
   const CAPS_ON = ['credential', 'read', 'write'] as const;
   const CAPS_OFF = [] as const;
+  const base = {
+    isolationCapableBackend: true,
+    noTransport: true,
+    isolationMarkerPresent: false,
+    policyOffTombstonePresent: false,
+    paneLive: true,
+    isolationMarkerReattachSafe: false,
+  };
 
-  it('policy ON always engages the guard (marker present or not)', () => {
-    // A suspend→resume of the SAME isolated process (marker present) and a fresh
-    // isolated spawn whose marker was lost (absent) must both be evaluated.
-    expect(persistentPaneReattachGuardEngaged(CAPS_ON, true)).toBe(true);
-    expect(persistentPaneReattachGuardEngaged(CAPS_ON, false)).toBe(true);
+  it('non-isolation-capable backend → skip (zellij/zmx/herdr can never carry a marker)', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF, isolationCapableBackend: false,
+      isolationMarkerPresent: true,
+    })).toEqual({ action: 'skip' });
   });
 
-  it('policy OFF + stale marker present → engages (so the OFF arm kills + cold-spawns unconfined)', () => {
-    // THE regression: old forced-isolation pane still alive & stamped, new policy
-    // OFF. Must engage, not silently reattach the confined process.
-    expect(persistentPaneReattachGuardEngaged(CAPS_OFF, true)).toBe(true);
+  // ── policy ON ──
+  it('policy ON + live pane stamped under current policy → reattach', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_ON,
+      isolationMarkerPresent: true, isolationMarkerReattachSafe: true,
+    })).toEqual({ action: 'reattach' });
   });
 
-  it('policy OFF + no marker → does NOT engage (ordinary never-isolated session, no false kill)', () => {
-    // A normal chat / no-transport session that was never isolated must warm-
-    // reattach untouched — no extra probe, no spurious kill.
-    expect(persistentPaneReattachGuardEngaged(CAPS_OFF, false)).toBe(false);
+  it('policy ON + live pane whose marker does NOT match → kill + cold-spawn (clear after kill)', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_ON,
+      isolationMarkerPresent: true, isolationMarkerReattachSafe: false,
+    })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
+  });
+
+  it('policy ON + no live pane → skip (nothing to guard; fresh spawn stamps)', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_ON, paneLive: false,
+    })).toEqual({ action: 'skip' });
+  });
+
+  // ── policy OFF, no-transport migration arm ──
+  it('policy OFF + live pane proven policy-off (tombstone, no isolation marker) → reattach', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF,
+      policyOffTombstonePresent: true, isolationMarkerPresent: false,
+    })).toEqual({ action: 'reattach' });
+  });
+
+  it('policy OFF + live pane with legacy ISOLATION marker → kill + cold-spawn (the core regression)', () => {
+    // Old forced-isolation pane still alive & stamped; new policy OFF. Must kill,
+    // not warm-reattach the still-confined process.
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF,
+      isolationMarkerPresent: true,
+    })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
+  });
+
+  it('policy OFF + live pane with NEITHER file → kill (absence never proves "never isolated")', () => {
+    // issue-3 root fix: the isolation stamp is best-effort, so "no marker" cannot
+    // be trusted as safe. Without positive tombstone proof the live pane is killed.
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF,
+      isolationMarkerPresent: false, policyOffTombstonePresent: false,
+    })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
+  });
+
+  it('policy OFF + live pane with BOTH files (marker wins) → kill', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF,
+      isolationMarkerPresent: true, policyOffTombstonePresent: true,
+    })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
+  });
+
+  it('policy OFF + pane MISSING but stale marker lingers → clear stale then cold-spawn (no next-restart false kill)', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF,
+      paneLive: false, isolationMarkerPresent: true,
+    })).toEqual({ action: 'clear-stale-then-cold-spawn' });
+  });
+
+  it('policy OFF + pane MISSING but stale tombstone lingers → clear stale then cold-spawn', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF,
+      paneLive: false, policyOffTombstonePresent: true,
+    })).toEqual({ action: 'clear-stale-then-cold-spawn' });
+  });
+
+  it('policy OFF + pane MISSING + no files → skip (nothing stale to clear)', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF, paneLive: false,
+    })).toEqual({ action: 'skip' });
+  });
+
+  it('policy OFF + TRANSPORT-ENABLED chat → skip even with a marker (never force-isolated, no false kill)', () => {
+    // Ordinary chats were never subject to the removed rule; the tombstone
+    // requirement must not touch them.
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF, noTransport: false,
+      isolationMarkerPresent: true,
+    })).toEqual({ action: 'skip' });
   });
 });
 

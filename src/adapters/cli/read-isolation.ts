@@ -437,6 +437,30 @@ export function isolatedPaneOriginChannel(
   }
 }
 
+/** Directory holding per-session persistent-pane provenance files. */
+export function persistentPaneProvenanceDir(runtimeDataDir: string): string {
+  return `${runtimeDataDir.replace(/\/+$/, '')}/read-isolation`;
+}
+
+/** ISOLATION marker path (`<sid>.boot`) — stamped for a policy-ON sandboxed pane. */
+export function isolationPaneMarkerPath(runtimeDataDir: string, sessionId: string): string {
+  return `${persistentPaneProvenanceDir(runtimeDataDir)}/${assertSafeAppId(sessionId)}.boot`;
+}
+
+/** TOMBSTONE path (`<sid>.policy-off`) — positively proves a live pane was
+ *  cold-spawned by the current NO-SANDBOX policy (see
+ *  {@link evaluatePersistentPaneMigration}). Distinct filename so it survives /
+ *  is cleared independently of the isolation marker. */
+export function policyOffTombstonePath(runtimeDataDir: string, sessionId: string): string {
+  return `${persistentPaneProvenanceDir(runtimeDataDir)}/${assertSafeAppId(sessionId)}.policy-off`;
+}
+
+/** Tombstone body: a self-describing, version-stamped generation proof. Content
+ *  is diagnostic only — presence (as a real 0600 file) is the signal. */
+export function policyOffTombstoneContent(bootId: string): string {
+  return JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, policyOff: true, bootId });
+}
+
 /**
  * Decide whether a live persistent pane (tmux/zellij/herdr) may be reattached for
  * an isolated bot. Isolation is injected at CLI *spawn* time (the Seatbelt
@@ -513,33 +537,117 @@ export function isolatedPaneReattachSafe(
 }
 
 /**
- * Should the worker's persistent-pane (tmux/zellij/herdr/zmx) reattach guard
- * ENGAGE for this spawn? The guard probes a live pane and, if its stamped marker
- * does not match the current policy, kills it and cold-spawns. Two spawn shapes
- * must engage it:
+ * Persistent-pane (tmux/zellij/herdr/zmx) reattach migration decision — the pure
+ * state machine behind the worker's stale-pane guard. Isolation is injected at
+ * CLI *spawn* time and lives on the RUNNING process, so a pane that survives a
+ * daemon restart keeps whatever confinement it was born with. This function
+ * decides, from persisted evidence + the current policy, whether the live pane
+ * may be warm-reattached or must be killed + cold-spawned under the new policy.
  *
- *   1. Policy ON (`appliedIsolationCapabilities` non-empty): a surviving pane
- *      might be a suspend→resume of the same isolated process (reattach OK) or a
- *      legacy/mismatched one (kill). Always evaluate.
- *   2. Policy OFF (no capabilities) but a boot marker is present on disk: the pane
- *      may be a still-confined process spawned by an OLDER build under the former
- *      FORCED no-transport isolation. Blindly reattaching it would keep the CLI
- *      confined against a policy we no longer want — silently violating "read
- *      scope follows local config" on resume/restart (the 2026-08 no-transport
- *      放宽 upgrade path). Engage so the OFF arm can kill + cold-spawn unconfined.
+ * Two provenance files live under `<runtimeDataDir>/read-isolation/`:
+ *   · `<sid>.boot`      — ISOLATION marker: written (best-effort) when a policy-ON
+ *                         (sandboxed) pane is spawned. Its capabilities/policy are
+ *                         version-checked by {@link isolatedPaneReattachSafe}.
+ *   · `<sid>.policy-off` — TOMBSTONE: written when a policy-OFF (no-sandbox) pane
+ *                         is cold-spawned, positively proving "this generation was
+ *                         created by the current no-sandbox policy".
  *
- * Policy OFF with NO marker is the ordinary never-isolated session: the guard
- * stays disengaged so a normal warm reattach is untouched (no false kill, no
- * extra probe). `markerPresentOnDisk` MUST come from a no-follow existence probe
- * (a planted/tampered leaf that fails to parse still counts as present, so it can
- * never be used to force a silent reattach). Backend/pty applicability is checked
- * by the caller.
+ * Why a tombstone and not just "no isolation marker": the isolation stamp is
+ * BEST-EFFORT (its write is wrapped in try/catch and the spawn proceeds anyway),
+ * so "no marker" does NOT prove the live process was never isolated — a sandboxed
+ * pane whose stamp write lost a race/perm/disk error looks identical. Under
+ * policy-OFF we therefore require POSITIVE proof (tombstone) to warm-reattach; any
+ * other shape (isolation marker present, or NEITHER file) is treated as
+ * possibly-still-confined and killed. Absence is never trusted as safe.
+ *
+ * The decision is scoped to sessions whose backend can actually be isolated
+ * (`isolationCapableBackend`, i.e. tmux — pty is never persistent; zellij/zmx/
+ * herdr hard-error under sandbox so they can never carry a marker) AND, for the
+ * migration arm, to `noTransport` sessions (the ONLY ones the removed rule ever
+ * force-isolated). An ordinary transport-enabled chat was never force-isolated,
+ * so it is never subjected to the tombstone requirement — no false kills.
+ *
+ * Existence flags MUST come from no-follow existence probes (a planted/tampered
+ * leaf that fails to parse still counts as present, so it can never be used to
+ * force a silent reattach). Pane liveness is the caller's probe.
  */
-export function persistentPaneReattachGuardEngaged(
-  appliedIsolationCapabilities: readonly IsolationCapability[],
-  markerPresentOnDisk: boolean,
-): boolean {
-  return appliedIsolationCapabilities.length > 0 || markerPresentOnDisk;
+export type PersistentPaneMigrationInput = {
+  /** Current-spawn isolation capabilities (empty ⇒ policy OFF this spawn). */
+  appliedIsolationCapabilities: readonly IsolationCapability[];
+  /** Backend can carry an isolation sandbox at all (tmux). */
+  isolationCapableBackend: boolean;
+  /** apiOnly bot OR HTTP-virtual chat — the sessions the old rule force-isolated. */
+  noTransport: boolean;
+  /** `<sid>.boot` exists on disk (no-follow). */
+  isolationMarkerPresent: boolean;
+  /** `<sid>.policy-off` tombstone exists on disk (no-follow). */
+  policyOffTombstonePresent: boolean;
+  /** The persistent pane is currently alive (caller's probe === 'exists'). */
+  paneLive: boolean;
+  /**
+   * Result of {@link isolatedPaneReattachSafe}(marker, current policy) — only
+   * meaningful when policy is ON. The caller computes it (it needs the parsed
+   * marker + policy digest); passed in to keep this function pure.
+   */
+  isolationMarkerReattachSafe: boolean;
+};
+
+export type PersistentPaneMigrationDecision =
+  /** Guard does not apply (backend can't isolate, or nothing to evaluate). */
+  | { action: 'skip' }
+  /** Live pane matches the current policy → keep the running process. */
+  | { action: 'reattach' }
+  /** Live pane's provenance is wrong/unknown → kill, then cold-spawn. Marker +
+   *  tombstone must be cleared ONLY AFTER the kill is confirmed (see clearAfterKill). */
+  | { action: 'kill-then-cold-spawn'; clearAfterKill: boolean }
+  /** No live pane, but stale provenance files linger → clear them (verified) then
+   *  cold-spawn fresh, so a later restart doesn't misjudge the new pane. */
+  | { action: 'clear-stale-then-cold-spawn' };
+
+export function evaluatePersistentPaneMigration(
+  input: PersistentPaneMigrationInput,
+): PersistentPaneMigrationDecision {
+  const {
+    appliedIsolationCapabilities, isolationCapableBackend, noTransport,
+    isolationMarkerPresent, policyOffTombstonePresent, paneLive,
+    isolationMarkerReattachSafe,
+  } = input;
+  const policyOn = appliedIsolationCapabilities.length > 0;
+
+  // A backend that cannot be isolated never carries a marker and cannot have been
+  // confined, so the migration guard is irrelevant. (Callers also skip pty.)
+  if (!isolationCapableBackend) return { action: 'skip' };
+
+  if (policyOn) {
+    // Policy ON: only a live pane stamped under the CURRENT policy may reattach;
+    // a legacy/mismatched one is killed. No live pane → nothing to guard.
+    if (!paneLive) return { action: 'skip' };
+    if (isolationMarkerReattachSafe) return { action: 'reattach' };
+    return { action: 'kill-then-cold-spawn', clearAfterKill: true };
+  }
+
+  // Policy OFF. Only no-transport sessions could ever have been force-isolated by
+  // the removed rule; an ordinary chat was never confined, so leave it untouched
+  // (no tombstone requirement, no probe, no false kill).
+  if (!noTransport) return { action: 'skip' };
+
+  const hasStaleFiles = isolationMarkerPresent || policyOffTombstonePresent;
+
+  if (paneLive) {
+    // Warm reattach is allowed ONLY with positive proof the live generation is a
+    // known policy-off pane: a tombstone present AND no isolation marker. Any
+    // other shape — isolation marker present, or NEITHER file (absence never
+    // proves "was never isolated", since the isolation stamp is best-effort) —
+    // is treated as possibly-still-confined and killed.
+    const provenPolicyOffGeneration = policyOffTombstonePresent && !isolationMarkerPresent;
+    if (provenPolicyOffGeneration) return { action: 'reattach' };
+    return { action: 'kill-then-cold-spawn', clearAfterKill: true };
+  }
+
+  // No live pane. If stale provenance files linger they must be cleared (verified)
+  // before the fresh cold-spawn, or a later restart would misjudge the new pane.
+  if (hasStaleFiles) return { action: 'clear-stale-then-cold-spawn' };
+  return { action: 'skip' };
 }
 
 function dedupe(xs: string[]): string[] {
