@@ -191,7 +191,7 @@ describe('persistent backend cold-restart ordering', () => {
 
   it('limits inconclusive-probe startup rejection to ZMX in both persistent gates', () => {
     const readIsolationStart = workerSource.indexOf(
-      'if (appliedIsolationCapabilities.length > 0 && persistentSessionName',
+      'if (persistentPaneReattachGuardEngaged(appliedIsolationCapabilities, stalePaneMarkerPresent)',
     );
     const readIsolationEnd = workerSource.indexOf('let willReattachPersistent', readIsolationStart);
     const mcpStart = workerSource.indexOf(

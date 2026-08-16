@@ -512,6 +512,36 @@ export function isolatedPaneReattachSafe(
   }
 }
 
+/**
+ * Should the worker's persistent-pane (tmux/zellij/herdr/zmx) reattach guard
+ * ENGAGE for this spawn? The guard probes a live pane and, if its stamped marker
+ * does not match the current policy, kills it and cold-spawns. Two spawn shapes
+ * must engage it:
+ *
+ *   1. Policy ON (`appliedIsolationCapabilities` non-empty): a surviving pane
+ *      might be a suspend→resume of the same isolated process (reattach OK) or a
+ *      legacy/mismatched one (kill). Always evaluate.
+ *   2. Policy OFF (no capabilities) but a boot marker is present on disk: the pane
+ *      may be a still-confined process spawned by an OLDER build under the former
+ *      FORCED no-transport isolation. Blindly reattaching it would keep the CLI
+ *      confined against a policy we no longer want — silently violating "read
+ *      scope follows local config" on resume/restart (the 2026-08 no-transport
+ *      放宽 upgrade path). Engage so the OFF arm can kill + cold-spawn unconfined.
+ *
+ * Policy OFF with NO marker is the ordinary never-isolated session: the guard
+ * stays disengaged so a normal warm reattach is untouched (no false kill, no
+ * extra probe). `markerPresentOnDisk` MUST come from a no-follow existence probe
+ * (a planted/tampered leaf that fails to parse still counts as present, so it can
+ * never be used to force a silent reattach). Backend/pty applicability is checked
+ * by the caller.
+ */
+export function persistentPaneReattachGuardEngaged(
+  appliedIsolationCapabilities: readonly IsolationCapability[],
+  markerPresentOnDisk: boolean,
+): boolean {
+  return appliedIsolationCapabilities.length > 0 || markerPresentOnDisk;
+}
+
 function dedupe(xs: string[]): string[] {
   return Array.from(new Set(xs));
 }

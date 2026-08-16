@@ -447,6 +447,30 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     expect(workerSource).toContain('no-transport suppressed');
   });
 
+  it('persistent-pane guard engages on policy-OFF migration and clears the stale marker before killing (no kill-loop)', () => {
+    // 2026-08 no-transport 放宽 migration: the reattach guard must be driven by
+    // persistentPaneReattachGuardEngaged (which engages when the policy is OFF but
+    // a boot marker survives on disk), NOT the old bare `capabilities.length > 0`
+    // gate that skipped policy-off entirely and warm-reattached a still-confined
+    // legacy pane. Behavioral truth table lives in read-isolation.test.ts.
+    expect(workerSource).toContain('const stalePaneMarkerPresent = hostEntryExistsNoFollow(stalePaneMarkerPath);');
+    expect(workerSource).toContain(
+      'if (persistentPaneReattachGuardEngaged(appliedIsolationCapabilities, stalePaneMarkerPresent)',
+    );
+    // The kill branch MUST unlink the on-disk marker before killing: a policy-off
+    // cold-spawn writes NO new marker (the stamp is still gated on capabilities>0),
+    // so a surviving marker would re-engage the guard every restart and kill the
+    // freshly-spawned pane forever. Assert the unlink precedes the kill.
+    const killBlock = region(workerSource,
+      '[read-isolation] legacy/unmarked persistent pane',
+      'let willReattachPersistent');
+    const unlink = killBlock.indexOf('unlinkSync(stalePaneMarkerPath)');
+    const kill = killBlock.indexOf('killPersistentBackendTarget(stalePersistentTarget, cfg.sessionId)');
+    expect(unlink).toBeGreaterThan(-1);
+    expect(kill).toBeGreaterThan(-1);
+    expect(unlink).toBeLessThan(kill);
+  });
+
   it('daemon freezes the actual loaded bots-config path into the worker init message', () => {
     // getLoadedConfigPath() is host-frozen; the worker must not re-guess from env.
     const block = region(workerPoolSource, 'apiOnly: botCfg.apiOnly,', 'brand: normalizeBrand(botCfg.brand),');

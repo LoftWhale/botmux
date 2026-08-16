@@ -9,6 +9,7 @@ import {
   buildCredentialIsolationRules,
   isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
+  persistentPaneReattachGuardEngaged,
   isolationPaneMarkerContent,
   ISOLATION_PANE_MARKER_VERSION,
   isolationPanePolicyDigest,
@@ -313,6 +314,38 @@ describe('isolatedPaneReattachSafe', () => {
 });
 
 // ─── cold-start migration: START-TIME env contract (bots.json EPERM fix) ──────
+
+describe('persistentPaneReattachGuardEngaged — policy-off migration re-evaluates stale isolated panes', () => {
+  // The worker's persistent-pane guard probes a live pane and, when its stamped
+  // marker does not match the current policy, kills it + cold-spawns. This helper
+  // is the ENTRY decision for that guard. Its correctness is the fix for the
+  // 2026-08 no-transport 放宽 upgrade path: an apiOnly / HTTP-virtual session that
+  // was FORCE-isolated by an older build leaves a live confined pane + boot marker;
+  // after upgrade the new policy is OFF, and without this the guard's outer gate
+  // (formerly `capabilities.length > 0`) skipped evaluation entirely and warm-
+  // reattached the still-confined process.
+  const CAPS_ON = ['credential', 'read', 'write'] as const;
+  const CAPS_OFF = [] as const;
+
+  it('policy ON always engages the guard (marker present or not)', () => {
+    // A suspend→resume of the SAME isolated process (marker present) and a fresh
+    // isolated spawn whose marker was lost (absent) must both be evaluated.
+    expect(persistentPaneReattachGuardEngaged(CAPS_ON, true)).toBe(true);
+    expect(persistentPaneReattachGuardEngaged(CAPS_ON, false)).toBe(true);
+  });
+
+  it('policy OFF + stale marker present → engages (so the OFF arm kills + cold-spawns unconfined)', () => {
+    // THE regression: old forced-isolation pane still alive & stamped, new policy
+    // OFF. Must engage, not silently reattach the confined process.
+    expect(persistentPaneReattachGuardEngaged(CAPS_OFF, true)).toBe(true);
+  });
+
+  it('policy OFF + no marker → does NOT engage (ordinary never-isolated session, no false kill)', () => {
+    // A normal chat / no-transport session that was never isolated must warm-
+    // reattach untouched — no extra probe, no spurious kill.
+    expect(persistentPaneReattachGuardEngaged(CAPS_OFF, false)).toBe(false);
+  });
+});
 
 /**
  * Regression guard (2026-08-03). The bots.json-EPERM fix injects a NEW start-time

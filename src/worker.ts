@@ -28,6 +28,7 @@ import {
   buildSeatbeltProfile,
   isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
+  persistentPaneReattachGuardEngaged,
   sendCredFilePath,
   botHomePath,
   buildCliExecutableReadCarveOuts,
@@ -11872,8 +11873,30 @@ async function spawnCli(
   // so the probe below sees no pane and we cold-spawn fresh isolated. A pane from
   // this lifetime (suspend→resume) keeps its marker → reattaches normally (it is
   // still the isolated process). This lets isolated bots use tmux/zellij/herdr.
+  //
+  // The MIRROR case is just as load-bearing: policy is now OFF (no sandbox, not
+  // enrolled → appliedIsolationCapabilities empty), but a pane spawned by an OLDER
+  // build under the previous FORCED no-transport isolation is still alive AND still
+  // stamped. That pane runs confined against a policy we no longer want; a bare
+  // `capabilities.length > 0` gate would skip the check entirely and warm-reattach
+  // the still-isolated process, silently contradicting "read scope follows local
+  // config" on resume/restart (the 2026-08 no-transport放宽 upgrade path). So we
+  // also enter when a boot marker is present on disk for THIS session — then the
+  // policy-off arm below (no expected capabilities) demands the marker be truly
+  // absent to reattach, else kills + cold-spawns unconfined. Presence is checked
+  // by the no-follow existence probe (a planted/tampered leaf that reads as null
+  // still counts as present, so it cannot be used to force a silent reattach).
   let persistentPaneOriginChannelId: string | undefined;
-  if (appliedIsolationCapabilities.length > 0 && persistentSessionName && effectiveBackendType !== 'pty') {
+  const stalePaneMarkerPath = join(
+    isolationRuntimeDataDir, 'read-isolation', `${cfg.sessionId}.boot`,
+  );
+  // When the policy is OFF, a boot marker on disk is the signal that a
+  // previously-isolated pane may still be alive and must be re-evaluated rather
+  // than blindly reattached (see persistentPaneReattachGuardEngaged). Probed with
+  // the no-follow existence check so a planted/tampered leaf still counts.
+  const stalePaneMarkerPresent = hostEntryExistsNoFollow(stalePaneMarkerPath);
+  if (persistentPaneReattachGuardEngaged(appliedIsolationCapabilities, stalePaneMarkerPresent)
+      && persistentSessionName && effectiveBackendType !== 'pty') {
     const persistentTarget = selectedBackend.persistentBackendTarget;
     // ZMX ownership is verified against the frozen PID, not just the name — a
     // same-named session may belong to the user or to a newer generation.
@@ -11903,9 +11926,7 @@ async function spawnCli(
     }
     const paneLive = paneProbe === 'exists';
     if (paneLive) {
-      const markerPath = join(
-        isolationRuntimeDataDir, 'read-isolation', `${cfg.sessionId}.boot`,
-      );
+      const markerPath = stalePaneMarkerPath;
       const marker = readManagedOriginAuthorityFile(markerPath);
       const originChannelPolicyExpected = !!managedOriginChannelPolicyDigest;
       // A stamped pane must match even when the new policy is OFF. Otherwise a
@@ -11936,6 +11957,13 @@ async function spawnCli(
         // Missing/legacy marker → pane predates the current policy and may retain
         // obsolete permissions. Kill it before publishing any new capability.
         log(`[read-isolation] legacy/unmarked persistent pane for ${cfg.sessionId} — killing + cold-spawning with current policy`);
+        // Remove the stale on-disk marker BEFORE the kill. If the new policy is
+        // OFF we cold-spawn unconfined and write NO new marker (see the stamp gate
+        // below, still keyed on capabilities>0), so a surviving marker would make
+        // every later restart re-enter here and kill the freshly-spawned pane — an
+        // infinite kill loop. A policy-ON cold-spawn re-stamps a fresh marker after
+        // reattach is ruled out, so clearing it here is safe in both directions.
+        try { unlinkSync(stalePaneMarkerPath); } catch { /* absent / already gone */ }
         // Capture the name before re-selection: `persistentSessionName` is
         // reassigned from the new selection below and widens back to
         // `string | undefined`, but the backing name we are tearing down is
