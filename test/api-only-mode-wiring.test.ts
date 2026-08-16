@@ -305,16 +305,22 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(fedRoster).toContain('larkTransportEnabled: b.larkTransportEnabled,');
   });
 
-  it('no-transport session FORCES read isolation on fresh/resume/restart; adopt is refused at restore', () => {
-    // fresh-spawn forkWorker (shared by fresh/resume/restart) forces read
-    // isolation for a no-transport session — the fail-closed credential boundary.
+  it('no-transport session read isolation FOLLOWS local sandbox config (no forced isolation); adopt is refused at restore', () => {
+    // fresh-spawn forkWorker (shared by fresh/resume/restart) NO LONGER force-
+    // isolates a no-transport session. readIsolation is opt-in only, driven purely
+    // by explicit per-bot `readIsolation`; a no-transport session with no sandbox
+    // config reads bots.json like a normal chat (accepted trade-off — lateral
+    // sibling-cred protection now depends on the owner enabling sandbox).
     const wp = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
-    expect(wp).toContain('readIsolation: botCfg.readIsolation === true\n      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })');
+    expect(wp).toContain('readIsolation: botCfg.readIsolation === true,');
+    // The old forced-isolation disjunct is gone: readIsolation must NOT be tied to
+    // transport state anymore.
+    expect(wp).not.toContain('readIsolation: botCfg.readIsolation === true\n      || !larkTransportEnabled(');
     // Adopt does NOT gate via the init field (the observe branch returns before
     // fs-policy is built — an init readIsolation would be a dead no-op). Instead
     // adoptSandboxBlocked refuses a no-transport adopt at daemon restore and
-    // converts it to cold-start, covering "normal adopt session later flipped to
-    // apiOnly then restarted".
+    // converts it to cold-start: adopt attaches to an ALREADY-running external CLI
+    // that could never be wrapped, so a no-transport turn must cold-start instead.
     const gate = region(wp, 'export function adoptSandboxBlocked(', 'export function forkAdoptWorker(');
     expect(gate).toContain('botCfg.apiOnly === true');
     expect(gate).toContain("session.chatId.startsWith('http_async_') || session.chatId.startsWith('http_wait_')");

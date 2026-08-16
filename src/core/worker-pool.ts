@@ -6836,16 +6836,23 @@ export function forkWorker(
     // Per-bot local read isolation (enforced worker-side; the worker gates it).
     // Sibling data needs no app-id enumeration: per-bot dirs are denied wholesale
     // and per-bot session files by filename pattern (see buildV2DenyPaths).
-    // HARD credential boundary for a no-transport session (apiOnly bot OR HTTP
-    // virtual chat): force read isolation so the CLI physically cannot read the
-    // full bots.json / sibling BOT_HOME / send-cred / lark-cli store — a model
-    // that deletes/forges the ancestry marker or bypasses the CLI still cannot
-    // build ANY (sibling) Lark client. The pid-marker gate is only friendly
-    // early-reject; THIS is the fail-closed boundary. Reuses the existing unified
-    // fs-policy (mac+Linux fail-closed); a backend that can't isolate locally
-    // refuses to spawn rather than leak creds.
-    readIsolation: botCfg.readIsolation === true
-      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }),
+    // Opt-in only, driven purely by explicit per-bot `readIsolation`. A
+    // no-transport session (apiOnly bot OR HTTP virtual chat) is NO LONGER
+    // force-isolated: disk read scope now follows the owner's own sandbox config,
+    // symmetric with a normal chat session (unset/false → not isolated). Accepted
+    // trade-off: a no-transport session with no sandbox config can read the full
+    // bots.json / sibling BOT_HOME on disk; protecting sibling creds from lateral
+    // read on a multi-bot host now depends on the owner explicitly enabling
+    // sandbox/readIsolation, not on this force. Two adjacent boundaries are
+    // unchanged and independent: (1) this bot's own transport secret is still
+    // withheld from the CLI env (gated on larkTransportEnabled below), so a
+    // no-transport session cannot drive Botmux's own send path even though it can
+    // read the file; (2) mandatory device-credential isolation (worker.ts) still
+    // masks the device authority dir / enrolled creds on enrolled hosts. Full-file
+    // sandbox stays independently driven worker-side by sandboxRequested
+    // (cfg.sandbox || cfg.readIsolation || BOTMUX_SANDBOX=1); session.sandbox is
+    // frozen from botCfg.sandbox at create time, so "follow local sandbox" holds.
+    readIsolation: botCfg.readIsolation === true,
     readDenyExtraPaths: botCfg.readDenyExtraPaths ?? [],
     // Identifies THIS daemon lifetime. Stamped onto isolated panes so the worker
     // can tell a suspend→resume reattach (same boot id, still isolated) from a

@@ -53,6 +53,14 @@ worker spawnCli
 
 → **所有飞书密钥全程不进沙盒**。
 
+## no-transport 会话（apiOnly / HTTP virtual）跟随本地配置
+
+no-transport 会话（core-only `apiOnly` bot、或 `http_async_*`/`http_wait_*` HTTP virtual 会话）**不被自动强制文件隔离**。它们的磁盘可读范围和普通聊天会话一样，只由 bot 自己的 `sandbox`/`readIsolation` 配置决定：没配 → 不隔离（能读宿主 `bots.json` 等）；配了 → 照常隔离。
+
+> 早先版本曾把「会话没有飞书 transport 通道」当作强制隔离条件（no-transport ⇒ 一律关进沙盒）。现已去掉这条写死的强制，改为跟随 owner 自己的配置——单 bot 部署 / 载荷可信时不再被无谓束缚。**多 bot 同机**、且担心某个半受信任的 no-transport 会话横向读到**兄弟 bot 的凭证**（`bots.json` 里各 bot 的 app secret）时，需 owner **显式**给该 bot 开 `sandbox`（或 `readIsolation` / 全局 `BOTMUX_SANDBOX=1`）。
+
+两条与文件沙盒正交、不受此放宽影响的边界仍在：① **本 bot 自己的 transport secret 不进 CLI 进程 env**（gated on transport 能力）——no-transport 会话即使能读磁盘 `bots.json`，也拿不到被注入 env 的本 bot secret，Botmux 自身的发送链路仍关闭；② enrolled 设备上的 **device-credential 强制隔离**独立生效，与本开关无关。
+
 ## 落盘（改动去向）
 
 fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接写宿主真实文件**——改动即时落盘，不再是「副本 + 补丁交回」。沙盒的作用是把可写面收敛到白名单：项目目录可写、认证目录可写，白名单之外（别的项目、别的会话、`~/.ssh`/`~/.aws`、`bots.json`、各类密钥）一律读不到写不了。
