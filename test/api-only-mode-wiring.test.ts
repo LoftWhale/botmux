@@ -455,13 +455,17 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     expect(workerSource).toContain('const migration = evaluatePersistentPaneMigration({');
     expect(workerSource).toContain('executePersistentPaneMigration(migration, migrationEffects)');
     expect(workerSource).not.toContain('persistentPaneReattachGuardEngaged');
-    // issue #1: the gate must ENTER without requiring provenance to be present, so a
-    // NEITHER-file no-transport tmux pane still reaches the state machine (else the
-    // best-effort-marker-lost pane silently warm-reattaches). Enter for any policy-ON
-    // spawn OR a policy-OFF no-transport tmux session.
+    // issue #1 + #4: the gate must ENTER without requiring provenance for the
+    // live-pane arms (a NEITHER-file no-transport tmux pane still reaches the
+    // state machine), AND must ALSO enter on ANY session/backend that has stale
+    // provenance on disk — so a dead pane's leftover marker/tombstone is cleared
+    // before cold-spawn even for a transport-enabled chat that turned sandbox OFF
+    // (else re-enabling sandbox warm-reattaches a fresh UNisolated pane as
+    // "isolated" against the stale matching marker — codex R4).
     expect(workerSource).toContain(
       'const persistentPaneGuardApplies = appliedIsolationCapabilities.length > 0\n'
-      + '    || (noTransportSession && isolationCapableBackend);',
+      + '    || (noTransportSession && isolationCapableBackend)\n'
+      + '    || stalePaneMarkerPresent || policyOffTombstonePresent;',
     );
     // issue #3: tombstone authorization requires a SECURE read + schema validation,
     // not a bare lstat "present".
