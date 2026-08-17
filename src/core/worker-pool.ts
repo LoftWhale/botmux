@@ -9510,6 +9510,7 @@ export function forkWorker(
       ? false
       : (botCfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(agentCfg.cliId)) || config.codexRpcInputDefault,
     ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
+    codexAuthSync: botCfg.codexAuthSync ?? 'shared',
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
