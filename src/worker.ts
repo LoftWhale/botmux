@@ -9727,6 +9727,15 @@ process.on('message', async (raw: unknown) => {
       // observation) would be dropped forever, because cold-resume re-attaches
       // with a baseline cutoff that never re-emits old turns.
       try { codexBridgeDrainAndMaybeEmit(); } catch { /* best-effort */ }
+      // The CLI's final rollout events can land on disk a few hundred ms
+      // AFTER the prompt renders (observed 2026-08-17 19:49: prompt at
+      // +578ms, suspend at +582ms, the completed turn flushed later in the
+      // same second). Suspend is not time-critical — wait out the flush
+      // and drain once more so a turn completed in the same second is not
+      // lost forever (it would otherwise never re-emit: cold-resume
+      // re-attaches with a baseline cutoff).
+      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400); } catch { /* */ }
+      try { codexBridgeDrainAndMaybeEmit(); } catch { /* best-effort */ }
       stopScreenshotLoop();
       stopBridgeWatcher();
       // A parked crash diagnostic shell has backend===null, so the
