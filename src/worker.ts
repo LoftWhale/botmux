@@ -175,6 +175,7 @@ import { createServer as createNetServer, type Server as NetServer, type Socket 
 import { WebSocketServer, WebSocket } from 'ws';
 import { listenWebTerminalWithFallback } from './utils/web-terminal-listen.js';
 import { HerdrWebTerminalBinding } from './utils/herdr-web-terminal-binding.js';
+import { resolveWebTerminalResize } from './utils/web-terminal-resize.js';
 import { TERMINAL_FAVICON_DATA_URI } from './utils/terminal-favicon.js';
 import type {
   CodexAppDispatchLedgerEntry,
@@ -14494,6 +14495,18 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       const { hasWrite } = resolveTerminalAccessForReq(req, url);
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
+      let lastAcceptedResizeAt: number | null = null;
+      const acceptResize = (msg: Record<string, unknown>) => {
+        const resize = resolveWebTerminalResize({
+          hasWrite,
+          cols: msg.cols,
+          rows: msg.rows,
+          now: Date.now(),
+          lastAcceptedAt: lastAcceptedResizeAt,
+        });
+        if (resize) lastAcceptedResizeAt = resize.acceptedAt;
+        return resize;
+      };
 
       if (isTmuxMode && !isPipeMode && sessionId) {
         // ── Tmux-attach mode: per-client attach ──
@@ -14562,12 +14575,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         ws.on('message', (raw) => {
           try {
             const msg = JSON.parse(String(raw));
-            if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
+            const resize = msg.type === 'resize' ? acceptResize(msg) : null;
+            if (resize) {
               if (!cp) {
                 clearTimeout(spawnTimer);
-                startAttach(msg.cols, msg.rows);
+                startAttach(resize.cols, resize.rows);
               } else {
-                cp.resize(msg.cols, msg.rows);
+                cp.resize(resize.cols, resize.rows);
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               // Mouse protocols carry clicks, releases, drags and wheel input;
@@ -14639,9 +14653,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         ws.on('message', (raw) => {
           try {
             const msg = JSON.parse(String(raw));
-            if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
-              if (!cp) { clearTimeout(spawnTimer); startAttach(msg.cols, msg.rows); }
-              else cp.resize(msg.cols, msg.rows);
+            const resize = msg.type === 'resize' ? acceptResize(msg) : null;
+            if (resize) {
+              if (!cp) { clearTimeout(spawnTimer); startAttach(resize.cols, resize.rows); }
+              else cp.resize(resize.cols, resize.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               if (!authedClients.has(ws)) return;
               if (cp) cp.write(msg.data);
@@ -14701,11 +14716,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         ws.on('message', (raw) => {
           try {
             const msg = JSON.parse(String(raw));
-            if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
-              const result = herdrWebBinding.resize(msg.cols, msg.rows);
+            const resize = msg.type === 'resize' ? acceptResize(msg) : null;
+            if (resize) {
+              const result = herdrWebBinding.resize(resize.cols, resize.rows);
               applyHerdrWebBindingResult(ws, result);
               if (!result.backend) {
-                backend?.resize(msg.cols, msg.rows);
+                backend?.resize(resize.cols, resize.rows);
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               // Mouse protocols can encode approvals/actions as well as wheel input.
@@ -14756,7 +14772,7 @@ function getTerminalHtml(
 <meta id="vp" name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>${cliName()} - ${label}</title>
 <link rel="icon" type="image/png" href="${TERMINAL_FAVICON_DATA_URI}">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" integrity="sha384-tStR1zLfWgsiXCF3IgfB3lBa8KmBe/lG287CL9WCeKgQYcp1bjb4/+mwN6oti4Co" crossorigin="anonymous">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;background:#1a1b26;overflow:hidden;overscroll-behavior:none}
@@ -14872,12 +14888,12 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
   </div>
 </div>
 <div id="status" class="err">connecting...</div>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0/lib/addon-web-links.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0/lib/addon-unicode11.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0/lib/addon-webgl.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-canvas@0/lib/addon-canvas.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js" integrity="sha384-J4qzUjBl1FxyLsl/kQPQIOeINsmp17OHYXDOMpMxlKX53ZfYsL+aWHpgArvOuof9" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js" integrity="sha384-UwMkGaBqfOcrTjPjXdAPWrGQkhpxTJ21vKtTwLb6wBpBM8HQXKAiUuwVJfgY0Yw6" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.12.0/lib/addon-web-links.min.js" integrity="sha384-qRCjDpXBNYif7WxgGNS9nK3b8jeByXxOaG33yBbmRm6mBaYUEJNSEiWpyoEstjEp" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.9.0/lib/addon-unicode11.min.js" integrity="sha384-L9FLhzqR3IBxZet0jMK5XT1x6KMOWFqpT43roGuW9QBtw99K9Vy6/9q3x8rnfYZA" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.19.0/lib/addon-webgl.min.js" integrity="sha384-XZQCtld4fwfpp4rw06rg+kVzIfVqv4G0UG7Em8oCawdlHA4L92O9pA7fJrDpLNG3" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-canvas@0.7.0/lib/addon-canvas.min.js" integrity="sha384-IveLZq8irhA8lKtR5dcxuwFbTZ7/BS8WipvgpGYiNzsIJ9aEwIFfEApSl8lzLE82" crossorigin="anonymous"></script>
 <script>
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch){document.body.classList.add('touch');}
@@ -15098,6 +15114,7 @@ term.onData(function(d){
 });
 var fixedSize=false,_lastC=0,_lastR=0,_rzT=0;
 function sendResize(){
+  if(!hasToken)return;
   if(!ws_||ws_.readyState!==1)return;
   // Dedup: a fit that lands on the same grid must NOT re-emit a resize — for a
   // zellij/tmux attach client that would reflow the shared pane for nothing.
