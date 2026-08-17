@@ -3707,26 +3707,30 @@ function codexAppLivenessStatus(base: RuntimeScreenStatus, nowMs = Date.now()): 
 
 /**
  * True when this CLI has an authoritative STRUCTURED rate-limit signal that is
- * actually PUBLISHED as a `limited` screen_update — i.e. the Claude family,
- * whose `bridgeIngest → maybeEmitStructuredRateLimit()` reads the transcript's
- * `error:"rate_limit"` record. For those CLIs the screen-text `rate` heuristic
- * is not just redundant but harmful: the model's own output or a dev editing
- * rate-limit code/tests puts phrases like "429 Too Many Requests" / "exceeded
- * retry limit" on screen, which the scraper cannot distinguish from a real
- * limit. So we suppress the screen-scan `rate` verdict and let the structured
- * path be the sole authority. `usage` (quota "hit your limit …") has no
- * structured equivalent yet, so it still comes from the screen.
+ * actually PUBLISHED as a `limited` screen_update. Two families qualify: the
+ * Claude family, whose `bridgeIngest → maybeEmitStructuredRateLimit()` reads the
+ * transcript's `error:"rate_limit"` record; and codex, whose
+ * `maybeEmitCodexStructuredRateLimit()` reads the rollout's `codex_rate_limited`
+ * terminal (`isCodexRateLimitEvent`). For those CLIs the screen-text `rate`
+ * heuristic is not just redundant but harmful: the model's own output or a dev
+ * editing rate-limit code/tests puts phrases like "429 Too Many Requests" /
+ * "exceeded retry limit" on screen, which the scraper cannot distinguish from a
+ * real limit. So we suppress the screen-scan `rate` verdict and let the
+ * structured path be the sole authority. `usage` (quota "hit your limit …") has
+ * no structured equivalent yet, so it still comes from the screen.
  *
- * Gate on `claudeDataDir` (the Claude-family marker: claude-code / seed /
- * genius), NOT on `reliableTurnTerminal`. Both are "transcript-backed", but the
- * structured rate-limit EMIT only exists on the Claude bridge (`bridgeJsonlPath`
- * path). The codexBridgeQueue CLIs (codex / grok / traex / pi) map an `error`
- * terminal to a failed/ambiguous receipt but publish NO `limited` state — so
- * suppressing their screen `rate` verdict would silently drop the Dashboard
- * 「需要你」signal + backoff on a real 429. Pi joining reliableTurnTerminal made
- * that latent over-suppression concrete; scoping to claudeDataDir fixes it for
- * every codexBridgeQueue CLI at once. (A future structured rate-limit emit for
- * those CLIs can widen this predicate.)
+ * Gate on the two capability fields (`claudeDataDir` for the Claude family;
+ * `emitsStructuredRateLimit` for codex), NOT on `reliableTurnTerminal`. The
+ * structured rate-limit EMIT only exists where those fields are set: codex's
+ * emit runs under the `structuredBridgeIsCodex()` gate, so among the
+ * codexBridgeQueue CLIs only codex carries the flag. The rest (grok / traex /
+ * pi / hermes / mtr / cursor) map an `error` terminal to a failed/ambiguous
+ * receipt but publish NO `limited` state — suppressing their screen `rate`
+ * verdict would silently drop the Dashboard「需要你」signal + backoff on a real
+ * 429. Most set `reliableTurnTerminal`, so gating on that flag would wrongly
+ * suppress them; gating on the explicit capability fields keeps the split
+ * exact. (A future structured rate-limit emit for another CLI just sets its
+ * `emitsStructuredRateLimit`.)
  */
 function structuredRateLimitAuthoritative(): boolean {
   return isStructuredRateLimitAuthoritative(cliAdapter);
@@ -4839,7 +4843,8 @@ function bridgeIngest(): void {
  *  session surfaces in Dashboard「需要你」with a retry countdown — identical
  *  wire shape to the screen-text detector's classify() output, so the daemon /
  *  card / persistence paths need no change. Claude-only (bridgeQueue is the
- *  Claude bridge; Codex uses codexBridgeQueue and has no structured 429). */
+ *  Claude bridge; Codex has its own structured 429 via
+ *  maybeEmitCodexStructuredRateLimit on the codexBridgeQueue path). */
 function maybeEmitStructuredRateLimit(events: readonly TranscriptEvent[]): void {
   for (const ev of events) {
     if (!ev.uuid || emittedRateLimitUuids.has(ev.uuid)) continue;
