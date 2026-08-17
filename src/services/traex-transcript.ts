@@ -69,6 +69,15 @@ function abortErrorCode(reason: unknown): string {
   return `traex_turn_aborted:${normalized}`;
 }
 
+/** Paths that have ever yielded a `response_item` user record. CoCo 0.200+
+ *  intermittently writes rollouts in a "history_mutation" dialect with NO
+ *  response_item records at all — user input exists only as event_msg
+ *  user_message (observed 2026-08-15/17/18 champion sessions, where the
+ *  completed turn was silently lost). In the response_item dialect the same
+ *  event_msg form appears ~100ms later as a mirror of the authoritative
+ *  record, so it is only honored for paths that never produced one. */
+const pathsWithResponseItemUser = new Set<string>();
+
 /** Incrementally drain complete TRAE rollout lines.
  *
  * `task_complete` is intentionally emitted even when last_agent_message is
@@ -115,6 +124,16 @@ export function drainTraexRollout(path: string, fromOffset: number): CodexDrainR
       && payload.type === 'message'
       && payload.role === 'user') {
       const userText = joinInputText(payload.content);
+      if (userText) {
+        pathsWithResponseItemUser.add(path);
+        events.push({ ...base, kind: 'user', text: userText });
+      }
+      continue;
+    }
+    if (obj.type === 'event_msg'
+      && payload.type === 'user_message'
+      && !pathsWithResponseItemUser.has(path)) {
+      const userText = typeof payload.message === 'string' ? payload.message : '';
       if (userText) events.push({ ...base, kind: 'user', text: userText });
       continue;
     }

@@ -104,6 +104,38 @@ describe('drainTraexRollout', () => {
     ]);
   });
 
+  it('captures the history_mutation dialect where user input only exists as event_msg/user_message', () => {
+    // CoCo 0.200.19 intermittently writes rollouts without ANY response_item
+    // records (observed 2026-08-15/17/18 champion sessions: history_mutation +
+    // item_completed dialect). Without this branch the drain yields zero
+    // events and the completed turn is silently lost.
+    writeFileSync(path, [
+      line({ timestamp: '2000-01-01T00:00:00.000Z', type: 'session_meta', payload: { id: SID } }),
+      line({ timestamp: '2000-01-01T00:00:00.500Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 't1' } }),
+      line({ timestamp: '2000-01-01T00:00:01.000Z', type: 'event_msg', payload: { type: 'user_message', message: '报警：TLB 流量下降' } }),
+      line({ timestamp: '2000-01-01T00:00:02.000Z', type: 'event_msg', payload: { type: 'agent_message', message: '排查中' } }),
+      line(taskComplete('已完成归因：流量自然回落')),
+    ].join(''));
+    const r = drainTraexRollout(path, 0);
+    expect(r.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    expect(r.events[0].text).toBe('报警：TLB 流量下降');
+    expect(r.events[1].text).toBe('已完成归因：流量自然回落');
+  });
+
+  it('does not double-count the event_msg user mirror when response_item records exist', () => {
+    // In the response_item dialect CoCo mirrors the user input as
+    // event_msg/user_message ~100ms later; the response_item record is the
+    // authoritative one and the mirror must be skipped.
+    writeFileSync(path, [
+      line(user('报警：TLB 流量下降')),
+      line({ timestamp: '2000-01-01T00:00:01.100Z', type: 'event_msg', payload: { type: 'user_message', message: '报警：TLB 流量下降' } }),
+      line(taskComplete('结论')),
+    ].join(''));
+    const r = drainTraexRollout(path, 0);
+    expect(r.events.filter(e => e.kind === 'user')).toHaveLength(1);
+    expect(r.events[0].text).toBe('报警：TLB 流量下降');
+  });
+
   it('emits an empty task_complete so a silent durable turn can settle', () => {
     writeFileSync(path, line(user('finish silently')) + line(taskComplete()));
     const result = drainTraexRollout(path, 0);
