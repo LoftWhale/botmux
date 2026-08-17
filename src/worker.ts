@@ -9721,6 +9721,12 @@ process.on('message', async (raw: unknown) => {
 
     case 'suspend': {
       log('Suspend requested');
+      // Final bridge drain BEFORE teardown: the idle sweeper can suspend a
+      // worker in the same tick the CLI finishes its turn, and the 1s bridge
+      // poller then loses the race — the completed turn (and its mirror-side
+      // observation) would be dropped forever, because cold-resume re-attaches
+      // with a baseline cutoff that never re-emits old turns.
+      try { codexBridgeDrainAndMaybeEmit(); } catch { /* best-effort */ }
       stopScreenshotLoop();
       stopBridgeWatcher();
       // A parked crash diagnostic shell has backend===null, so the
