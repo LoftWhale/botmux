@@ -457,7 +457,10 @@ describe('VcConsumerProfilesSection · 按 bot 的会议开关', () => {
     expect(botRows(r).findIndex(row => textOf(row).includes('Bot Alpha'))).toBe(0);
 
     const gamma = botRow(r, 'Bot Gamma');
-    expect(textOf(gamma)).toContain('无飞书连接（apiOnly），收不到会议事件');
+    // 能力缺口收成一个 ⚠，详情在 title（hover 可见），不再平铺整行长文案。
+    const gammaWarn = gamma.findAllByProps({ className: 'vc-bot-policy-warn' })
+      .find(node => textOf(node) === '⚠');
+    expect(gammaWarn?.props.title).toContain('无飞书连接（apiOnly），收不到会议事件');
     expect(rowCheckbox(gamma, 'vcEnabled').props.disabled).toBe(true);
     expect(preflightButton(gamma).props.disabled).toBe(true);
 
@@ -470,6 +473,30 @@ describe('VcConsumerProfilesSection · 按 bot 的会议开关', () => {
     const alpha = botRow(r, 'Bot Alpha');
     expect(rowSelect(alpha, 'text').props.disabled).toBe(false);
     expect(preflightButton(alpha).props.disabled).toBe(false);
+  });
+
+  it('filters the bot rows by the search box (name or appId)', async () => {
+    stubFetch({ onGet: () => jsonRes(200, catalogBody({ agentOptions: THREE_BOTS })) });
+    const r = await mount();
+    expect(botRows(r)).toHaveLength(3);
+
+    const search = r.root.findAllByType('input').find(i => i.props.className === 'vc-bot-policy-search')!;
+    await setInput(search, 'Gamma');
+    expect(botRows(r)).toHaveLength(1);
+    expect(textOf(botRows(r)[0]!)).toContain('Bot Gamma');
+
+    // 按 appId 也能命中。
+    await setInput(search, 'app_on');
+    expect(botRows(r)).toHaveLength(1);
+    expect(textOf(botRows(r)[0]!)).toContain('Bot Alpha');
+
+    // 无命中给空态提示。
+    await setInput(search, 'zzz-nope');
+    expect(botRows(r)).toHaveLength(0);
+
+    // 清空恢复全部。
+    await setInput(search, '');
+    expect(botRows(r)).toHaveLength(3);
   });
 
   it('submits only the bot rows whose policy actually changed', async () => {

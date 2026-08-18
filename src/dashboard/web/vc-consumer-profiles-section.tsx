@@ -239,6 +239,7 @@ export function VcConsumerProfilesSection(props: {
    *  同一份开放平台会话，并发跑会互相抢 csrf/session）。 */
   const [preflightBusyAppId, setPreflightBusyAppId] = useState<string | null>(null);
   const [preflightResults, setPreflightResults] = useState<Record<string, { ok: boolean; text: string }>>({});
+  const [botPolicyQuery, setBotPolicyQuery] = useState('');
 
   useEffect(() => {
     mountedRef.current = true;
@@ -497,12 +498,17 @@ export function VcConsumerProfilesSection(props: {
 
   const sortedBotPolicies = useMemo(() => {
     if (!catalog) return [];
-    return [...catalog.botPolicies].sort((a, b) => {
+    const q = botPolicyQuery.trim().toLowerCase();
+    const rows = q
+      ? catalog.botPolicies.filter(row =>
+          row.label.toLowerCase().includes(q) || row.appId.toLowerCase().includes(q))
+      : catalog.botPolicies;
+    return [...rows].sort((a, b) => {
       if (a.vcEnabled !== b.vcEnabled) return a.vcEnabled ? -1 : 1;
       if (a.online !== b.online) return a.online ? -1 : 1;
       return a.label.localeCompare(b.label);
     });
-  }, [catalog]);
+  }, [catalog, botPolicyQuery]);
 
   const err = (path: string): string | undefined => fieldErrors[path];
   // 保存/加载期间冻结全部编辑控件：PUT 用提交时的闭包，成功响应会整份
@@ -652,14 +658,26 @@ export function VcConsumerProfilesSection(props: {
                 <strong>{tr('settings.vcProfiles.botPolicies.title')}</strong>
                 <p>{tr('settings.vcProfiles.botPolicies.help')}</p>
               </div>
+              <input
+                type="search"
+                className="vc-bot-policy-search"
+                placeholder={tr('settings.vcProfiles.botPolicies.searchPlaceholder')}
+                value={botPolicyQuery}
+                disabled={frozen}
+                onChange={(event) => setBotPolicyQuery(event.target.value)}
+              />
             </div>
             <div className="vc-bot-policy-table" style={{ maxHeight: 320, overflowY: 'auto' }}>
+              {sortedBotPolicies.length === 0 ? (
+                <p className="vc-bot-policy-empty hint">{tr('settings.vcProfiles.botPolicies.noMatch')}</p>
+              ) : null}
               {sortedBotPolicies.map(row => {
                 const effectiveText = row.textOutputPolicy ?? 'allow';
                 const effectiveVoice = !row.realtimeVoiceEnabled ? 'deny' : (row.voiceOutputPolicy ?? 'allow');
                 const policyLabel = (value: OutputPolicyValue): string => tr(`settings.vcProfiles.botPolicies.${value}`);
                 // 只在这里提示能力缺口：预设与 bot 解耦后，这张表是唯一能解释
-                // 「为什么拉这个 bot 进会没反应」的地方。
+                // 「为什么拉这个 bot 进会没反应」的地方。逐条文案很长(尤其沙盒那条),
+                // 一行 bot 后面平铺会喧宾夺主——收成一个 ⚠,详情放 hover title。
                 const warnings = [
                   row.vcEligible ? undefined : tr('settings.vcProfiles.botPolicies.vcIneligible'),
                   row.online ? undefined : tr('settings.vcProfiles.agentOffline'),
@@ -669,7 +687,7 @@ export function VcConsumerProfilesSection(props: {
                   row.managedSideEffectEligible && !row.sandboxIsolated
                     ? tr('settings.vcProfiles.agentUnsandboxedRisk')
                     : undefined,
-                ].filter(Boolean);
+                ].filter((w): w is string => !!w);
                 const rowFrozen = !props.canWrite || saving || loading;
                 const renderSelect = (
                   field: 'textOutputPolicy' | 'voiceOutputPolicy',
@@ -698,7 +716,7 @@ export function VcConsumerProfilesSection(props: {
                     <span className="vc-bot-policy-name" title={row.appId}>
                       {row.online ? '' : '⚪ '}{row.label}
                       {warnings.length > 0 ? (
-                        <em className="vc-bot-policy-warn">⚠ {warnings.join(' · ')}</em>
+                        <em className="vc-bot-policy-warn" title={warnings.join(' · ')}>⚠</em>
                       ) : null}
                       {preflight ? (
                         <em className={preflight.ok ? 'vc-bot-policy-preflight' : 'vc-bot-policy-warn'}>
