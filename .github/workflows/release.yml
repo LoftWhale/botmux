@@ -153,8 +153,10 @@ jobs:
 
       - name: Upgrade npm for Trusted Publishing
         # npm Trusted Publishing (OIDC) 要求 npm CLI >= 11.5.1（需 Node >= 22.14.0）。
-        # Node 22 自带的 npm 可能不够新，这里直接升到 latest 确保支持 OIDC。
-        run: npm install -g npm@latest
+        # Node 22 自带的 npm 可能不够新，这里升级到固定的 11.19.0（2026-07-28 的最新
+        # 11.x）。不用 npm@latest —— floating latest 可能跳到 npm 12 并在 tag-push 发版
+        # 时引入破坏性改动；固定版本确保发版流程可预测。
+        run: npm install -g npm@11.19.0
 
       - name: Sync version from git tag to package.json
         run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
