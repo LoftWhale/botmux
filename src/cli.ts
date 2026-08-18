@@ -203,8 +203,10 @@ import {
 } from './core/managed-origin-attestation.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
+  collaborationHelp,
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
+  type BotCollaborationFactsByAppId,
 } from './cli/bots-list-output.js';
 import { ensureBotChatGrantMatrix, requestExactChatGrant } from './cli/exact-chat-grant-client.js';
 import {
@@ -7943,7 +7945,7 @@ import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './servi
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
-import { resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
+import { effectiveDefaultWorkingDir, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
 import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
@@ -12109,6 +12111,25 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   let botEntries: BotInfoEntry[] = [];
   try { if (existsSync(botInfoPath)) botEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
 
+  const collaborationFactsFor = (appIds: string[]): BotCollaborationFactsByAppId => {
+    const facts: Record<string, BotCollaborationFactsByAppId[string]> = Object.create(null);
+    const wanted = new Set(appIds.filter(Boolean));
+    try {
+      for (const cfg of loadBotConfigs()) {
+        if (!wanted.has(cfg.larkAppId)) continue;
+        facts[cfg.larkAppId] = {
+          workspaceSource: cfg.oncallChats?.some(c => c.chatId === s.chatId)
+            ? 'oncall'
+            : effectiveDefaultWorkingDir(cfg) ? 'default' : 'unknown',
+          mentionMode: cfg.regularGroupMentionMode ?? 'always',
+          replyMode: cfg.chatReplyModes?.[s.chatId] ?? cfg.regularGroupReplyMode ?? 'chat-topic',
+          transport: cfg.apiOnly !== true,
+        };
+      }
+    } catch { /* config unreadable under isolation: all facts stay unknown */ }
+    return facts;
+  };
+
   try {
     const { listChatBotMembers } = await import('./im/lark/client.js');
     const chatBots = await listChatBotMembers(appId, s.chatId);
@@ -12116,12 +12137,12 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
     // botmux daemon on this host). 'introduce' = discovered via /introduce
     // collaboration command (external bot, possibly other-tenant). isSelf is
     // retained (not filtered) so the model can still identify itself when needed.
-    const result = formatChatBotsForCli(chatBots, appId);
-    console.log(JSON.stringify({ sessionId: sid, chatId: s.chatId, bots: result, total: result.length }, null, 2));
+    const result = formatChatBotsForCli(chatBots, appId, collaborationFactsFor(chatBots.map(bot => bot.larkAppId)));
+    console.log(JSON.stringify({ sessionId: sid, chatId: s.chatId, bots: result, total: result.length, collaborationHelp }, null, 2));
   } catch (err: any) {
     // Fallback to bots-info.json
-    const result = formatBotInfoEntriesForCli(botEntries, appId);
-    console.log(JSON.stringify({ sessionId: sid, bots: result, total: result.length, note: `chat query failed: ${err.message}` }, null, 2));
+    const result = formatBotInfoEntriesForCli(botEntries, appId, collaborationFactsFor(botEntries.map(bot => bot.larkAppId)));
+    console.log(JSON.stringify({ sessionId: sid, bots: result, total: result.length, collaborationHelp, note: `chat query failed: ${err.message}` }, null, 2));
   }
 }
 
