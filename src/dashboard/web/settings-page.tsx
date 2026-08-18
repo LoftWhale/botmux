@@ -64,14 +64,6 @@ interface DashboardSettings {
   noVisibleOutputHint: boolean;
   vcMeetingAgent: {
     enabled: boolean;
-    listenerBotAppId: string | null;
-    listenerBotOptions: Array<{
-      larkAppId: string;
-      botName?: string | null;
-      cliId?: string;
-      vcMeetingAgentEnabled?: boolean;
-      hasLarkCliProfile?: boolean;
-    }>;
     larkCliVersion?: string | null;
     larkCliMeetsRequirement?: boolean;
     larkCliMinVersion?: string;
@@ -200,8 +192,6 @@ function parseSettings(s: any): DashboardSettings {
     noVisibleOutputHint: s?.noVisibleOutputHint === true,
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
-      listenerBotAppId: typeof s?.vcMeetingAgent?.listenerBotAppId === 'string' ? s.vcMeetingAgent.listenerBotAppId : null,
-      listenerBotOptions: Array.isArray(s?.vcMeetingAgent?.listenerBotOptions) ? s.vcMeetingAgent.listenerBotOptions : [],
       larkCliVersion: s?.vcMeetingAgent?.larkCliVersion === undefined ? undefined : (s.vcMeetingAgent.larkCliVersion ?? null),
       larkCliMeetsRequirement: s?.vcMeetingAgent?.larkCliMeetsRequirement === true,
       larkCliMinVersion: typeof s?.vcMeetingAgent?.larkCliMinVersion === 'string' ? s.vcMeetingAgent.larkCliMinVersion : undefined,
@@ -556,6 +546,7 @@ function SettingsPage() {
       updateBlock={updateBlock}
       feishuLoginQr={feishuLoginQr}
       onCloseFeishuLoginQr={() => setFeishuLoginQr(null)}
+      onFeishuLoginQr={setFeishuLoginQr}
       onSave={saveSettings}
     />
   ) : loadError ? (
@@ -586,6 +577,8 @@ function SettingsBody(props: {
   updateBlock: ReactNode;
   feishuLoginQr: string | null;
   onCloseFeishuLoginQr(): void;
+  /** per-bot 前置配置失败且需要重新登录开放平台时，把二维码顶到本页已有的扫码面板。 */
+  onFeishuLoginQr(qr: string | null): void;
   onSave(key: string, payload: unknown, optimistic: (settings: DashboardSettings) => DashboardSettings): Promise<void>;
 }) {
   const tr = useT();
@@ -627,19 +620,6 @@ function SettingsBody(props: {
     { value: 'attach' as const, label: tr('settings.localCliOpenModeAttach') },
     { value: 'resume' as const, label: tr('settings.localCliOpenModeResume') },
   ], [tr]);
-  const vcListenerOptions = useMemo(() => [
-    { value: '', label: tr('settings.vcMeetingListenerBotAuto') },
-    ...settings.vcMeetingAgent.listenerBotOptions.map(bot => {
-      const label = bot.botName || bot.larkAppId;
-      const detail = bot.cliId ? ` · ${bot.cliId}` : '';
-      const suffixParts = [
-        bot.vcMeetingAgentEnabled === true ? undefined : tr('settings.vcMeetingListenerBotDisabled'),
-        bot.hasLarkCliProfile === true ? undefined : tr('settings.vcMeetingListenerBotNoProfile'),
-      ].filter(Boolean);
-      const suffix = suffixParts.length > 0 ? ` · ${suffixParts.join(' · ')}` : '';
-      return { value: bot.larkAppId, label: `${label}${detail}${suffix}` };
-    }),
-  ], [settings.vcMeetingAgent.listenerBotOptions, tr]);
   return (
     <div className="settings-layout">
       {canWrite ? null : (
@@ -833,31 +813,11 @@ function SettingsBody(props: {
               );
             }}
           />
-          <div className="settings-field-row">
-            <FieldTitle help={tr('settings.vcMeetingListenerBotHelp')}>{tr('settings.vcMeetingListenerBot')}</FieldTitle>
-            <DropdownMenu
-              className="settings-field-menu"
-              ariaLabel={tr('settings.vcMeetingListenerBot')}
-              disabled={dis || savingKey === 'vcMeetingAgent'}
-              value={settings.vcMeetingAgent.listenerBotAppId ?? ''}
-              label={dropdownLabel(vcListenerOptions, settings.vcMeetingAgent.listenerBotAppId ?? '')}
-              options={vcListenerOptions}
-              onChange={value => {
-                const next = value || null;
-                void props.onSave(
-                  'vcMeetingAgent',
-                  { vcMeetingAgent: { listenerBotAppId: next } },
-                  s => ({ ...s, vcMeetingAgent: { ...s.vcMeetingAgent, listenerBotAppId: next } }),
-                );
-              }}
-            />
-          </div>
           <LarkCliStatus settings={settings.vcMeetingAgent} />
           <VcConsumerProfilesGate
             enabled={settings.vcMeetingAgent.enabled}
             canWrite={canWrite}
-            listenerBotAppId={settings.vcMeetingAgent.listenerBotAppId}
-            listenerBotOptions={settings.vcMeetingAgent.listenerBotOptions}
+            onFeishuLoginQr={props.onFeishuLoginQr}
           />
           {props.feishuLoginQr ? (
             <div className="settings-feishu-login">

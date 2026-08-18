@@ -491,7 +491,7 @@ import {
   computeVcMeetingConsumerProfileHash,
   normalizeVcMeetingProfileInstructions,
 } from './services/vc-meeting-profile-instructions.js';
-import { bootstrapVcMeetingDefaultConsumerProfile } from './services/vc-meeting-consumer-profile-bootstrap.js';
+import { bindVcMeetingConsumerCatalogToBot } from './services/vc-meeting-shared-consumer-catalog.js';
 import {
   getVcMeetingPreparation,
   normalizeVcMeetingNumber,
@@ -2116,10 +2116,23 @@ function defaultVcMeetingVoiceOutputPolicy(cfg: VcMeetingAgentConfig): VcMeeting
   // default matches text: send without per-utterance approval. An operator may
   // tighten back to 'approval' or 'deny' via meetingConsumer.voiceOutputPolicy
   // (dashboard-editable).
-  if (cfg.realtimeVoice?.enabled !== true) return 'deny';
+  if (!vcMeetingRealtimeVoiceEnabled(cfg)) return 'deny';
   const configured = cfg.meetingConsumer?.voiceOutputPolicy;
   if (configured === 'approval' || configured === 'deny' || configured === 'allow') return configured;
   return 'allow';
+}
+
+/**
+ * 实时语音能力现在**默认开启**：`realtimeVoice.enabled` 未配 = 视为开,只有显式
+ * `false` 才关。scope 已 fleet 级预授(实测含 vc:meeting.bot.realtime:write),所以
+ * 语音关着只是保守默认、不是权限卡。
+ *
+ * 注意「能力开」不等于「入会即建连」:语音 WebSocket 只在这个 bot 真要发言时
+ * (deliverVcMeetingVoiceOutput → ensureVcMeetingRealtimeVoiceSession)按需建立,
+ * 纯监听 / 从不发言的 bot 不会挂空闲连接。见 maybeStartVcMeetingRealtimeVoice。
+ */
+function vcMeetingRealtimeVoiceEnabled(cfg: VcMeetingAgentConfig | undefined): boolean {
+  return cfg?.realtimeVoice?.enabled !== false;
 }
 
 function vcMeetingOutputReviewTimeoutMs(channel: VcMeetingOutputChannel): number {
@@ -6854,7 +6867,49 @@ function effectiveVcMeetingAgentConfig(larkAppId: string): VcMeetingAgentConfig 
   // `restoreVcMeetingRuntimeSessionsForBot`, whose call site sits OUTSIDE the
   // `!cfg.apiOnly` boot block — so a migrated bots.json (normal VC bot flipped to
   // apiOnly, stale runtime record on disk) can no longer re-spawn lark-cli at boot.
-  return vcMeetingAgentConfigActive(getBot(larkAppId)?.config);
+  //
+  // 这是 daemon 侧唯一一处产出 VcMeetingAgentConfig 的地方，所以角色预设的绑定也在
+  // 这里做：没有自己 consumerProfiles 的 bot 继承 fleet 共享目录，且**所有**预设的
+  // 执行方一律重绑为 larkAppId 本人——「拉 A 进会却拉 B 进群」在这一层被彻底切断，
+  // 历史配置里写歪的 agentAppId 也在读路径上被纠正，不需要迁移写盘。
+  const cfg = vcMeetingAgentConfigActive(getBot(larkAppId)?.config);
+  if (!cfg) return cfg;
+  return withDefaultVcMeetingJoinProfile(larkAppId, bindVcMeetingConsumerCatalogToBot(larkAppId, cfg));
+}
+
+/**
+ * 没配 `larkCliProfile` 的 bot，入会身份默认用它**自己的 appId** 作为 lark-cli
+ * profile 名。
+ *
+ * 背景：入会门禁 {@link ensureVcMeetingJoinProfile} 要求 `larkCliProfile` 非空，
+ * 否则以 `no_profile` 拒绝入会。而这个字段过去只有 Dashboard 的「配置权限」按钮
+ * 会落盘（见 preflightVcMeetingBot），于是 fleet 里绝大多数从没点过那颗按钮的 bot
+ * 被拉进会一律被拒——正是「拉别的 bot 进会还是不行」。
+ *
+ * 把默认值放在**读路径**而不是要求人工点按钮，是因为这个默认值是纯确定性的：
+ *   - 就是 bot **自己的 appId**，既不是跨 app 身份、也不含任何 secret，app-scoped，
+ *     不触碰 owner 身份边界；
+ *   - profile 一旦有名字，{@link ensureLarkCliBotProfile} 会用该 bot **自己**保存的
+ *     appSecret 走 `--app-secret-stdin`（不进 argv、只落 lark-cli 加密库、只在受信
+ *     daemon 里）自动注册它——PR #392 当年之所以 fail-closed（“no faked profile”），
+ *     是因为那时没有自动注册、写个名字会 ringing；PR #782 补上自动注册后这个顾虑
+ *     已消除。
+ *
+ * 真正需要人在场的是**开放平台权限开通 / 事件订阅**（可能要扫码登录），那部分仍留在
+ * 「配置权限」按钮里；权限/secret 真缺时，入会会在后面以 `missing_secret` /
+ * `add_failed` / scope 校验等**可操作**错误失败，而不是这里这条造出来的 `no_profile`。
+ *
+ * apiOnly bot 在 {@link vcMeetingAgentConfigActive} 已返回 undefined，走不到这里，
+ * 所以默认只加给结构上真能入会的 bot。纯函数，不改入参、不写盘。
+ */
+function withDefaultVcMeetingJoinProfile(
+  larkAppId: string,
+  cfg: VcMeetingAgentConfig,
+): VcMeetingAgentConfig {
+  if (cfg.larkCliProfile?.trim()) return cfg;
+  const appId = larkAppId.trim();
+  if (!appId) return cfg;
+  return { ...cfg, larkCliProfile: appId };
 }
 
 function configuredVcMeetingListenerChatId(cfg: VcMeetingAgentConfig): string | undefined {
@@ -7215,28 +7270,31 @@ async function maybeStartVcMeetingRealtimeVoice(
   cfg: VcMeetingAgentConfig,
 ): Promise<void> {
   const voiceCfg = cfg.realtimeVoice;
-  if (voiceCfg?.enabled !== true) return;
+  if (!vcMeetingRealtimeVoiceEnabled(cfg)) return;
+  // 按需建连:实时语音能力默认开,但入会时**不**急着开语音 WS——真正要发言时
+  // deliverVcMeetingVoiceOutput 会按需 ensureVcMeetingRealtimeVoiceSession 建连,
+  // 纯监听 / 从不发言的 bot 不挂空闲连接。唯一在入会时就预热的情况是显式配了
+  // testSpeakOnStartText 的 dogfood 场景(要在入会瞬间说一句自检话)。
+  if (!voiceCfg?.testSpeakOnStartText || session.realtimeVoiceTestUtteranceSent) return;
   try {
     const voice = await ensureVcMeetingRealtimeVoiceSession(larkAppId, session, cfg);
-    if (voiceCfg.testSpeakOnStartText && !session.realtimeVoiceTestUtteranceSent) {
-      session.realtimeVoiceTestUtteranceSent = true;
-      void (async () => {
-        let sent = false;
-        try {
-          const r = await voice.speak(voiceCfg.testSpeakOnStartText!);
-          sent = true;
-          logger.info(`[vc-agent] realtime voice test utterance sent meeting=${session.state.meeting.id} frames=${r.frames} durationMs=${r.durationMs}`);
-          await delay(DEFAULT_VC_REALTIME_TEST_SPEAK_CLOSE_GRACE_MS);
-        } catch (err) {
-          logger.warn(`[vc-agent] realtime voice test utterance failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
-        } finally {
-          await voice.stop(sent ? 'test-speak-finished' : 'test-speak-failed').catch((err) => {
-            logger.warn(`[vc-agent] realtime voice test utterance stop failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
-          });
-          if (session.realtimeVoice === voice) session.realtimeVoice = undefined;
-        }
-      })();
-    }
+    session.realtimeVoiceTestUtteranceSent = true;
+    void (async () => {
+      let sent = false;
+      try {
+        const r = await voice.speak(voiceCfg.testSpeakOnStartText!);
+        sent = true;
+        logger.info(`[vc-agent] realtime voice test utterance sent meeting=${session.state.meeting.id} frames=${r.frames} durationMs=${r.durationMs}`);
+        await delay(DEFAULT_VC_REALTIME_TEST_SPEAK_CLOSE_GRACE_MS);
+      } catch (err) {
+        logger.warn(`[vc-agent] realtime voice test utterance failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        await voice.stop(sent ? 'test-speak-finished' : 'test-speak-failed').catch((err) => {
+          logger.warn(`[vc-agent] realtime voice test utterance stop failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
+        });
+        if (session.realtimeVoice === voice) session.realtimeVoice = undefined;
+      }
+    })();
   } catch (err) {
     await session.realtimeVoice?.stop('start-failed').catch(() => { /* ignore cleanup errors */ });
     session.realtimeVoice = undefined;
@@ -7249,8 +7307,8 @@ async function ensureVcMeetingRealtimeVoiceSession(
   session: VcMeetingDaemonSession,
   cfg: VcMeetingAgentConfig,
 ): Promise<RealtimeVoiceSession> {
+  if (!vcMeetingRealtimeVoiceEnabled(cfg)) throw new Error('realtime voice is disabled');
   const voiceCfg = cfg.realtimeVoice;
-  if (voiceCfg?.enabled !== true) throw new Error('realtime voice is disabled');
   if (session.realtimeVoice && (session.realtimeVoice.status === 'failed' || session.realtimeVoice.status === 'stopped')) {
     await session.realtimeVoice.stop('rebuild-stale-session').catch((err) => {
       logger.warn(`[vc-agent] stale realtime voice cleanup failed meeting=${session.state.meeting.id}: ${err instanceof Error ? err.message : String(err)}`);
@@ -7267,9 +7325,9 @@ async function ensureVcMeetingRealtimeVoiceSession(
       protocol: createProtoRealtimeVoiceProtocol(),
       transport,
       audioFormat: {
-        ...(voiceCfg.sampleRate !== undefined ? { sampleRate: voiceCfg.sampleRate } : {}),
-        ...(voiceCfg.channels !== undefined ? { channels: voiceCfg.channels } : {}),
-        ...(voiceCfg.frameMs !== undefined ? { frameMs: voiceCfg.frameMs } : {}),
+        ...(voiceCfg?.sampleRate !== undefined ? { sampleRate: voiceCfg.sampleRate } : {}),
+        ...(voiceCfg?.channels !== undefined ? { channels: voiceCfg.channels } : {}),
+        ...(voiceCfg?.frameMs !== undefined ? { frameMs: voiceCfg.frameMs } : {}),
       },
     });
   }
@@ -16049,6 +16107,8 @@ export const __vcMeetingAgentTest = {
     const cfg = effectiveVcMeetingAgentConfig(larkAppId);
     if (cfg) restoreVcMeetingRuntimeSessionsForBot(larkAppId, cfg);
   },
+  /** 测试用：读某个 bot 的有效 VC 配置（含共享目录绑定 + larkCliProfile 默认值）。 */
+  effectiveConfig: (larkAppId: string) => effectiveVcMeetingAgentConfig(larkAppId),
   reset: () => {
     for (const session of vcMeetingSessions.values()) {
       if (session.flushTimer) clearInterval(session.flushTimer);
@@ -20888,26 +20948,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     botConfigs = loadBotConfigs();
     cfg = loadBotConfigAtIndex(idx);
   }
-  // One-time, lock-protected catalog bootstrap. This runs only after the
-  // complete bots.json has parsed successfully, and the helper re-reads the
-  // latest file under its lock before deciding. Explicit [] and legacy agent
-  // policy are durable opt-outs. Reload the selected config after a write so
-  // this daemon exposes the seeded selection card immediately on the same boot.
+  // 这里曾经有一次「给本 bot 播种默认会议角色预设」的启动写盘。已退役：角色预设
+  // 改成全 fleet 共享目录 + 读路径内置默认（services/vc-meeting-shared-consumer-
+  // catalog.ts），没有任何 bot 还需要自己那份 per-bot 拷贝。退役的两个理由：
+  //   1. 播种出来的 per-bot `consumerProfiles` 会永久遮蔽共享目录——操作者在
+  //      Dashboard 改共享预设，被播种过的 bot 完全不跟随；
+  //   2. 那次写盘还会把「另一个 bot」的 appId 焊进预设（旧的换人兜底），正是
+  //      「拉 A 进会却把 B 拉进监听群」的源头。
+  // 现在启动路径对 VC 预设零写盘，fleet 里几十个 daemon 同时启动也不再有写竞争。
   const selectedAppId = cfg.larkAppId;
-  const profileBootstrap = await bootstrapVcMeetingDefaultConsumerProfile(selectedAppId);
-  if (profileBootstrap.ok) {
-    if (profileBootstrap.seeded) {
-      logger.info(
-        `[vc-agent] seeded default meeting minutes profile listener=${selectedAppId} `
-        + `agent=${profileBootstrap.agentAppId}`,
-      );
-    }
-  } else if (!profileBootstrap.ok) {
-    logger.warn(
-      `[vc-agent] default consumer profile bootstrap skipped: ${profileBootstrap.reason}`
-      + `${profileBootstrap.error ? ` (${profileBootstrap.error})` : ''}`,
-    );
-  }
   // A bootstrap failure is not authority to keep an earlier in-memory config.
   // Every explicit PM2 daemon must prove its same raw slot and App identity
   // immediately before registerBot, regardless of the bootstrap result.

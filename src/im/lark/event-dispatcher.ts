@@ -453,10 +453,15 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       const globalVcListenerAppId = vcMeetingAgentGlobalListenerBotAppId();
       if (
         isVcMeetingAgentGloballyEnabled()
-        && bot.config.vcMeetingAgent?.enabled === true
+        // VC 现在默认对每个连着飞书的 bot 生效（enabled:false 才是显式退出），所以
+        // 就绪自检也要跟着走 vcMeetingAgentConfigActive，而不是只认显式 enabled:true——
+        // 否则「默认开」的绝大多数 bot 在启动时永远不做权限体检。
+        && !!vcMeetingAgentConfigActive(bot.config)
         && (!globalVcListenerAppId || globalVcListenerAppId === larkAppId)
       ) {
-        const requiredVcScopes = bot.config.vcMeetingAgent.realtimeVoice?.enabled === true
+        // 实时语音也默认开启（未配=开），所以 VC 权限体检默认把实时语音 scope 纳入
+        // 必需项；只有显式 realtimeVoice.enabled=false 才不查它。
+        const requiredVcScopes = bot.config.vcMeetingAgent?.realtimeVoice?.enabled !== false
           ? [...VC_MEETING_FEATURE_SCOPES, ...VC_MEETING_REALTIME_VOICE_SCOPES]
           : VC_MEETING_FEATURE_SCOPES;
         const missingVc = requiredVcScopes.filter(s => !grantedScopes.has(s.name));

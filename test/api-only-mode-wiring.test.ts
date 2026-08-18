@@ -486,13 +486,40 @@ describe('API-only bot mode — riff env re-freeze + VC listener exclusion (sour
     expect(block.indexOf('...cfg.backendConfig.env')).toBeLessThan(block.indexOf('delete mergedEnv.BOTMUX_LARK_APP_SECRET;'));
   });
 
-  it('excludes apiOnly bots from VC listener options and fail-closes scope fetch', () => {
+  it('excludes apiOnly bots from VC meeting preflight and fail-closes scope fetch', () => {
+    // 全局「会议事件接收 Bot」下拉退役后（daemon 侧改成谁收到会议事件谁处理），
+    // 会给某个 bot 开权限/订事件的入口只剩这一个 preflight。apiOnly bot 结构上收不到
+    // 飞书事件，必须在跑开放平台自动化之前就被挡住。
     const dashSource = readFileSync(resolve('src/dashboard.ts'), 'utf8');
-    const optsBlock = region(dashSource, 'function vcMeetingListenerBotOptions(', '.map(bot => ({');
-    expect(optsBlock).toContain('bot.apiOnly !== true');
+    const preflightBlock = region(dashSource, 'async function preflightVcMeetingBot(', '\n}\n');
+    const guardAt = preflightBlock.indexOf("if (bot.apiOnly === true) return { ok: false, error: 'vcMeetingBot_preflight_api_only' };");
+    expect(guardAt).toBeGreaterThan(-1);
+    // 拦截必须排在任何开放平台调用之前（自动化 + scope 回读）。
+    for (const call of ['await automateOpenPlatformSetup(', 'await validateVcMeetingScopesForBot(']) {
+      const callAt = preflightBlock.indexOf(call);
+      expect(callAt, `${call} not found`).toBeGreaterThan(-1);
+      expect(guardAt, `apiOnly guard must precede ${call}`).toBeLessThan(callAt);
+    }
     const fetchBlock = region(dashSource, 'async function fetchGrantedScopesForBot(', 'const brand =');
     expect(fetchBlock).toContain('bot.apiOnly === true');
     expect(fetchBlock).toContain('api_only_bot_has_no_feishu_credentials');
+  });
+
+  it('never seeds per-bot meeting roles while granting permissions (the cross-bot invite regression)', () => {
+    // 「拉 A 进会却把 B 拉进监听群」的根因是给 bot 配置时顺手播种了一条 per-bot
+    // 预设，并把执行方 appId 焊了进去（本 bot 结构上不合格时还会静默换成别人）。
+    // 角色预设现在归 fleet 共享目录，执行方在读路径绑定为收到会议事件的 bot 自己；
+    // 这个入口只负责权限与事件订阅，落盘只允许补 larkCliProfile。
+    const dashSource = readFileSync(resolve('src/dashboard.ts'), 'utf8');
+    const preflightBlock = region(dashSource, 'async function preflightVcMeetingBot(', '\n}\n');
+    for (const forbidden of ['consumerProfiles', 'defaultConsumerIds', 'defaultProfileBootstrap', 'agentAppId']) {
+      expect(preflightBlock, `preflight must not touch ${forbidden}`).not.toContain(`${forbidden} =`);
+      expect(preflightBlock, `preflight must not touch ${forbidden}`).not.toContain(`${forbidden}:`);
+    }
+    // 唯一允许的落盘字段。
+    const writeBlock = region(preflightBlock, 'await withFileLock(', '\n    });');
+    expect(writeBlock).toContain('next.larkCliProfile = targetAppId;');
+    expect(writeBlock).not.toMatch(/next\.(?!larkCliProfile\b)[A-Za-z]+\s*=/u);
   });
 
   it('skips open-platform rename/avatar handler registration for apiOnly (fails closed to local rename)', () => {

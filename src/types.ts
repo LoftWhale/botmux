@@ -92,6 +92,16 @@ export interface VcMeetingConsumerConfig {
   defaultAgentAppId?: string;
   /** Default profile ids used by defaultMode=agents. */
   defaultConsumerIds?: string[];
+  /**
+   * Per-bot default role picked from the fleet-shared consumer catalog. When a
+   * bot inherits the shared catalog (no own `consumerProfiles`), this single id
+   * overrides the catalog's global default for THIS bot — "not chosen = follow
+   * the global default". Unlike `defaultConsumerIds`, this field is independent
+   * of `consumerProfiles` (the bot doesn't own profiles; it inherits them), so
+   * it is normalized unconditionally and never triggers the legacy
+   * "consumerProfiles required" resolver gate.
+   */
+  catalogDefaultConsumerId?: string;
   /** Presence of this property opts into profile mode, including an explicit empty array. */
   consumerProfiles?: VcMeetingConsumerProfileConfig[];
   /** Generator provenance; never grants runtime authority. */

@@ -334,6 +334,12 @@ function normalizeVcMeetingConsumerConfig(raw: unknown): VcMeetingConsumerConfig
     out.voiceOutputPolicy = entry.voiceOutputPolicy;
   }
 
+  // per-bot 从共享目录挑的默认角色。与 consumerProfiles 无关(bot 继承目录、不拥有
+  // 预设),故无条件归一化,不触发 legacy "consumerProfiles required" resolver 门。
+  // 空串/空白 = 「跟随全局默认」,等同没配。
+  const catalogDefaultConsumerId = normalizeNonEmptyString(entry.catalogDefaultConsumerId);
+  if (catalogDefaultConsumerId) out.catalogDefaultConsumerId = catalogDefaultConsumerId;
+
   if (Object.prototype.hasOwnProperty.call(entry, 'defaultProfileBootstrap')) {
     const marker = entry.defaultProfileBootstrap;
     const path = 'vcMeetingAgent.meetingConsumer.defaultProfileBootstrap';
@@ -529,7 +535,7 @@ function normalizeVcMeetingListenerDelivery(
   return { placement: entry.placement as 'auto' | 'chat' | 'topic' };
 }
 
-function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProfileConfig[] {
+export function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProfileConfig[] {
   const path = 'vcMeetingAgent.meetingConsumer.consumerProfiles';
   if (!Array.isArray(raw)) strictConfigError(path, 'must be an array');
   return raw.map((value, index) => {
