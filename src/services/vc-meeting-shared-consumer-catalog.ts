@@ -132,22 +132,39 @@ export function bindVcMeetingConsumerCatalogToBot(
   // 还可能指向另一个 bot。读路径直接当作「没有 per-bot 预设」走共享目录，磁盘残留
   // 原样留着，零迁移写盘。两代播种物都要认：v2 带 `defaultProfileBootstrap` 出处
   // 标记，v1（更早的版本升上来的）没有标记，只能按逐字段精确形状识别。
-  if (!isSeededConsumerProfileBlock(cfg.meetingConsumer)
-    && cfg.meetingConsumer?.consumerProfiles !== undefined) return cfg;
+  const seeded = isSeededConsumerProfileBlock(cfg.meetingConsumer);
+  if (!seeded && cfg.meetingConsumer?.consumerProfiles !== undefined) return cfg;
+
+  // 共享目录不可用时的退回值。**关键**:如果 cfg 带的是机器播种残留(seeded),它里面
+  // 焊死的 agentAppId 可能指向**另一个** bot——正是本 PR 要消灭的「拉 A 拉 B」。所以
+  // seeded 情形绝不能原样 `return cfg`(那等于让 foreign appId 从 fallback 复活),必须
+  // 把这些播种预设剥掉、退回「仅监听」。非 seeded(操作者内容/无 per-bot 预设)原样返回。
+  const fallbackCfg: VcMeetingAgentConfig = seeded
+    ? {
+        ...cfg,
+        meetingConsumer: {
+          ...cfg.meetingConsumer,
+          consumerProfiles: [],
+          defaultMode: 'listenOnly' as const,
+          defaultConsumerIds: [],
+        },
+      }
+    : cfg;
 
   // 没配过共享目录 → 内置默认目录（一个「会议纪要」角色）。否则「装好就能用」不
   // 成立：43/47 个 bot 从来没有过 vcMeetingAgent 配置，被拉进会只能干听。
   // 显式清空（profiles: []）是持久的「都不要」，不会被内置默认顶掉。
   const catalog = (deps.readCatalog ?? globalVcMeetingSharedConsumerCatalog)()
     ?? BUILTIN_VC_MEETING_SHARED_CONSUMER_CATALOG;
-  if (catalog.profiles.length === 0) return cfg;
+  if (catalog.profiles.length === 0) return fallbackCfg;
 
   const bound = validateBoundProfiles(
     catalog.profiles.map(profile => bindToBot(profile, botAppId)),
   );
-  // 整份目录都是坏条目时退回原配置，而不是把这个 bot 的会议消费面配成空数组
-  // （空数组是「这个 bot 不要任何角色」的显式语义，坏数据不该表达它）。
-  if (bound.length === 0) return cfg;
+  // 整份目录都是坏条目时退回 fallbackCfg（seeded 已被中和成仅监听），而不是把这个
+  // bot 的会议消费面配成空数组（空数组是「这个 bot 不要任何角色」的显式语义,坏数据
+  // 不该表达它;seeded 焊死的 foreign appId 更不能从这里复活）。
+  if (bound.length === 0) return fallbackCfg;
 
   const profileIds = new Set(bound.map(profile => profile.id));
   // per-bot 默认预设覆盖:这个 bot 若自己挑了 meetingConsumer.catalogDefaultConsumerId

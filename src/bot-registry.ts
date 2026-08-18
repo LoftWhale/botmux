@@ -310,7 +310,11 @@ function normalizeVcMeetingAgentConfig(raw: unknown): VcMeetingAgentConfig | und
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
   const out: VcMeetingAgentConfig = {};
+  // VC 默认对每个连着飞书的 bot 生效(vcMeetingAgentConfigActive:enabled!==false),
+  // 所以 enabled:false 是**显式退出**,必须原样保留——只留 true 会把 false round-trip
+  // 成 undefined(=默认开),让"关掉这个 bot 的会议"重载即失效。
   if (entry.enabled === true) out.enabled = true;
+  else if (entry.enabled === false) out.enabled = false;
   const notificationChatId = normalizeNonEmptyString(entry.notificationChatId);
   const listenerChatId = normalizeNonEmptyString(entry.listenerChatId);
   const attentionTargetOpenId = normalizeNonEmptyString(entry.attentionTargetOpenId);
@@ -795,7 +799,10 @@ function normalizeVcMeetingRealtimeVoiceConfig(raw: unknown): VcMeetingRealtimeV
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
   const out: VcMeetingRealtimeVoiceConfig = {};
+  // 实时语音默认开启(vcMeetingRealtimeVoiceEnabled:enabled!==false),enabled:false 是
+  // 显式关闭,必须保留——只留 true 会让"关掉实时语音"round-trip 成 undefined(=默认开)。
   if (entry.enabled === true) out.enabled = true;
+  else if (entry.enabled === false) out.enabled = false;
   const sampleRate = normalizePositiveInt(entry.sampleRate);
   const channels = normalizePositiveInt(entry.channels);
   const frameMs = normalizePositiveInt(entry.frameMs);

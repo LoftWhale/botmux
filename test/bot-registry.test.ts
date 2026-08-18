@@ -1801,6 +1801,25 @@ describe('vcMeetingAgentConfigActive — apiOnly bots never attend VC meetings',
     expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: enabledVc, apiOnly: true }))
       .toBeUndefined();
   });
+
+  // 回归(PR#916 codex阻断①):VC/实时语音默认开翻转后,enabled:false 是显式退出,
+  // 必须能 round-trip 存活。这里**过真实 parseBotConfigsFromText → vcMeetingAgentConfigActive**
+  // (而不是手搓对象喂 active),否则 normalizer 丢 false 的 bug 会被假绿掩盖。
+  it('a persisted vcMeetingAgent.enabled:false round-trips through parse and stays opted out', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'cli_off', larkAppSecret: 's', vcMeetingAgent: { enabled: false } },
+    ]));
+    expect(cfg.vcMeetingAgent?.enabled).toBe(false);
+    expect(mod.vcMeetingAgentConfigActive(cfg)).toBeUndefined();
+  });
+
+  it('a persisted realtimeVoice.enabled:false round-trips through parse (voice stays off)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'cli_v', larkAppSecret: 's', vcMeetingAgent: { realtimeVoice: { enabled: false } } },
+    ]));
+    // 顶层不 enabled:false → bot 仍接收会议事件,但实时语音显式关闭必须保留。
+    expect(cfg.vcMeetingAgent?.realtimeVoice?.enabled).toBe(false);
+  });
 });
 
 // ─── bots.json unreadable (sandbox read isolation) ────────────────────────

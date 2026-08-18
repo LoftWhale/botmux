@@ -366,6 +366,42 @@ describe('bindVcMeetingConsumerCatalogToBot', () => {
     expect(cfg.meetingConsumer.consumerProfiles[0].agentAppId).toBe(OTHER); // 入参不被改
   });
 
+  // 回归(PR#916 codex阻断②):seeded 块被判要忽略后,若共享目录不可用而 fallback
+  // 原样 `return cfg`,焊死的 foreign appId 会从 fallback 复活——正是 PR 要消灭的
+  // 「拉 A 拉 B」。fallback 对 seeded 必须剥成仅监听。
+  const seededV2Cfg = () => ({
+    enabled: true,
+    meetingConsumer: {
+      enabled: true,
+      consumerProfiles: [seededProfile(OTHER)],
+      defaultMode: 'agents',
+      defaultConsumerIds: ['minutes'],
+      defaultProfileBootstrap: { generatorVersion: 2, profileId: 'minutes', configHash: 'sha256:whatever' },
+    },
+  }) as never;
+
+  it('strips a seeded block (not resurrect foreign appId) when the catalog is explicitly emptied', async () => {
+    const bind = await bindModule();
+    const out = bind.bindVcMeetingConsumerCatalogToBot(SELF, seededV2Cfg(), {
+      readCatalog: () => catalog({ profiles: [], defaultMode: 'listenOnly', defaultConsumerIds: [] }),
+    });
+    // 目录显式清空 → 该 bot 不跑角色;但绝不能把 OTHER 的预设留在配置里。
+    expect(out.meetingConsumer?.consumerProfiles).toEqual([]);
+    expect(out.meetingConsumer?.defaultMode).toBe('listenOnly');
+  });
+
+  it('strips a seeded block when every catalog entry is invalid (foreign appId never survives fallback)', async () => {
+    const bind = await bindModule();
+    const out = bind.bindVcMeetingConsumerCatalogToBot(SELF, seededV2Cfg(), {
+      // 整份目录都是坏条目 → bound.length===0 fallback;seeded 仍须剥离。
+      readCatalog: () => catalog({ profiles: [{ id: 'bad', role: 'minutes', responseMode: 'nope' }] }),
+    });
+    expect(out.meetingConsumer?.consumerProfiles).toEqual([]);
+    expect(out.meetingConsumer?.defaultMode).toBe('listenOnly');
+    const appIds = (out.meetingConsumer?.consumerProfiles ?? []).map(p => p.agentAppId);
+    expect(appIds).not.toContain(OTHER);
+  });
+
   it('lets a pre-provenance (v1) seeded block fall back too, but keeps a near miss', async () => {
     const bind = await bindModule();
     const v1 = (profile: Record<string, unknown>) => ({
