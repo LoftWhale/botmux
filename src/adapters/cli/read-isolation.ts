@@ -325,10 +325,18 @@ export function buildSeatbeltProfile(
 //   · 9 → 10: credential-only Seatbelt/bwrap panes receive a private rotating
 //     managed-origin channel for capability-gated daemon IPC. A warm pane with
 //     the v9 marker lacks both the env and the private read carve-out.
+//   · 10 → 11: provenance proofs gain a two-phase `state:'pending'|'committed'`
+//     lifecycle (generational-race fix). A v10 marker was written UNCONDITIONALLY
+//     BEFORE spawn (the vulnerable path) and has NO `state` field, so a late-winner
+//     pane may already wear a "valid" v10 marker it never earned. Requiring v11 +
+//     strict `state:'committed'` forces every pre-existing no-state marker to
+//     cold-spawn ONCE under the new pending→commit contract — closing the INSTALLED
+//     BASE risk, not just new spawns. (A legacy no-state marker is now version-
+//     rejected, so validators no longer need to tolerate `state===undefined`.)
 // #709 (→8) merged first; this PR (#714) rebased on top and takes 9. Numbers stay
 // strictly monotonic — a pane at any intermediate version must be rejected so it
 // cold-spawns under the current contract rather than bypassing a migration.
-export const ISOLATION_PANE_MARKER_VERSION = 10;
+export const ISOLATION_PANE_MARKER_VERSION = 11;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 
@@ -420,6 +428,11 @@ export function isolationPaneMarkerContent(
     version: ISOLATION_PANE_MARKER_VERSION,
     bootId,
     capabilities: normalizeIsolationCapabilities(capabilities),
+    // Committed = an attributably-fresh generation was established (the proof is
+    // written PENDING before the pane exists, then rewritten committed only after
+    // spawn confirms a fresh, non-reattached generation). isolatedPaneReattachSafe
+    // refuses anything whose state is present-but-not-'committed'.
+    state: 'committed',
     ...(policy ?? {}),
   });
 }
@@ -460,9 +473,48 @@ export function policyOffTombstonePath(runtimeDataDir: string, sessionId: string
  *  is diagnostic-bearing but its PRESENCE-as-valid (not equality to any live boot
  *  id) is the reattach signal — a legitimate policy-off pane warm-reattaches
  *  across daemon restarts, so binding to the current boot id would cold-spawn it
- *  every restart. bootId is kept only for diagnostics. */
+ *  every restart. bootId is kept only for diagnostics.
+ *
+ *  `state:'committed'` is REQUIRED for authorization: a proof is written first as
+ *  PENDING (see {@link provenancePendingContent}) before the pane is created, and
+ *  only rewritten to committed once the fresh generation is attributably
+ *  established (see the generational-race guard in worker.ts). A pending record
+ *  never authorizes a reattach — {@link policyOffTombstoneValid} rejects it. */
 export function policyOffTombstoneContent(bootId: string): string {
-  return JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, policyOff: true, bootId });
+  return JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, policyOff: true, bootId, state: 'committed' });
+}
+
+/**
+ * PENDING provenance body: written to the FINAL proof path BEFORE `backend.spawn()`
+ * for a predicted-fresh persistent launch, then rewritten to the committed body
+ * only after the fresh generation is attributably established. It carries a random
+ * `nonce` (compare-before-replace at commit time, so a superseded generation's
+ * deferred callback can't overwrite a newer pending) and, deliberately, NEITHER a
+ * committed `state` NOR the structural fields the validators require — so both
+ * {@link policyOffTombstoneValid} and {@link isolatedPaneReattachSafe} reject it
+ * outright. Its on-disk PRESENCE still drives the conservative guard: a pending
+ * file means "this system KNOWS a generation's attribution is incomplete", which
+ * is STRONGER than legacy provenance and dominates the migration scope (a live
+ * pane with a pending proof is always killed + cold-spawned; see
+ * {@link evaluatePersistentPaneMigration}).
+ */
+export function provenancePendingContent(nonce: string): string {
+  return JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, state: 'pending', nonce });
+}
+
+/** Extract the pending nonce for the compare-before-replace at commit time.
+ *  Returns the nonce string only for a well-formed pending record read from a
+ *  secure 0600 file; null otherwise (so a garbage/committed/absent file never
+ *  matches a live launch's nonce). */
+export function provenancePendingNonce(content: string | null | undefined): string | null {
+  try {
+    const parsed = JSON.parse(content ?? '') as { state?: unknown; nonce?: unknown };
+    return parsed.state === 'pending' && typeof parsed.nonce === 'string' && parsed.nonce.length > 0
+      ? parsed.nonce
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -474,16 +526,24 @@ export function policyOffTombstoneContent(bootId: string): string {
  * blank/garbage/structurally-wrong tombstone cannot authorize a warm reattach.
  * Mirror of {@link isolatedPaneReattachSafe}'s fail-closed parse discipline, but
  * for the opposite polarity: here VALID authorizes reattach.
+ *
+ * A `state:'pending'` record is explicitly rejected (an incomplete generation
+ * proof must never authorize). `state` is now REQUIRED to equal 'committed': the
+ * v11 version bump means every legitimate proof carries it, so a missing/other
+ * state is refused (this is what forces a pre-v11 no-state marker — possibly
+ * washed onto a late-winner pane under the old pre-spawn-write path — to
+ * cold-spawn once instead of being trusted).
  */
 export function policyOffTombstoneValid(content: string | null | undefined): boolean {
   try {
     const parsed = JSON.parse(content ?? '') as {
-      version?: unknown; policyOff?: unknown; bootId?: unknown;
+      version?: unknown; policyOff?: unknown; bootId?: unknown; state?: unknown;
     };
     return parsed.version === ISOLATION_PANE_MARKER_VERSION
       && parsed.policyOff === true
       && typeof parsed.bootId === 'string'
-      && parsed.bootId.trim().length > 0;
+      && parsed.bootId.trim().length > 0
+      && parsed.state === 'committed';
   } catch {
     return false;
   }
@@ -522,10 +582,18 @@ export function isolatedPaneReattachSafe(
       writeSandbox?: unknown;
       originChannelId?: unknown;
       policyDigest?: unknown;
+      state?: unknown;
     };
     if (parsed.version !== ISOLATION_PANE_MARKER_VERSION
       || typeof parsed.bootId !== 'string'
       || parsed.bootId.trim().length === 0
+      // A committed generation proof is REQUIRED. A PENDING record (written before
+      // the pane is attributably established) must never authorize; and with the
+      // v11 bump every legitimate marker carries state:'committed', so a
+      // missing/other state (e.g. a washed pre-v11 no-state marker) is refused →
+      // cold-spawn once. (Version check above already rejects pre-v11; this keeps
+      // the contract explicit and rejects a same-version pending.)
+      || parsed.state !== 'committed'
       || !Array.isArray(parsed.capabilities)
       || parsed.capabilities.some(capability =>
         typeof capability !== 'string'
@@ -643,6 +711,17 @@ export type PersistentPaneMigrationInput = {
    *  `unknown` must never have its provenance cleared nor be cold-spawned around.
    *  Only an authoritative `missing` proves the pane is gone. */
   paneProbe: SessionProbe;
+  /** A PENDING provenance file (marker OR tombstone whose secure-read body parses
+   *  as `state:'pending'`) is present on disk. This is STRONGER than legacy
+   *  provenance and DOMINATES everything below: it means the system explicitly
+   *  knows a generation's fresh-attribution never completed (crash between
+   *  pending-write and commit, or a late-flip/collision that was never committed).
+   *  A pending file is evaluated FIRST, on ALL backends and BOTH policy directions,
+   *  independent of the tmux migration scope — `exists`→kill, `unknown`→refuse,
+   *  `missing`→clear. Its no-follow presence also keeps isolationMarkerPresent /
+   *  policyOffTombstonePresent true (the file exists), but the pending branch runs
+   *  before any of the committed-provenance logic. */
+  pendingProvenancePresent: boolean;
   /**
    * Result of {@link isolatedPaneReattachSafe}(marker, current policy) — only
    * meaningful when policy is ON. The caller computes it (it needs the parsed
@@ -676,11 +755,28 @@ export function evaluatePersistentPaneMigration(
   const {
     appliedIsolationCapabilities, isolationCapableBackend, noTransport,
     isolationMarkerPresent, policyOffTombstonePresent, policyOffTombstoneValid: tombstoneValid,
-    paneProbe, isolationMarkerReattachSafe,
+    paneProbe, pendingProvenancePresent, isolationMarkerReattachSafe,
   } = input;
   const policyOn = appliedIsolationCapabilities.length > 0;
   const anyProvenance = isolationMarkerPresent || policyOffTombstonePresent;
   const paneLive = paneProbe === 'exists';
+
+  // ── PENDING dominates everything (all backends, both policy directions, ANY
+  //    scope). A pending provenance file means the system EXPLICITLY knows a
+  //    generation's fresh-attribution never completed — a crash between the
+  //    pre-spawn pending-write and the post-spawn commit, or a late-flip/collision
+  //    that was never committed. This is STRONGER than legacy provenance, so it is
+  //    judged BEFORE the migration-scope logic (which would otherwise `skip` a
+  //    live pane out of the tmux scope and warm-reattach an undetermined
+  //    generation — e.g. an enrolled zellij pane whose credential policy later
+  //    flipped OFF). Only an authoritative `missing` clears it; `unknown` refuses
+  //    (never erase evidence of a possibly-live pane); `exists` kills + cold-spawns.
+  if (pendingProvenancePresent) {
+    if (paneProbe === 'exists') return { action: 'kill-then-cold-spawn', clearAfterKill: true };
+    if (paneProbe === 'unknown') return { action: 'refuse-inconclusive-probe' };
+    return { action: 'clear-stale-then-cold-spawn' }; // authoritative missing
+  }
+
   // TRI-STATE liveness. `unknown` is NOT "dead": the backend (tmux/zellij/herdr/
   // zmx) could not answer, so the pane may still be alive AND still confined under
   // its original (possibly obsolete) policy. Acting on `unknown` — clearing
@@ -819,6 +915,30 @@ export function executePersistentPaneMigration(
       effects.reselectBackend();
       return decision.action;
   }
+}
+
+/**
+ * Which kill/probe primitive a persistent-pane teardown must use, so it targets
+ * the EXACT just-launched pane and never a shared host. Pure so the worker's
+ * inline teardown and the migration effects share one behaviorally-tested policy:
+ *
+ *   · 'zmx'    — identity-verified kill against the frozen managed PID + owned probe.
+ *   · 'target' — the recorded PersistentBackendTarget (REQUIRED when one exists):
+ *                a herdr isolated/MCP agent lives as `{sessionName:'botmux',
+ *                agentName:<topic>}` on the SHARED host, so a name-only kill of
+ *                'botmux' would tear down every bot's agent. The target scopes the
+ *                kill to this agent.
+ *   · 'name'   — last-resort name-only kill, ONLY when no target was recorded
+ *                (legacy tmux/zellij that own their whole session by name).
+ */
+export type PersistentTeardownKillKind = 'zmx' | 'target' | 'name';
+export function persistentTeardownKillKind(input: {
+  backendType: string;
+  hasBackendTarget: boolean;
+}): PersistentTeardownKillKind {
+  if (input.backendType === 'zmx') return 'zmx';
+  if (input.hasBackendTarget) return 'target';
+  return 'name';
 }
 
 function dedupe(xs: string[]): string[] {

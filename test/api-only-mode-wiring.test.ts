@@ -496,12 +496,56 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     expect(workerSource).toContain('could not verify existing ${effectiveBackendType} pane');
     expect(effects).toContain('clearProvenanceVerified:');
     expect(effects).toContain('reselectBackend:');
-    // Policy-OFF cold-spawn of a no-transport isolation-capable pane MUST record a
-    // tombstone, clearing any stale isolation marker first, and FAIL CLOSED if it
-    // cannot (else the next restart mis-kills it).
-    expect(workerSource).toContain('policyOffTombstoneContent(cfg.daemonBootId ?? \'\')');
-    expect(workerSource).toContain('could not record policy-off generation tombstone');
-    expect(workerSource).toContain('stale isolation marker survived removal at');
+    // Generational-race fix: provenance is written PENDING before spawn (a nonce
+    // record both validators reject) and only rewritten to committed AFTER spawn
+    // confirms a fresh, non-reattached generation.
+    expect(workerSource).toContain('provenancePendingContent(nonce)');
+    expect(workerSource).toContain('let pendingProvenanceCommit: PersistentPaneCommit | null = null;');
+    // The PENDING presence is fed into the state machine as a dominant input.
+    expect(workerSource).toContain('pendingProvenancePresent,');
+    expect(workerSource).toContain('provenancePendingNonce(readManagedOriginAuthorityFile(stalePaneMarkerPath))');
+    // Commit runs AFTER actuallyReattachedPersistent is known, with a generation
+    // fence + compare-before-replace on the pending nonce.
+    const commitBlock = region(workerSource,
+      'if (pendingProvenanceCommit) {', 'finalizeCodexAppControlGeneration(');
+    // Condition #2: a predicted-fresh launch that dynamically reattached a late
+    // pane must tear down + refuse, not silently keep running.
+    expect(commitBlock).toContain('if (actuallyReattachedPersistent) {');
+    expect(commitBlock).toContain('dynamically reattached a late-arriving pane');
+    // Option B: isolation-capable zellij never commits (stays pending → cold-spawn).
+    expect(commitBlock).toContain("effectiveBackendType === 'zellij'");
+    expect(commitBlock).toContain('does not warm-reattach');
+    // Condition #3: fence + compare-before-replace + commit-fail teardown.
+    expect(commitBlock).toContain('spawnGeneration !== cliSpawnGeneration');
+    expect(commitBlock).toContain('provenancePendingNonce(readManagedOriginAuthorityFile(commit.path))');
+    expect(commitBlock).toContain('pending proof nonce mismatch');
+    expect(commitBlock).toContain('replaceManagedOriginCapabilityFile(commit.path, commit.committedContent)');
+    // Teardown = kill the EXACT backend target → confirm authoritative missing →
+    // else keep pending + refuse (never erase evidence of a possibly-live pane).
+    // CRITICAL: must NOT name-only kill — an isolated/MCP herdr agent lives on the
+    // SHARED host session `botmux`, so a name-only killPersistentSession('herdr',
+    // 'botmux') would tear down every bot's agent. Mirror the migration effects:
+    // target helper for herdr's agent scope, frozen-PID path for ZMX identity.
+    const teardown = region(commitBlock,
+      'const teardownTarget = selectedBackend.persistentBackendTarget;', 'Condition #2:');
+    // Dispatches on the pure, behaviorally-tested policy (read-isolation.test.ts).
+    expect(teardown).toContain('persistentTeardownKillKind({');
+    expect(teardown).toContain('killPersistentBackendTarget(teardownTarget!, cfg.sessionId)');
+    expect(teardown).toContain('probePersistentBackendTarget(teardownTarget!)');
+    expect(teardown).toContain('ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)');
+    expect(teardown).toContain('probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe');
+    expect(teardown).toContain("postKill !== 'missing'");
+    expect(teardown).toContain('pending proof retained');
+
+    // Blocker #3: the policy-ON PENDING write is a spawn-time ADMISSION
+    // PRECONDITION, not best-effort — a write failure must THROW before spawn (else
+    // a late-flip reattach skips the pendingProvenanceCommit-gated teardown and
+    // runs unattributed). Assert the policy-ON arm fails closed, same as policy-off.
+    const pendingWrite = region(workerSource,
+      "if (appliedIsolationCapabilities.length > 0 && persistentSessionName && !willReattachPersistent) {",
+      "} else if (appliedIsolationCapabilities.length === 0");
+    expect(pendingWrite).toContain('could not record pending isolation-marker generation proof');
+    expect(pendingWrite).not.toContain('non-fatal');
   });
 
   it('daemon freezes the actual loaded bots-config path into the worker init message', () => {

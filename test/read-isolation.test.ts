@@ -11,8 +11,11 @@ import {
   isolatedPaneReattachSafe,
   evaluatePersistentPaneMigration,
   executePersistentPaneMigration,
+  persistentTeardownKillKind,
   policyOffTombstoneContent,
   policyOffTombstoneValid,
+  provenancePendingContent,
+  provenancePendingNonce,
   isolationPaneMarkerContent,
   ISOLATION_PANE_MARKER_VERSION,
   isolationPanePolicyDigest,
@@ -334,6 +337,7 @@ describe('evaluatePersistentPaneMigration — policy-on/off pane provenance stat
     policyOffTombstonePresent: false,
     policyOffTombstoneValid: false,
     paneProbe: 'exists' as const,
+    pendingProvenancePresent: false,
     isolationMarkerReattachSafe: false,
   };
 
@@ -507,6 +511,90 @@ describe('evaluatePersistentPaneMigration — policy-on/off pane provenance stat
       isolationCapableBackend: false, paneProbe: 'unknown',
     })).toEqual({ action: 'skip' });
   });
+
+  // ── PENDING dominates everything (generational-race fix). A pending provenance
+  //    file = the system explicitly knows a generation's fresh-attribution never
+  //    completed. It is judged FIRST, on ALL backends and BOTH policy directions,
+  //    independent of the tmux migration scope. This is what stops a leftover
+  //    pending on an enrolled non-tmux (zellij) pane from warm-reattaching an
+  //    undetermined generation once its credential policy flips OFF. ──
+  it('PENDING + exists → kill (dominates, even policy-OFF out of tmux migration scope)', () => {
+    // Enrolled zellij pane, credential policy now OFF, out of tmux scope — the old
+    // `!inMigrationScope → skip` path would warm-reattach. Pending overrides it.
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF, noTransport: false,
+      isolationCapableBackend: false, paneProbe: 'exists',
+      isolationMarkerPresent: true, pendingProvenancePresent: true,
+    })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
+  });
+
+  it('PENDING + exists + policy-ON → kill (pending dominates the policy-ON reattach path too)', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_ON, paneProbe: 'exists',
+      isolationMarkerPresent: true, pendingProvenancePresent: true,
+      // even if a stale committed check would have said "safe", pending wins:
+      isolationMarkerReattachSafe: true,
+    })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
+  });
+
+  it('PENDING + unknown → refuse (never erase evidence of a possibly-live pending pane)', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF, paneProbe: 'unknown',
+      policyOffTombstonePresent: true, pendingProvenancePresent: true,
+    })).toEqual({ action: 'refuse-inconclusive-probe' });
+  });
+
+  it('PENDING + missing → clear-stale (verified) then cold-spawn', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF, paneProbe: 'missing',
+      isolationMarkerPresent: true, pendingProvenancePresent: true,
+    })).toEqual({ action: 'clear-stale-then-cold-spawn' });
+  });
+
+  it('regression #6: zellij policy-ON fresh left PENDING, restart still policy-ON → kill/cold (never reattach)', () => {
+    // Option B: isolation-capable zellij never commits, so its proof stays pending.
+    // On restart the still-live pane + pending → kill, regardless of policy-ON.
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_ON, isolationCapableBackend: false,
+      paneProbe: 'exists', isolationMarkerPresent: true, pendingProvenancePresent: true,
+      isolationMarkerReattachSafe: false,
+    })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
+  });
+
+  it('regression #7: same PENDING pane, restart now policy-OFF + OUT of tmux migration scope → still kill (never the old skip)', () => {
+    // This is the exact hole the pending-dominance fix closes: policy-OFF + live +
+    // !inMigrationScope used to `skip` (warm-reattach). Pending forces kill.
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF, noTransport: false,
+      isolationCapableBackend: false, paneProbe: 'exists',
+      isolationMarkerPresent: true, pendingProvenancePresent: true,
+    })).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
+  });
+});
+
+describe('persistentTeardownKillKind — exact-target teardown policy (herdr shared-host safety)', () => {
+  // The generational-race teardown must NOT name-only kill: an isolated/MCP herdr
+  // agent lives on the SHARED host session `botmux`, so killing by session name
+  // would tear down every bot's agent. This pure policy is what the worker's inline
+  // teardown dispatches on.
+  it('herdr WITH a recorded target → target-scoped kill (never the shared host name)', () => {
+    expect(persistentTeardownKillKind({ backendType: 'herdr', hasBackendTarget: true })).toBe('target');
+  });
+  it('zmx → identity-verified frozen-PID path regardless of target', () => {
+    expect(persistentTeardownKillKind({ backendType: 'zmx', hasBackendTarget: true })).toBe('zmx');
+    expect(persistentTeardownKillKind({ backendType: 'zmx', hasBackendTarget: false })).toBe('zmx');
+  });
+  it('tmux/zellij WITH a target → target-scoped; WITHOUT a target → name-only (legacy own-session)', () => {
+    expect(persistentTeardownKillKind({ backendType: 'tmux', hasBackendTarget: true })).toBe('target');
+    expect(persistentTeardownKillKind({ backendType: 'tmux', hasBackendTarget: false })).toBe('name');
+    expect(persistentTeardownKillKind({ backendType: 'zellij', hasBackendTarget: false })).toBe('name');
+  });
+  it('a herdr WITHOUT a recorded target falls back to name — but the worker always captures the target for a live agent', () => {
+    // Documents the only path to 'name' for herdr: no target recorded at all. The
+    // worker captures selectedBackend.persistentBackendTarget, which for a herdr
+    // agent is always populated, so the dangerous host-name kill is unreachable there.
+    expect(persistentTeardownKillKind({ backendType: 'herdr', hasBackendTarget: false })).toBe('name');
+  });
 });
 
 describe('executePersistentPaneMigration — ordered, fail-closed IO seam', () => {
@@ -608,6 +696,60 @@ describe('policyOffTombstoneValid — secure-read schema/version check', () => {
     // An isolation marker must NOT validate as a tombstone.
     expect(policyOffTombstoneValid(isolationPaneMarkerContent('boot', ['credential']))).toBe(false);
   });
+
+  it('requires state:committed — rejects PENDING and any no-state/other-state record (v11 strict)', () => {
+    // PENDING generation proof must never authorize (generational-race fix).
+    expect(policyOffTombstoneValid(provenancePendingContent('nonce-abc'))).toBe(false);
+    expect(policyOffTombstoneValid(JSON.stringify({
+      version: ISOLATION_PANE_MARKER_VERSION, policyOff: true, bootId: 'x', state: 'pending',
+    }))).toBe(false);
+    // committed authorizes.
+    expect(policyOffTombstoneValid(policyOffTombstoneContent('boot-xyz'))).toBe(true);
+    // A NO-state record (the pre-v11 pre-spawn-write shape, possibly washed onto a
+    // late-winner pane) is now REFUSED — state:'committed' is required, forcing a
+    // cold-spawn once instead of trusting an unearned proof.
+    expect(policyOffTombstoneValid(JSON.stringify({
+      version: ISOLATION_PANE_MARKER_VERSION, policyOff: true, bootId: 'legacy',
+    }))).toBe(false);
+    // Any other explicit state is refused.
+    expect(policyOffTombstoneValid(JSON.stringify({
+      version: ISOLATION_PANE_MARKER_VERSION, policyOff: true, bootId: 'x', state: 'weird',
+    }))).toBe(false);
+  });
+});
+
+describe('provenance PENDING encoding (generational-race two-phase proof)', () => {
+  it('both validators reject a pending body; presence-nonce round-trips', () => {
+    const pending = provenancePendingContent('nonce-123');
+    // Neither validator authorizes a pending record.
+    expect(policyOffTombstoneValid(pending)).toBe(false);
+    expect(isolatedPaneReattachSafe(pending, { requiredCapabilities: ['credential'] })).toBe(false);
+    expect(isolatedPaneReattachSafe(pending)).toBe(false);
+    // The nonce round-trips for the commit-time compare-before-replace.
+    expect(provenancePendingNonce(pending)).toBe('nonce-123');
+  });
+
+  it('provenancePendingNonce returns null for committed / garbage / absent bodies', () => {
+    expect(provenancePendingNonce(policyOffTombstoneContent('boot'))).toBeNull();
+    expect(provenancePendingNonce(isolationPaneMarkerContent('boot', ['credential']))).toBeNull();
+    expect(provenancePendingNonce(null)).toBeNull();
+    expect(provenancePendingNonce('not json')).toBeNull();
+    expect(provenancePendingNonce(JSON.stringify({ state: 'pending' }))).toBeNull(); // no nonce
+    expect(provenancePendingNonce(JSON.stringify({ state: 'pending', nonce: '' }))).toBeNull();
+  });
+
+  it('a committed isolation marker carries state:committed and still validates', () => {
+    const committed = isolationPaneMarkerContent('boot-abc', ['credential', 'read', 'write']);
+    expect(JSON.parse(committed).state).toBe('committed');
+    expect(isolatedPaneReattachSafe(committed, {
+      requiredCapabilities: ['credential', 'read', 'write'], exactCapabilities: true,
+    })).toBe(true);
+    // An explicit state:'pending' spliced onto an otherwise-valid marker is refused.
+    const tampered = JSON.stringify({ ...JSON.parse(committed), state: 'pending' });
+    expect(isolatedPaneReattachSafe(tampered, {
+      requiredCapabilities: ['credential', 'read', 'write'], exactCapabilities: true,
+    })).toBe(false);
+  });
 });
 
 /**
@@ -644,6 +786,29 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
     // lack BOTMUX_READ_ISOLATION. Anything ≥ 8 is fine; reverting to ≤ 7 would
     // silently warm-reattach those broken panes.
     expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(7);
+  });
+
+  it('rejects a pre-v11 NO-state marker (the pre-spawn-write shape) → forces cold-spawn once', () => {
+    // The generational-race fix (pending→commit) added state:'committed'. A v10
+    // marker was written UNCONDITIONALLY before spawn (the vulnerable path) with NO
+    // state field, so a late-winner pane may wear a "full-capability" v10 marker it
+    // never earned. Both the version bump AND the strict state check must reject it
+    // so it cold-spawns once under the new contract — closing the INSTALLED-BASE
+    // risk, not just new spawns.
+    const legacyV10NoState = JSON.stringify({
+      version: 10,
+      bootId: 'washed-late-winner',
+      capabilities: ['credential', 'read', 'write'],
+    });
+    expect(isolatedPaneReattachSafe(legacyV10NoState, ['credential', 'read', 'write'])).toBe(false);
+    // Even a hypothetical CURRENT-version marker with no state is refused (strict).
+    const currentVersionNoState = JSON.stringify({
+      version: ISOLATION_PANE_MARKER_VERSION,
+      bootId: 'no-state',
+      capabilities: ['credential', 'read', 'write'],
+    });
+    expect(isolatedPaneReattachSafe(currentVersionNoState, ['credential', 'read', 'write'])).toBe(false);
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThanOrEqual(11);
   });
 });
 
