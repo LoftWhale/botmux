@@ -44,7 +44,7 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldEmitFailedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -66,6 +66,12 @@ import {
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
 import { decideRestartFollowup, settleDurableTurnForRestart } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
+import {
+  parseReadOnlyRemoteScrollPayload,
+  READ_ONLY_REMOTE_SCROLL_SESSION_BUDGET,
+  READ_ONLY_REMOTE_SCROLL_WINDOW_MS,
+  ReadOnlyRemoteScrollLimiter,
+} from './utils/web-terminal-scroll.js';
 import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
@@ -143,7 +149,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
@@ -1729,6 +1735,25 @@ let spawnArgvInitialPromptBusy = false;
  * arm above; quiescence argv adapters seed working then idle at first ready.
  */
 let spawnArgvNeedsWorkingSeed = false;
+/**
+ * Startup-window evidence for an argv-baked first prompt: true once the turn
+ * has VISIBLY started — busyPattern seen in the raw PTY stream since spawn, or
+ * a live structured-transcript user/final event ingested. Pi's TUI renders its
+ * input box seconds before it begins consuming the argv prompt (extension /
+ * model loading), and during that gap the screen shows no busy marker and the
+ * transcript has no user record — quiescence then reports a FALSE first idle
+ * ("not started yet", not "turn complete"). Until this latches,
+ * markPromptReady holds ready + re-arms instead of seeding working→idle.
+ */
+let spawnArgvTurnStartEvidenceSeen = false;
+/** Rolling ANSI-stripped PTY tail scanned for busyPattern while the argv
+ *  first-turn evidence gate is armed; dropped once evidence latches. */
+let spawnArgvTurnStartBusyScanTail = '';
+/** Fail-open deadline for the evidence gate: past this instant the gate stops
+ *  holding, so an argv prompt the CLI never consumed (e.g. dropped on a
+ *  restart) cannot park the card at 工作中 forever. */
+let spawnArgvTurnStartEvidenceDeadlineMs = 0;
+let spawnArgvTurnStartFailOpenTimer: ReturnType<typeof setTimeout> | null = null;
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
 /** True once a crash diagnostic tmux shell (bmx-diag-<sid>) is live. */
@@ -1780,6 +1805,10 @@ const authedClients = new WeakSet<WebSocket>();
 const clientPtys = new Map<WebSocket, pty.IPty>();
 /** Managed-Herdr viewers survive an in-worker /restart while backend changes. */
 const herdrWebBindings = new Map<WebSocket, HerdrWebTerminalBinding>();
+const readOnlyRemoteScrollLimiter = new ReadOnlyRemoteScrollLimiter({
+  budget: READ_ONLY_REMOTE_SCROLL_SESSION_BUDGET,
+  windowMs: READ_ONLY_REMOTE_SCROLL_WINDOW_MS,
+});
 // Standalone/test fallback. Production replaces this after init with a stable
 // per-session HMAC derived from the host-only dashboard secret, so an
 // already-issued 「操作链接」/write link survives a worker restart (a silent
@@ -4007,7 +4036,8 @@ function failedBridgeFallbackContent(errorCode?: string, summary?: string, parti
         ? 'worker.empty_final_failed_connection'
         : 'worker.empty_final_failed';
   const failure = t(key, { cliName: cliName(), reason });
-  return partialText?.trim() ? `${partialText.trim()}\n\n${failure}` : failure;
+  const visiblePartialText = stripTrailingOaiMemoryCitation(partialText ?? '').trim();
+  return visiblePartialText ? `${visiblePartialText}\n\n${failure}` : failure;
 }
 
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
@@ -5273,7 +5303,11 @@ function currentHermesBridgeDbPath(): string {
 
 function structuredBridgeIngestPath(path: string, offset: number) {
   if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
-  if (structuredBridgeIsTraex()) return drainTraexRollout(path, offset);
+  // adoptMode gates the drainer's bare-sentinel synthesis: adopt posts
+  // transcript text verbatim, so a synthesised token would leak into Lark.
+  if (structuredBridgeIsTraex()) {
+    return drainTraexRollout(path, offset, { adoptMode: lastInitConfig?.adoptMode === true });
+  }
   if (codexBridgeIsCursor()) return drainCursorTranscript(path, offset);
   if (structuredBridgeIsPi()) return drainPiTranscript(path, offset);
   if (structuredBridgeIsGrok()) return drainGrokUpdates(path, offset);
@@ -6034,6 +6068,9 @@ function codexBridgeIngest(opts: {
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
+  // After ingest so the latch's delivery re-kick observes the started turn —
+  // the flush's own bridge mark must queue behind it, not ahead of it.
+  noteSpawnArgvTurnStartTranscriptEvidence(result.events);
   pruneExpiredStructuredHeadsAndEmit('structured ingest');
   // Transcript-driven idle: a normal `assistant_final` or no-output
   // `turn_aborted` is Codex declaring end-of-turn, far more reliable than the screen-pattern heuristic
@@ -6517,13 +6554,19 @@ function emitReadyCodexTurns(): void {
       isLocal: turn.isLocal,
       finalText: turn.finalText,
       terminalStatus: turn.terminalStatus,
+      terminalErrorCode: turn.terminalErrorCode,
     };
-    const content = turn.terminalErrorCode !== CODEX_RATE_LIMIT_ERROR_CODE
-      && shouldEmitFailedBridgeFallback(gateInput, nextBoundaryMs, markers, adoptMode)
+    // The rate-limit skip is narrowed to CLIs with a dedicated structured
+    // rate-limit chain (Codex): TRAE 429 has no such chain, so skipping the
+    // generic failed fallback would post nothing at all.
+    const fallbackKind = structuredFallbackKind(
+      gateInput, nextBoundaryMs, markers, adoptMode, structuredBridgeIsCodex(),
+    );
+    const content = fallbackKind === 'failed'
       ? failedBridgeFallbackContent(turn.terminalErrorCode, turn.terminalErrorSummary, turn.finalText)
-      : turn.finalText && turn.finalText.trim()
-        ? turn.finalText
-        : shouldEmitEmptyCompletedBridgeFallback(gateInput, nextBoundaryMs, markers, adoptMode)
+      : fallbackKind === 'final'
+        ? turn.finalText ?? ''
+        : fallbackKind === 'empty_completed'
           ? emptyCompletedBridgeFallbackContent()
           : '';
     if (!content) continue;
@@ -6805,6 +6848,11 @@ function restoreHerdrWebBindings(): void {
     }
     applyHerdrWebBindingResult(ws, binding.restore());
   }
+}
+
+function canHandleReadOnlyRemoteScroll(): boolean {
+  return cliAdapter?.readOnlyRemoteScroll === true
+    && !(lastInitConfig?.adoptMode && lastInitConfig.adoptZellijPaneId);
 }
 
 function wireHerdrWebTerminalRelays(be: HerdrBackend): void {
@@ -8512,12 +8560,12 @@ async function handleTrustedCodexAppMarker(
       log(`${cliName()} native turn ${nativeTurnId.substring(0, 12)} mapped to botmux turn ${turnId.substring(0, 12)}`);
     }
     let suppressDelivery = false;
-    // What actually reaches Lark: strip a trailing sentinel line so the literal
-    // token never posts. `finalContent` stays RAW above (the steer_superseded
-    // validator asserts finalContent==='' and must see the unstripped payload).
-    // If nothing remains after stripping, this was a pure-silence final → treat
-    // as suppressed so the daemon persists the FIFO advance without delivering.
-    const deliverableContent = stripTrailingBridgeSentinelLine(finalContent);
+    // What actually reaches Lark: strip internal memory attribution and a
+    // trailing sentinel line. `finalContent` stays RAW above (the
+    // steer_superseded validator asserts finalContent==='' and the fallback gate
+    // must see the unstripped payload). If nothing remains, this was metadata or
+    // a pure-silence final → persist the FIFO advance without delivering.
+    const deliverableContent = bridgePostText(finalContent, false);
     if (deliverableContent.trim().length === 0 && finalContent.trim().length > 0) {
       suppressDelivery = true;
     }
@@ -8982,6 +9030,25 @@ function onPtyData(data: string): void {
   maybeReportDeferredTopicMaterialization(data);
   maybeCaptureKiroSessionId(data);
   captureWorkflowTranscript(data);
+  // Argv first-turn start evidence (Pi): latch the busy marker from the raw
+  // PTY stream. The viewport-based defer cannot see a marker that has not
+  // rendered yet, and a fast turn can paint and clear `Working...` between
+  // screen samples — the stream sees every byte exactly once.
+  if (
+    spawnArgvNeedsWorkingSeed
+    && !spawnArgvTurnStartEvidenceSeen
+    && structuredBridgeIsPi()
+    && cliAdapter?.busyPattern
+  ) {
+    spawnArgvTurnStartBusyScanTail = tailChars(
+      spawnArgvTurnStartBusyScanTail + stripAnsiForLog(data),
+      500,
+    );
+    if (cliAdapter.busyPattern.test(spawnArgvTurnStartBusyScanTail)) {
+      spawnArgvTurnStartEvidenceSeen = true;
+      spawnArgvTurnStartBusyScanTail = '';
+    }
+  }
   renderer?.write(data);
 
   // In tmux-attach mode, each web client has its own tmux attach PTY —
@@ -9230,6 +9297,120 @@ function scheduleStructuredStartGraceRecheck(remainingMs: number): void {
   structuredStartGraceRecheckTimer.unref?.();
 }
 
+/** How long the argv first-turn evidence gate may hold ready with no start
+ *  evidence at all. Pi's startup gap (extension/model loading before it
+ *  consumes the argv prompt) is typically 3–9s; 90s covers slow hosts while
+ *  keeping a never-consumed argv prompt from parking the card at 工作中
+ *  forever. */
+const SPAWN_ARGV_TURN_START_EVIDENCE_GRACE_MS = 90_000;
+
+/** True while markPromptReady must hold the argv-baked first prompt's ready:
+ *  no "turn started" evidence yet and the bounded grace has not expired.
+ *  Scoped to Pi — the only quiescence-argv adapter with BOTH evidence channels
+ *  (busyPattern + always-on structured transcript); Gemini/OpenCode/MTR keep
+ *  their historical first-idle behavior. Never applies to the Grok-class busy
+ *  arm, whose first ready is handled by spawnArgvInitialPromptBusy. */
+function spawnArgvTurnStartGateHolds(): boolean {
+  if (!spawnArgvNeedsWorkingSeed || spawnArgvInitialPromptBusy) return false;
+  if (!structuredBridgeIsPi()) return false;
+  if (spawnArgvTurnStartEvidenceSeen) return false;
+  return Date.now() < spawnArgvTurnStartEvidenceDeadlineMs;
+}
+
+/** Latch "the argv first turn actually began" from live structured-transcript
+ *  events. The latch must happen at INGEST time, not lazily at gate time: a
+ *  fast first turn can be started AND drained/emitted before markPromptReady
+ *  runs, leaving no started turn to observe in the queue. A user record is the
+ *  authoritative start signal; a final implies start too (covers a drain that
+ *  sees both lines at once).
+ *
+ *  The latch is also a DELIVERY DRIVER, not just a boolean: when evidence
+ *  lands later than the 15s first-prompt timeout, every markPromptReady-based
+ *  driver has already fired rejected and stopped (probe one-shot, timeout
+ *  short-circuit) and the 90s fail-open stands down on evidenceSeen — with a
+ *  silent PTY nothing else would ever deliver a startup-queued message. The
+ *  user record hitting disk is itself the proof the TUI accepts input, so
+ *  re-kick immediately. (The PTY busyPattern latch needs no re-kick: busy
+ *  output implies a later quiescence edge that re-drives markPromptReady.) */
+function noteSpawnArgvTurnStartTranscriptEvidence(events: readonly { kind: string }[]): void {
+  // The whole evidence mechanism is Pi-scoped (matching the onPtyData busy
+  // scan and spawnArgvTurnStartGateHolds); this generic ingest path also
+  // serves Grok — another argv-baked + structured-bridge + type-ahead CLI —
+  // so without this guard the flush side effect below would add a new
+  // startup-window write for Grok (whose first ready is owned by the
+  // SessionStart busy arm, not by this gate).
+  if (!structuredBridgeIsPi()) return;
+  if (spawnArgvTurnStartEvidenceSeen || !spawnArgvNeedsWorkingSeed) return;
+  if (!events.some(ev => ev.kind === 'user' || ev.kind === 'assistant_final')) return;
+  spawnArgvTurnStartEvidenceSeen = true;
+  spawnArgvTurnStartBusyScanTail = '';
+  if (!isPromptReady && pendingMessages.length > 0) {
+    log('Argv first-turn start evidence landed via transcript — releasing startup-queued input');
+    flushQueuedInputAfterTurnStartEvidence();
+  }
+}
+
+function stopSpawnArgvTurnStartFailOpen(): void {
+  if (!spawnArgvTurnStartFailOpenTimer) return;
+  clearTimeout(spawnArgvTurnStartFailOpenTimer);
+  spawnArgvTurnStartFailOpenTimer = null;
+}
+
+/** Turn-start evidence in hand ⇒ startup-queued input becomes deliverable.
+ *
+ *  Messages that arrive during startup (awaitingFirstPrompt) skip
+ *  handleMessage's type-ahead write (shouldWriteNow holds them, "no input box
+ *  yet") and historically relied on markPromptReady()'s tail flush for
+ *  delivery. When a Pi argv first turn never lands its terminal record
+ *  (terminate:true gap), every ready driver dies rejected: the structured
+ *  lifecycle block refuses quiescence idles, the queued-message busy probe
+ *  and the 15s first-prompt timeout both short-circuit through the same
+ *  rejected markPromptReady(), and the 90s fail-open stands down once
+ *  evidence is latched. Without an explicit re-kick the message sits in
+ *  pendingMessages forever (card pinned at 工作中, the next transcript user
+ *  event never appears, HOL-drop never fires).
+ *
+ *  Two call sites, one safety argument — input may only be re-kicked once the
+ *  TUI provably booted far enough to accept it:
+ *   1. markPromptReady()'s lifecycle-block rejection (a started turn /
+ *      confirmed submit exists);
+ *   2. the transcript-evidence latch in codexBridgeIngest (the user record
+ *      just hit disk — the ONLY driver left when evidence lands later than
+ *      every probe/timeout and the PTY stays silent).
+ *  The argv turn-start evidence gate must NOT re-kick — before any evidence
+ *  the TUI may still be loading extensions/models and a type-ahead paste
+ *  could be dropped or land in a half-drawn screen (flushPending() has no
+ *  awaitingFirstPrompt gate of its own; shouldWriteNow()'s hold is the only
+ *  startup input protection).
+ *
+ *  flushPending() still re-checks its own admission gates (type-ahead
+ *  allowance, durable HOL, injection serialization, restart fences,
+ *  ready-gate settle), so a non-type-ahead adapter keeps holding until a real
+ *  ready edge; this is a re-kick, never a bypass of those gates. */
+function flushQueuedInputAfterTurnStartEvidence(): void {
+  if (pendingMessages.length === 0) return;
+  flushPending();
+}
+
+/** Re-drive the held first idle if no start evidence ever appears. Without
+ *  this, a swallowed quiescence idle followed by a fully silent PTY (argv
+ *  prompt never consumed) would leave no later signal to re-check the gate.
+ *  The re-driven idle still passes deferPromptReadyWhileBusy, so a turn whose
+ *  evidence was merely missed keeps deferring on a busy viewport. */
+function scheduleSpawnArgvTurnStartFailOpen(): void {
+  if (spawnArgvTurnStartFailOpenTimer) return;
+  const backendAtSchedule = backend;
+  const cliGenerationAtSchedule = cliSpawnGeneration;
+  spawnArgvTurnStartFailOpenTimer = setTimeout(() => {
+    spawnArgvTurnStartFailOpenTimer = null;
+    if (backend !== backendAtSchedule || cliSpawnGeneration !== cliGenerationAtSchedule) return;
+    if (isPromptReady || !spawnArgvNeedsWorkingSeed || spawnArgvTurnStartEvidenceSeen) return;
+    log('Argv-baked first prompt showed no start evidence within grace — failing open to quiescence idle');
+    idleDetector?.fireIdle();
+  }, Math.max(1, spawnArgvTurnStartEvidenceDeadlineMs - Date.now()));
+  spawnArgvTurnStartFailOpenTimer.unref?.();
+}
+
 function markPromptReady(): void {
   if (bareShellLaunchBlocked) {
     log('Ignoring non-PTY prompt-ready while bare-shell launch block is active');
@@ -9304,6 +9485,29 @@ function markPromptReady(): void {
     return;
   }
   if (freshnessAction === 'ignore') return;
+  // Argv-baked first prompt start gate (Pi): the TUI paints its input box
+  // seconds before the CLI begins consuming the argv prompt, and that startup
+  // window has no busyPattern on screen and no transcript user record —
+  // quiescence then produces a FALSE first idle ("not started yet", not "turn
+  // complete"). Letting it through would set isPromptReady for the whole turn
+  // and seed working→idle mid-turn (premature ✅ DONE + card flip to 等待输入).
+  // Hold ready and re-arm until the turn visibly starts; bounded fail-open via
+  // SPAWN_ARGV_TURN_START_EVIDENCE_GRACE_MS restores the historical quiescence
+  // behavior if evidence never appears.
+  // Deliberately NO flush re-kick here (unlike the lifecycle block below):
+  // with zero turn-start evidence the TUI may still be booting, and a
+  // type-ahead paste could be dropped or land in a half-drawn screen —
+  // shouldWriteNow()'s awaitingFirstPrompt hold is the only startup input
+  // protection and flushPending() does not re-check it. Queued messages are
+  // delivered the moment evidence appears (the transcript latch re-kicks, a
+  // busy-marker latch implies a later quiescence edge) or by the 90s
+  // fail-open.
+  if (spawnArgvTurnStartGateHolds()) {
+    log('Argv-baked first prompt has not visibly started (no busy marker or transcript user event since spawn) — re-arming idle detector');
+    idleDetector?.reset();
+    scheduleSpawnArgvTurnStartFailOpen();
+    return;
+  }
   // Screen prompt/quiescence is only a UI heuristic. Structured transcript
   // bridges have the stronger lifecycle signal: a transcript-started turn
   // without assistant_final is still running even if the TUI redraw exposes a
@@ -9319,6 +9523,7 @@ function markPromptReady(): void {
     log('Ignoring prompt-ready heuristic while a structured turn is unfinished or submit verification/start is pending');
     idleDetector?.reset();
     if (remainingMs !== undefined) scheduleStructuredStartGraceRecheck(remainingMs);
+    flushQueuedInputAfterTurnStartEvidence();
     return;
   }
   structuredRejectedReadyEvidenceGeneration = undefined;
@@ -12317,6 +12522,14 @@ async function spawnCli(
     injectsReadyHook: cliAdapter.injectsReadyHook === true,
     reliableTurnTerminal: cliAdapter.reliableTurnTerminal === true,
   });
+  // Fresh evidence window for the argv first-turn start gate (Pi): the new
+  // generation must not inherit a previous spawn's latch or fail-open timer.
+  stopSpawnArgvTurnStartFailOpen();
+  spawnArgvTurnStartEvidenceSeen = false;
+  spawnArgvTurnStartBusyScanTail = '';
+  spawnArgvTurnStartEvidenceDeadlineMs = spawnArgvNeedsWorkingSeed
+    ? Date.now() + SPAWN_ARGV_TURN_START_EVIDENCE_GRACE_MS
+    : 0;
   if (deferInitialPrompt && preparedDeferredInput) {
     piInitialPromptAdditionalArgs = [...(preparedDeferredInput.additionalArgs ?? [])];
     piInitialPromptEnv = { ...(preparedDeferredInput.env ?? {}) };
@@ -12368,6 +12581,8 @@ async function spawnCli(
     larkAppId: cfg.larkAppId,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
+    // dsh runner only; other adapters ignore the field.
+    turnTimeoutMs: cfg.turnTimeoutMs,
     reasoningEffort: cfg.reasoningEffort,
     disableCliBypass: cfg.disableCliBypass === true,
     // Codex-family hook-trust bypass: global toggle (default ON) so a headless
@@ -14199,6 +14414,8 @@ function killCli(opts: {
   stopReattachIdleProbe();
   stopBusyPatternIdleProbe();
   stopStructuredStartGraceRecheck();
+  stopSpawnArgvTurnStartFailOpen();
+  spawnArgvTurnStartBusyScanTail = '';
   structuredRejectedReadyEvidenceGeneration = undefined;
   ptyOutputGeneration.reset();
   // Cancel any pending ready-gate fallback / settle timers; spawnCli re-arms on respawn.
@@ -14453,6 +14670,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       // normal buffer until resize causes a redraw. Preserve that mode so
       // scroll gestures continue to target the CLI's own transcript.
       const forceRemoteScroll = effectiveBackendType === 'herdr' && cliAdapter?.altScreen === true;
+      const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       // The wheel burst cap throttles backends where a forwarded wheel is
       // EXPENSIVE or has no local terminal to drive:
       //   • Herdr — each forwarded wheel → pane send-text + snapshot re-render.
@@ -14470,7 +14688,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         || effectiveBackendType === 'tmux'
         || effectiveBackendType === 'zellij';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend));
+      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll));
     });
 
     wss = new WebSocketServer({
@@ -14505,6 +14723,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         return;
       }
       const { hasWrite } = resolveTerminalAccessForReq(req, url);
+      const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
 
@@ -14707,8 +14926,17 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             scrollback,
             onError: log,
           });
-        if (seed.length > 0) {
-          ws.send(seed + herdrWebCursorSequence());
+        // A capture-pane seed carries screen cells but no DECSET state: a fresh
+        // client xterm never learns the CLI enabled mouse tracking (grok build:
+        // 1003+1006), so clicks/double-clicks are silently swallowed instead of
+        // reported. Re-assert the pane's live input modes after the seed —
+        // write clients only: a read-only viewer forwards no input anyway, and
+        // mouse-mode xterm would break its plain select-to-copy. Raw-scrollback
+        // seeds already contain the original DECSET bytes; backends that can't
+        // be queried (herdr/zmx/pty) simply don't implement the hook.
+        const modeSeed = hasWrite ? (backend?.capturePaneInputModes?.() ?? '') : '';
+        if (seed.length > 0 || modeSeed.length > 0) {
+          ws.send(seed + modeSeed + herdrWebCursorSequence());
         }
 
         ws.on('message', (raw) => {
@@ -14728,6 +14956,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
               }
+              backend?.write(msg.data);
+            } else if (msg.type === 'scroll' && typeof msg.data === 'string') {
+              if (!allowReadOnlyRemoteScroll || authedClients.has(ws)) return;
+              const parsed = parseReadOnlyRemoteScrollPayload(msg.data);
+              if (!parsed) return;
+              if (!readOnlyRemoteScrollLimiter.tryConsume(parsed.eventCount)) return;
+              if (usesHerdrSnapshotWebHistory()) herdrWebScrollDirection = parsed.direction;
               backend?.write(msg.data);
             }
           } catch { /* ignore non-JSON or bad messages */ }
@@ -14760,6 +14995,7 @@ function getTerminalHtml(
   loginUrl = '',
   forceRemoteScroll = false,
   localTerminalBackend = false,
+  allowReadOnlyRemoteScroll = false,
 ): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
@@ -14898,6 +15134,7 @@ var hasToken=${hasWrite};
 var platformReadonly=${platformReadonly};
 var remoteScroll=${forceRemoteScroll};
 var localTerminalBackend=${localTerminalBackend};
+var readOnlyRemoteScroll=${allowReadOnlyRemoteScroll};
 if(!hasToken){
   if(platformReadonly){var _lb=document.getElementById('login-banner');_lb.classList.add('show');}
   else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
@@ -15101,13 +15338,34 @@ if(hasToken && !/[?&]imefix=0\\b/.test(location.search)){(function(){
 
 // ── WebSocket ──
 var ws_=null,el=document.getElementById('status');
+function _sendInput(d){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:d}))}
+// Pure pointer-motion reports (SGR button code 35 + shift/alt/ctrl modifier
+// bits). Emitted by xterm once the seed re-asserts DECSET 1003 (grok build) —
+// one per cell crossed. Each forwarded report costs a synchronous tmux
+// send-keys exec in the worker, so an unthrottled sweep across a 120-col pane
+// would stall the relay for every viewer. Clicks/drags/wheel stay immediate.
+var _MOTION_RE=/^(?:\\x1b\\[<(?:35|39|43|47|51|55|59|63);\\d+;\\d+[Mm])+$/;
+var _motionPend=null,_motionT=0;
 term.onData(function(d){
   if(!hasToken){
     // Mouse escape sequences are input too: a TUI can bind clicks or wheel
     // events to actions. View links never forward terminal bytes.
     _showReadonlyToast();return;
   }
-  if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:d}));
+  if(_MOTION_RE.test(d)){
+    // Trailing throttle: keep only the LATEST motion, flush every 90ms. Hover
+    // feedback survives; the send-keys exec rate is bounded (~11/s).
+    _motionPend=d;
+    if(!_motionT)_motionT=setTimeout(function(){
+      _motionT=0;if(_motionPend){_sendInput(_motionPend);_motionPend=null}
+    },90);
+    return;
+  }
+  // A press/release/drag/key supersedes any pending motion (it carries its own
+  // coordinates); dropping it preserves event ordering for the TUI.
+  if(_motionT){clearTimeout(_motionT);_motionT=0}
+  _motionPend=null;
+  _sendInput(d);
 });
 var fixedSize=false,_lastC=0,_lastR=0,_rzT=0;
 function sendResize(){
@@ -15194,8 +15452,9 @@ window.addEventListener('resize',onViewportResize);
 // Alt-screen + mouse-mode CLIs (e.g. Claude Code) keep NO scrollback in xterm OR
 // tmux — their whole transcript is redrawn by the app inside the fixed alt-screen
 // grid, so term.scrollLines() reveals nothing. In the alternate buffer we forward
-// scrolling as SGR mouse-wheel events so the CLI scrolls its own transcript and
-// repaints. This is write-capability only; view links stay locally scrollable.
+// scrolling as SGR mouse-wheel events so the CLI scrolls its own transcript.
+// Read-only viewers get this remote path only for adapters that explicitly opt
+// in; the server then accepts only validated wheel events, never general input.
 // Normal-buffer CLIs keep xterm's native scrollback scroll. Capture-phase +
 // stopPropagation pre-empts xterm's own handler. Skipped for pure tmux/zellij
 // ATTACH (gate), where the attach client owns scrolling via copy-mode.
@@ -15255,7 +15514,7 @@ function _cellAt(clientX,clientY){
   return col+';'+row;
 }
 function _fwdScroll(px,coord){
-  if(!hasToken||!ws_||ws_.readyState!==1||!px)return;
+  if((!hasToken&&!readOnlyRemoteScroll)||!ws_||ws_.readyState!==1||!px)return;
   coord=coord||(((term.cols>>1)+1)+';'+((term.rows>>1)+1)); // never (1,1)
   var dir=px<0?-1:1;
   if(_scrollBurstDir&&dir!==_scrollBurstDir){_scrollAccum=0;_scrollBurstTicks=0;}
@@ -15269,7 +15528,7 @@ function _fwdScroll(px,coord){
     _scrollAccum+=up?_SCROLL_STEP:-_SCROLL_STEP;n++;_scrollBurstTicks++;
   }
   if(_scrollBurstTicks>=_SCROLL_BURST_MAX)_scrollAccum=0;
-  if(data)ws_.send(JSON.stringify({type:'input',data:data}));
+  if(data)ws_.send(JSON.stringify({type:hasToken?'input':'scroll',data:data}));
 }
 if(!${isTmuxMode && !isPipeMode}){
   document.getElementById('terminal').addEventListener('wheel',function(e){
@@ -15282,7 +15541,9 @@ if(!${isTmuxMode && !isPipeMode}){
       return;
     }
     if(!hasToken){
-      e.preventDefault();e.stopPropagation();term.scrollLines(e.deltaY>0?3:-3);return;
+      e.preventDefault();e.stopPropagation();
+      if(readOnlyRemoteScroll)_fwdScroll(px,_cellAt(e.clientX,e.clientY));
+      else term.scrollLines(e.deltaY>0?3:-3);return;
     }
     e.preventDefault();e.stopPropagation();
     _fwdScroll(px,_cellAt(e.clientX,e.clientY)); // report the cell under the pointer
@@ -15603,8 +15864,7 @@ if(!${isTmuxMode && !isPipeMode}){
     if(e.touches.length===1)_tLastY=e.touches[0].clientY;
   },{capture:true,passive:true});
   _tTerm.addEventListener('touchmove',function(e){
-    // View links never forward input; let xterm/browser handle local scrolling.
-    if(!hasToken||_tLastY===null||e.touches.length!==1)return;
+    if((!hasToken&&!readOnlyRemoteScroll)||_tLastY===null||e.touches.length!==1)return;
     e.preventDefault();e.stopPropagation();
     var y=e.touches[0].clientY;
     var px=_tLastY-y;

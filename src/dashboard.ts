@@ -123,6 +123,7 @@ import {
   writeRestartIntent,
 } from './services/restart-intent-store.js';
 import { withFileLock } from './utils/file-lock.js';
+import { evaluateRestartShutdownPreflight } from './cli/restart-shutdown-preflight.js';
 import { spawn } from 'node:child_process';
 import {
   applySettingsWrite,
@@ -2057,7 +2058,7 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort'] }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2069,18 +2070,19 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       wrapperCli: b.wrapperCli,
       model: b.model,
       reasoningEffort: b.reasoningEffort,
+      turnTimeoutMs: b.turnTimeoutMs,
     }]));
   } catch {
     return new Map();
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort'] }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number }>(
   bot: T,
   ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort'] } {
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number } {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort'] } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: BotConfig['reasoningEffort']; turnTimeoutMs?: number } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -2089,6 +2091,7 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
     model: bot.model || fallback?.model,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
+    turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
   };
 }
 
@@ -3562,6 +3565,25 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/update/restart') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      // The real restart runs in a detached `botmux restart` child, whose
+      // shutdown-capability throw would only reach the maintenance-restart log
+      // — the UI would then poll a reconnect that never happens and mislabel it
+      // as "restart is slow". Detect that fail-closed boundary synchronously so
+      // we can return a precise, actionable error instead of firing a restart
+      // that is guaranteed to die silently. A read failure is non-authoritative
+      // and falls through to the existing behavior (never fabricate a block).
+      try {
+        const preflight = evaluateRestartShutdownPreflight();
+        if (preflight.bootstrapRequired) {
+          return jsonRes(res, 409, {
+            ok: false,
+            error: 'bootstrap_shutdown_protocol_required',
+            unsafeDaemons: preflight.unsafeDaemonNames,
+          });
+        }
+      } catch (error) {
+        logger.warn(`[dashboard] restart shutdown-capability preflight unavailable: ${error instanceof Error ? error.message : error}`);
+      }
       let body: Record<string, unknown> = {};
       try {
         const parsed = await readJsonBody(req);
@@ -3635,7 +3657,14 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, dashboardSkillsPayload());
     }
 
-    if (req.method === 'DELETE' && url.pathname === '/api/skills') {
+    // Batch skill removal. POST /api/skills/remove is the canonical route the
+    // dashboard UI calls: the payload (names[], force) must travel in the body,
+    // and DELETE bodies are dropped by the platform dashboard proxy (it assumes
+    // DELETE carries no body, forwards content-length but never pipes the bytes,
+    // so readJsonBody hangs until the outer gateway returns 504). DELETE
+    // /api/skills stays as an alias for direct/scripted callers.
+    if ((req.method === 'DELETE' && url.pathname === '/api/skills')
+      || (req.method === 'POST' && url.pathname === '/api/skills/remove')) {
       let parsed: unknown;
       try {
         parsed = await readJsonBody(req);
@@ -4883,6 +4912,7 @@ const server = createServer(async (req, res) => {
             wrapperCli: j.wrapperCli || d.wrapperCli,
             model: j.model || d.model,
             reasoningEffort: j.reasoningEffort || d.reasoningEffort,
+            turnTimeoutMs: typeof j.turnTimeoutMs === 'number' ? j.turnTimeoutMs : d.turnTimeoutMs,
           }, j);
         } catch (e: any) {
           return botDefaultsPayload(d, undefined, e?.message ?? String(e));

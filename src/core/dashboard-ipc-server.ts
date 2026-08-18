@@ -194,7 +194,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, MAX_TURN_TIMEOUT_MS, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
@@ -3514,6 +3514,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let wrapperCli: string | null = null;
   let model: string | null = null;
   let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
+  // dsh runner turn timeout (ms). Only meaningful for the dsh adapter; exposed
+  // so the dashboard can render the dsh-only field with its current value.
+  let turnTimeoutMs: number | null = null;
   let agentSelectionKey = '';
   try {
     const cfg = getBot(cachedLarkAppId).config;
@@ -3529,6 +3532,10 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     wrapperCli = typeof cfg.wrapperCli === 'string' && cfg.wrapperCli.trim() ? cfg.wrapperCli : null;
     model = typeof cfg.model === 'string' && cfg.model.trim() ? cfg.model : null;
     reasoningEffort = cfg.reasoningEffort ?? null;
+    turnTimeoutMs = typeof cfg.turnTimeoutMs === 'number'
+      && Number.isInteger(cfg.turnTimeoutMs) && cfg.turnTimeoutMs > 0
+      ? cfg.turnTimeoutMs
+      : null;
     agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
@@ -3604,6 +3611,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     wrapperCli,
     model,
     reasoningEffort,
+    turnTimeoutMs,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     defaultWorkingDir,
@@ -3945,8 +3953,8 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const larkAppId = cachedLarkAppId;
-  let body: { cliId?: unknown; model?: unknown; reasoningEffort?: unknown; cliRuntime?: unknown };
-  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; reasoningEffort?: unknown; cliRuntime?: unknown }>(req); }
+  let body: { cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown };
+  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
@@ -3965,6 +3973,22 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   }
   const currentBotConfig = getBot(larkAppId).config;
   const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
+  // Per-bot dsh runner turn timeout. Only the dsh adapter forwards it
+  // (`--turn-timeout-ms`); the dashboard exposes the field for dsh only. The
+  // field is optional in the body, so distinguish absent (preserve) from
+  // present-but-empty (clear → runner default) like reasoningEffort does.
+  const supportsTurnTimeout = selected.cliId === 'dsh';
+  const turnTimeoutFieldPresent = Object.prototype.hasOwnProperty.call(body, 'turnTimeoutMs');
+  let nextTurnTimeoutMs: number | undefined;
+  if (turnTimeoutFieldPresent && body.turnTimeoutMs !== null && body.turnTimeoutMs !== '') {
+    const n = Number(body.turnTimeoutMs);
+    // Positive integer within the arm-able bound; reject anything else so an
+    // over-bound value can't wrap to ~1ms in the runner's setTimeout.
+    if (!Number.isInteger(n) || n <= 0 || n > MAX_TURN_TIMEOUT_MS) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_turn_timeout_ms' });
+    }
+    nextTurnTimeoutMs = n;
+  }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
   const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
   const selectionChanged = key !== currentSelectionKey;
@@ -4089,6 +4113,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
       else delete entry.reasoningEffort;
     }
+    // dsh-only turn timeout: non-dsh always drops it; on dsh, an explicit
+    // field value writes/clears it, absence preserves the current value.
+    if (!supportsTurnTimeout) delete entry.turnTimeoutMs;
+    else if (turnTimeoutFieldPresent) {
+      if (nextTurnTimeoutMs !== undefined) entry.turnTimeoutMs = nextTurnTimeoutMs;
+      else delete entry.turnTimeoutMs;
+    }
     if (entry.readIsolation === true &&
         !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
       delete entry.readIsolation;
@@ -4123,6 +4154,10 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     bot.config.model = model || undefined;
     if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
     else bot.config.reasoningEffort = r.result.nextReasoningEffort ?? undefined;
+    // Mirror the entry write: non-dsh clears it, dsh with an explicit field
+    // takes the parsed value, dsh without the field preserves the existing one.
+    if (!supportsTurnTimeout) bot.config.turnTimeoutMs = undefined;
+    else if (turnTimeoutFieldPresent) bot.config.turnTimeoutMs = nextTurnTimeoutMs;
     if (readIsolationCleared) bot.config.readIsolation = false;
     if (selected.cliId === 'riff') {
       bot.config.backendType = 'riff';
@@ -4143,6 +4178,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       wrapperCli: selected.wrapperCli ?? null,
       model: model || null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
+      turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       selectionKey,
       closedMismatchedSessions,
       // Report the (possibly auto-cleared) read-isolation state + whether the new
@@ -4200,7 +4236,7 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
   try {
     const cfg = getBot(cachedLarkAppId).config;
     const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand));
-    jsonRes(res, 200, { ok: true, ...status, tagMode: cfg.sessionGroup?.tag?.mode ?? 'chat-tag' });
+    jsonRes(res, 200, { ok: true, ...status, tagMode: cfg.sessionGroup?.tag?.mode ?? 'feed-group' });
   } catch (e: any) {
     jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
   }
@@ -4208,9 +4244,10 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
 
 // PUT /api/session-group-tag-config — 会话群标签模式（Dashboard tag mode
 // selector，PR review：授权行必须与实际 tagMode 一致）。Body `{ mode }`：
-// 'chat-tag'（默认，应用租户身份，无需用户授权）| 'feed-group'（个人侧边栏
-// 分组，需一次 OAuth）| 'off'。写 bots.json 的 sessionGroup.tag.mode 并热更
-// 内存注册表，与 /botconfig 同一持久化通道。
+// 'feed-group'（默认，个人侧边栏分组，需一次 OAuth，任何租户可用）|
+// 'chat-tag'（应用租户身份，无需用户授权，但部分租户权限目录无该 scope）|
+// 'off'。写 bots.json 的 sessionGroup.tag.mode 并热更内存注册表，与
+// /botconfig 同一持久化通道。
 ipcRoute('PUT', '/api/session-group-tag-config', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { mode?: unknown };

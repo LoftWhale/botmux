@@ -2,6 +2,7 @@ import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
+import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
@@ -33,8 +34,10 @@ import {
   isOverloadAlertTarget,
   type OverloadState,
   type OverloadThresholds,
+  type OverloadCardBrowser,
 } from './core/host-overload-alert.js';
 import { registerOverloadNonce } from './im/lark/overload-nonce.js';
+import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
 import {
@@ -18576,15 +18579,9 @@ export const __testOnly_handleBotAdded = handleBotAdded;
  *  than blocking the message.
  */
 function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
-  try {
-    const fp = join(config.session.dataDir, `bot-openids-${larkAppId}.json`);
-    if (existsSync(fp)) {
-      const data: Record<string, string> = JSON.parse(readFileSync(fp, 'utf-8'));
-      for (const [name, openId] of Object.entries(data)) {
-        if (openId === senderOpenId) return name;
-      }
-    }
-  } catch { /* fall through */ }
+  for (const [name, openId] of Object.entries(readPeerCrossRef(config.session.dataDir, larkAppId))) {
+    if (openId === senderOpenId) return name;
+  }
   try {
     const infoPath = join(config.session.dataDir, 'bots-info.json');
     if (existsSync(infoPath)) {
@@ -22126,7 +22123,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           let counts = { stopped: 0, idle: 0 };
           try { counts = await countHostOverload(); }
           catch (err) { logger.warn(`[overload] count failed, showing 0: ${err instanceof Error ? err.message : String(err)}`); }
-          cardJson = buildOverloadAlertCard(initialOverloadCardState(action, counts, nonce));
+          // Probe which configured browsers are running + holding memory so the
+          // card can offer a per-browser「♻️ 重启」button (the real memory hog on
+          // a dev Mac is usually a browser, not botmux sessions). Best-effort:
+          // any probe failure just yields no browser buttons.
+          let browsers: OverloadCardBrowser[] = [];
+          try {
+            const targets = resolveBrowserTargets((alertCfg as { browserRestartTargets?: unknown }).browserRestartTargets);
+            const running = await detectRunningBrowsers(targets);
+            browsers = running.map(b => ({ bundleId: b.bundleId, label: b.label, memMB: b.memMB }));
+          } catch (err) { logger.warn(`[overload] browser probe failed, no restart buttons: ${err instanceof Error ? err.message : String(err)}`); }
+          cardJson = buildOverloadAlertCard(initialOverloadCardState(action, counts, nonce, browsers));
         } else {
           cardJson = buildOverloadRecoveredCard(action);
         }

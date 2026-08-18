@@ -66,6 +66,29 @@ export const LARK_REQUEST_TIMEOUT_MS = 15_000;
  * purpose does not apply to them. Give uploads a far looser ceiling. */
 export const LARK_UPLOAD_TIMEOUT_MS = 120_000;
 
+/**
+ * Upper bound for a per-bot dsh runner turn timeout. Node's `setTimeout` delay
+ * is a 32-bit signed int of milliseconds; a larger value silently wraps to ~1ms
+ * and emits `TimeoutOverflowWarning`, so any timeout the runner will actually
+ * arm must fit here. Config parsing, the dashboard IPC, and the dashboard UI all
+ * validate against this single bound.
+ */
+export const MAX_TURN_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Normalize an untrusted `turnTimeoutMs` value: a positive integer within the
+ * arm-able bound is kept, anything else (≤0, non-integer, over the bound,
+ * non-number, absent) collapses to `undefined` (= use the runner default).
+ */
+export function normalizeTurnTimeoutMs(value: unknown): number | undefined {
+  return typeof value === 'number'
+    && Number.isInteger(value)
+    && value > 0
+    && value <= MAX_TURN_TIMEOUT_MS
+    ? value
+    : undefined;
+}
+
 export function configureLarkClientHttpTimeout(client: unknown): void {
   const defaults = (client as { httpInstance?: { defaults?: { timeout?: number } } } | null)
     ?.httpInstance?.defaults;
@@ -1151,13 +1174,13 @@ export interface SessionGroupConfig {
   onClose?: 'keep' | 'disband' | 'archive';
   /**
    * Session-group tagging.
-   * 'chat-tag' (default) — tenant chat tags (企业自定义群标签): a property of
-   *   the GROUP itself, applied with the bot's own tenant token. Zero user
-   *   OAuth; needs the im:tag:write + im:biz_entity_tag_relation:write tenant
-   *   scopes enabled for the app.
-   * 'feed-group' — the owner's personal sidebar 消息分组 (feed group). Needs a
-   *   one-time user OAuth (im:feed_group_v1) — kept as an opt-in because it
-   *   touches the user's personal sidebar data.
+   * 'feed-group' (default) — the owner's personal sidebar 消息分组 (feed
+   *   group). Needs a one-time user OAuth (im:feed_group_v1), auto-refreshed
+   *   afterwards; works on any tenant — no tenant scope catalog involved.
+   * 'chat-tag' — tenant chat tags (企业自定义群标签): a property of the GROUP
+   *   itself, applied with the bot's own tenant token. Zero user OAuth; needs
+   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes, which
+   *   some tenants' scope catalogs don't offer at all (hence not the default).
    * 'off' — no tagging.
    */
   tag?: {
@@ -1261,6 +1284,14 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /**
+   * Per-bot dsh runner turn timeout in milliseconds. The dsh adapter forwards
+   * it as `--turn-timeout-ms` to the runner, overriding the built-in 10-minute
+   * default (`DEFAULT_TURN_TIMEOUT_MS` in dsh-runner.ts). Positive integer
+   * only; unset/≤0/non-integer → runner default. Only affects the `dsh` CLI
+   * adapter; other adapters ignore the field.
+   */
+  turnTimeoutMs?: number;
   /** Default Codex reasoning effort for newly created sessions. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /**
@@ -2866,6 +2897,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
+      // Positive integer within the arm-able bound only; anything else → undefined
+      // (= runner default). See normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS.
+      turnTimeoutMs: normalizeTurnTimeoutMs(entry.turnTimeoutMs),
       reasoningEffort: isCodexReasoningCliId(entryCliId)
         && isCodexReasoningEffort(entry.reasoningEffort)
         && codexModelSupportsReasoningEffort(

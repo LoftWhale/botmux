@@ -131,6 +131,10 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** Optional per-bot turn timeout in milliseconds for runner-based adapters
+     *  (dsh). Forwarded as `--turn-timeout-ms` to override the runner default;
+     *  adapters without a runner turn timeout ignore the field. */
+    turnTimeoutMs?: number;
     /** Optional per-turn reasoning effort (codex `model_reasoning_effort`).
      *  Only codex/codex-app adapters honor it; others ignore. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
@@ -420,6 +424,12 @@ export interface CliAdapter {
 
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;
+
+  /** Whether read-only Web Terminal viewers may forward SGR wheel events.
+   *  This is narrower than write access: the worker accepts only validated
+   *  mouse-wheel escape sequences, for TUIs whose transcript can only scroll
+   *  inside the alternate-screen app viewport. */
+  readonly readOnlyRemoteScroll?: boolean;
 
   /** Curated model candidates surfaced in `botmux setup`. When undefined the
    *  setup flow skips the model prompt for this CLI entirely (e.g. CLIs whose

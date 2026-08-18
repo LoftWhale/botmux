@@ -142,6 +142,12 @@ import {
 import { assertLinuxPm2GodExecutableUsable } from './cli/pm2-preflight.js';
 import { assertNoUnregisteredLiveDaemonDescriptorsIn } from './cli/pm2-descriptor-guard.js';
 import { assertPm2DaemonShutdownCapabilitiesIn } from './cli/pm2-shutdown-capability.js';
+import { evaluateRestartShutdownPreflight } from './cli/restart-shutdown-preflight.js';
+import {
+  recordAndNotifyRestartBootstrapFailure,
+  restartFailurePathIn,
+} from './cli/restart-failure-notification.js';
+import { resolveRestartFailureOwner } from './cli/restart-failure-owner.js';
 import { assertIncludePm2RestartAdmission } from './cli/pm2-god-admission.js';
 import {
   requestAttestedDaemonShutdown,
@@ -224,6 +230,7 @@ import {
 import {
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
+  stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import {
   bindRestartLeaseTo,
@@ -579,6 +586,60 @@ function loadBotsJson(): any[] {
     }
   }
   return [];
+}
+
+/**
+/**
+ * Resolve one DM target inside the SAME bot application that will send it,
+ * registering that app in this fresh CLI process's bot registry first. See
+ * cli/restart-failure-owner.ts for why registration must happen on both the
+ * ownerOpenId and allowedUsers paths.
+ */
+async function resolveRestartFailureOwnerInProcess(bot: any): Promise<string | undefined> {
+  const { registerBot } = await import('./bot-registry.js');
+  const { resolveAllowedUsers } = await import('./im/lark/client.js');
+  return resolveRestartFailureOwner(bot, { registerBot, resolveAllowedUsers });
+}
+
+async function persistAndNotifyRestartBootstrapFailure(
+  dataDir: string,
+  bots: any[],
+  stagedRestartIntent: RestartIntent | null,
+  unsafeDaemonNames: string[],
+  detail: string,
+): Promise<void> {
+  // Persistence + delivery are best-effort telemetry around a failure that is
+  // ALSO surfaced by the throw below. If anything here throws (file write,
+  // dynamic import, SDK), never let it mask the clear bootstrap-required error
+  // the caller is about to raise — degrade to a logged warning instead.
+  try {
+    const { sendUserMessage } = await import('./im/lark/client.js');
+    const outcome = await recordAndNotifyRestartBootstrapFailure({
+      dataDir,
+      bots,
+      unsafeDaemonNames,
+      detail,
+      restartIntent: stagedRestartIntent,
+      resolveOwner: resolveRestartFailureOwnerInProcess,
+      sendText: ({ larkAppId, ownerOpenId }, text) => (
+        sendUserMessage(larkAppId, ownerOpenId, text)
+      ),
+    });
+    const status = outcome.notification.status;
+    const destination = outcome.notification.larkAppId
+      ? ` via app ${outcome.notification.larkAppId}`
+      : '';
+    console.error(
+      `[restart] bootstrap-required failure persisted at ${restartFailurePathIn(dataDir)}; `
+      + `owner notification=${status}${destination}`,
+    );
+  } catch (error) {
+    console.error(
+      `[restart] bootstrap-required failure notification could not be persisted/sent `
+      + `(${error instanceof Error ? error.message : String(error)}); `
+      + 'the terminal error below remains authoritative',
+    );
+  }
 }
 
 function ensureBotWorkingDirsExist(bot: Record<string, any>, context = 'workingDir'): boolean {
@@ -3661,8 +3722,36 @@ async function cmdRestart(): Promise<void> {
     preflightNodeSanity();
     await ensureSystemDependencies();
     cleanupLegacyPm2(bootstrapShutdownProtocol ? 'restart' : undefined);
-    if (bootstrapShutdownProtocol) bootstrapDeleteAllBotmuxProcesses('restart');
-    else deleteAllBotmuxProcesses();
+    if (bootstrapShutdownProtocol || includePm2) {
+      // An include-pm2 restart was admitted only when no live PM2 God existed;
+      // a read-only jlist probe would start one and invalidate that admission.
+      // Keep the existing include-pm2 clean-start path unchanged.
+      if (bootstrapShutdownProtocol) bootstrapDeleteAllBotmuxProcesses('restart');
+      else deleteAllBotmuxProcesses();
+    } else {
+      // This process is the newly installed code generation even when the
+      // Dashboard that spawned it is still the old in-memory generation. Do
+      // the policy probe here, before the generic retirement path throws, so
+      // the first-upgrade failure becomes durable and reaches the owner.
+      const preflight = evaluateRestartShutdownPreflight();
+      if (preflight.bootstrapRequired) {
+        const detail = 'current daemon PM2 policy requires the one-time shutdown-protocol bootstrap';
+        await persistAndNotifyRestartBootstrapFailure(
+          restartIntentDir,
+          loadBotsJson(),
+          stagedRestartIntent,
+          preflight.unsafeDaemonNames,
+          detail,
+        );
+        throw new Error(
+          `[restart] daemon PM2 policy requires one-time bootstrap; unsafe: `
+          + `${preflight.unsafeDaemonNames.join(', ') || 'unknown'}. `
+          + 'After confirming every Session/Riff workload is idle, run: '
+          + 'botmux restart --bootstrap-shutdown-protocol --yes',
+        );
+      }
+      deleteAllBotmuxProcesses();
+    }
     if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
     cleanupStaleDaemonDescriptors();
 
@@ -6851,7 +6940,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        --with-card-json 为每张卡片附原始结构化 JSON（消息均带 resources 附件 key）
   quoted <message_id> [--raw]          按消息 id 拉取单条消息 (JSON) 并下载附件到本地；id 取自引用提示行或 history 输出，
                                        --raw 附原始内容（卡片 → cardJson，其它 → rawContent）
-  ask buttons --options "a,b" "<问题>"  把选择题做成按钮卡片抛给飞书，等用户点选后返回其选择
+  ask buttons [--multi] --options "a,b" "<问题>"
+                                       把选择题做成按钮卡片抛给飞书；--multi 返回逗号分隔的多个 key
                                        （无 hook 的 CLI 用它把决策引到人；也可省略 buttons 走裸别名）
   skill list                           列出本会话可用的技能（用户自定义 + botmux 内置）及其描述
   skill show <name>                    读取某技能的完整 SKILL.md 说明（prompt 注入模式下按需拉取内置技能全文）
@@ -7913,6 +8003,7 @@ async function relaySend(
     const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
+  content = stripTrailingOaiMemoryCitation(content);
   const preparedCardContent = cardJsonArg === undefined && cardFile === undefined && !rest.includes('--voice')
     ? prepareCardMarkdown(extractCardText(content), process.cwd(), 'filesystem')
     : undefined;
@@ -8994,6 +9085,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       content = await readStdin();
     }
   }
+  // Keep memory attribution in the model's rollout, but never render the
+  // complete internal suffix into Lark or count it in send markers.
+  content = stripTrailingOaiMemoryCitation(content);
   if (!contentFile && !customCardRequested) rejectLikelyWindowsStdinMojibake(content);
 
   const managedPayloadError = managedVcSendPayloadError({
@@ -9726,8 +9820,8 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   try {
     // A file-sandbox relay supplies a host-private copy normalized inside the
-    // sandbox namespace. Voice/doc-comment paths returned above and therefore
-    // continue using the untouched raw content.
+    // sandbox namespace. Voice/doc-comment paths returned above use the same
+    // already-sanitized outbound content, without card-markdown preparation.
     let text = extractCardText(content);
     const preparedContentFile = process.env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
     if (preparedContentFile) {
@@ -10680,6 +10774,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     const pos = positionals(rest, ['--top-level', '--legacy-dispatch']);
     content = pos.length ? pos.join(' ') : await readStdin();
   }
+  content = stripTrailingOaiMemoryCitation(content);
   if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
   if (!content.trim()) {
     console.error('没有回报内容。用法: botmux report "子项目X 完成 + 产出位置"');
@@ -11426,7 +11521,8 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const optionsRaw = argValue(rest, '--options');
   const timeoutRaw = argValue(rest, '--timeout');
   const useJson = rest.includes('--json');
-  const positionalArgs = positionals(rest, ['--json']);
+  const multiSelect = rest.includes('--multi');
+  const positionalArgs = positionals(rest, ['--json', '--multi']);
 
   let options;
   let timeoutMs;
@@ -11464,8 +11560,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     chatId: process.env.BOTMUX_CHAT_ID!,
     larkAppId,
     rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID || null,
-    options,
-    prompt,
+    ...(multiSelect
+      ? { questions: [{ prompt, options, multiSelect: true }] }
+      : { options, prompt }),
     timeoutMs,
     // Explicit `botmux ask buttons` has no reconnecting claimant (the CLI exits
     // on daemon restart), so mark it non-hook: the broker won't persist/handoff
@@ -11492,7 +11589,11 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
 
   if (useJson) {
     const out: AskJsonOutput = {
-      selected,
+      // `selected` 是「单问单选」的向后兼容值（= toLegacySelected 的形状判据：
+      // 恰好 1 问且恰好 1 个 key）。`--multi` 下调用方明确按多选语义读 `answers[0]`，
+      // 此时 `selected` 必须恒为 null——否则「多选恰好 1 项」会因形状巧合退化出一个
+      // key，令 `selected` 的含义随选中数量漂移（违反公开契约）。
+      selected: multiSelect ? null : selected,
       answers: result.kind === 'answered' ? (result.answers as string[][]) : null,
       by: result.kind === 'answered' ? result.by : null,
       comment: result.kind === 'answered' ? result.comment : null,
@@ -11500,10 +11601,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     };
     process.stdout.write(JSON.stringify(out) + '\n');
   } else if (result.kind === 'answered') {
-    // 非 JSON 模式：输出 selected key（单问单选），多选/多问输出空字符串。
+    // 非 JSON 模式：单选输出 key，多选输出逗号分隔的 keys。
     //
-    // 用户以文字作答时同样落到空字符串，与多选/多问的降级值无法区分，且 exit 0
-    // ——调用方会静默走进空分支。comment 可能含换行，塞进「一行一个 key」的
+    // 用户以文字作答时落到空字符串；comment 可能含换行，塞进「一行一个 key」的
     // stdout 契约并不安全，因此 stdout 保持不变，改由 stderr 指明答案去向。
     if (isCustomReply(result)) {
       console.error(
@@ -11511,7 +11611,12 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
           ' 用 `--json` 读 comment 字段取回原文。',
       );
     }
-    process.stdout.write((selected ?? '') + '\n');
+    // 单选走 `selected`（单问单选的 key，与旧行为字节一致）；多选直接拼 `answers[0]`
+    // 的完整 key 数组，与 selected 的单选语义解耦——多选 0 项→空行、1 项→单 key、
+    // N 项→逗号分隔，全程 exit 0。文字作答时 answers[0] 为空数组同样落空行（上面已在
+    // stderr 提示改读 --json 的 comment）。
+    const value = multiSelect ? (result.answers[0]?.join(',') ?? '') : (selected ?? '');
+    process.stdout.write(value + '\n');
   }
 
   switch (result.kind) {

@@ -232,6 +232,18 @@ describe('claude-code buildArgs', () => {
     }
   });
 
+  it('keeps the final-answer feedback hint aligned across both injection paths', () => {
+    // 回归守卫：feedbackResponseKindHint 必须同时出现在 system-prompt 路径
+    // （injectsSessionContext CLI）与 shell-hints 路径，否则启用最终回答反馈时
+    // 两类 CLI 的发送行为会静默分叉。
+    const systemPrompt = buildBotmuxSystemPromptText({ locale: 'en' });
+    const shellHints = buildBotmuxShellHints('en').join('\n');
+    for (const prompt of [systemPrompt, shellHints]) {
+      expect(prompt).toContain('--response-kind final');
+      expect(prompt).toContain('feedback buttons');
+    }
+  });
+
   it('passes configured model with --model', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, model: 'opus' });
     const idx = args.indexOf('--model');
@@ -586,6 +598,18 @@ describe('dsh buildArgs (runner model)', () => {
     expect(args).not.toContain('--model');
   });
 
+  it('forwards a per-bot turn timeout to the runner', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: 30 * 60 * 1000 });
+    expect(args).toContain('--turn-timeout-ms');
+    expect(args).toContain(String(30 * 60 * 1000));
+  });
+
+  it('omits --turn-timeout-ms when unset or non-positive', () => {
+    expect(adapter.buildArgs({ sessionId: 's', resume: false })).not.toContain('--turn-timeout-ms');
+    expect(adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: 0 })).not.toContain('--turn-timeout-ms');
+    expect(adapter.buildArgs({ sessionId: 's', resume: false, turnTimeoutMs: -5 })).not.toContain('--turn-timeout-ms');
+  });
+
   it('has no portable copy-paste resume command', () => {
     expect(adapter.buildResumeCommand?.({ sessionId: 'sess-dsh', cliSessionId: 'session-abc' })).toBeNull();
   });
@@ -727,8 +751,9 @@ describe('copilot buildArgs', () => {
 describe('cursor buildArgs', () => {
   const adapter = createCursorAdapter('/usr/bin/cursor-agent');
 
-  it('fresh session passes force/model flags without resume flags', () => {
+  it('fresh session passes trust/force/model flags without resume flags', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, model: 'gpt-5' });
+    expect(args).toContain('--trust');
     expect(args).toContain('--force');
     expect(args).toContain('--model');
     expect(args).toContain('gpt-5');
@@ -743,6 +768,7 @@ describe('cursor buildArgs', () => {
       resume: true,
       resumeSessionId: chatId,
     });
+    expect(args).toContain('--trust');
     expect(args).toContain('--resume');
     const idx = args.indexOf('--resume');
     expect(args[idx + 1]).toBe(chatId);
@@ -751,8 +777,19 @@ describe('cursor buildArgs', () => {
 
   it('resume without a persisted chatId falls back to --continue', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: true });
+    expect(args).toContain('--trust');
     expect(args).toContain('--continue');
     expect(args).not.toContain('--resume');
+  });
+
+  // The workspace-trust dialog is a startup gate, not an approval flow: a
+  // headless spawn can never answer it, and the injected first prompt would
+  // answer it by accident (`a` trusts, `q` quits). So --trust must survive
+  // disableCliBypass while --force is dropped.
+  it('disableCliBypass drops --force but keeps --trust', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, disableCliBypass: true });
+    expect(args).toContain('--trust');
+    expect(args).not.toContain('--force');
   });
 });
 
@@ -1436,8 +1473,18 @@ describe('idleToBusyPattern', () => {
     expect(busy!.test('Working through the implementation')).toBe(false);
   });
 
+  it('pi opts in with the same Working... marker as its busyPattern', () => {
+    // Pi's `Working...` is an ephemeral status line (never part of transcript
+    // history redraws), so idle→busy recovery is safe: a falsely published
+    // ready self-heals when the marker renders again.
+    const adapter = createPiAdapter('/bin/pi');
+    expect(adapter.idleToBusyPattern).toBeDefined();
+    expect(adapter.idleToBusyPattern!.source).toBe(adapter.busyPattern!.source);
+    expect(adapter.idleToBusyPattern!.test('● Working... (esc to interrupt)')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test('Working through the implementation')).toBe(false);
+  });
+
   it.each([
-    ['pi', createPiAdapter('/bin/pi')],
     ['genius', createGeniusAdapter('/bin/genius')],
     ['grok', createGrokAdapter('/bin/grok')],
   ])('%s keeps legacy busyPattern semantics and does not opt in', (_name, adapter) => {
