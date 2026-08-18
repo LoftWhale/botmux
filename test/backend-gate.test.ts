@@ -191,7 +191,7 @@ describe('persistent backend cold-restart ordering', () => {
     expect(gate).toContain('resolvedZmxSessionProbe = postKillProbe');
   });
 
-  it('limits inconclusive-probe startup rejection to ZMX in both persistent gates', () => {
+  it('read-isolation gate fail-closes on an inconclusive probe for EVERY backend; mcp-gateway keeps its ZMX-scoped semantics', () => {
     const readIsolationStart = workerSource.indexOf(
       "if (persistentSessionName && effectiveBackendType !== 'pty' && persistentPaneGuardApplies) {",
     );
@@ -200,23 +200,30 @@ describe('persistent backend cold-restart ordering', () => {
       'if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length',
     );
     const mcpEnd = workerSource.indexOf('// The plugin set is stable only', mcpStart);
-    const gates = [
-      workerSource.slice(readIsolationStart, readIsolationEnd),
-      workerSource.slice(mcpStart, mcpEnd),
-    ];
+    const readIsolationGate = workerSource.slice(readIsolationStart, readIsolationEnd);
+    const mcpGate = workerSource.slice(mcpStart, mcpEnd);
 
     expect(readIsolationStart).toBeGreaterThan(-1);
     expect(readIsolationEnd).toBeGreaterThan(readIsolationStart);
     expect(mcpStart).toBeGreaterThan(-1);
     expect(mcpEnd).toBeGreaterThan(mcpStart);
-    for (const gate of gates) {
-      expect(gate).toContain(
-        "if (effectiveBackendType === 'zmx' && paneProbe === 'unknown')",
-      );
-      expect(gate).not.toContain("if (paneProbe === 'unknown')");
-      expect(gate).toContain('shouldRejectPersistentPostKillProbe(');
-      expect(gate).not.toContain("postKillProbe !== 'missing'");
-    }
+
+    // ── read-isolation gate (this PR): liveness is TRI-STATE. `unknown` is routed
+    //    through the state machine (refuse-inconclusive-probe) for ALL backends, so
+    //    the OLD ZMX-only early `unknown` throw is GONE, and the post-kill confirm
+    //    requires an authoritative `missing` (NOT the ZMX-scoped shared helper). ──
+    expect(readIsolationGate).not.toContain(
+      "if (effectiveBackendType === 'zmx' && paneProbe === 'unknown')",
+    );
+    expect(readIsolationGate).toContain('paneProbe,'); // passed tri-state into the state machine
+    expect(readIsolationGate).toContain("postKillProbe !== 'missing'");
+    expect(readIsolationGate).not.toContain('shouldRejectPersistentPostKillProbe(');
+    expect(readIsolationGate).toContain('refuseInconclusiveProbe:');
+
+    // ── mcp-gateway gate (pre-existing, unchanged): still ZMX-scoped unknown +
+    //    shared helper. Not in scope for the no-transport tri-state fix. ──
+    expect(mcpGate).toContain("if (effectiveBackendType === 'zmx' && paneProbe === 'unknown')");
+    expect(mcpGate).toContain('shouldRejectPersistentPostKillProbe(');
   });
 
   it('verifies read-isolation teardown against the exact captured backend target', () => {

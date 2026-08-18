@@ -333,7 +333,7 @@ describe('evaluatePersistentPaneMigration — policy-on/off pane provenance stat
     isolationMarkerPresent: false,
     policyOffTombstonePresent: false,
     policyOffTombstoneValid: false,
-    paneLive: true,
+    paneProbe: 'exists' as const,
     isolationMarkerReattachSafe: false,
   };
 
@@ -371,14 +371,14 @@ describe('evaluatePersistentPaneMigration — policy-on/off pane provenance stat
 
   it('policy ON + no live pane + stale tombstone lingering → clear stale (else a later policy-off misreads it)', () => {
     expect(evaluatePersistentPaneMigration({
-      ...base, appliedIsolationCapabilities: CAPS_ON, paneLive: false,
+      ...base, appliedIsolationCapabilities: CAPS_ON, paneProbe: 'missing',
       policyOffTombstonePresent: true,
     })).toEqual({ action: 'clear-stale-then-cold-spawn' });
   });
 
   it('policy ON + no live pane + no provenance → skip (fresh spawn stamps)', () => {
     expect(evaluatePersistentPaneMigration({
-      ...base, appliedIsolationCapabilities: CAPS_ON, paneLive: false,
+      ...base, appliedIsolationCapabilities: CAPS_ON, paneProbe: 'missing',
     })).toEqual({ action: 'skip' });
   });
 
@@ -423,20 +423,20 @@ describe('evaluatePersistentPaneMigration — policy-on/off pane provenance stat
   it('policy OFF + pane MISSING but stale marker lingers → clear stale then cold-spawn (no next-restart false kill)', () => {
     expect(evaluatePersistentPaneMigration({
       ...base, appliedIsolationCapabilities: CAPS_OFF,
-      paneLive: false, isolationMarkerPresent: true,
+      paneProbe: 'missing', isolationMarkerPresent: true,
     })).toEqual({ action: 'clear-stale-then-cold-spawn' });
   });
 
   it('policy OFF + pane MISSING but stale tombstone lingers → clear stale then cold-spawn', () => {
     expect(evaluatePersistentPaneMigration({
       ...base, appliedIsolationCapabilities: CAPS_OFF,
-      paneLive: false, policyOffTombstonePresent: true,
+      paneProbe: 'missing', policyOffTombstonePresent: true,
     })).toEqual({ action: 'clear-stale-then-cold-spawn' });
   });
 
   it('policy OFF + pane MISSING + no files → skip (nothing stale to clear)', () => {
     expect(evaluatePersistentPaneMigration({
-      ...base, appliedIsolationCapabilities: CAPS_OFF, paneLive: false,
+      ...base, appliedIsolationCapabilities: CAPS_OFF, paneProbe: 'missing',
     })).toEqual({ action: 'skip' });
   });
 
@@ -452,8 +452,60 @@ describe('evaluatePersistentPaneMigration — policy-on/off pane provenance stat
     // so it cannot mislead a future decision.
     expect(evaluatePersistentPaneMigration({
       ...base, appliedIsolationCapabilities: CAPS_OFF, noTransport: false,
-      paneLive: false, isolationMarkerPresent: true,
+      paneProbe: 'missing', isolationMarkerPresent: true,
     })).toEqual({ action: 'clear-stale-then-cold-spawn' });
+  });
+
+  // ── TRI-STATE liveness: `unknown` must NEVER be collapsed into "dead". The
+  //    original bug modeled paneLive:boolean, so a flaky `unknown` probe took the
+  //    dead-pane path and CLEARED the provenance of a possibly-live confined pane
+  //    (or cold-spawned around it). `unknown` now fail-closes wherever anything is
+  //    at stake, and only `skip`s a wholly unconcerned session. ──
+  it('policy ON + UNKNOWN probe → refuse (never clear a still-confined pane on a flaky probe)', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_ON, paneProbe: 'unknown',
+      isolationMarkerPresent: true,
+    })).toEqual({ action: 'refuse-inconclusive-probe' });
+  });
+
+  it('policy ON + UNKNOWN probe + no provenance → still refuse (policy-on is always concerned)', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_ON, paneProbe: 'unknown',
+    })).toEqual({ action: 'refuse-inconclusive-probe' });
+  });
+
+  it('policy OFF + no-transport tmux + UNKNOWN probe + legacy marker → refuse (the core tri-state fix)', () => {
+    // The initial-`unknown` scenario: a flaky tmux probe on an upgraded
+    // no-transport session with a leftover isolation marker. Must NOT clear-stale
+    // (the pane may still be alive AND confined).
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF, paneProbe: 'unknown',
+      isolationMarkerPresent: true,
+    })).toEqual({ action: 'refuse-inconclusive-probe' });
+  });
+
+  it('policy OFF + no-transport tmux + UNKNOWN probe + NO provenance → refuse (in migration scope = concerned)', () => {
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF, paneProbe: 'unknown',
+    })).toEqual({ action: 'refuse-inconclusive-probe' });
+  });
+
+  it('policy OFF + UNKNOWN probe + stale provenance out of migration scope → refuse (provenance = concerned)', () => {
+    // Transport-enabled chat / non-tmux backend, but a stale marker is on disk: an
+    // `unknown` probe must not clear it (the file might belong to a live pane).
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF, noTransport: false,
+      isolationCapableBackend: false, paneProbe: 'unknown', isolationMarkerPresent: true,
+    })).toEqual({ action: 'refuse-inconclusive-probe' });
+  });
+
+  it('policy OFF + UNKNOWN probe + NOTHING at stake (out of scope, no provenance) → skip (no false start-failure)', () => {
+    // Ordinary transport chat, non-file-sandbox backend, no provenance: probe
+    // flakiness must NOT block startup — there is nothing to clear or protect.
+    expect(evaluatePersistentPaneMigration({
+      ...base, appliedIsolationCapabilities: CAPS_OFF, noTransport: false,
+      isolationCapableBackend: false, paneProbe: 'unknown',
+    })).toEqual({ action: 'skip' });
   });
 });
 
@@ -467,6 +519,7 @@ describe('executePersistentPaneMigration — ordered, fail-closed IO seam', () =
       confirmPaneGone: () => { calls.push('confirm'); },
       clearProvenanceVerified: () => { calls.push('clear'); },
       reselectBackend: () => { calls.push('reselect'); },
+      refuseInconclusiveProbe: (): never => { calls.push('refuse'); throw new Error('inconclusive probe'); },
     };
     return { calls, eff };
   };
@@ -524,6 +577,13 @@ describe('executePersistentPaneMigration — ordered, fail-closed IO seam', () =
     expect(() => executePersistentPaneMigration({ action: 'clear-stale-then-cold-spawn' }, eff))
       .toThrow('rmdir');
     expect(calls).toEqual(['clear']);
+  });
+
+  it('refuse-inconclusive-probe → refuse ONLY (never kill/confirm/clear/reselect), throws', () => {
+    const { calls, eff } = makeEffects();
+    expect(() => executePersistentPaneMigration({ action: 'refuse-inconclusive-probe' }, eff))
+      .toThrow('inconclusive probe');
+    expect(calls).toEqual(['refuse']); // NOT kill, NOT clear, NOT reselect
   });
 });
 

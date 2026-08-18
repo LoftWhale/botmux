@@ -482,7 +482,18 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
       'executePersistentPaneMigration(migration, migrationEffects)');
     expect(effects).toContain('killStalePane:');
     expect(effects).toContain('confirmPaneGone:');
-    expect(effects).toContain('shouldRejectPersistentPostKillProbe(');
+    // Tri-state fix: migration teardown fail-closes on ANY non-`missing` post-kill
+    // probe for EVERY backend (kill unconfirmed on `unknown` — tmux swallows kill
+    // errors, zellij ignores its exit — must not publish a new generation). This is
+    // STRICTER than the shared shouldRejectPersistentPostKillProbe (ZMX-only
+    // unknown), which the migration path deliberately no longer uses.
+    expect(effects).toContain("postKillProbe !== 'missing'");
+    expect(effects).not.toContain('shouldRejectPersistentPostKillProbe(');
+    // Tri-state fix: an inconclusive (`unknown`) liveness probe fails closed via a
+    // dedicated effect — never clear provenance / cold-spawn around a possibly-live
+    // confined pane.
+    expect(effects).toContain('refuseInconclusiveProbe:');
+    expect(workerSource).toContain('could not verify existing ${effectiveBackendType} pane');
     expect(effects).toContain('clearProvenanceVerified:');
     expect(effects).toContain('reselectBackend:');
     // Policy-OFF cold-spawn of a no-transport isolation-capable pane MUST record a

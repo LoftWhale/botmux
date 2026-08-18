@@ -11932,9 +11932,12 @@ async function spawnCli(
     const zmxOwnedProbe = effectiveBackendType === 'zmx'
       ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)
       : undefined;
-    // ZMX ownership is label/PID-sensitive, so an inconclusive ZMX probe must
-    // fail closed. Other persistent backends retain the upstream semantics:
-    // their target probe returning unknown is not proof that a pane exists.
+    // ZMX ownership is label/PID-sensitive, so an inconclusive ZMX probe is not
+    // proof of anything. Other persistent backends: their target probe returning
+    // unknown is likewise not proof that a pane exists. Liveness is passed TRI-STATE
+    // (paneProbe) into the state machine, which fail-closes on `unknown` for EVERY
+    // backend (refuse-inconclusive-probe) — no longer only ZMX, and no longer
+    // collapsed into "dead" (which would clear a still-confined pane's provenance).
     const paneProbe = zmxOwnedProbe?.probe
       ?? (persistentTarget ? probePersistentBackendTarget(persistentTarget) : 'missing');
     if (
@@ -11945,12 +11948,6 @@ async function spawnCli(
       throw new Error(
         `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
         'ZMX session appeared after the frozen launch probe',
-      );
-    }
-    if (effectiveBackendType === 'zmx' && paneProbe === 'unknown') {
-      throw new Error(
-        `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
-        `could not verify existing ${effectiveBackendType} pane`,
       );
     }
     const paneLive = paneProbe === 'exists';
@@ -11983,7 +11980,7 @@ async function spawnCli(
       isolationMarkerPresent: stalePaneMarkerPresent,
       policyOffTombstonePresent,
       policyOffTombstoneValid: policyOffTombstoneIsValid,
-      paneLive,
+      paneProbe,
       isolationMarkerReattachSafe,
     });
     // Verified removal of a provenance file: unlink then confirm it is truly gone
@@ -12026,10 +12023,19 @@ async function spawnCli(
           : (stalePersistentTarget
             ? probePersistentBackendTarget(stalePersistentTarget)
             : probePersistentSession(effectiveBackendType as PersistentBackendType, staleSessionName));
-        if (shouldRejectPersistentPostKillProbe(effectiveBackendType as PersistentBackendType, postKillProbe)) {
+        // Migration teardown fail-closes on ANY non-`missing` post-kill probe for
+        // EVERY backend — not just ZMX. `exists` (kill didn't take) and `unknown`
+        // (kill unconfirmed: tmux swallows kill errors incl. timeout, zellij does
+        // not check its spawnSync exit) both mean "the confined pane may still be
+        // alive", so publishing a new generation around it would silently keep the
+        // old confinement. Only an authoritative `missing` confirms termination.
+        // (This is STRICTER than the shared shouldRejectPersistentPostKillProbe,
+        // which the separate mcp-gateway gate still uses with its own semantics.)
+        if (postKillProbe !== 'missing') {
           throw new Error(
             `[read-isolation] refusing to start session ${cfg.sessionId}: `
-            + `could not confirm stale ${effectiveBackendType} pane termination`,
+            + `could not confirm stale ${effectiveBackendType} pane termination `
+            + `(post-kill probe: ${postKillProbe})`,
           );
         }
         if (effectiveBackendType === 'zmx') {
@@ -12054,6 +12060,17 @@ async function spawnCli(
         cliLifetimeNonce++;
         persistentSessionName = selectedBackend.persistentSessionName;
       },
+      refuseInconclusiveProbe: (): never => {
+        // The liveness probe was `unknown` where acting would be unsafe (the pane
+        // may still be alive AND still confined under an obsolete policy). No
+        // provenance is touched, no reselect — fail closed and let the next launch
+        // re-probe once the backend is answering again.
+        throw new Error(
+          `[read-isolation] refusing to start session ${cfg.sessionId}: `
+          + `could not verify existing ${effectiveBackendType} pane `
+          + `(liveness probe: ${paneProbe})`,
+        );
+      },
     };
     if (migration.action === 'reattach') {
       if (originChannelPolicyExpected) {
@@ -12068,6 +12085,8 @@ async function spawnCli(
       log(`[read-isolation] clearing stale provenance for dead pane before cold-spawn (${cfg.sessionId})`);
     } else if (migration.action === 'kill-then-cold-spawn') {
       log(`[read-isolation] persistent pane provenance mismatch for ${cfg.sessionId} — killing + cold-spawning with current policy`);
+    } else if (migration.action === 'refuse-inconclusive-probe') {
+      log(`[read-isolation] inconclusive liveness probe (${paneProbe}) for ${cfg.sessionId} — refusing to start rather than clear/cold-spawn around a possibly-live confined pane`);
     }
     // Ordered, fail-closed side effects (kill → confirm → clear → reselect) live
     // in executePersistentPaneMigration so the ordering + stop-on-failure

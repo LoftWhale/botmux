@@ -21,6 +21,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import type { SessionProbe } from '../backend/types.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
@@ -601,7 +602,17 @@ export function isolatedPaneReattachSafe(
  * Existence flags MUST come from no-follow existence probes (a planted/tampered
  * leaf that fails to parse still counts as present, so it can never be used to
  * force a silent reattach). `policyOffTombstoneValid` is the secure-read result.
- * Pane liveness is the caller's probe.
+ *
+ * Pane liveness is TRI-STATE (`paneProbe`: exists | missing | unknown), NOT a
+ * boolean. `unknown` (the backend could not answer) is never collapsed into
+ * "dead": a still-alive, still-confined pane whose probe is momentarily `unknown`
+ * would otherwise have its provenance cleared and be cold-spawned around, silently
+ * downgrading confinement. On `unknown` the machine returns
+ * `refuse-inconclusive-probe` (fail-closed) whenever anything is at stake — policy
+ * ON, in the policy-off migration scope, or ANY provenance on disk — and only
+ * `skip`s when a wholly unconcerned session (policy OFF, out of scope, no
+ * provenance) sees probe flakiness, so an ordinary chat never fails to start.
+ * Only an authoritative `missing` clears stale provenance / cold-spawns.
  */
 export type PersistentPaneMigrationInput = {
   /** Current-spawn isolation capabilities (empty ⇒ policy OFF this spawn). May be
@@ -625,8 +636,13 @@ export type PersistentPaneMigrationInput = {
    *  validation ({@link policyOffTombstoneValid}). ONLY this authorizes a
    *  policy-off warm reattach. */
   policyOffTombstoneValid: boolean;
-  /** The persistent pane is currently alive (caller's probe === 'exists'). */
-  paneLive: boolean;
+  /** The persistent pane's liveness probe — TRI-STATE, NOT a boolean. `exists`
+   *  and `missing` are authoritative; `unknown` means the probe could not answer
+   *  (flaky/unavailable backend). Collapsing `unknown` into "dead" is the bug this
+   *  field prevents: a still-alive, still-confined pane whose probe is momentarily
+   *  `unknown` must never have its provenance cleared nor be cold-spawned around.
+   *  Only an authoritative `missing` proves the pane is gone. */
+  paneProbe: SessionProbe;
   /**
    * Result of {@link isolatedPaneReattachSafe}(marker, current policy) — only
    * meaningful when policy is ON. The caller computes it (it needs the parsed
@@ -645,7 +661,14 @@ export type PersistentPaneMigrationDecision =
   | { action: 'kill-then-cold-spawn'; clearAfterKill: boolean }
   /** No live pane, but stale provenance files linger → clear them (verified) then
    *  cold-spawn fresh, so a later restart doesn't misjudge the new pane. */
-  | { action: 'clear-stale-then-cold-spawn' };
+  | { action: 'clear-stale-then-cold-spawn' }
+  /** The liveness probe is INCONCLUSIVE (`unknown`) in a context where acting would
+   *  be unsafe — clearing provenance the pane might still own, or cold-spawning
+   *  around a pane a later `exists` probe would warm-reattach unvalidated. The
+   *  caller MUST refuse to start rather than guess (fail-closed). Only reached when
+   *  the guard is security-concerned; an ordinary transport chat with no provenance
+   *  skips on `unknown` instead (no gratuitous start-failures on probe flakiness). */
+  | { action: 'refuse-inconclusive-probe' };
 
 export function evaluatePersistentPaneMigration(
   input: PersistentPaneMigrationInput,
@@ -653,10 +676,24 @@ export function evaluatePersistentPaneMigration(
   const {
     appliedIsolationCapabilities, isolationCapableBackend, noTransport,
     isolationMarkerPresent, policyOffTombstonePresent, policyOffTombstoneValid: tombstoneValid,
-    paneLive, isolationMarkerReattachSafe,
+    paneProbe, isolationMarkerReattachSafe,
   } = input;
   const policyOn = appliedIsolationCapabilities.length > 0;
   const anyProvenance = isolationMarkerPresent || policyOffTombstonePresent;
+  const paneLive = paneProbe === 'exists';
+  // TRI-STATE liveness. `unknown` is NOT "dead": the backend (tmux/zellij/herdr/
+  // zmx) could not answer, so the pane may still be alive AND still confined under
+  // its original (possibly obsolete) policy. Acting on `unknown` — clearing
+  // provenance the pane might still own, or cold-spawning around it so a later
+  // `exists` probe warm-reattaches an unvalidated generation — is exactly the
+  // silent-downgrade this guard exists to prevent. We fail closed on `unknown`
+  // whenever there is anything at stake (policy ON, in the policy-off migration
+  // scope, or ANY provenance on disk); only a truly unconcerned session (policy
+  // OFF, out of scope, no provenance) skips on `unknown` so probe flakiness on an
+  // ordinary chat never blocks startup. Only an authoritative `missing` is trusted
+  // as "the pane is gone".
+  const inMigrationScope = noTransport && isolationCapableBackend;
+  const guardConcerned = policyOn || inMigrationScope || anyProvenance;
 
   if (policyOn) {
     // Policy ON (file sandbox OR credential-only): runs on EVERY persistent
@@ -670,9 +707,13 @@ export function evaluatePersistentPaneMigration(
       if (isolationMarkerReattachSafe) return { action: 'reattach' };
       return { action: 'kill-then-cold-spawn', clearAfterKill: true };
     }
-    // No live pane: nothing to reattach. A fresh policy-on spawn re-stamps its
-    // marker, but any stale tombstone from a prior policy-off generation must be
-    // cleared first, or a later flip back to policy-off could misread it.
+    // Not authoritatively alive. An `unknown` probe under policy ON must not clear
+    // a still-confined pane's marker nor cold-spawn around it — fail closed.
+    if (paneProbe === 'unknown') return { action: 'refuse-inconclusive-probe' };
+    // Authoritative `missing`: nothing to reattach. A fresh policy-on spawn
+    // re-stamps its marker, but any stale tombstone from a prior policy-off
+    // generation must be cleared first, or a later flip back to policy-off could
+    // misread it.
     if (anyProvenance) return { action: 'clear-stale-then-cold-spawn' };
     return { action: 'skip' };
   }
@@ -682,8 +723,6 @@ export function evaluatePersistentPaneMigration(
   // (or a non-file-sandboxable backend) was never force-isolated and is left
   // untouched — EXCEPT we still clear any stale provenance on a dead pane so a
   // lingering file can't mislead a future decision.
-  const inMigrationScope = noTransport && isolationCapableBackend;
-
   if (paneLive) {
     if (!inMigrationScope) return { action: 'skip' };
     // Warm reattach requires POSITIVE, VALIDATED proof the live generation is a
@@ -696,9 +735,19 @@ export function evaluatePersistentPaneMigration(
     return { action: 'kill-then-cold-spawn', clearAfterKill: true };
   }
 
-  // No live pane. Clear any lingering provenance (verified) before the fresh
-  // cold-spawn regardless of scope — a stale file must never survive to mislead a
-  // later restart.
+  // Not authoritatively alive under policy OFF.
+  if (paneProbe === 'unknown') {
+    // Inconclusive. Clearing provenance now could delete the marker/tombstone of a
+    // pane that is actually still alive (and, if it predates the 放宽, still
+    // confined) — and cold-spawning would let a later `exists` probe warm-reattach
+    // that unvalidated pane. Fail closed whenever the guard is concerned; a wholly
+    // unconcerned session (out of scope, no provenance) just skips.
+    return guardConcerned ? { action: 'refuse-inconclusive-probe' } : { action: 'skip' };
+  }
+
+  // Authoritative `missing`. Clear any lingering provenance (verified) before the
+  // fresh cold-spawn regardless of scope — a stale file must never survive to
+  // mislead a later restart.
   if (anyProvenance) return { action: 'clear-stale-then-cold-spawn' };
   return { action: 'skip' };
 }
@@ -721,6 +770,10 @@ export type PersistentPaneMigrationEffects = {
   /** Re-select the backend so a stale isReattach=true does not target the pane we
    *  just destroyed. Only called after a confirmed kill + cleared provenance. */
   reselectBackend: () => void;
+  /** Refuse to start the session because the liveness probe was inconclusive
+   *  (`unknown`) where acting would be unsafe. MUST throw — there is no safe
+   *  fall-through. */
+  refuseInconclusiveProbe: () => never;
 };
 
 /**
@@ -736,6 +789,9 @@ export type PersistentPaneMigrationEffects = {
  *     new generation while a stale proof lingers).
  *   clear-stale-then-cold-spawn : clearProvenanceVerified only (no live pane to
  *                          kill; a throw aborts the spawn).
+ *   refuse-inconclusive-probe : refuseInconclusiveProbe (always throws — the probe
+ *                          was `unknown` where clearing/cold-spawning is unsafe).
+ *                          NO provenance is touched and NO reselect happens.
  *   reattach / skip : no effects.
  *
  * Returns the action taken so the caller can branch (e.g. set warm-reattach).
@@ -747,6 +803,9 @@ export function executePersistentPaneMigration(
   switch (decision.action) {
     case 'reattach':
     case 'skip':
+      return decision.action;
+    case 'refuse-inconclusive-probe':
+      effects.refuseInconclusiveProbe(); // always throws — no safe fall-through
       return decision.action;
     case 'clear-stale-then-cold-spawn':
       effects.clearProvenanceVerified();
