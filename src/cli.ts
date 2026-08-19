@@ -161,6 +161,7 @@ import { assertIncludePm2RestartAdmission } from './cli/pm2-god-admission.js';
 import {
   BOTMUX_SYSTEMD_SERVICE,
   BOTMUX_SYSTEMD_SERVICE_ENV,
+  ExternalPm2GodOwnershipError,
   currentLinuxSystemdCgroup,
   describeExternalPm2Owner,
   inspectLinuxPm2Command,
@@ -465,16 +466,22 @@ function linuxPm2CommandInspection(
 
 function pm2LifecycleOwnershipError(inspection: LinuxPm2CommandInspection): Error {
   const { plan, ownership } = inspection;
-  if (plan.kind === 'reject') {
-    return new Error(
-      `检测到 PM2 God Daemon 归属于其它 supervisor (${plan.owner}): `
-      + `${describeExternalPm2Owner(ownership)}。拒绝复用；请先停止 Botmux Session，`
-      + `再由原 owner 停掉该 PM2 God，最后重试。`,
-    );
+  if (plan.kind === 'reject' && ownership.kind === 'external') {
+    return new ExternalPm2GodOwnershipError(ownership);
   }
   return new Error(
     'PM2 God Daemon 尚未由 botmux.service 建立；请先运行 `botmux start` 完成 systemd handoff。',
   );
+}
+
+async function runPm2LifecycleCliCommand(action: () => void | Promise<void>): Promise<void> {
+  try {
+    await action();
+  } catch (error) {
+    if (!(error instanceof ExternalPm2GodOwnershipError)) throw error;
+    console.error(`❌ ${error.message}`);
+    process.exitCode = error.exitCode;
+  }
 }
 
 function assertDirectPm2Access(
@@ -13367,14 +13374,14 @@ switch (command) {
     else await cmdSetup();
     break;
   }
-  case 'start':   await cmdStart(); break;
+  case 'start':   await runPm2LifecycleCliCommand(() => cmdStart()); break;
   case 'serve':   await cmdServe(process.argv.slice(3)); break;
-  case 'start-bot': await cmdStartBot(process.argv.slice(3)); break;
-  case 'stop-bot': await cmdStopBot(process.argv.slice(3)); break;
-  case 'stop':    await cmdStop(); break;
-  case 'restart': await cmdRestart(); break;
-  case 'logs':    cmdLogs(); break;
-  case 'status':  cmdStatus(); break;
+  case 'start-bot': await runPm2LifecycleCliCommand(() => cmdStartBot(process.argv.slice(3))); break;
+  case 'stop-bot': await runPm2LifecycleCliCommand(() => cmdStopBot(process.argv.slice(3))); break;
+  case 'stop':    await runPm2LifecycleCliCommand(() => cmdStop()); break;
+  case 'restart': await runPm2LifecycleCliCommand(() => cmdRestart()); break;
+  case 'logs':    await runPm2LifecycleCliCommand(() => cmdLogs()); break;
+  case 'status':  await runPm2LifecycleCliCommand(() => cmdStatus()); break;
   case 'upgrade':
   case 'update':  cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;
@@ -13581,7 +13588,7 @@ switch (command) {
     break;
   }
   case 'plugin':
-  case 'plugins':  await cmdPlugin(process.argv.slice(3)); break;
+  case 'plugins':  await runPm2LifecycleCliCommand(() => cmdPlugin(process.argv.slice(3))); break;
   case 'whiteboard':
   case 'wb':       await cmdWhiteboard(process.argv[3] ?? 'status', process.argv.slice(4)); break;
   case 'thread':   {
@@ -13597,13 +13604,15 @@ switch (command) {
     break;
   }
   case 'autostart': {
-    ensureConfigDir();
-    const sub = process.argv[3] ?? 'status';
-    const opts = { pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR };
-    if (sub === 'enable' || sub === 'install') enableAutostart(opts);
-    else if (sub === 'disable' || sub === 'uninstall') disableAutostart(opts);
-    else if (sub === 'status') autostartStatus(opts);
-    else { console.error(`用法: botmux autostart <enable|disable|status>`); process.exit(1); }
+    await runPm2LifecycleCliCommand(() => {
+      ensureConfigDir();
+      const sub = process.argv[3] ?? 'status';
+      const opts = { pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR };
+      if (sub === 'enable' || sub === 'install') enableAutostart(opts);
+      else if (sub === 'disable' || sub === 'uninstall') disableAutostart(opts);
+      else if (sub === 'status') autostartStatus(opts);
+      else { console.error(`用法: botmux autostart <enable|disable|status>`); process.exit(1); }
+    });
     break;
   }
   default:

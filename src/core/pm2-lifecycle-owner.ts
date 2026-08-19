@@ -15,6 +15,27 @@ export type LinuxPm2GodOwnership =
   | { kind: 'owned'; processes: LinuxPm2GodProcess[] }
   | { kind: 'external'; processes: LinuxPm2GodProcess[] };
 
+type ExternalLinuxPm2GodOwnership = Extract<LinuxPm2GodOwnership, { kind: 'external' }>;
+
+/** A stable CLI-facing refusal: never reuse or signal a God owned by another cgroup. */
+export class ExternalPm2GodOwnershipError extends Error {
+  readonly code = 'BOTMUX_PM2_EXTERNAL_OWNER';
+  readonly exitCode = 2;
+
+  constructor(ownership: ExternalLinuxPm2GodOwnership) {
+    const owner = serviceOwnerFromCgroup(ownership.processes[0]?.cgroup ?? 'unknown');
+    super([
+      `检测到 PM2 God Daemon 归属于其它 supervisor (${owner}): ${describeExternalPm2Owner(ownership)}。`,
+      '为避免复用外部 cgroup，本次操作已拒绝。',
+      '迁移建议：',
+      '1. 先确认所有 Botmux Session/Riff workload 已空闲；',
+      '2. 由当前 owner 安全停止该 PM2 God generation（不要直接运行 `pm2 kill`，它会绕过 Botmux shutdown 校验）；',
+      '3. 确认旧 God 已退出后，运行 `botmux restart`，由 botmux.service 建立新的 owner。',
+    ].join('\n'));
+    this.name = 'ExternalPm2GodOwnershipError';
+  }
+}
+
 export type LinuxPm2Command = 'start' | 'restart' | 'status' | 'logs' | 'stop' | 'start-bot' | 'plugin';
 
 export type LinuxPm2CommandPlan =
@@ -198,8 +219,10 @@ export function revalidateLinuxPm2GodProcess(
 }
 
 function serviceOwnerFromCgroup(path: string): string {
-  const service = path.split('/').reverse().find(part => part.endsWith('.service'));
-  return service ?? path;
+  const owner = path.split('/').reverse().find(
+    part => part.endsWith('.service') || part.endsWith('.scope'),
+  );
+  return owner ?? path;
 }
 
 export function planLinuxPm2Command(input: {
@@ -252,9 +275,10 @@ export function inspectLinuxPm2ReadonlyTarget(
   const { ownership, plan } = inspectLinuxPm2Command({ command: 'status', home }, deps);
   if (plan.kind === 'absent') return false;
   if (plan.kind === 'reject') {
-    throw new Error(
-      `检测到 PM2 God Daemon 归属于其它 supervisor，拒绝复用: ${describeExternalPm2Owner(ownership)}`,
-    );
+    if (ownership.kind !== 'external') {
+      throw new Error('PM2 ownership plan rejected a non-external God');
+    }
+    throw new ExternalPm2GodOwnershipError(ownership);
   }
   if (plan.kind !== 'direct' || ownership.kind !== 'owned') return true;
   if (ownership.processes.length !== 1) {

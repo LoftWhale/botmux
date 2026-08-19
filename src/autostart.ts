@@ -21,6 +21,7 @@ import { join, dirname } from 'node:path';
 import {
   BOTMUX_SYSTEMD_SERVICE,
   BOTMUX_SYSTEMD_SERVICE_ENV,
+  ExternalPm2GodOwnershipError,
   describeExternalPm2Owner,
   inspectLinuxPm2GodOwnership,
   revalidateLinuxPm2GodProcess,
@@ -387,11 +388,7 @@ export function linuxUserSystemdAvailable(): boolean {
 function assertLinuxServiceOwnershipAvailable(opts: AutostartOpts): void {
   const ownership = inspectLinuxPm2GodOwnership(join(opts.configDir, 'pm2'));
   if (ownership.kind !== 'external') return;
-  throw new Error(
-    `检测到 PM2 God Daemon 不属于 ${SERVICE_NAME}: ${describeExternalPm2Owner(ownership)}。\n`
-    + `为避免复用其它 supervisor 的 cgroup，本次操作已中止。请先停止 Botmux Session，`
-    + `再由原 owner 停掉该 PM2 God，最后重试。`,
-  );
+  throw new ExternalPm2GodOwnershipError(ownership);
 }
 
 function systemctlUser(args: string[], timeout = SYSTEMCTL_DEFAULT_TIMEOUT_MS): string {
@@ -513,9 +510,7 @@ function syncAndInspectLinuxService(opts: AutostartOpts): {
 
   const ownership = inspectLinuxPm2GodOwnership(join(opts.configDir, 'pm2'));
   if (ownership.kind === 'external') {
-    throw new Error(
-      `检测到 PM2 God Daemon 不属于 ${SERVICE_NAME}: ${describeExternalPm2Owner(ownership)}`,
-    );
+    throw new ExternalPm2GodOwnershipError(ownership);
   }
   const godProcesses = ownership.kind === 'owned' ? ownership.processes : [];
   const godPids = godProcesses.map(process => process.pid);

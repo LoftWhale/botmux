@@ -17,8 +17,8 @@ function tempHome(): string {
   return home;
 }
 
-function runStatus(home: string) {
-  return spawnSync(process.execPath, ['--import', 'tsx', CLI_PATH, 'status'], {
+function runCli(home: string, ...args: string[]) {
+  return spawnSync(process.execPath, ['--import', 'tsx', CLI_PATH, ...args], {
     cwd: dirname(dirname(CLI_PATH)),
     encoding: 'utf8',
     timeout: 15_000,
@@ -41,7 +41,7 @@ describe.runIf(process.platform === 'linux')('PM2 read-only CLI lifecycle bounda
 
   it('reports absence without creating a PM2 God daemon', () => {
     const home = tempHome();
-    const result = runStatus(home);
+    const result = runCli(home, 'status');
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('daemon 未在运行');
@@ -59,9 +59,14 @@ describe.runIf(process.platform === 'linux')('PM2 read-only CLI lifecycle bounda
     });
     expect(boot.status).toBe(0);
 
-    const result = runStatus(home);
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toMatch(/其它 supervisor|拒绝复用/);
+    for (const command of ['status', 'logs']) {
+      const result = runCli(home, command);
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain('❌ 检测到 PM2 God Daemon 归属于其它 supervisor');
+      expect(result.stderr).toContain('迁移建议：');
+      expect(result.stderr).toContain('botmux restart');
+      expect(result.stderr).not.toMatch(/\n\s+at /);
+    }
   });
 
   it('queries an existing God through direct RPC without rotating its generation', () => {

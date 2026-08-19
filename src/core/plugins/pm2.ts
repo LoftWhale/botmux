@@ -9,7 +9,7 @@ import { captureReadonlyPm2Jlist } from '../../cli/pm2-readonly.js';
 import { runExistingPm2Command } from '../../cli/pm2-existing.js';
 import { stripPm2GracefulExitMarker } from '../../pm2-graceful-exit.js';
 import {
-  describeExternalPm2Owner,
+  ExternalPm2GodOwnershipError,
   inspectLinuxPm2Command,
   inspectLinuxPm2ReadonlyTarget,
   type LinuxPm2GodProcess,
@@ -56,9 +56,10 @@ function assertPluginPm2MutationOwned() {
   });
   if (plan.kind === 'direct') return { ownership, plan };
   if (plan.kind === 'reject') {
-    throw new Error(
-      `plugin PM2 拒绝复用其它 supervisor 的 God Daemon: ${describeExternalPm2Owner(ownership)}`,
-    );
+    if (ownership.kind !== 'external') {
+      throw new Error('plugin PM2 ownership plan rejected a non-external God');
+    }
+    throw new ExternalPm2GodOwnershipError(ownership);
   }
   throw new Error('plugin PM2 尚无 botmux.service owner；请先运行 `botmux start`。');
 }
