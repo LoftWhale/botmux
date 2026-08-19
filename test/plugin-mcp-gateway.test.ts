@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -16,8 +16,17 @@ import {
 import { refreshSessionMcpRuntimeManifest } from '../src/core/plugins/mcp/session-runtime.js';
 import {
   sessionMcpGatewayPathRegex,
+  sessionMcpGatewaySocketDir,
+  sessionMcpGatewaySocketPath,
   startSessionMcpGatewayHost,
 } from '../src/core/plugins/mcp/host.js';
+import {
+  MCP_GATEWAY_RELAY_PROTOCOL_VERSION,
+  mcpGatewayPaneReattachSafe,
+  readMcpGatewayLaunchRecord,
+  clearMcpGatewayLaunchRecord,
+  writeMcpGatewayLaunchRecord,
+} from '../src/core/plugins/mcp/launch-record.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
@@ -466,6 +475,90 @@ describe('plugin MCP Gateway', () => {
     }
   });
 
+  it('relay survives a Gateway host replacement: reconnects, replays initialize, flushes buffered requests', async () => {
+    const sessionId = 'relay-reconnect-across-hosts';
+    const customDataDir = join(home, 'custom-botmux', 'data');
+    vi.stubEnv('SESSION_DATA_DIR', customDataDir);
+    installFixturePlugin('plugin-a', 'alpha');
+    refreshSessionMcpRuntimeManifest({
+      sessionId,
+      pluginIds: ['plugin-a'],
+      dataDir: customDataDir,
+    });
+    const host1 = await startSessionMcpGatewayHost({ sessionId, dataDir: customDataDir });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+      cwd: resolve('.'),
+      env: {
+        ...mcpServeEnvironment(sessionId),
+        SESSION_DATA_DIR: customDataDir,
+        [MCP_GATEWAY_SOCKET_ENV]: host1.socketPath,
+        [MCP_GATEWAY_REQUIRED_ENV]: '1',
+        BOTMUX_MCP_RELAY_BACKOFF_MS: '50',
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'relay-reconnect-test', version: '1.0.0' });
+    let host2: Awaited<ReturnType<typeof startSessionMcpGatewayHost>> | undefined;
+    try {
+      await client.connect(transport);
+      expect((await client.listTools()).tools.map(tool => tool.name).sort()).toEqual(['alpha_unique', 'echo']);
+
+      // Kill the host the way a daemon restart does. The relay (and the MCP
+      // client on top of it) stays alive inside the "pane".
+      await host1.close();
+      // Give the relay a moment to observe the disconnect so the next request
+      // is deterministically buffered rather than racing the close event.
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 150));
+
+      // Issue a request during the outage — it must buffer, not fail.
+      const pendingCall = client.callTool({ name: 'echo', arguments: {} });
+
+      // Replacement worker: same session → same deterministic socket path.
+      host2 = await startSessionMcpGatewayHost({ sessionId, dataDir: customDataDir });
+      expect(host2.socketPath).toBe(host1.socketPath);
+
+      // The relay reconnects, replays initialize/initialized on the fresh
+      // Gateway connection (the client never re-initializes), then flushes the
+      // buffered call.
+      const result = await pendingCall;
+      expect((result.content[0] as { text: string }).text).toContain(`session=${sessionId}`);
+
+      // Steady-state after the swap keeps working.
+      expect((await client.listTools()).tools.map(tool => tool.name).sort()).toEqual(['alpha_unique', 'echo']);
+    } finally {
+      await client.close().catch(() => undefined);
+      await host2?.close();
+    }
+  }, 30_000);
+
+  it('decides pane reattach from the persisted Gateway launch record', () => {
+    const dataDir = join(home, 'custom-botmux', 'data');
+    const sessionId = 'launch-record-session';
+    const expected = sessionMcpGatewaySocketPath(sessionId, dataDir);
+
+    // No record (legacy pane or never launched with a gateway) → cold-resume.
+    expect(mcpGatewayPaneReattachSafe(readMcpGatewayLaunchRecord(dataDir, sessionId), expected)).toBe(false);
+
+    // Matching record from a reconnect-capable relay → reattach.
+    writeMcpGatewayLaunchRecord(dataDir, sessionId, expected);
+    expect(mcpGatewayPaneReattachSafe(readMcpGatewayLaunchRecord(dataDir, sessionId), expected)).toBe(true);
+
+    // Path mismatch (e.g. dataDir moved, or an mkdtemp-era path) → cold-resume.
+    expect(mcpGatewayPaneReattachSafe(
+      { version: MCP_GATEWAY_RELAY_PROTOCOL_VERSION, socketPath: '/tmp/bmcp-0-deadbeef-XYZ/g.sock' },
+      expected,
+    )).toBe(false);
+
+    // Pre-reconnect relay protocol → cold-resume.
+    expect(mcpGatewayPaneReattachSafe({ version: 1, socketPath: expected }, expected)).toBe(false);
+
+    // Cleared record (generation launched without a gateway) → cold-resume.
+    clearMcpGatewayLaunchRecord(dataDir, sessionId);
+    expect(readMcpGatewayLaunchRecord(dataDir, sessionId)).toBeNull();
+  });
+
   it('fails closed when a managed relay loses its worker-owned socket', () => {
     const run = spawnSync(
       process.execPath,
@@ -572,15 +665,49 @@ describe('plugin MCP Gateway', () => {
     expect(profile.indexOf(writeDeny)).toBeGreaterThan(profile.indexOf(allow));
   });
 
-  it('revokes the worker-owned socket path synchronously during shutdown', async () => {
+  it('revokes the worker-owned socket path synchronously during shutdown but keeps the directory', async () => {
     const host = await startSessionMcpGatewayHost({
       sessionId: 'synchronous-socket-revoke',
       dataDir: join(home, 'custom-botmux', 'data'),
     });
     expect(existsSync(host.socketPath)).toBe(true);
     const closing = host.close();
-    expect(existsSync(host.socketDir)).toBe(false);
+    // The socket (the connectable capability) is gone synchronously; the
+    // directory must SURVIVE so a sandboxed pane's bwrap bind mount (pinned to
+    // the directory inode) still sees the replacement host's socket after a
+    // worker restart.
+    expect(existsSync(host.socketPath)).toBe(false);
+    expect(existsSync(host.socketDir)).toBe(true);
     await closing;
+  });
+
+  it('re-serves the same deterministic socket path across host generations', async () => {
+    const dataDir = join(home, 'custom-botmux', 'data');
+    const host1 = await startSessionMcpGatewayHost({ sessionId: 'stable-path', dataDir });
+    expect(host1.socketPath).toBe(sessionMcpGatewaySocketPath('stable-path', dataDir));
+    const path1 = host1.socketPath;
+    await host1.close();
+    const host2 = await startSessionMcpGatewayHost({ sessionId: 'stable-path', dataDir });
+    try {
+      expect(host2.socketPath).toBe(path1);
+      expect(existsSync(host2.socketPath)).toBe(true);
+    } finally {
+      await host2.close();
+    }
+  });
+
+  it('fails closed when the deterministic socket dir is a planted symlink', async () => {
+    const dataDir = join(home, 'custom-botmux', 'data');
+    const plantedTarget = join(home, 'attacker-target');
+    mkdirSync(plantedTarget, { recursive: true });
+    const dir = sessionMcpGatewaySocketDir('symlink-squat', dataDir);
+    symlinkSync(plantedTarget, dir);
+    try {
+      await expect(startSessionMcpGatewayHost({ sessionId: 'symlink-squat', dataDir }))
+        .rejects.toThrow(/not a directory/);
+    } finally {
+      rmSync(dir, { force: true });
+    }
   });
 
   it('closes the Gateway once when its MCP host stdin ends', async () => {
