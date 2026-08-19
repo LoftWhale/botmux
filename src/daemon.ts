@@ -18,7 +18,7 @@ import {
   isVcMeetingAgentGloballyEnabled,
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
-import { readGlobalConfig, repoPickerScanOptions } from './global-config.js';
+import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from './global-config.js';
 import { buildDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
@@ -316,6 +316,7 @@ import {
   isLegacyTemplateCommand,
   LEGACY_TEMPLATE_RETIRED_MESSAGE,
   WORKFLOW_USAGE,
+  WORKFLOW_DISABLED_MESSAGE,
 } from './im/lark/workflow-slash-command.js';
 import {
   parseV3SavedWorkflowCommand,
@@ -4369,6 +4370,13 @@ async function handleV3SavedWorkflowCommandIfAny(
     await notify('❌ Saved Workflow 需要可验证的飞书用户身份。', 'authorization');
     return true;
   }
+  // Machine-wide workflow kill-switch: refuse starting/authoring a workflow when
+  // the feature is off. `cancel` (and other decrease-only management) stays
+  // available so an in-flight run started before the flip can be wound down.
+  if ((command.kind === 'save' || command.kind === 'run') && !isWorkflowFeatureEnabled()) {
+    await notify(WORKFLOW_DISABLED_MESSAGE, 'validation');
+    return true;
+  }
   if (
     // Cancellation is decrease-only and is still protected below by the
     // immutable owner/chat/app binding (or explicit canOperate). Keep it
@@ -5457,6 +5465,13 @@ for (const path of [
 workflowDaemonMutationRoute('start', async (reply, params, _body, identity) => {
   const runId = params.runId;
   if (!isValidV3RunId(runId)) return reply(400, { ok: false, error: 'bad_run_id' });
+  // Machine-wide workflow kill-switch: refuse launching a NEW daemon-driven run
+  // when the feature is off. This is the common sink for both `botmux workflow
+  // start` and the grill `approve-dag` kick, so gating here closes the edge where
+  // a run was grilled+approved before the flip. Restart recovery of an
+  // already-started run (coldAttach / reconcileV3PendingGates) is a separate path
+  // and is intentionally NOT gated, and `retry`/`grant`/`cancel` stay available.
+  if (!isWorkflowFeatureEnabled()) return reply(409, { ok: false, error: 'workflow_disabled' });
   const runDir = join(v3DefaultBaseDir(), runId);
   const preflight = preflightV3RunStart(runDir);
   if (!preflight.ok) {
@@ -17476,6 +17491,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   let workflowGrillPrompt: string | undefined;
   const newTopicGrill = parseWorkflowGrillTrigger(cmdContent);
   if (newTopicGrill) {
+    if (!isWorkflowFeatureEnabled()) {
+      await sessionReply(anchor, WORKFLOW_DISABLED_MESSAGE, 'text', larkAppId);
+      return;
+    }
     if (await replyGrantRestrictionIfNeeded(larkAppId, chatId, senderOpenId, anchor, '/workflow')) {
       return;
     }
@@ -18891,6 +18910,10 @@ async function handleThreadReplyAdmitted(
   // `/template` 只保留退役提示。
   const threadGrill = parseWorkflowGrillTrigger(cmdContent);
   if (threadGrill) {
+    if (!isWorkflowFeatureEnabled()) {
+      await sessionReply(anchor, WORKFLOW_DISABLED_MESSAGE, 'text', larkAppId);
+      return;
+    }
     if (await replyGrantRestrictionIfNeeded(larkAppId, threadChatId, threadSenderOpenId, anchor, '/workflow')) {
       return;
     }

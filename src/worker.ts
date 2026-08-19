@@ -131,7 +131,7 @@ import {
   resolveUsageDisplay,
   type BotConfig,
 } from './bot-registry.js';
-import { readGlobalConfig } from './global-config.js';
+import { readGlobalConfig, isWorkflowFeatureEnabled } from './global-config.js';
 import {
   deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
@@ -12030,6 +12030,10 @@ async function spawnCli(
     const chatBotDiscovery = resolveChatBotDiscoveryConfig();
     sessionEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
     sessionEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
+    // Inject the resolved workflow kill-switch so a pane's `botmux workflow …`
+    // subcommand agrees with the daemon that spawned it, independent of stale
+    // rcfile/tmux env (mirrors the chatBotDiscovery injection above).
+    sessionEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
     // Per-bot env (bots.json `env`) takes precedence over session context;
     // explicit riff config.env takes precedence over both.
     const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...riffCfg.env };
@@ -13197,6 +13201,10 @@ async function spawnCli(
   const chatBotDiscovery = resolveChatBotDiscoveryConfig();
   childEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
   childEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
+  // Inject the resolved workflow kill-switch so a pane's `botmux workflow …`
+  // subcommand agrees with the daemon that spawned it, independent of stale
+  // rcfile/tmux env (mirrors the chatBotDiscovery injection above).
+  childEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
   if (cliAdapter.injectsReadyHook) childEnv.BOTMUX_READY_COMMAND = sessionReadyHookCommand();
   // Initial value only; long-lived panes get the latest turn via the JSON pid marker.
   if (cfg.turnId) childEnv.BOTMUX_TURN_ID = cfg.turnId;

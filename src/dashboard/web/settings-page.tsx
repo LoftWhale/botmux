@@ -82,6 +82,7 @@ interface DashboardSettings {
   localDevInstall: boolean;
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
+  workflow: { enabled: boolean };
   remoteAccess: boolean;
   scheduleTimeZone: string;
   hostTimeZone: string;
@@ -214,6 +215,7 @@ function parseSettings(s: any): DashboardSettings {
     localDevInstall: s?.localDevInstall === true,
     autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
+    workflow: { enabled: s?.workflow?.enabled !== false },
     remoteAccess: s?.remoteAccess === true,
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
     hostTimeZone: typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC',
@@ -812,6 +814,17 @@ function SettingsBody(props: {
             disabled={dis || savingKey === 'whiteboard'}
             onChange={value => {
               void props.onSave('whiteboard', { whiteboard: { enabled: value } }, s => ({ ...s, whiteboard: { enabled: value } }));
+            }}
+          />
+        </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionWorkflow')}>
+          <ToggleRow
+            title={tr('settings.workflowEnable')}
+            help={tr('settings.workflowEnableHelp')}
+            checked={settings.workflow.enabled}
+            disabled={dis || savingKey === 'workflow'}
+            onChange={value => {
+              void props.onSave('workflow', { workflow: { enabled: value } }, s => ({ ...s, workflow: { enabled: value } }));
             }}
           />
         </SettingsBlock>

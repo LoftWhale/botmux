@@ -8,7 +8,7 @@ import { homedir } from 'node:os';
 import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, removeGlobalBotmuxSkills } from '../skills/installer.js';
+import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
@@ -17,7 +17,7 @@ import { hookCommandFor } from '../adapters/hook-command.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
-import { readGlobalConfig } from '../global-config.js';
+import { readGlobalConfig, isWorkflowFeatureEnabled } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import {
@@ -2478,6 +2478,9 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
     const pluginSkillsDir = join(adapter.pluginDir, 'skills');
     // 白板 skill 每次 spawn 重新评估（跟随运行时开关），不进 once-cache。
     ensureWhiteboardSkill(cliId, pluginSkillsDir, whiteboardEnabled());
+    // Workflow skill 家族同理：跟随机器级 workflow 开关，每次 spawn 重新评估，
+    // 关闭时删除已装的三个 skill，下一个会话即生效。
+    ensureWorkflowSkills(cliId, pluginSkillsDir, isWorkflowFeatureEnabled());
     if (skillsInstalledCliIds.has(cliId)) return;
     ensurePluginSkills(cliId, adapter.pluginDir);
     if (adapter.hookInstall) {
@@ -2509,6 +2512,9 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   //    立刻不再看到 botmux 技能，无需等 daemon 重启。只动 `botmux-` 命名空间，
   //    绝不碰用户自定义 skill。
   ensureWhiteboardSkill(cliId, skillsDir, globalInstall && whiteboardEnabled());
+  // Workflow skill 家族：仅 global 模式落全局盘，且跟随机器级 workflow 开关。
+  // 非 global（prompt/off）由上面的 removeGlobalBotmuxSkills 前缀清理兜底。
+  ensureWorkflowSkills(cliId, skillsDir, globalInstall && isWorkflowFeatureEnabled());
   if (!globalInstall && skillsDir) removeGlobalBotmuxSkills(skillsDir);
 
   if (skillsInstalledCliIds.has(cliId)) return;

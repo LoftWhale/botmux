@@ -60,6 +60,9 @@ vi.mock('../src/core/daemon-ipc-auth.js', async (importOriginal) => {
 vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: vi.fn(() => ({})),
   isRemoteAccessEnabled: vi.fn(() => false),
+  // Workflow feature defaults ON (production default) so /help renders the
+  // workflow section as before; the gate itself is covered in workflow-feature-gate.test.ts.
+  isWorkflowFeatureEnabled: vi.fn(() => true),
   // repoPickerScanOptions is the shared helper command-handler depends on;
   // default to legacy (include worktrees), overridden per-test.
   repoPickerScanOptions: vi.fn(() => ({ includeWorktrees: true })),

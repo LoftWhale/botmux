@@ -897,6 +897,10 @@ interface ResolvedDashboardSettings {
   autoUpdateSupported: boolean;
   /** Optional local project whiteboard. Disabled by default. */
   whiteboard: WhiteboardConfig;
+  /** Machine-wide v3 Workflow feature switch. Default ON; set false to disable
+   *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
+   *  family, and the CLI authoring/run subcommands host-wide. */
+  workflow: { enabled: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1502,6 +1506,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     localDevInstall: isLocalDevInstall(),
     autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || tryResolveGlobalInstallPlan() !== null,
     whiteboard: { enabled: global.whiteboard?.enabled === true },
+    workflow: { enabled: global.workflow?.enabled !== false }, // default ON
     remoteAccess: global.remoteAccess === true,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
     hostTimeZone: hostLocalTimeZone(),
