@@ -600,9 +600,12 @@ setInterval(() => {}, 1_000);
   // 过期的窥屏通道，中央前门再怎么撤销也够不着它。
   //
   // 这条缝的宽度就等于那次同步文件读：本地 SSD 上 ~0.1ms，$HOME 挂在慢盘/NFS 上就是
-  // 几十上百毫秒（backlog P1-10 记的正是这种 HOME）。测试把 secret 文件用空白撑大来
-  // 复现慢 HOME 的时序：loadDashboardSecret 读完就 trim，secret 值一个字节没变，生产
-  // 代码一行没动，只是把这条本来就存在的缝拉宽到可稳定观测。
+  // 几十上百毫秒（backlog P1-10 记的正是这种 HOME）。以前靠把 secret 文件用 32MB 空白
+  // 撑大来复现慢 HOME 的时序，但 #920 给宿主凭证读取加了严格 0600 + 256 字节上限，撑大的
+  // 文件会被直接判「大小异常」拒读——于是改用 worker 侧的测试专用 env
+  // （BOTMUX_TEST_TERMINAL_SECRET_READ_DELAY_MS）在握手路径的那次 secret 读后加一段有界
+  // 忙等：secret 值一个字节没变、凭证文件仍是合法的小文件，只是把这条本来就存在的缝
+  // 稳定拉宽到可观测（生产不设该 env，行为不变）。
   it('P1-3: a view capability that dies inside the WS handshake is refused at the connection re-check', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-ws-handshake-race-'));
     tempDirs.add(root);
@@ -611,11 +614,15 @@ setInterval(() => {}, 1_000);
     const secret = 'integration-ws-handshake-race-secret';
     const botmuxDir = join(root, '.botmux');
     mkdirSync(botmuxDir, { recursive: true });
+    // 合法的小凭证文件（0600），满足 #920 的严格宿主凭证读取；握手读窗口由下面的
+    // 测试专用 env 拉宽，而不是靠撑大文件。
     writeFileSync(
       join(botmuxDir, '.dashboard-secret'),
-      `${secret}${' '.repeat(32 * 1024 * 1024)}`,
+      secret,
       { mode: 0o600 },
     );
+    // 握手路径每次读 secret 后忙等这么久，复现慢 HOME 的读窗口（> P1-3 需要的 20ms 下限）。
+    const handshakeReadDelayMs = 40;
 
     // 让 scrollback 非空。socket 一旦被登记，worker 会立刻把这段历史种子推过去，于是
     // 「有没有被登记」在客户端侧是直接可观测的事实，不用去断言 worker 的内部集合。
@@ -640,6 +647,7 @@ setInterval(() => {}, 1_000);
         BOTMUX_SESSION_ID: sessionId,
         LARK_APP_ID: 'app_ws_race',
         LARK_APP_SECRET: 'secret',
+        BOTMUX_TEST_TERMINAL_SECRET_READ_DELAY_MS: String(handshakeReadDelayMs),
       },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
