@@ -855,6 +855,7 @@ export const messages: Record<string, string> = {
   'worker.raw_input_failed_recovery': '⚠️ The slash command could not be confirmed as delivered to {cliName}, so the follow-up text in the same message was not submitted.\nReason: {reason}',
   'worker.raw_input_failed_command_only_recovery': '⚠️ The slash command could not be confirmed as delivered to {cliName}.\nReason: {reason}',
   'worker.empty_final_completed': '⚠️ {cliName} reported this turn as completed, but botmux captured no final text from the terminal transcript and saw no tracked reply for this turn. If you already replied via a redirected send (--top-level / --into / --override-chat), you can ignore this. Otherwise open the web terminal to inspect the last output, or resend a message to continue the session.',
+  'worker.bridge_restored_turn_notice': '⚠️ This turn was interrupted by a botmux restart. Below is the output recovered from the terminal transcript (may be incomplete):',
   'worker.failed_reason_unavailable': 'no error summary was safe to display',
   'worker.empty_final_failed': '⚠️ {cliName} failed this turn: {reason}\nThe complete error remains available in the web terminal and daemon logs. Resolve the issue, then resend the message.',
   'worker.empty_final_failed_invalid_request': '⚠️ The {cliName} request was rejected: {reason}\nCheck the CLI, model gateway, and tool schema configuration, then resend the message.',

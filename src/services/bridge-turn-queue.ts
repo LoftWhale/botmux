@@ -103,6 +103,11 @@ export interface BridgePendingTurn {
    *  the turn — short fingerprints ("hello", "test") would otherwise risk
    *  matching pre-existing user lines in unrelated sibling jsonls. */
   markTimeMs?: number;
+  /** Set when this mark was re-created from the durable turn journal after a
+   *  worker/daemon restart interrupted the turn. The emit path prefixes the
+   *  delivered fallback with an "interrupted by restart" notice so the user
+   *  can tell a recovered partial answer from a live one. */
+  restoredFromJournal?: boolean;
 }
 
 /** Trim a Lark message into a stable fingerprint. Keeps a leading window
@@ -181,6 +186,7 @@ export class BridgeTurnQueue {
     markTimeMs: number = Date.now(),
     contentNormalized?: string,
     dispatchAttempt?: number,
+    opts?: { restoredFromJournal?: boolean },
   ): string {
     this.queue.push({
       turnId,
@@ -190,6 +196,7 @@ export class BridgeTurnQueue {
       contentFingerprint,
       contentNormalized,
       markTimeMs,
+      ...(opts?.restoredFromJournal ? { restoredFromJournal: true } : {}),
     });
     return turnId;
   }
