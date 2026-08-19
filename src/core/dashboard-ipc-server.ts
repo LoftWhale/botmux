@@ -5,7 +5,8 @@ import { readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
-import { cliAuthBind, verifyHmac } from '../dashboard/auth.js';
+import { cliAuthBind, loadDashboardSecret, verifyHmac } from '../dashboard/auth.js';
+import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
@@ -585,10 +586,40 @@ function closeUntrustedRequestAfterResponse(req: IncomingMessage, res: ServerRes
 let injectedIpcSecret: string | null = null;
 /** Test seam: override the secret used to verify token-route HMAC. */
 export function setIpcAuthSecret(secret: string | null): void { injectedIpcSecret = secret; }
+let loggedUnsafeIpcSecretAt = 0;
+/**
+ * Load the machine-local dashboard secret used to verify token-route HMAC.
+ *
+ * Goes through {@link loadDashboardSecret} — the same strict host-authority
+ * reader the dashboard and daemon startup use — instead of a bare
+ * `readFileSync`: the leaf must be a regular 0600 file owned by the current
+ * user and must NOT be a symlink, and `~/.botmux` must not be
+ * group/other-writable. This is a per-request verifier on ~96 daemon IPC routes,
+ * so an attacker who can plant a symlink or loose-perms `.dashboard-secret` after
+ * boot must not have that content trusted as the HMAC key here (the dashboard
+ * caches its secret once at startup; this path re-reads every request, so it is
+ * the more exposed reader).
+ *
+ * Fail-closed either way: an unsafe shape returns `null` (→ nobody can sign →
+ * 401) rather than being followed. We log it — throttled, since this runs per
+ * request — so a planted/misconfigured credential is diagnosable instead of
+ * looking identical to "no secret on disk".
+ */
 function ipcAuthSecret(): string | null {
   if (injectedIpcSecret) return injectedIpcSecret;
-  try { return readFileSync(dashboardSecretPath(), 'utf8').trim() || null; }
-  catch { return null; }
+  try {
+    return loadDashboardSecret(dashboardSecretPath());
+  } catch (err) {
+    if (err instanceof UnsafeHostAuthorityFileError) {
+      const now = Date.now();
+      if (now - loggedUnsafeIpcSecretAt > 60_000) {
+        loggedUnsafeIpcSecretAt = now;
+        logger.error(`[dashboard-ipc] 拒绝使用不安全的 .dashboard-secret：${err.message}（IPC 鉴权 fail-closed）`);
+      }
+      return null;
+    }
+    return null;
+  }
 }
 /** Authenticate legacy terminal-token routes with the machine-local dashboard
  * secret. Workflow v3 mutations intentionally use their separate, full-request
