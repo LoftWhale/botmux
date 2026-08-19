@@ -84,4 +84,64 @@ describe('plugin PM2 environment', () => {
     expect(options.env.PLUGIN_VALUE).toBe('preserved');
     expect(options.env.PATH).toBe(process.env.PATH);
   });
+
+  it('applies the same five scrub families as the core pm2 boundary', async () => {
+    // Plugin PM2 shares the God's PM2_HOME, so this entry both persists env
+    // into plugin apps and can birth the shared God — a plugin start issued
+    // from a bot/workflow session must not carry the session's CLI home,
+    // Claude markers, workflow identity, agent-shell fingerprints, or turn
+    // identity into either.
+    vi.stubEnv('CLAUDE_CONFIG_DIR', '/leak/claude');
+    vi.stubEnv('CODEX_HOME', '/leak/codex');
+    vi.stubEnv('CLAUDECODE', '1');
+    vi.stubEnv('BOTMUX_WORKFLOW', 'wf-1');
+    vi.stubEnv('NO_COLOR', '1');
+    vi.stubEnv('CODEX_CI', '1');
+    vi.stubEnv('BOTMUX_SESSION_ID', 'session-leak');
+    vi.stubEnv('BOTMUX_OWNER_OPEN_ID', 'ou_leak');
+    vi.resetModules();
+    const { runPluginPm2 } = await import('../src/core/plugins/pm2.js');
+
+    runPluginPm2(['start', 'fixture'], { inherit: false });
+
+    const options = childProcess.spawnSync.mock.calls[0]?.[2] as { env: NodeJS.ProcessEnv };
+    for (const key of [
+      'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'CLAUDECODE', 'BOTMUX_WORKFLOW',
+      'NO_COLOR', 'CODEX_CI', 'BOTMUX_SESSION_ID', 'BOTMUX_OWNER_OPEN_ID',
+    ]) {
+      expect(options.env[key], key).toBeUndefined();
+    }
+    // Deterministic TERM instead of absent (pm2 client color detection).
+    expect(options.env.TERM).toBe('xterm-256color');
+  });
+
+  it('freezes the scrubs over the manifest env merge — extras cannot revive scrubbed keys', async () => {
+    const { PM2_GRACEFUL_EXIT_CODE_ENV } = await import('../src/pm2-graceful-exit.js');
+    vi.resetModules();
+    const { runPluginPm2 } = await import('../src/core/plugins/pm2.js');
+
+    runPluginPm2(['start', 'fixture'], {
+      inherit: false,
+      env: {
+        BOTMUX_SESSION_ID: 'manifest-forged',
+        CLAUDECODE: '1',
+        NO_COLOR: '1',
+        TERM: 'dumb',
+        BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'manifest-forged-secret',
+        [PM2_GRACEFUL_EXIT_CODE_ENV]: '90',
+        PM2_HOME: '/forged/pm2-home',
+        PLUGIN_VALUE: 'preserved',
+      },
+    });
+
+    const options = childProcess.spawnSync.mock.calls[0]?.[2] as { env: NodeJS.ProcessEnv };
+    expect(options.env.BOTMUX_SESSION_ID).toBeUndefined();
+    expect(options.env.CLAUDECODE).toBeUndefined();
+    expect(options.env.NO_COLOR).toBeUndefined();
+    expect(options.env[PM2_GRACEFUL_EXIT_CODE_ENV]).toBeUndefined();
+    expect(options.env.BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET).toBeUndefined();
+    expect(options.env.TERM).toBe('xterm-256color');
+    expect(options.env.PM2_HOME).toBe(join(home, '.botmux', 'pm2'));
+    expect(options.env.PLUGIN_VALUE).toBe('preserved');
+  });
 });

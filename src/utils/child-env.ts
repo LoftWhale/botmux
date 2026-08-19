@@ -144,6 +144,54 @@ export function stripDashboardH5Env(env: NodeJS.ProcessEnv): void {
 }
 
 /**
+ * Terminal/interactivity fingerprints of whichever process invoked a pm2
+ * mutation. pm2 persists the caller's env into every managed app (and into
+ * dump.pm2 for resurrect), so a `botmux restart` issued from an agent's
+ * non-interactive shell — Claude Code / Codex tool shells export NO_COLOR=1,
+ * CODEX_CI=1, PAGER=cat, plus the terminal-app identity of whatever terminal
+ * hosted them — bakes "you have no colors, you are in CI" into every daemon,
+ * which every worker and session PTY then inherits: all bot CLI TUIs render
+ * colorless, and TERMINFO can even point at a terminal app's private terminfo
+ * dir. A daemon is a headless service: every key here describes the invoker's
+ * terminal or harness, never the machine, so deleting them at the pm2
+ * boundary is always correct. Session PTYs set their own TERM (the backends
+ * spawn with name 'xterm-256color'), and a user who wants genuinely colorless
+ * bots keeps the per-bot `env` channel — like CLAUDE_EFFORT, the ambient
+ * "export it in the shell that runs `botmux restart`" channel is sacrificed
+ * because at this boundary it cannot be told apart from contamination.
+ */
+export const INVOKER_TERMINAL_ENV_KEYS = [
+  // Color semantics
+  'NO_COLOR',
+  'FORCE_COLOR',
+  'CLICOLOR',
+  'CLICOLOR_FORCE',
+  // Terminal identity. TERMINFO is a single-directory override that terminal
+  // apps export for their own private terminfo bundle — invoker-scoped.
+  // TERMINFO_DIRS is deliberately ABSENT: it is a search-path list that
+  // NixOS/home-manager and custom-ncurses setups configure machine-wide, and
+  // deleting it would break terminfo resolution for every PTY on such hosts.
+  'TERM',
+  'COLORTERM',
+  'TERMINFO',
+  'TERM_PROGRAM',
+  'TERM_PROGRAM_VERSION',
+  'TERM_SESSION_ID',
+  // CI / agent-harness flags
+  'CI',
+  'CODEX_CI',
+  // Non-interactive pager pins agent shells export for their own subcommands
+  'PAGER',
+  'GIT_PAGER',
+  'GH_PAGER',
+] as const;
+
+/** Delete inherited invoker-terminal fingerprints from `env` in place. */
+export function scrubInvokerTerminalEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of INVOKER_TERMINAL_ENV_KEYS) delete env[key];
+}
+
+/**
  * Env vars that must never reach a spawned CLI child. The bot's IM-app creds
  * (a child CLI's own Lark OAuth reads `process.env.LARK_APP_ID` as the app to
  * authorize and gets hijacked by the botmux IM app → no docs scopes → 403
@@ -369,6 +417,82 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',
 ] as const;
+
+/**
+ * Session-only botmux identity and capabilities of the process that invoked a
+ * pm2 mutation. A `botmux restart` issued from inside a bot session carries
+ * that session's routing identity and capabilities; persisted by pm2 into the
+ * fleet, every daemon then carries a stale foreign turn identity, and a
+ * plugin service started from the same env would misroute its own
+ * `botmux send` to a long-dead thread.
+ *
+ * This is a DELIBERATELY hand-maintained list. It is NOT derived from
+ * BOTMUX_INJECTED_ENV_KEYS: that list is the tmux/pane TRANSPORT whitelist
+ * and mixes session-only keys with ambient/daemon config that merely needs
+ * pane delivery (CLAUDE_CODE_RESUME_TOKEN_THRESHOLD is ambient-only — worker
+ * reads it from its own process.env and per-bot env REJECTS it, so a boot
+ * scrub would silently kill the user's setting; HERMES_HOME and the two
+ * HERMES_BOTMUX_* roots are ambient install-location config nothing in
+ * botmux ever sets, same contract as GROK_HOME; BOTS_CONFIG /
+ * SESSION_DATA_DIR / BOTMUX_LARK_LIST_BOTS_API_* are documented ambient or
+ * ecosystem-block config). The reverse also holds: session/sandbox routing
+ * keys the pane transport never carries (BOTMUX_SESSION_SCOPE,
+ * BOTMUX_SEND_RELAY) still need scrubbing here. Every entry below is
+ * session-scoped BY CONSTRUCTION: the daemon/worker computes and injects it
+ * per session AFTER every boundary scrub, and no ambient/env-file channel for
+ * it exists.
+ */
+export const SESSION_TURN_MARKER_ENV_KEYS = [
+  // "Runs inside botmux" pane marker; pane wrapper injects it per session.
+  'BOTMUX',
+  // Turn/session routing identity (worker-injected per pane/turn).
+  'BOTMUX_SESSION_ID',
+  'BOTMUX_CHAT_ID',
+  'BOTMUX_CHAT_TYPE',
+  'BOTMUX_ROOT_MESSAGE_ID',
+  'BOTMUX_TURN_ID',
+  'BOTMUX_DISPATCH_ATTEMPT',
+  // thread|chat scope, computed per session from rootMessageId (worker.ts).
+  'BOTMUX_SESSION_SCOPE',
+  // Daemon-authenticated session owner, both channels (applySessionOwnerEnv).
+  'BOTMUX_OWNER_OPEN_ID',
+  '__OWNER_OPEN_ID',
+  // Unguessable pane/profile authority channel (daemon-rotated capability).
+  'BOTMUX_ORIGIN_CHANNEL_ID',
+  // Sandbox send-relay directory — a per-session capability path.
+  'BOTMUX_SEND_RELAY',
+  // Session-scoped MCP gateway capability + fail-closed marker.
+  'BOTMUX_MCP_GATEWAY_SOCKET',
+  'BOTMUX_MCP_GATEWAY_REQUIRED',
+  // Owning daemon's per-boot IPC port; the daemon self-sets the real value at
+  // boot (daemon.ts), so an inherited copy is always a stale foreign port.
+  'BOTMUX_DAEMON_IPC_PORT',
+  // Per-session read-isolation / apiOnly / sandbox verdicts (worker-owned).
+  'BOTMUX_READ_ISOLATION',
+  'BOTMUX_READ_ISOLATED',
+  'BOTMUX_API_ONLY',
+  'IS_SANDBOX',
+  // Per-session display footer resolved from bots.json (never env-configured).
+  'BOTMUX_BRAND_LABEL',
+  // Per-bot usage display, resolved via resolveUsageDisplay(cfg) per session;
+  // env is never a config input for it.
+  'BOTMUX_USAGE_DISPLAY',
+  // One-shot per-session artifacts/paths.
+  'BOTMUX_PI_INITIAL_PROMPT_FILE',
+  'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
+  // Ready-gate hook command, sessionReadyHookCommand() per session.
+  'BOTMUX_READY_COMMAND',
+  // Per-app value pinned by the ecosystemConfig env block; an inherited copy
+  // is untrusted (the daemon resolves its bot via BOTMUX_BOT_INDEX).
+  'BOTMUX_LARK_APP_ID',
+  // cjadk wrapper-branch knob, set/deleted per spawn by the worker.
+  'CJADK_INTERACTIVE',
+] as const;
+
+/** Delete inherited session-only identity/capabilities from `env` in place. */
+export function scrubSessionTurnMarkerEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of SESSION_TURN_MARKER_ENV_KEYS) delete env[key];
+}
 
 /** Proxy env vars that must reach the CLI child process so it can dial the
  *  upstream API on hosts without direct internet access. Forwarded explicitly
