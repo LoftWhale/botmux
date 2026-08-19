@@ -259,6 +259,40 @@ describe('botmux bots list CLI output mapping', () => {
     }
   });
 
+  it('S-2b gates talk/operate on source===configured, not just a non-empty larkAppId', () => {
+    // Today the sole producers guarantee introduce rows carry larkAppId='' (so
+    // non-empty ⇒ configured). This locks in the defense for a HYPOTHETICAL
+    // future introduce producer that carries a remote stable app id: talk/operate
+    // promise a --bot-app dispatch that requires LOCAL config, so a non-configured
+    // row — even with a non-empty larkAppId — must fall to unknown, never silently
+    // flip to preflight-required. (deployment already gates the same way.)
+    const [introduceWithAppId] = formatChatBotsForCli([{
+      larkAppId: 'cli_remote_future',
+      openId: 'ou_remote',
+      name: 'remote',
+      displayName: 'Remote Introduced',
+      source: 'introduce',
+      hasTeamRole: false,
+      mentionable: true,
+      mentionSource: 'observed',
+    }], 'cli_self');
+    expect(introduceWithAppId.collaboration.authorization).toEqual({ talk: 'unknown', operate: 'unknown' });
+    expect(introduceWithAppId.collaboration.runtime.deployment).toBe('unknown');
+
+    // A locally-configured peer with the same non-empty larkAppId DOES preflight.
+    const [configuredPeer] = formatChatBotsForCli([{
+      larkAppId: 'cli_local',
+      openId: 'ou_local',
+      name: 'local',
+      displayName: 'Local Peer',
+      source: 'configured',
+      hasTeamRole: false,
+      mentionable: true,
+      mentionSource: 'cross-ref',
+    }], 'cli_self');
+    expect(configuredPeer.collaboration.authorization).toEqual({ talk: 'preflight-required', operate: false });
+  });
+
   it('S-3 documents every collaboration value and wires one top-level help object per output path', () => {
     const expectedValues: Record<string, string[]> = {
       reachability: ['ready', 'needs-introduce', 'offline', 'unknown'],

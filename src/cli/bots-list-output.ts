@@ -173,7 +173,15 @@ function collaborationGuide(
   live: boolean,
   facts: BotCollaborationFacts | undefined,
 ): BotListOutputEntry['collaboration'] {
-  const stablePeer = live && row.larkAppId !== '' && !row.isSelf;
+  // A "stable peer" is a locally-configured bot we can preflight a talk-only
+  // grant against. Gate on source==='configured' explicitly, not just a
+  // non-empty larkAppId: today the sole producers guarantee introduce rows
+  // carry larkAppId='' (so non-empty ⇒ configured), but talk/operate promise a
+  // "--bot-app" dispatch that REQUIRES local config — so we encode that
+  // invariant here rather than relying on it. deployment already gates the same
+  // way; this keeps a future introduce producer carrying a remote app id from
+  // silently flipping talk to preflight-required.
+  const stablePeer = live && row.larkAppId !== '' && row.source === 'configured' && !row.isSelf;
   return {
     reachability: live
       ? (row.mentionable ? 'ready' : row.source === 'configured' ? 'needs-introduce' : 'unknown')
