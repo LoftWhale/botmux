@@ -91,6 +91,16 @@ describe('workflow feature kill-switch (BOTMUX_WORKFLOW_ENABLED=false)', () => {
     expect(result.output).toContain(DISABLED);
   });
 
+  it('refuses `goal run` when disabled (same v3 runtime as v3 run — P1)', () => {
+    // `botmux goal run` reuses runWorkflow + ephemeral pool, so it is a real-run
+    // launch and must be gated too. It emits a JSON/text result and exits with
+    // the goal-run error code (14), not a silent pass-through.
+    const result = runCliWithWorkflow(['goal', 'run', '调研三家竞品', '--json'], false);
+    expect(result.status).toBe(14);
+    expect(result.output).toContain('WORKFLOW_DISABLED');
+    expect(result.output).toContain(DISABLED);
+  });
+
   it('still allows read-only `workflow list` when disabled (not gated)', () => {
     const result = runCliWithWorkflow(['workflow', 'list'], false);
     // list must not be blocked by the kill-switch — it may fail for unrelated
@@ -98,10 +108,20 @@ describe('workflow feature kill-switch (BOTMUX_WORKFLOW_ENABLED=false)', () => {
     expect(result.output).not.toContain(DISABLED);
   });
 
-  it('still allows `workflow help` when disabled', () => {
+  it('`workflow help` when disabled surfaces the kill-switch but still exits 0', () => {
     const result = runCliWithWorkflow(['workflow', 'help'], false);
     expect(result.status).toBe(0);
+    // Help must not silently advertise a disabled feature (P2): it names the
+    // switch and points at the still-available management verbs.
+    expect(result.output).toContain(DISABLED);
+    expect(result.output).toContain('cancel');
+  });
+
+  it('`workflow help` when enabled lists the full command surface (no notice)', () => {
+    const result = runCliWithWorkflow(['workflow', 'help'], true);
+    expect(result.status).toBe(0);
     expect(result.output).not.toContain(DISABLED);
+    expect(result.output).toContain('Saved Workflow');
   });
 
   it('does NOT print the disabled notice for the same host verb when enabled', () => {

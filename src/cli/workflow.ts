@@ -102,6 +102,17 @@ function failRetired(command: string): never {
 }
 
 function printWorkflowHelp(): void {
+  // Surface the machine-wide kill-switch in the CLI help too, so `botmux
+  // workflow help` on a disabled host doesn't advertise commands that refuse
+  // (mirrors the IM `/help` omission). In-flight management stays listed since
+  // cancel/retry/grant remain available.
+  if (!isWorkflowFeatureEnabled()) {
+    console.log(`⛔ 本机已关闭「工作流(Workflow)」功能：即兴编排与 Saved Workflow 的运行/保存不可用（如需开启，见 Dashboard 设置页「工作流功能」或设置 BOTMUX_WORKFLOW_ENABLED=true）。
+进行中的 run 仍可管理: botmux workflow <cancel|retry|grant> [...]
+v2 资产离线处理: botmux template <migrate-v3|archive-runs>
+`);
+    return;
+  }
   console.log(`用法: botmux workflow <目标控制|save|run|list|show|start|cancel|retry|grant> [...]
 
 Saved Workflow:
