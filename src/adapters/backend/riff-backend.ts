@@ -1,6 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, delimiter } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import type {
@@ -83,6 +83,28 @@ export interface RiffBackendConfig {
   jwt?: string;
   /** Name of env var containing the JWT token (default: RIFF_JWT). */
   jwtEnv?: string;
+  /**
+   * Command to refresh the ByteCloud JWT when the keychain holds no live token.
+   * When neither `config.jwt` nor the env token is set and `readBytecloudKeychainJwt`
+   * returns null (every candidate expired / within the safety window / absent),
+   * riff task creation would fail with a 401 that aborts the whole turn. Before
+   * giving up, we run this command ONCE (debounced) to let the owning CLI
+   * (bytedcli / kaboo-cli) refresh credentials and rewrite the keychain, then
+   * re-read. bytedcli is the ByteCloud JWT owner: `bytedcli auth
+   * get-bytecloud-jwt-token --force-refresh` refreshes via its Auth SDK and
+   * writes the token to `~/.local/share/bytedcli/data/bytecloud-auth/…`, which is
+   * already a `bytecloudKeychainCandidates` path.
+   *
+   * Shape: [binary, ...args]. When unset, resolves in order:
+   *   1. env `BOTMUX_RIFF_JWT_REFRESH_CMD` (space-split, e.g. `bytedcli auth get-bytecloud-jwt-token --force-refresh`)
+   *   2. a `bytedcli` binary found on PATH → `bytedcli auth get-bytecloud-jwt-token --force-refresh`
+   *   3. otherwise no auto-refresh (fail-closed to the old behaviour — a 401).
+   * We intentionally do NOT default to `npx @bytedance-dev/bytedcli@latest`: an
+   * uncached/`@latest` npx resolve can block ~30s per call, far too slow for a
+   * synchronous pre-request refresh. Deployments wanting npx must set the env
+   * explicitly (and ideally pin the version).
+   */
+  jwtRefreshCmd?: string[];
   /** Sandbox resource pool selected for newly-created tasks. Riff defaults to
    *  BOE when omitted; follow-ups inherit the parent task's sandbox. */
   sandboxCluster?: RiffSandboxCluster;
@@ -309,6 +331,13 @@ function aimeDataHome(env: NodeJS.ProcessEnv): string | null {
   return join(workspace, sanitizeAimeUser(user), '.local', 'share');
 }
 
+/** True when BOTH AIME vars are set (trimmed non-empty), i.e. bytedcli swaps its
+ *  storage root to the AIME workspace. In that runtime we must not trigger a
+ *  host-identity JWT refresh — see resolveJwt's fail-closed skip. */
+function isFullAimeRuntime(env: NodeJS.ProcessEnv): boolean {
+  return aimeDataHome(env) !== null;
+}
+
 /**
  * The keychain candidates for a ByteCloud tool's `bytecloud-auth/` store, across
  * the CLIs botmux users log into (kaboo-cli / aiden-cli / cjadk / bytedcli).
@@ -502,6 +531,107 @@ export function readBytecloudKeychainJwt(
     if (!bestLive || exp > bestLive.exp) bestLive = { jwt, exp };
   }
   return bestLive?.jwt ?? opaqueFallback;
+}
+
+/**
+ * Locate a `bytedcli` binary on PATH (used to build the default JWT-refresh
+ * command). Returns the bare name `bytedcli` when found so execFileSync resolves
+ * it via PATH, or null when absent. Injectable env/platform for testing.
+ *
+ * We look for a real installed binary rather than defaulting to
+ * `npx @bytedance-dev/bytedcli@latest`: an uncached / `@latest` npx resolve can
+ * block ~30s, which is unacceptable on the synchronous pre-request path. If
+ * bytedcli is not installed we simply do not auto-refresh (fail-closed to the
+ * prior behaviour — the request may 401, exactly as before this change).
+ */
+export function findBytedcliBinary(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const pathVar = env.PATH ?? env.Path ?? '';
+  if (!pathVar) return null;
+  const names = platform === 'win32' ? ['bytedcli.cmd', 'bytedcli.exe', 'bytedcli'] : ['bytedcli'];
+  for (const dir of pathVar.split(delimiter)) {
+    if (!dir) continue;
+    for (const name of names) {
+      try {
+        if (existsSync(join(dir, name))) return 'bytedcli';
+      } catch { /* ignore unreadable PATH entry */ }
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the JWT-refresh command: explicit config → env
+ * `BOTMUX_RIFF_JWT_REFRESH_CMD` (space-split) → a PATH-resident bytedcli →
+ * null (no auto-refresh). See RiffBackendConfig.jwtRefreshCmd for the rationale.
+ */
+export function resolveJwtRefreshCmd(
+  configured: string[] | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string[] | null {
+  if (configured && configured.length > 0) return configured;
+  const fromEnv = env.BOTMUX_RIFF_JWT_REFRESH_CMD?.trim();
+  if (fromEnv) {
+    const parts = fromEnv.split(/\s+/).filter(Boolean);
+    if (parts.length > 0) return parts;
+  }
+  const bin = findBytedcliBinary(env, platform);
+  if (bin) return [bin, 'auth', 'get-bytecloud-jwt-token', '--force-refresh'];
+  return null;
+}
+
+/** Minimum gap between JWT refresh attempts. A single stuck/expired token would
+ *  otherwise trigger a refresh on EVERY getJwt() call (reconnect loops read the
+ *  JWT once per attempt); we refresh at most once per window and let the shared
+ *  keychain re-read serve subsequent calls. Also caps the cost of a refresh
+ *  command that keeps failing (e.g. bytedcli not logged in). */
+export const JWT_REFRESH_DEBOUNCE_MS = 60_000;
+
+/** Process-wide last-attempt timestamp (ms). Shared across RiffBackend instances
+ *  because the orphan-cancel path builds a throwaway instance per call — a
+ *  per-instance clock there would never debounce. `-Infinity` means "never
+ *  attempted", so the first call always runs regardless of the clock's
+ *  magnitude. Reset helper for tests. */
+let lastJwtRefreshAtMs = Number.NEGATIVE_INFINITY;
+export function __resetJwtRefreshDebounceForTest(): void {
+  lastJwtRefreshAtMs = Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * Run the JWT-refresh command once, honouring the debounce window. Never throws:
+ * a missing command, a non-zero exit, or a timeout all resolve to `false` (the
+ * caller then falls back to whatever the keychain holds — i.e. the pre-change
+ * behaviour). Returns true only when a command actually ran to completion.
+ *
+ * Pure-ish + injectable (runner / now) so the debounce and fail-closed paths are
+ * unit-testable without spawning a real process.
+ */
+export function refreshBytecloudJwt(
+  cmd: string[] | null,
+  runner: (bin: string, args: string[]) => void = defaultJwtRefreshRunner,
+  nowMs: number = Date.now(),
+): boolean {
+  if (!cmd || cmd.length === 0) return false;
+  if (nowMs - lastJwtRefreshAtMs < JWT_REFRESH_DEBOUNCE_MS) return false;
+  lastJwtRefreshAtMs = nowMs;
+  const [bin, ...args] = cmd;
+  try {
+    runner(bin!, args);
+    return true;
+  } catch (err) {
+    logger.warn(`[riff] JWT refresh command failed: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+/** Default refresh runner: execFileSync with a bounded timeout. stdout/stderr are
+ *  discarded — the command's SIDE EFFECT (rewriting the keychain) is what matters;
+ *  we re-read the keychain afterwards rather than parse its output. */
+function defaultJwtRefreshRunner(bin: string, args: string[]): void {
+  execFileSync(bin, args, { timeout: 30_000, stdio: ['ignore', 'ignore', 'ignore'] });
 }
 
 function defaultRunGit(cwd: string): (args: string[]) => string | null {
@@ -727,6 +857,24 @@ export class RiffBackend implements SessionBackend {
     if (fromKeychain) {
       logger.info(`[riff] JWT loaded from ByteCloud keychain`);
       return fromKeychain;
+    }
+
+    // No live keychain token — every candidate is expired, within the safety
+    // window, or absent. This is exactly the "token expired mid-task" case (the
+    // JWT is re-read per request, so a reconnect after expiry lands here). Before
+    // giving up to a 401 that would abort the turn, ask the owning CLI to refresh
+    // (debounced, non-fatal), then re-read once. Skipped inside a full AIME
+    // runtime to preserve the fail-closed identity boundary (we never trigger a
+    // host-identity refresh there — the AIME store is refreshed inside AIME).
+    if (!isFullAimeRuntime(process.env)) {
+      const cmd = resolveJwtRefreshCmd(this.config.jwtRefreshCmd);
+      if (refreshBytecloudJwt(cmd)) {
+        const refreshed = this.readJwtFromBytecloudKeychain();
+        if (refreshed) {
+          logger.info(`[riff] JWT refreshed via ByteCloud CLI and reloaded from keychain`);
+          return refreshed;
+        }
+      }
     }
 
     logger.warn(`[riff] JWT not found in config, env ${envKey}, or ByteCloud keychain; API calls will fail`);
