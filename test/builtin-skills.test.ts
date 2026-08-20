@@ -197,6 +197,7 @@ describe('built-in botmux-bots skill (collaboration roster)', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-bots');
     expect(skill!.content).toContain('--scope team');
     expect(skill!.content).toContain('create-group --team');
+    expect(skill!.content).toContain('bots invite');
     expect(skill!.content).toContain('--agent');
     expect(skill!.content).toContain('specialties');
     expect(skill!.content).toContain('opt-in');
