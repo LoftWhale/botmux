@@ -12839,7 +12839,7 @@ async function cmdBotsInvite(rest: string[]): Promise<void> {
 
   if (!chatArg) {
     console.error('用法: botmux bots invite --chat <chatId> --team <id> --agent <appId>... [--no-owners]');
-    console.error('--chat 必填：目标群 chatId（必须是本团队自己建/拉的协作群，非机器人大厅）。');
+    console.error('--chat 必填：目标群 chatId（须已有平台机器人 BotmuxPlatform + 你本机的 bot 在场，非机器人大厅）。');
     process.exit(1);
   }
   if (appIds.length === 0) {
@@ -12858,10 +12858,13 @@ async function cmdBotsInvite(rest: string[]): Promise<void> {
     else if (res.reason === 'not_deployed') console.error('平台尚未部署补人端点（/v1/machine/groups/:chatId/members）。等平台上线后重试。');
     else if (res.reason === 'rate_limited') console.error(`补人被限流，${rateLimitRetryHint(res)}。`);
     else if (res.reason === 'client' && res.status === 403) {
-      // 403 可能是 chat_not_in_team（目标群不是本团队的群）/ chat_is_hall（大厅不允许补人）/ not_in_team_bots。
+      // 403 分支（平台按 error code 返回）：可行性/归属/opt-in/大厅，各给可操作的提示。
       const which = res.appIds && res.appIds.length ? `（${res.appIds.join('、')}）` : '';
-      const hint = res.error === 'chat_not_in_team' ? '目标群不是本团队的协作群，只能往本团队自己建/拉的群补人'
+      const hint =
+          res.error === 'platform_bot_not_in_chat' ? '平台机器人（BotmuxPlatform）还不在目标群里——请先把它拉进该群，再补人'
+        : res.error === 'requester_bot_not_in_chat' ? '目标群里没有你这台机器的 bot——只能往「已有你自己 bot 在场」的群补人（先让你的 bot 进群）'
         : res.error === 'chat_is_hall' ? '目标群是机器人大厅，不允许往里补人（大厅是 bot-only 身份登记群）'
+        : res.error === 'chat_not_in_team' ? '目标群不是本团队的协作群'
         : `相关 bot${which} 未由其 owner 在平台「管理机器人」加入该团队`;
       console.error(`补人被拒（403 ${res.error}）：${hint}。`);
     } else if (res.reason === 'client' && res.status === 404) {

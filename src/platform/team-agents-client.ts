@@ -115,11 +115,18 @@ function classify(status: number, json: unknown): TeamAgentsFailure {
   }
   if (status === 401 || status === 403) {
     // 403 分型必须**按 error code**，不能「有 error 体就当 client」：
-    //  · 请求对象类（opt-in / 群归属）→ client（请求本身的问题，改参数才有意义）：
-    //    not_in_team_bots（bot 没 opt-in）、chat_not_in_team（目标群不是本团队的）、chat_is_hall（大厅不可补人）。
+    //  · 请求对象类（opt-in / 群资格）→ client（请求本身的问题，改参数/前置动作才有意义）：
+    //    not_in_team_bots（bot 没 opt-in）、chat_is_hall（大厅不可补人）、
+    //    platform_bot_not_in_chat（平台 bot 不在目标群 → 先把平台 bot 拉进群）、
+    //    requester_bot_not_in_chat（群里没有发起方本机的 bot → 不是你在协作的群）。
     //  · 其余 403（如 machine_ownership_mismatch：机器 RETIRED/换绑 owner）是**凭证/归属问题** → forbidden，
-    //    该去 rebind，不是改参数——归 client 会误导用户「确认 bot 已加入团队」。纯 401 / 无 error 体的 403 同理 forbidden。
-    const CLIENT_403 = new Set(['not_in_team_bots', 'chat_not_in_team', 'chat_is_hall', 'not_found']);
+    //    该去 rebind，不是改参数——归 client 会误导排查方向。纯 401 / 无 error 体的 403 同理 forbidden。
+    //  （旧 chat_not_in_team 随 groupChatIds 判据下线，被上面两个 *_not_in_chat 取代。）
+    const CLIENT_403 = new Set([
+      'not_in_team_bots', 'chat_is_hall', 'platform_bot_not_in_chat', 'requester_bot_not_in_chat',
+      'chat_not_in_team', // 兼容：旧端点未升级前仍可能回它
+      'not_found',
+    ]);
     if (status === 403 && hasError && CLIENT_403.has(rawErr as string)) {
       return { ok: false, reason: 'client', status, error, ...(bodyAppIds.length ? { appIds: bodyAppIds } : {}) };
     }

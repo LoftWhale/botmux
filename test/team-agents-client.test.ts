@@ -287,10 +287,17 @@ describe('addTeamGroupMembers（端点4 / B：往现有群补人）', () => {
     expect(calls[0].url).toBe('https://platform.example/v1/machine/groups/oc%2Fweird%20id/members');
   });
 
-  it('403 chat_not_in_team（目标群不是本团队的群）→ client', async () => {
-    const { o } = opts([{ status: 403, json: { error: 'chat_not_in_team' } }]);
+  it('403 platform_bot_not_in_chat（平台 bot 不在目标群）→ client', async () => {
+    const { o } = opts([{ status: 403, json: { error: 'platform_bot_not_in_chat' } }]);
     const r = await addTeamGroupMembers({ chatId: 'oc_x', teamId: 't1', appIds: ['cli_a'] }, o);
-    expect(r).toMatchObject({ ok: false, reason: 'client', status: 403, error: 'chat_not_in_team' });
+    expect(r).toMatchObject({ ok: false, reason: 'client', status: 403, error: 'platform_bot_not_in_chat' });
+    expect(isRetriable(r as any)).toBe(false);
+  });
+
+  it('403 requester_bot_not_in_chat（群里没有发起方本机的 bot）→ client', async () => {
+    const { o } = opts([{ status: 403, json: { error: 'requester_bot_not_in_chat' } }]);
+    const r = await addTeamGroupMembers({ chatId: 'oc_x', teamId: 't1', appIds: ['cli_a'] }, o);
+    expect(r).toMatchObject({ ok: false, reason: 'client', status: 403, error: 'requester_bot_not_in_chat' });
     expect(isRetriable(r as any)).toBe(false);
   });
 
@@ -298,6 +305,18 @@ describe('addTeamGroupMembers（端点4 / B：往现有群补人）', () => {
     const { o } = opts([{ status: 403, json: { error: 'chat_is_hall' } }]);
     const r = await addTeamGroupMembers({ chatId: 'oc_hall', teamId: 't1', appIds: ['cli_a'] }, o);
     expect(r).toMatchObject({ ok: false, reason: 'client', status: 403, error: 'chat_is_hall' });
+  });
+
+  it('403 machine_ownership_mismatch → forbidden（凭证问题，非 client）', async () => {
+    const { o } = opts([{ status: 403, json: { error: 'machine_ownership_mismatch' } }]);
+    const r = await addTeamGroupMembers({ chatId: 'oc_x', teamId: 't1', appIds: ['cli_a'] }, o);
+    expect(r).toMatchObject({ ok: false, reason: 'forbidden', status: 403 });
+  });
+
+  it('403 chat_not_in_team（旧码，端点未升级前兼容）→ 仍 client', async () => {
+    const { o } = opts([{ status: 403, json: { error: 'chat_not_in_team' } }]);
+    const r = await addTeamGroupMembers({ chatId: 'oc_x', teamId: 't1', appIds: ['cli_a'] }, o);
+    expect(r).toMatchObject({ ok: false, reason: 'client', status: 403, error: 'chat_not_in_team' });
   });
 
   it('200 带 invalid* → 如实透传', async () => {
