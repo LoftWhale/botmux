@@ -103,8 +103,10 @@ const CONSUMERS: Record<string, Rule> = {
   'core/dashboard-ipc-server.ts::<module>::closeSession': {
     category: 'user_surface',
     why: 'Close route: serialises the whole result; the closed-row fast path '
-      + 'replays the residual.',
-    count: 4,
+      + 'replays the residual. The goal cleanup-local fan-out counts only ok '
+      + 'closes into the reported total and logs a refused close instead of '
+      + 'flattening it into "closed".',
+    count: 5,
   },
 
   // ── background: no UI, so refusal/residual must be logged ────────────────

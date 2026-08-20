@@ -1195,8 +1195,11 @@ ipcRoute('POST', '/api/goal/:goalChatId/cleanup-local', async (_req, res, params
   let closed = 0;
   for (const ds of targets) {
     try {
-      await closeSession(ds.session.sessionId);
-      closed++;
+      // 消费 close 结果：拒绝关闭（refusal）不能被扁平化成「已关闭」计数，
+      // 否则卡片上报的 closed 数会把残留会话当成清理完成。
+      const r = await closeSession(ds.session.sessionId);
+      if (r.ok) closed++;
+      else logger.warn(`[goal-cleanup-local] close ${ds.session.sessionId} refused: ${JSON.stringify(r)}`);
     } catch (err) {
       logger.warn(`[goal-cleanup-local] close ${ds.session.sessionId} failed: ${err}`);
     }
