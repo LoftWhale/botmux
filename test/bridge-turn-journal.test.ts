@@ -25,6 +25,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   appendBridgeTurnJournalEntry,
+  BridgeRestoreGate,
   clearBridgeTurnJournal,
   readBridgeTurnJournal,
   removeBridgeTurnJournalEntry,
@@ -131,6 +132,46 @@ describe('selectRestorableBridgeTurns', () => {
     ];
     const restorable = selectRestorableBridgeTurns(entries, { currentJsonlPath: '/a.jsonl', nowMs: now });
     expect(restorable.map(e => e.turnId)).toEqual(['older', 'newer']);
+  });
+
+  it('excludes durable turns (dispatchAttempt set) — they self-recover, restoring would double-deliver', () => {
+    // A durable turn has its own cross-restart recovery owner (daemon
+    // queuedActivation* write-ahead + receipt auto-redispatch). Restoring it
+    // from the journal too would post the recovered partial AND the
+    // re-dispatched attempt (same turnId, different lastUuid → daemon dedupe
+    // can't collapse them). The write side no longer journals durable turns;
+    // this guards a journal left behind by a pre-fix build across an upgrade.
+    const entries = [
+      entry({ turnId: 'plain', jsonlPath: '/a.jsonl', markTimeMs: now - 1_000 }),
+      entry({ turnId: 'durable', jsonlPath: '/a.jsonl', markTimeMs: now - 2_000, dispatchAttempt: 1 }),
+    ];
+    const restorable = selectRestorableBridgeTurns(entries, { currentJsonlPath: '/a.jsonl', nowMs: now });
+    expect(restorable.map(e => e.turnId)).toEqual(['plain']);
+  });
+});
+
+describe('BridgeRestoreGate (restore at most once, only on the first baseline)', () => {
+  it('allows restore on the first baseline, refuses every later baseline', () => {
+    const gate = new BridgeRestoreGate();
+    // First baseline of a fresh worker process (daemon restart / crash) — the
+    // one baseline with no competing recovery owner.
+    expect(gate.mayRestoreOnThisBaseline()).toBe(true);
+    // Peeking again without a generation retiring must NOT flip it: an empty
+    // first baseline that never restored still needs to restore if the file
+    // shows up on a lazy re-baseline within the same generation.
+    expect(gate.mayRestoreOnThisBaseline()).toBe(true);
+  });
+
+  it('disarms after a CLI generation is retired (in-worker restart)', () => {
+    const gate = new BridgeRestoreGate();
+    // A watcher teardown ends the first CLI generation. Every baseline after
+    // this is an in-worker restart whose carryover already re-delivers the
+    // interrupted turn — restoring again would double-deliver.
+    gate.markGenerationRetired();
+    expect(gate.mayRestoreOnThisBaseline()).toBe(false);
+    // Idempotent + terminal: further retirements keep it disarmed.
+    gate.markGenerationRetired();
+    expect(gate.mayRestoreOnThisBaseline()).toBe(false);
   });
 });
 

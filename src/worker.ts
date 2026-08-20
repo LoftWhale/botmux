@@ -111,6 +111,7 @@ import {
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
 import {
   appendBridgeTurnJournalEntry,
+  BridgeRestoreGate,
   clearBridgeTurnJournal,
   readBridgeTurnJournal,
   removeBridgeTurnJournalEntry,
@@ -4058,6 +4059,19 @@ const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue();
+/** Journal-restore of interrupted Lark turns is allowed AT MOST ONCE per worker
+ *  process, and only on the FIRST baseline this process runs. Rationale: the
+ *  journal exists to recover a turn that a *cross-process* death (daemon
+ *  restart / worker crash) orphaned — there the whole worker is new and no
+ *  other recovery owner survives. An *in-worker* CLI restart (crash-respawn,
+ *  cwd-move, durable lease expiry) keeps this process alive, so its
+ *  InflightInputTracker carryover already re-delivers the interrupted plain-IM
+ *  input (a full fresh answer) — letting the journal ALSO restore that turn
+ *  would post the recovered partial AND the fresh answer (same turnId, different
+ *  lastUuid → daemon dedupe can't collapse them). Armed on every watcher
+ *  teardown so restore is confined to the one baseline with no competing
+ *  recovery owner. */
+const bridgeRestoreGate = new BridgeRestoreGate();
 /** uuids of structured transcript rate-limit records already turned into a
  *  `limited` emit. Readers may re-read from offset 0 after rotation, so the
  *  stable record uuid keeps the notification idempotent. */
@@ -4488,6 +4502,12 @@ function bridgeAbsorbBaseline(): void {
  *      persist across restarts, so an answer the model already `botmux
  *      send`-ed before the kill stays suppressed. */
 function tryRestoreInterruptedBridgeTurns(): boolean {
+  // At-most-once, and only on this worker process's FIRST bridge baseline. Any
+  // baseline that runs after a watcher teardown is an in-worker CLI restart
+  // whose InflightInputTracker carryover already re-delivers the interrupted
+  // turn — restoring here too would double-deliver (see bridgeRestoreGate,
+  // armed in stopBridgeWatcher).
+  if (!bridgeRestoreGate.mayRestoreOnThisBaseline()) return false;
   const journalPath = bridgeTurnJournalFilePath();
   if (!journalPath || !bridgeJsonlPath) return false;
   const entries = readBridgeTurnJournal(journalPath);
@@ -5289,6 +5309,12 @@ function stopBridgeWatcher(): void {
   // A fresh backend must not inherit a terminal/fingerprint from the exited
   // process; durable replay is owned by the receiver with a new attempt.
   bridgeQueue.clearPending();
+  // A watcher teardown means this worker process has now had at least one CLI
+  // generation, so any FUTURE baseline is an in-worker restart — never the
+  // first-baseline cross-process recovery the journal is for. Disarm journal
+  // restore: the restart's InflightInputTracker carryover already re-delivers
+  // the interrupted turn, and restoring on top would double-deliver.
+  bridgeRestoreGate.markGenerationRetired();
   bridgePreambleSent = false;
 }
 
@@ -5356,10 +5382,17 @@ function bridgeMarkPendingTurn(
   const markTimeMs = Date.now();
   bridgeQueue.mark(turnId, fingerprint, markTimeMs, contentNormalized, dispatchAttempt);
   // Journal the mark so a worker/daemon restart mid-turn can restore it
-  // (bridgeAbsorbBaseline). Adopt mode is excluded: its baseline absorbs the
-  // whole transcript with different semantics, and adopt drain never
-  // suppresses — restore marks would double-attribute.
-  if (!lastInitConfig?.adoptMode && bridgeJsonlPath) {
+  // (bridgeAbsorbBaseline). Excluded:
+  //   - adopt mode: its baseline absorbs the whole transcript with different
+  //     semantics and never suppresses — restore marks would double-attribute;
+  //   - durable turns (dispatchAttempt !== undefined): a durable delivery has
+  //     its OWN cross-restart recovery owner (the daemon's persisted
+  //     queuedActivation* write-ahead + receipt auto-redispatch), so a journal
+  //     restore is always redundant for it and — because the recovered partial
+  //     and the re-dispatched attempt carry the same turnId but different
+  //     lastUuid — would double-deliver. Only PLAIN Lark IM turns (no other
+  //     recovery owner) actually need the journal.
+  if (!lastInitConfig?.adoptMode && bridgeJsonlPath && dispatchAttempt === undefined) {
     journalBridgeTurnMark({
       turnId,
       dispatchAttempt,

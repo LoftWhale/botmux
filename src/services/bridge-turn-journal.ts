@@ -137,6 +137,50 @@ export function selectRestorableBridgeTurns(
   const maxAgeMs = opts.maxAgeMs ?? BRIDGE_TURN_RESTORE_MAX_AGE_MS;
   return entries
     .filter(entry => entry.jsonlPath === opts.currentJsonlPath
-      && nowMs - entry.markTimeMs <= maxAgeMs)
+      && nowMs - entry.markTimeMs <= maxAgeMs
+      // Only PLAIN Lark IM turns are restorable. Durable turns
+      // (dispatchAttempt set) have their own cross-restart recovery owner (the
+      // daemon's persisted queuedActivation* write-ahead + receipt
+      // auto-redispatch); restoring one from the journal would double-deliver
+      // (recovered partial + re-dispatched attempt share a turnId but carry
+      // different lastUuids, so the daemon dedupe can't collapse them). The
+      // write side already skips journaling them; this is belt-and-braces for a
+      // journal file left behind by a pre-fix build across an upgrade.
+      && entry.dispatchAttempt === undefined)
     .sort((a, b) => a.markTimeMs - b.markTimeMs);
+}
+
+/**
+ * One-shot latch that confines journal restore to a worker process's FIRST
+ * bridge baseline. Extracted from worker.ts (like InflightInputTracker) so the
+ * "restore at most once, only on the first baseline" rule is unit-testable.
+ *
+ * Why it exists: the journal recovers a plain-IM turn orphaned by a
+ * CROSS-process death (daemon restart / worker crash) — there the whole worker
+ * is new and no other recovery owner survives. But an IN-worker CLI restart
+ * (crash-respawn / cwd-move / durable lease expiry) keeps the process alive, so
+ * its InflightInputTracker carryover ALREADY re-delivers the interrupted plain
+ * IM input as a full fresh answer. If the journal ALSO restored that turn on the
+ * post-restart baseline, the recovered partial and the fresh answer — same
+ * turnId, different lastUuid — would both reach Lark (the daemon dedupe can't
+ * collapse them). The worker arms this latch on every watcher teardown, so only
+ * the first baseline (the one with no competing recovery owner) may restore.
+ */
+export class BridgeRestoreGate {
+  private consumed = false;
+
+  /** True only on the first call after construction — the process's first
+   *  baseline. Every later call (a post-restart baseline) returns false. Does
+   *  NOT itself consume the latch: an empty-journal first baseline must still
+   *  arm it via markGenerationRetired so a later restart can't restore. */
+  mayRestoreOnThisBaseline(): boolean {
+    return !this.consumed;
+  }
+
+  /** Arm the latch: a CLI generation has ended (watcher torn down), so any
+   *  future baseline is an in-worker restart, never first-baseline recovery.
+   *  Idempotent. */
+  markGenerationRetired(): void {
+    this.consumed = true;
+  }
 }
