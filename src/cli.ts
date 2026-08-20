@@ -11988,7 +11988,7 @@ async function runAddTeamGroupMembers(a: {
   if (!res.ok) {
     if (res.reason === 'unbound') console.error('本机未绑定平台。补人需要先 botmux bind。');
     else if (res.reason === 'not_deployed') console.error('平台尚未部署补人端点（/v1/machine/groups/:chatId/members）。等平台上线后重试。');
-    else if (res.reason === 'rate_limited') console.error('补人被限流（同机 30s 一次），请稍后重试。');
+    else if (res.reason === 'rate_limited') console.error('补人被限流，请稍后重试。');
     else if (res.reason === 'client' && res.status === 403) {
       // 403 可能是 chat_not_in_team（目标群不是本团队的群）/ chat_is_hall（大厅不允许补人）/ not_in_team_bots。
       const which = res.appIds && res.appIds.length ? `（${res.appIds.join('、')}）` : '';
@@ -12004,16 +12004,18 @@ async function runAddTeamGroupMembers(a: {
     process.exit(1);
   }
 
-  const { added, invalidBotIds, invalidOwnerUnionIds } = res.value;
+  const { invalidBotIds, invalidOwnerUnionIds } = res.value;
   // stdout 单行 chatId（与建群一致：调用方拿到即可复用该群）。
   console.log(a.chatId);
+  const hasInvalid = invalidBotIds.length > 0 || invalidOwnerUnionIds.length > 0;
   if (a.jsonStatus) {
-    console.log(JSON.stringify({ ok: true, chatId: a.chatId, added, invalidBotIds, invalidOwnerUnionIds, teamId: a.teamId }));
+    console.log(JSON.stringify({ ok: true, chatId: a.chatId, invalidBotIds, invalidOwnerUnionIds, teamId: a.teamId }));
   }
-  if (added.length > 0) console.error(`✅ 已加入群：${added.join('、')}`);
+  // 补人幂等（已在群内视作成功）；平台 200 不列「实际加了谁」，成功即 invalid* 为空。
+  if (!hasInvalid) console.error('✅ 补人成功（选中的 agent 及其 owner 均已在群内或已加入）。');
   if (invalidBotIds.length > 0) console.error(`⚠️ 以下 agent 未加入团队或补入失败：${invalidBotIds.join('、')}`);
   if (invalidOwnerUnionIds.length > 0) console.error(`⚠️ 以下 owner 未能补入：${invalidOwnerUnionIds.join('、')}`);
-  if (invalidBotIds.length > 0 || invalidOwnerUnionIds.length > 0) process.exitCode = 1;
+  if (hasInvalid) process.exitCode = 1;
 }
 
 // ─── Bots subcommand ─────────────────────────────────────────────────────────

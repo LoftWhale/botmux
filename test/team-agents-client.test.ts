@@ -251,7 +251,7 @@ describe('addTeamGroupMembers（端点4 / B：往现有群补人）', () => {
   it('POST 到 /groups/:chatId/members，body 带 teamId+appIds，默认不含 includeOwners', async () => {
     const { o, calls } = opts([{ status: 200, json: { ok: true, chatId: 'oc_1', invalidBotIds: [], invalidOwnerUnionIds: [] } }]);
     const r = await addTeamGroupMembers({ chatId: 'oc_1', teamId: 't1', appIds: ['cli_a', 'cli_b'] }, o);
-    expect(r).toEqual({ ok: true, value: { ok: true, added: [], invalidBotIds: [], invalidOwnerUnionIds: [] } });
+    expect(r).toEqual({ ok: true, value: { ok: true, invalidBotIds: [], invalidOwnerUnionIds: [] } });
     expect(calls[0].method).toBe('POST');
     expect(calls[0].url).toBe('https://platform.example/v1/machine/groups/oc_1/members');
     expect(calls[0].body).toEqual({ teamId: 't1', appIds: ['cli_a', 'cli_b'] });

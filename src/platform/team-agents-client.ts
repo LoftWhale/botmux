@@ -57,10 +57,11 @@ export interface CreateTeamGroupResult {
   invalidOwnerUnionIds: string[];
 }
 
-/** 端点4（B：往已存在的团队群补人）结果。对齐端点3 的 invalid* 语义，另带 added（实际加入的 appId）。 */
+/** 端点4（B：往已存在的团队群补人）结果。对齐端点3 的 invalid* 语义：invalidBotIds /
+ *  invalidOwnerUnionIds 是平台过滤掉的对象（未 opt-in / 拉不动）。平台 200 体不返回「实际
+ *  加了哪些」——补人是幂等的（已在群内视作成功），成功即以 invalid* 为空表达，不单列 added。 */
 export interface AddTeamGroupMembersResult {
   ok: boolean;
-  added: string[];
   invalidBotIds: string[];
   invalidOwnerUnionIds: string[];
 }
@@ -290,7 +291,6 @@ export function addTeamGroupMembers(
     body,
     (j) => ({
       ok: j?.ok === true,
-      added: strList(j?.added),
       invalidBotIds: strList(j?.invalidBotIds),
       invalidOwnerUnionIds: strList(j?.invalidOwnerUnionIds),
     }),
