@@ -349,7 +349,9 @@ async function routeGoalParentCardDecisionAcrossDaemons(
     const ctrl = new AbortController();
     const tt = setTimeout(() => ctrl.abort(), 3_000);
     try {
-      const res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/goal/route-parent-reply`, {
+      // Trusted-host HMAC required: the daemon IPC server runs authRequired and
+      // this route is not on the narrow capability allowlist — a bare fetch 401s.
+      const res = await fetchDaemonIpc(daemon.ipcPort, '/api/goal/route-parent-reply', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -2037,8 +2039,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const ctrl = new AbortController();
       const tt = setTimeout(() => ctrl.abort(), 5_000);
       try {
-        const r = await fetch(
-          `http://127.0.0.1:${d.ipcPort}/api/goal/${encodeURIComponent(goalChatId)}/cleanup-local`,
+        // Same trusted-host HMAC requirement as routeGoalParentCardDecision…:
+        // cleanup-local is a token-gated IPC route, a bare fetch would 401.
+        const r = await fetchDaemonIpc(
+          d.ipcPort,
+          `/api/goal/${encodeURIComponent(goalChatId)}/cleanup-local`,
           { method: 'POST', signal: ctrl.signal },
         );
         const body = await r.json().catch(() => null) as { closed?: number } | null;
