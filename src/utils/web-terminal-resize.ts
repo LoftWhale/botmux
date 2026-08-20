@@ -1,10 +1,4 @@
-import {
-  MAX_RENDER_COLS,
-  MAX_RENDER_ROWS,
-  MIN_RENDER_COLS,
-  MIN_RENDER_ROWS,
-  clamp,
-} from './render-dimensions.js';
+import { MAX_RENDER_COLS, MAX_RENDER_ROWS } from './render-dimensions.js';
 
 export const WEB_TERMINAL_RESIZE_MIN_INTERVAL_MS = 75;
 
@@ -31,9 +25,13 @@ export function resolveWebTerminalResize(input: {
   ) {
     return null;
   }
+  // Cap only the UPPER bound (snapshot/PNG memory protection). Do NOT raise
+  // small grids to MIN_RENDER_*: those minimums exist for screenshot canvases,
+  // while a phone-width owner viewport legitimately fits fewer than 80 cols —
+  // inflating it desyncs the PTY grid from the xterm grid and garbles TUIs.
   return {
-    cols: clamp(cols, MIN_RENDER_COLS, MAX_RENDER_COLS),
-    rows: clamp(rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS),
+    cols: Math.min(cols, MAX_RENDER_COLS),
+    rows: Math.min(rows, MAX_RENDER_ROWS),
     acceptedAt: input.now,
   };
 }

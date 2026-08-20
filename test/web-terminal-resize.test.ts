@@ -30,6 +30,18 @@ describe('resolveWebTerminalResize', () => {
     ).toMatchObject({ cols: 320, rows: 100, acceptedAt: 1_000 });
   });
 
+  it('passes a small phone-width grid through unchanged (no minimum inflation)', () => {
+    expect(
+      resolveWebTerminalResize({
+        hasWrite: true,
+        cols: 45,
+        rows: 20,
+        now: 1_000,
+        lastAcceptedAt: null,
+      }),
+    ).toMatchObject({ cols: 45, rows: 20, acceptedAt: 1_000 });
+  });
+
   it('rejects malformed and over-frequent authorized resizes', () => {
     expect(
       resolveWebTerminalResize({
