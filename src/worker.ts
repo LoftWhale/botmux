@@ -12030,17 +12030,23 @@ async function spawnCli(
     const chatBotDiscovery = resolveChatBotDiscoveryConfig();
     sessionEnv.BOTMUX_LARK_LIST_BOTS_API_ENABLED = chatBotDiscovery.listBotsApiEnabled ? 'true' : 'false';
     sessionEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
-    // Inject the resolved workflow kill-switch so a pane's `botmux workflow …`
-    // subcommand agrees with the daemon that spawned it, independent of stale
-    // rcfile/tmux env (mirrors the chatBotDiscovery injection above).
-    sessionEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
     // Per-bot env (bots.json `env`) takes precedence over session context;
-    // explicit riff config.env takes precedence over both.
+    // explicit riff config.env takes precedence over both. The workflow
+    // kill-switch is a host-resolved snapshot and is re-frozen AFTER this merge
+    // (see below), so it is intentionally NOT set in sessionEnv here.
     const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...riffCfg.env };
     // The effective policy is a host-resolved snapshot, not a user-overridable
     // backend env knob. Re-freeze it after config.env/per-bot env merge.
     if (cfg.feedback) mergedEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
     else delete mergedEnv.BOTMUX_FEEDBACK_POLICY;
+    // The workflow kill-switch is likewise a host-resolved snapshot. Re-freeze it
+    // AFTER the merge: unlike per-bot `env` (sanitizePerBotEnv strips the BOTMUX*
+    // prefix), `riffCfg.env` merges LAST and is NOT sanitized, so a stale or
+    // user-shaped backendConfig.env could otherwise flip the pane's
+    // BOTMUX_WORKFLOW_ENABLED and desync the remote CLI-side gate from the
+    // daemon's authoritative decision. The daemon-side gate is unaffected either
+    // way; this keeps the in-pane defense-in-depth honest on the riff path too.
+    mergedEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
     // Re-freeze the no-transport capability keys AFTER the merge: a stale or
     // attacker-shaped backendConfig.env / per-bot env merges LAST and would
     // otherwise override the frozen values, restoring send capability for a
