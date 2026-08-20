@@ -17,8 +17,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  *
  * These assert the env object each child actually receives.
  */
-const childProcess = vi.hoisted(() => ({ spawn: vi.fn() }));
-vi.mock('node:child_process', () => ({ spawn: childProcess.spawn }));
+const childProcess = vi.hoisted(() => ({ spawn: vi.fn(), execFile: vi.fn() }));
+// core/log-rotation.ts 在 import 期 promisify(execFile)，mock 需保留该导出且必须是
+// 函数（promisify 对 undefined 会直接抛）；本套件的断言只关心 spawn 调用，
+// execFile 桩在这里永远不会被调用。
+vi.mock('node:child_process', () => ({ spawn: childProcess.spawn, execFile: childProcess.execFile }));
 
 function fakeChild(exit: { code?: number; stdout?: string } = {}) {
   const child: any = new EventEmitter();

@@ -154,7 +154,11 @@ describe('a real process with the guard survives an unhandled rejection', () => 
 
 describe('daemon wiring', () => {
   const daemonSrc = (): string =>
-    execFileSync('cat', [join(import.meta.dirname, '../src/daemon.ts')], { encoding: 'utf-8' });
+    execFileSync('cat', [join(import.meta.dirname, '../src/daemon.ts')], {
+      encoding: 'utf-8',
+      // daemon.ts 已超过 execFileSync 默认 1MB maxBuffer，读满会 ENOBUFS
+      maxBuffer: 64 * 1024 * 1024,
+    });
 
   it('installs the guard inside startDaemon, not only in one entry file', () => {
     // startDaemon has TWO callers (index-daemon.ts and index-core-only.ts), so
