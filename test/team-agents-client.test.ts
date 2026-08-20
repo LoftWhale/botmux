@@ -10,6 +10,7 @@ import {
   addTeamGroupMembers,
   isRetriable,
   describeTeamAgentsFailure,
+  rateLimitRetryHint,
   type TeamAgentsClientOptions,
 } from '../src/platform/team-agents-client.js';
 
@@ -211,6 +212,23 @@ describe('createTeamGroup（端点3）', () => {
     const r = await createTeamGroup({ teamId: 't1', appIds: ['cli_a'] }, o);
     expect(r).toMatchObject({ ok: false, reason: 'rate_limited', status: 429 });
     expect(isRetriable(r as any)).toBe(true);
+  });
+
+  it('429 带 retryAfterMs → 解析进 failure，rateLimitRetryHint 用它给秒数', async () => {
+    const { o } = opts([{ status: 429, json: { error: 'rate_limited', retryAfterMs: 12000 } }]);
+    const r = await createTeamGroup({ teamId: 't1', appIds: ['cli_a'] }, o);
+    expect(r).toMatchObject({ ok: false, reason: 'rate_limited', retryAfterMs: 12000 });
+    if (r.ok) return;
+    if (r.reason !== 'rate_limited') return;
+    expect(rateLimitRetryHint(r)).toContain('12 秒');
+  });
+
+  it('429 无 retryAfterMs → hint 回落中性文案（不写死 30s）', async () => {
+    const { o } = opts([{ status: 429, json: { error: 'rate_limited' } }]);
+    const r = await createTeamGroup({ teamId: 't1', appIds: ['cli_a'] }, o);
+    if (r.ok || r.reason !== 'rate_limited') { expect.fail('expected rate_limited'); return; }
+    expect(r.retryAfterMs).toBeUndefined();
+    expect(rateLimitRetryHint(r)).toBe('请稍后重试');
   });
 
   it('分型只看当次 status：一个非 opt-in 请求也可能拿 429（不是恒定 403）', async () => {

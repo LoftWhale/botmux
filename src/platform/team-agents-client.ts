@@ -18,7 +18,7 @@
  *    的正常含义是「同团队里还没有别人 opt-in」，不是错误。
  *
  * 错误分型沿用 issue-client 的口径（network 可重试 / forbidden 停手 / client 4xx 请求本身
- * 有问题 / server 5xx 退避），额外把端点3 的 429 `rate_limited`（同机 30s 一次）单列出来，
+ * 有问题 / server 5xx 退避），额外把建群/补人共用的 429 `rate_limited` 单列出来，
  * 让 CLI 能给出「稍后再试」而不是当成永久失败。
  */
 import { getJson, postJson } from './platform-http.js';
@@ -69,8 +69,10 @@ export interface AddTeamGroupMembersResult {
 export type TeamAgentsFailure =
   | { ok: false; reason: 'unbound' }
   | { ok: false; reason: 'network'; error: string }
-  /** 端点3 专有：429，同机 30s 一次的限流。稍后重试即可，别当永久失败。 */
-  | { ok: false; reason: 'rate_limited'; status: number; error: string }
+  /** 429：建群/补人共用同一个限流器（同机 30s 窗）。多 pod 下限流表是进程内 per-pod Map，
+   *  全局实际速率 ≈ N_pod × (1/30s)，所以不保证精确 30s——退避读平台带回的 `retryAfterMs`
+   *  更诚实（多 pod 下真实等待本就不确定）。稍后重试即可，别当永久失败。 */
+  | { ok: false; reason: 'rate_limited'; status: number; error: string; retryAfterMs?: number }
   | { ok: false; reason: 'forbidden'; status: number; error: string }
   /** 404 + 非 JSON/无 error 体：平台框架级路由兜底（apex 的 text/plain "not found"），
    *  = 端点2/3 还没部署到本机绑定的平台。与「非成员/团队不存在」的**业务 404**
@@ -105,7 +107,12 @@ function classify(status: number, json: unknown): TeamAgentsFailure {
   const error = hasError ? rawErr : `http_${status}`;
   // 平台在部分 403（如 not_in_team_bots）体里带回被拒的具体 agent appIds，透出以便精准提示。
   const bodyAppIds = strList((json as { appIds?: unknown })?.appIds);
-  if (status === 429) return { ok: false, reason: 'rate_limited', status, error };
+  if (status === 429) {
+    // 429 体带 retryAfterMs（建群/补人都带）→ 读它做退避，别写死 30s（多 pod 下真实等待不确定）。
+    const ra = (json as { retryAfterMs?: unknown })?.retryAfterMs;
+    const retryAfterMs = typeof ra === 'number' && Number.isFinite(ra) && ra >= 0 ? ra : undefined;
+    return { ok: false, reason: 'rate_limited', status, error, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) };
+  }
   if (status === 401 || status === 403) {
     // 403 分型必须**按 error code**，不能「有 error 体就当 client」：
     //  · 请求对象类（opt-in / 群归属）→ client（请求本身的问题，改参数才有意义）：
@@ -249,7 +256,7 @@ export function fetchTeamAgents(
  * 这里全靠 appId 走 machine-auth，不依赖任何飞书 @。
  *
  * 平台会把未 opt-in / 拉不动的对象放进 invalidBotIds / invalidOwnerUnionIds 原样带回；
- * 429 rate_limited（同机 30s 一次）单独分型，让上层提示稍后再试。
+ * 429 rate_limited（建群/补人共用限流器）单独分型，让上层读 retryAfterMs 退避、提示稍后再试。
  */
 export function createTeamGroup(
   args: { teamId: string; appIds: string[]; name?: string },
@@ -302,12 +309,21 @@ export function isRetriable(f: TeamAgentsFailure): boolean {
   return f.reason === 'network' || f.reason === 'rate_limited' || (f.reason === 'server' && f.status >= 500);
 }
 
+/** 429 的重试提示：优先用平台带回的 retryAfterMs（多 pod 下比写死 30s 诚实），否则中性文案。 */
+export function rateLimitRetryHint(f: Extract<TeamAgentsFailure, { reason: 'rate_limited' }>): string {
+  if (f.retryAfterMs !== undefined) {
+    const sec = Math.ceil(f.retryAfterMs / 1000);
+    return `请约 ${sec} 秒后重试`;
+  }
+  return '请稍后重试';
+}
+
 /** 把一次失败转成给人看的一句话（CLI 直接打印）。unbound 由调用方单独提示（要引导 bind）。 */
 export function describeTeamAgentsFailure(f: TeamAgentsFailure): string {
   switch (f.reason) {
     case 'unbound': return '本机未绑定平台';
     case 'network': return `网络错误：${f.error}（稍后重试）`;
-    case 'rate_limited': return '被限流（同机 30s 一次），请稍后重试';
+    case 'rate_limited': return `被限流，${rateLimitRetryHint(f)}`;
     case 'forbidden': return `凭证失效或无权限（${f.status} ${f.error}），可能需要重新 botmux bind`;
     case 'not_deployed': return '平台尚未部署团队 agent 端点（/v1/machine/agents|groups），请等平台上线后重试';
     case 'client': return `请求被拒（${f.status} ${f.error}）`;

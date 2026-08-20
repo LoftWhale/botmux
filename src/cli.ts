@@ -11883,7 +11883,7 @@ botmux create-group — 用一组机器人新建飞书群
  * 但 stdout 的 chatId 已经可用（群已建，别重建）。
  */
 async function cmdCreateGroupTeam(rest: string[]): Promise<void> {
-  const { fetchTeamAgents, fetchTeams, createTeamGroup, addTeamGroupMembers, describeTeamAgentsFailure } =
+  const { fetchTeamAgents, fetchTeams, createTeamGroup, addTeamGroupMembers, describeTeamAgentsFailure, rateLimitRetryHint } =
     await import('./platform/team-agents-client.js');
   const jsonStatus = rest.includes('--json-status');
   const name = argValue(rest, '--name');
@@ -11920,7 +11920,7 @@ async function cmdCreateGroupTeam(rest: string[]): Promise<void> {
   if (chatArg !== undefined) {
     if (!chatArg.trim()) { console.error('--chat 不能为空（传目标群 chatId）。'); process.exit(1); }
     await runAddTeamGroupMembers({
-      addTeamGroupMembers, describeTeamAgentsFailure,
+      addTeamGroupMembers, describeTeamAgentsFailure, rateLimitRetryHint,
       chatId: chatArg.trim(), teamId, appIds, jsonStatus,
       includeOwners: includeOwnersFalse ? false : undefined,
     });
@@ -11931,7 +11931,7 @@ async function cmdCreateGroupTeam(rest: string[]): Promise<void> {
   if (!res.ok) {
     if (res.reason === 'unbound') console.error('本机未绑定平台。拉群需要先 botmux bind。');
     else if (res.reason === 'not_deployed') console.error('平台尚未部署拉群端点（/v1/machine/groups）。等平台上线后重试。');
-    else if (res.reason === 'rate_limited') console.error('拉群被限流（同机 30s 一次），请稍后重试。');
+    else if (res.reason === 'rate_limited') console.error(`拉群被限流，${rateLimitRetryHint(res)}。`);
     else if (res.reason === 'client' && res.status === 403) {
       // 403 not_in_team_bots：所选 agent（或本机 bot）没 opt-in 进团队。平台可能带回具体 appIds。
       const which = res.appIds && res.appIds.length ? `：${res.appIds.join('、')}` : '';
@@ -11979,6 +11979,7 @@ async function cmdCreateGroupTeam(rest: string[]): Promise<void> {
 async function runAddTeamGroupMembers(a: {
   addTeamGroupMembers: typeof import('./platform/team-agents-client.js').addTeamGroupMembers;
   describeTeamAgentsFailure: typeof import('./platform/team-agents-client.js').describeTeamAgentsFailure;
+  rateLimitRetryHint: typeof import('./platform/team-agents-client.js').rateLimitRetryHint;
   chatId: string; teamId: string; appIds: string[]; jsonStatus: boolean; includeOwners?: boolean;
 }): Promise<void> {
   const res = await a.addTeamGroupMembers({
@@ -11988,7 +11989,7 @@ async function runAddTeamGroupMembers(a: {
   if (!res.ok) {
     if (res.reason === 'unbound') console.error('本机未绑定平台。补人需要先 botmux bind。');
     else if (res.reason === 'not_deployed') console.error('平台尚未部署补人端点（/v1/machine/groups/:chatId/members）。等平台上线后重试。');
-    else if (res.reason === 'rate_limited') console.error('补人被限流，请稍后重试。');
+    else if (res.reason === 'rate_limited') console.error(`补人被限流，${a.rateLimitRetryHint(res)}。`);
     else if (res.reason === 'client' && res.status === 403) {
       // 403 可能是 chat_not_in_team（目标群不是本团队的群）/ chat_is_hall（大厅不允许补人）/ not_in_team_bots。
       const which = res.appIds && res.appIds.length ? `（${res.appIds.join('、')}）` : '';
