@@ -57,6 +57,14 @@ export interface CreateTeamGroupResult {
   invalidOwnerUnionIds: string[];
 }
 
+/** 端点4（B：往已存在的团队群补人）结果。对齐端点3 的 invalid* 语义，另带 added（实际加入的 appId）。 */
+export interface AddTeamGroupMembersResult {
+  ok: boolean;
+  added: string[];
+  invalidBotIds: string[];
+  invalidOwnerUnionIds: string[];
+}
+
 export type TeamAgentsFailure =
   | { ok: false; reason: 'unbound' }
   | { ok: false; reason: 'network'; error: string }
@@ -68,8 +76,10 @@ export type TeamAgentsFailure =
    *  （JSON `{error:'not_found'}`）区分开——后者归 client。判据：业务 404 一定带
    *  可解析的 `.error`，路由缺失兜底不带（平台契约明确、稳定）。 */
   | { ok: false; reason: 'not_deployed'; status: number }
-  /** 其余 4xx（400 invalid / 403 not_in_team_bots / 404 not_found 业务态）：请求本身的问题。 */
-  | { ok: false; reason: 'client'; status: number; error: string }
+  /** 其余 4xx（400 invalid / 403 not_in_team_bots|chat_not_in_team|chat_is_hall / 404 not_found 业务态）：
+   *  请求本身的问题。`appIds` 是平台在 403 体里带回的「被拒的具体 agent」（如 not_in_team_bots），
+   *  透出后提示能精准到 agent；无则 undefined。 */
+  | { ok: false; reason: 'client'; status: number; error: string; appIds?: string[] }
   | { ok: false; reason: 'server'; status: number; error: string };
 
 export type TeamAgentsClientResult<T> = { ok: true; value: T } | TeamAgentsFailure;
@@ -92,15 +102,19 @@ function classify(status: number, json: unknown): TeamAgentsFailure {
   const rawErr = (json as { error?: unknown })?.error;
   const hasError = typeof rawErr === 'string' && rawErr.length > 0;
   const error = hasError ? rawErr : `http_${status}`;
+  // 平台在部分 403（如 not_in_team_bots）体里带回被拒的具体 agent appIds，透出以便精准提示。
+  const bodyAppIds = strList((json as { appIds?: unknown })?.appIds);
   if (status === 429) return { ok: false, reason: 'rate_limited', status, error };
   if (status === 401 || status === 403) {
-    // 403 not_in_team_bots 是「这个 bot 没 opt-in 进团队」——语义上是请求对象不对，不是凭证失效，
-    // 归 client（请求本身的问题）；只有纯 401 / 无 error 体的 403 当 forbidden（凭证/归属问题，停手）。
-    // ⚠️ 不要据此假设「非法请求永远拿 403、不会撞 429」：平台端点3 的检查顺序是
-    // 404(成员) → 429(限流) → 403(opt-in)，且限流器只在真正建群那步 arm。所以一个**合法**
-    // 建群请求 arm 了 30s 窗后，紧接着的非 opt-in 请求会先撞 429、而非 403。分型按**当次
-    // status** 判即可（本函数就是这么做的），别把「同参数重发结果恒定」写进任何调用方逻辑。
-    if (status === 403 && hasError) return { ok: false, reason: 'client', status, error };
+    // 403 分型必须**按 error code**，不能「有 error 体就当 client」：
+    //  · 请求对象类（opt-in / 群归属）→ client（请求本身的问题，改参数才有意义）：
+    //    not_in_team_bots（bot 没 opt-in）、chat_not_in_team（目标群不是本团队的）、chat_is_hall（大厅不可补人）。
+    //  · 其余 403（如 machine_ownership_mismatch：机器 RETIRED/换绑 owner）是**凭证/归属问题** → forbidden，
+    //    该去 rebind，不是改参数——归 client 会误导用户「确认 bot 已加入团队」。纯 401 / 无 error 体的 403 同理 forbidden。
+    const CLIENT_403 = new Set(['not_in_team_bots', 'chat_not_in_team', 'chat_is_hall', 'not_found']);
+    if (status === 403 && hasError && CLIENT_403.has(rawErr as string)) {
+      return { ok: false, reason: 'client', status, error, ...(bodyAppIds.length ? { appIds: bodyAppIds } : {}) };
+    }
     return { ok: false, reason: 'forbidden', status, error };
   }
   // 404 的两义性（平台契约明确、稳定）：
@@ -109,7 +123,9 @@ function classify(status: number, json: unknown): TeamAgentsFailure {
   //  · 框架路由缺失兜底（apex 的 text/plain "not found"，端点未部署）→ 无可解析 error → not_deployed。
   // getJson/postJson 对非 JSON 响应返回 {}，故「404 且无 .error」即路由未上线，不能误报成业务 404。
   if (status === 404 && !hasError) return { ok: false, reason: 'not_deployed', status };
-  if (status >= 400 && status < 500) return { ok: false, reason: 'client', status, error };
+  if (status >= 400 && status < 500) {
+    return { ok: false, reason: 'client', status, error, ...(bodyAppIds.length ? { appIds: bodyAppIds } : {}) };
+  }
   return { ok: false, reason: 'server', status, error };
 }
 
@@ -247,6 +263,38 @@ export function createTeamGroup(
     invalidBotIds: strList(j?.invalidBotIds),
     invalidOwnerUnionIds: strList(j?.invalidOwnerUnionIds),
   }));
+}
+
+/**
+ * 端点4（B）：往一个**已存在的团队群** `chatId` 补人——把 `appIds` 指定的 agent
+ * （+ 默认各自 owner）加进去。与端点3（建新群）互补：这条服务「群已经在了、往里加同 team
+ * 别人的 agent」的场景。
+ *
+ * 平台侧授权（客户端零判断，只透传）：① 调用者是 teamId 成员（否则 404）；② chatId 必须是
+ * 该 team 自己的协作群（∈ groupChatIds，且**排除机器人大厅**）——否则 403 `chat_not_in_team`
+ * / `chat_is_hall`，杜绝拿任意 chatId 往别人群塞人；③ opt-in 闸同 team.bots。
+ *
+ * `includeOwners` 默认 true（对齐端点3「bot 不进没主人的群」）；只加**被加 bot 各自的 owner**
+ * （都是 team 成员、同信任域），绝不加任意真人。传 false 则只补 bot、不动人。
+ */
+export function addTeamGroupMembers(
+  args: { chatId: string; teamId: string; appIds: string[]; includeOwners?: boolean },
+  opts: TeamAgentsClientOptions = {},
+): Promise<TeamAgentsClientResult<AddTeamGroupMembersResult>> {
+  const body: Record<string, unknown> = { teamId: args.teamId, appIds: args.appIds };
+  if (args.includeOwners !== undefined) body.includeOwners = args.includeOwners;
+  return call(
+    opts,
+    'POST',
+    `/v1/machine/groups/${encodeURIComponent(args.chatId)}/members`,
+    body,
+    (j) => ({
+      ok: j?.ok === true,
+      added: strList(j?.added),
+      invalidBotIds: strList(j?.invalidBotIds),
+      invalidOwnerUnionIds: strList(j?.invalidOwnerUnionIds),
+    }),
+  );
 }
 
 /** 该失败是否值得退避后重投（对齐 issue-client.isRetriable，额外含 429 限流）。 */

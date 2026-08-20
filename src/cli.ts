@@ -101,7 +101,7 @@ import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import { pm2CallerEnv } from './cli/pm2-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
-import { firstPositional } from './cli/arg-utils.js';
+import { firstPositional, hasFlagOrEq } from './cli/arg-utils.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
 import {
   computeSessionPickerLayout,
@@ -11603,12 +11603,17 @@ botmux create-group — 用一组机器人新建飞书群
                    部分失败都保持历史兼容，只输出单行 chatId；部分失败仍以非零退出表示。
 
 团队模式（跨机拉群，走中心化平台）:
+  # 建聚焦新群：
   botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群名"]
+  # 往已存在的团队群补人：
+  botmux create-group --chat <chatId> --team <teamId> --agent <appId> [--agent ...] [--no-owners]
 
   用途：把「同团队、已 opt-in」的**别人机器上的** agent（用 bots list --scope team 发现到的 appId）
-  和它们各自的 owner 一起拉进一个聚焦新群——由平台代建、代拉，全程 machine-auth。
+  和它们各自的 owner 一起拉进群——由平台代建/代拉，全程 machine-auth。
   正因为发起人在别人 bot 进群前 @不到它，这条只认 appId、不依赖任何飞书 @，天然绕开视角问题。
   --agent 至少一个、可多次、按 appId 去重。团队模式忽略 --bot/--kickoff/--working-dir（那些是本机建群用的）。
+  --chat <chatId>：往**已存在的团队群**补人（而非建新群）；目标群必须是本团队自己建/拉的协作群
+                   （机器人大厅除外），否则平台拒绝。--no-owners 只补 bot、不拉 owner（默认连 owner 一起补）。
   未传 --team：本机唯一团队则自动用它，多个要求显式指定。
 
 行为:
@@ -11630,9 +11635,11 @@ botmux create-group — 用一组机器人新建飞书群
     return;
   }
 
-  // 团队模式：走平台端点3 拉群，与本机飞书建群是两条完全不同的路径。必须在 transport
-  // 闸门之前分流——平台代建群，本机 bot 不需要飞书传输身份（沙盒/apiOnly 也能发起）。
-  if (rest.includes('--team') || rest.includes('--agent')) {
+  // 团队模式：走平台端点3/4 拉群/补人，与本机飞书建群是两条完全不同的路径。必须在 transport
+  // 闸门之前分流——平台代建/代拉，本机 bot 不需要飞书传输身份（沙盒/apiOnly 也能发起）。
+  // 用 hasFlagOrEq（同时认 `--team` 与 `--team=xxx`）：argValue/argValues 支持 = 形式，
+  // 分流若只 includes('--team') 精确匹配，`--team=t1` 会漏判、落到本机建群路径报错误导（pi review P2）。
+  if (hasFlagOrEq(rest, '--team') || hasFlagOrEq(rest, '--agent') || hasFlagOrEq(rest, '--chat')) {
     await cmdCreateGroupTeam(rest);
     return;
   }
@@ -11876,10 +11883,12 @@ botmux create-group — 用一组机器人新建飞书群
  * 但 stdout 的 chatId 已经可用（群已建，别重建）。
  */
 async function cmdCreateGroupTeam(rest: string[]): Promise<void> {
-  const { fetchTeamAgents, fetchTeams, createTeamGroup, describeTeamAgentsFailure } =
+  const { fetchTeamAgents, fetchTeams, createTeamGroup, addTeamGroupMembers, describeTeamAgentsFailure } =
     await import('./platform/team-agents-client.js');
   const jsonStatus = rest.includes('--json-status');
   const name = argValue(rest, '--name');
+  const chatArg = argValue(rest, '--chat');
+  const includeOwnersFalse = rest.includes('--no-owners');
   const appIds = [...new Set(argValues(rest, '--agent').map(s => s.trim()).filter(Boolean))];
 
   if (appIds.length === 0) {
@@ -11907,14 +11916,26 @@ async function cmdCreateGroupTeam(rest: string[]): Promise<void> {
     teamId = teams[0].teamId;
   }
 
+  // --chat：往「已存在的团队群」补人（端点4/B），而非建新群（端点3）。
+  if (chatArg !== undefined) {
+    if (!chatArg.trim()) { console.error('--chat 不能为空（传目标群 chatId）。'); process.exit(1); }
+    await runAddTeamGroupMembers({
+      addTeamGroupMembers, describeTeamAgentsFailure,
+      chatId: chatArg.trim(), teamId, appIds, jsonStatus,
+      includeOwners: includeOwnersFalse ? false : undefined,
+    });
+    return;
+  }
+
   const res = await createTeamGroup({ teamId, appIds, ...(name !== undefined ? { name } : {}) });
   if (!res.ok) {
     if (res.reason === 'unbound') console.error('本机未绑定平台。拉群需要先 botmux bind。');
     else if (res.reason === 'not_deployed') console.error('平台尚未部署拉群端点（/v1/machine/groups）。等平台上线后重试。');
     else if (res.reason === 'rate_limited') console.error('拉群被限流（同机 30s 一次），请稍后重试。');
     else if (res.reason === 'client' && res.status === 403) {
-      // 403 not_in_team_bots：所选 agent（或本机 bot）没 opt-in 进团队。
-      console.error(`拉群被拒（403 ${res.error}）：请确认相关 bot 已由其 owner 在平台「管理机器人」加入该团队。`);
+      // 403 not_in_team_bots：所选 agent（或本机 bot）没 opt-in 进团队。平台可能带回具体 appIds。
+      const which = res.appIds && res.appIds.length ? `：${res.appIds.join('、')}` : '';
+      console.error(`拉群被拒（403 ${res.error}）：请确认相关 bot 已由其 owner 在平台「管理机器人」加入该团队${which}。`);
     } else if (res.reason === 'client' && res.status === 404) {
       console.error(`团队不存在或本机 owner 不是其成员：teamId=${teamId}`);
     } else {
@@ -11947,6 +11968,52 @@ async function cmdCreateGroupTeam(rest: string[]): Promise<void> {
   if (shareLink) console.error(`群分享链接：${shareLink}`);
   // 部分失败 → 非零退出（但群已建、chatId 已在 stdout，调用方应复用不重建）。
   if (hasInvalid) process.exitCode = 1;
+}
+
+/**
+ * B（端点4）：往已存在的团队群 `chatId` 补人。与建新群共用 cmdCreateGroupTeam 的团队解析，
+ * 只是走 addTeamGroupMembers。输出协议：stdout 单行 chatId（补人成功即原样回传，skill 友好、
+ * 与建群一致）；--json-status 追加 {ok, chatId, added, invalid*}；invalid* 非空 → 非零退出。
+ * 授权/opt-in/大厅排除全在平台，CLI 只如实展示平台判定。
+ */
+async function runAddTeamGroupMembers(a: {
+  addTeamGroupMembers: typeof import('./platform/team-agents-client.js').addTeamGroupMembers;
+  describeTeamAgentsFailure: typeof import('./platform/team-agents-client.js').describeTeamAgentsFailure;
+  chatId: string; teamId: string; appIds: string[]; jsonStatus: boolean; includeOwners?: boolean;
+}): Promise<void> {
+  const res = await a.addTeamGroupMembers({
+    chatId: a.chatId, teamId: a.teamId, appIds: a.appIds,
+    ...(a.includeOwners !== undefined ? { includeOwners: a.includeOwners } : {}),
+  });
+  if (!res.ok) {
+    if (res.reason === 'unbound') console.error('本机未绑定平台。补人需要先 botmux bind。');
+    else if (res.reason === 'not_deployed') console.error('平台尚未部署补人端点（/v1/machine/groups/:chatId/members）。等平台上线后重试。');
+    else if (res.reason === 'rate_limited') console.error('补人被限流（同机 30s 一次），请稍后重试。');
+    else if (res.reason === 'client' && res.status === 403) {
+      // 403 可能是 chat_not_in_team（目标群不是本团队的群）/ chat_is_hall（大厅不允许补人）/ not_in_team_bots。
+      const which = res.appIds && res.appIds.length ? `（${res.appIds.join('、')}）` : '';
+      const hint = res.error === 'chat_not_in_team' ? '目标群不是本团队的协作群，只能往本团队自己建/拉的群补人'
+        : res.error === 'chat_is_hall' ? '目标群是机器人大厅，不允许往里补人（大厅是 bot-only 身份登记群）'
+        : `相关 bot${which} 未由其 owner 在平台「管理机器人」加入该团队`;
+      console.error(`补人被拒（403 ${res.error}）：${hint}。`);
+    } else if (res.reason === 'client' && res.status === 404) {
+      console.error(`团队不存在或本机 owner 不是其成员：teamId=${a.teamId}`);
+    } else {
+      console.error(`补人失败：${a.describeTeamAgentsFailure(res)}`);
+    }
+    process.exit(1);
+  }
+
+  const { added, invalidBotIds, invalidOwnerUnionIds } = res.value;
+  // stdout 单行 chatId（与建群一致：调用方拿到即可复用该群）。
+  console.log(a.chatId);
+  if (a.jsonStatus) {
+    console.log(JSON.stringify({ ok: true, chatId: a.chatId, added, invalidBotIds, invalidOwnerUnionIds, teamId: a.teamId }));
+  }
+  if (added.length > 0) console.error(`✅ 已加入群：${added.join('、')}`);
+  if (invalidBotIds.length > 0) console.error(`⚠️ 以下 agent 未加入团队或补入失败：${invalidBotIds.join('、')}`);
+  if (invalidOwnerUnionIds.length > 0) console.error(`⚠️ 以下 owner 未能补入：${invalidOwnerUnionIds.join('、')}`);
+  if (invalidBotIds.length > 0 || invalidOwnerUnionIds.length > 0) process.exitCode = 1;
 }
 
 // ─── Bots subcommand ─────────────────────────────────────────────────────────
@@ -12737,6 +12804,8 @@ async function cmdBotsListTeam(rest: string[]): Promise<void> {
     if (!teamsRes.ok) {
       if (teamsRes.reason === 'unbound') {
         console.error('本机未绑定平台（~/.botmux/platform.json 缺失）。团队发现需要先 botmux bind。');
+      } else if (teamsRes.reason === 'not_deployed') {
+        console.error('平台尚未部署团队端点（/v1/machine/teams）。等平台上线后重试。');
       } else {
         console.error(`拉取团队列表失败：${describeTeamAgentsFailure(teamsRes)}`);
       }

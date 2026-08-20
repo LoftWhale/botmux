@@ -150,8 +150,13 @@ export function clearBotCapability(dataDir: string, larkAppId: string): boolean 
   const existing = readProfile(dataDir, larkAppId);
   const had = existing?.capability !== undefined;
   if (existing?.specialties && existing.specialties.length > 0) {
-    // Keep the file — specialties still live here.
-    writeProfileAtomic(dataDir, larkAppId, { specialties: existing.specialties, updatedAt: Date.now() });
+    // Keep the file — specialties still live here. Preserve updatedBy so the
+    // audit trail (who last touched this profile) survives a capability clear.
+    writeProfileAtomic(dataDir, larkAppId, {
+      specialties: existing.specialties,
+      updatedAt: Date.now(),
+      ...(existing.updatedBy ? { updatedBy: existing.updatedBy } : {}),
+    });
   } else {
     try { unlinkSync(profilePath(dataDir, larkAppId)); } catch { /* already gone */ }
   }

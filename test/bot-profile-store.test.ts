@@ -114,6 +114,14 @@ describe('bot-profile-store specialties', () => {
     expect(getBotSpecialties(dataDir, 'app1')).toEqual(['backend']); // survived
   });
 
+  it('clearBotCapability keeps updatedBy when rewriting to preserve specialties (review nit)', () => {
+    setBotCapability(dataDir, 'app1', 'X', 'ou_author');
+    setBotSpecialties(dataDir, 'app1', ['backend'], 'ou_author');
+    clearBotCapability(dataDir, 'app1');
+    // File was rewritten (specialties survive) — the audit trail must not be dropped.
+    expect(getBotProfile(dataDir, 'app1')?.updatedBy).toBe('ou_author');
+  });
+
   it('empty specialties list persists as explicit [] (owner cleared tags)', () => {
     setBotSpecialties(dataDir, 'app1', ['backend']);
     setBotSpecialties(dataDir, 'app1', []);

@@ -7,6 +7,7 @@ import {
   fetchTeamAgents,
   fetchTeams,
   createTeamGroup,
+  addTeamGroupMembers,
   isRetriable,
   describeTeamAgentsFailure,
   type TeamAgentsClientOptions,
@@ -190,6 +191,21 @@ describe('createTeamGroup（端点3）', () => {
     expect(isRetriable(r as any)).toBe(false);
   });
 
+  it('403 not_in_team_bots 带 appIds → 透传到 failure.appIds（review P2 优化）', async () => {
+    const { o } = opts([{ status: 403, json: { error: 'not_in_team_bots', appIds: ['cli_x', 'cli_y'] } }]);
+    const r = await createTeamGroup({ teamId: 't1', appIds: ['cli_x', 'cli_y', 'cli_z'] }, o);
+    expect(r).toMatchObject({ ok: false, reason: 'client', status: 403, appIds: ['cli_x', 'cli_y'] });
+  });
+
+  it('403 machine_ownership_mismatch → forbidden（凭证问题，非 client）（review P1）', async () => {
+    // 机器 RETIRED / 换绑 owner 时平台发这个 403。它是凭证/归属问题（该 rebind），不能像
+    // not_in_team_bots 那样归 client 并提示「确认 bot 已加入团队」——那会误导排查方向。
+    const { o } = opts([{ status: 403, json: { error: 'machine_ownership_mismatch' } }]);
+    const r = await createTeamGroup({ teamId: 't1', appIds: ['cli_a'] }, o);
+    expect(r).toMatchObject({ ok: false, reason: 'forbidden', status: 403, error: 'machine_ownership_mismatch' });
+    expect(isRetriable(r as any)).toBe(false);
+  });
+
   it('429 rate_limited（同机 30s 一次）→ 单独分型且可重试', async () => {
     const { o } = opts([{ status: 429, json: { error: 'rate_limited' } }]);
     const r = await createTeamGroup({ teamId: 't1', appIds: ['cli_a'] }, o);
@@ -228,5 +244,63 @@ describe('createTeamGroup（端点3）', () => {
     const r = await createTeamGroup({ teamId: 't1', appIds: ['cli_a'] }, o);
     expect(r).toMatchObject({ ok: false, reason: 'network' });
     expect(isRetriable(r as any)).toBe(true);
+  });
+});
+
+describe('addTeamGroupMembers（端点4 / B：往现有群补人）', () => {
+  it('POST 到 /groups/:chatId/members，body 带 teamId+appIds，默认不含 includeOwners', async () => {
+    const { o, calls } = opts([{ status: 200, json: { ok: true, chatId: 'oc_1', invalidBotIds: [], invalidOwnerUnionIds: [] } }]);
+    const r = await addTeamGroupMembers({ chatId: 'oc_1', teamId: 't1', appIds: ['cli_a', 'cli_b'] }, o);
+    expect(r).toEqual({ ok: true, value: { ok: true, added: [], invalidBotIds: [], invalidOwnerUnionIds: [] } });
+    expect(calls[0].method).toBe('POST');
+    expect(calls[0].url).toBe('https://platform.example/v1/machine/groups/oc_1/members');
+    expect(calls[0].body).toEqual({ teamId: 't1', appIds: ['cli_a', 'cli_b'] });
+  });
+
+  it('includeOwners:false 显式进 body（只补 bot 不拉人）', async () => {
+    const { o, calls } = opts([{ status: 200, json: { ok: true, chatId: 'oc_1' } }]);
+    await addTeamGroupMembers({ chatId: 'oc_1', teamId: 't1', appIds: ['cli_a'], includeOwners: false }, o);
+    expect(calls[0].body).toEqual({ teamId: 't1', appIds: ['cli_a'], includeOwners: false });
+  });
+
+  it('chatId 进 path 时被 URL 编码', async () => {
+    const { o, calls } = opts([{ status: 200, json: { ok: true } }]);
+    await addTeamGroupMembers({ chatId: 'oc/weird id', teamId: 't1', appIds: ['cli_a'] }, o);
+    expect(calls[0].url).toBe('https://platform.example/v1/machine/groups/oc%2Fweird%20id/members');
+  });
+
+  it('403 chat_not_in_team（目标群不是本团队的群）→ client', async () => {
+    const { o } = opts([{ status: 403, json: { error: 'chat_not_in_team' } }]);
+    const r = await addTeamGroupMembers({ chatId: 'oc_x', teamId: 't1', appIds: ['cli_a'] }, o);
+    expect(r).toMatchObject({ ok: false, reason: 'client', status: 403, error: 'chat_not_in_team' });
+    expect(isRetriable(r as any)).toBe(false);
+  });
+
+  it('403 chat_is_hall（机器人大厅不允许补人）→ client', async () => {
+    const { o } = opts([{ status: 403, json: { error: 'chat_is_hall' } }]);
+    const r = await addTeamGroupMembers({ chatId: 'oc_hall', teamId: 't1', appIds: ['cli_a'] }, o);
+    expect(r).toMatchObject({ ok: false, reason: 'client', status: 403, error: 'chat_is_hall' });
+  });
+
+  it('200 带 invalid* → 如实透传', async () => {
+    const { o } = opts([{ status: 200, json: { ok: true, chatId: 'oc_1', invalidBotIds: ['cli_z'], invalidOwnerUnionIds: ['on_w'] } }]);
+    const r = await addTeamGroupMembers({ chatId: 'oc_1', teamId: 't1', appIds: ['cli_a', 'cli_z'] }, o);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.invalidBotIds).toEqual(['cli_z']);
+    expect(r.value.invalidOwnerUnionIds).toEqual(['on_w']);
+  });
+
+  it('502 feishu_unavailable → server，可重试', async () => {
+    const { o } = opts([{ status: 502, json: { error: 'feishu_unavailable' } }]);
+    const r = await addTeamGroupMembers({ chatId: 'oc_1', teamId: 't1', appIds: ['cli_a'] }, o);
+    expect(r).toMatchObject({ ok: false, reason: 'server', status: 502 });
+    expect(isRetriable(r as any)).toBe(true);
+  });
+
+  it('404 路由未部署（纯文本）→ not_deployed', async () => {
+    const { o } = opts([{ status: 404, json: {} }]);
+    const r = await addTeamGroupMembers({ chatId: 'oc_1', teamId: 't1', appIds: ['cli_a'] }, o);
+    expect(r).toMatchObject({ ok: false, reason: 'not_deployed', status: 404 });
   });
 });
