@@ -177,8 +177,17 @@ export function buildV3RunDetailUrl(runId: string, opts: { host: string; port: n
  * Build the platform owner-login URL advertised by an unauthenticated
  * Dashboard response. The SPA replaces only the hash-route `next` value, so
  * the server never exposes the Dashboard token or machine tunnel credential.
+ *
+ * `next` is where the platform lands the browser AFTER it mints this machine's
+ * host-only proxy-session cookie (the credential the owner check reads; the
+ * cross-subdomain SSO cookie alone does NOT make a request owner-writable). It
+ * defaults to the SPA home `/#/`; pass a terminal path `/s/<sessionId>` so an
+ * owner opening the read-only web terminal is returned to that very terminal
+ * WITH the freshly-minted proxy cookie in place — the platform routes a
+ * `/s/`-prefixed `next` to the terminal subdomain surface, so the round-trip
+ * lands the owner back on a now-writable terminal instead of the dashboard.
  */
-export function buildPlatformDashboardLoginUrl(): string | undefined {
+export function buildPlatformDashboardLoginUrl(next: string = '/#/'): string | undefined {
   if (!isRemoteAccessEnabled()) return undefined;
   const binding = readPlatformBinding();
   const machineId = binding?.machineId.trim();
@@ -189,7 +198,8 @@ export function buildPlatformDashboardLoginUrl(): string | undefined {
       return undefined;
     }
     const loginUrl = new URL(`/open/${encodeURIComponent(machineId)}`, platform);
-    loginUrl.searchParams.set('next', '/#/');
+    // searchParams.set percent-encodes the whole value, so pass the raw path.
+    loginUrl.searchParams.set('next', next);
     return loginUrl.toString();
   } catch {
     return undefined;

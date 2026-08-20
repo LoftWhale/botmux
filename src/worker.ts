@@ -163,6 +163,7 @@ import {
 } from './core/terminal-control-grant.js';
 import { appendControlAudit, controlAuditRecord } from './dashboard/control-audit.js';
 import { readPlatformBinding } from './platform/binding.js';
+import { buildPlatformDashboardLoginUrl } from './core/dashboard-url.js';
 import { loadDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
 import { InputTurnDeduper } from './core/input-turn-dedupe.js';
@@ -1951,6 +1952,19 @@ interface WorkerTerminalAccess extends TerminalAccessDecision {
   auditUser?: string;
   /** Fixed grant expiry. Writable WS connections are closed at this boundary. */
   controlExpiresAt?: number;
+}
+
+/**
+ * Owner-login URL for THIS session's read-only web terminal, or '' when the
+ * machine is unbound / remote access is off (banner then shows non-link text).
+ * `next=/s/<sessionId>` is what makes the round-trip land the owner back on a
+ * writable terminal: the platform routes a `/s/`-prefixed next to the terminal
+ * subdomain surface and mints the host-only proxy-session cookie there, which
+ * is the credential the owner write-check reads (the cross-subdomain SSO cookie
+ * alone does not). See buildPlatformDashboardLoginUrl.
+ */
+function deriveTerminalLoginUrl(sid: string): string {
+  return buildPlatformDashboardLoginUrl(`/s/${encodeURIComponent(sid)}`) ?? '';
 }
 
 function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerminalAccess {
@@ -15793,7 +15807,22 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         return;
       }
       const loginHdr = req.headers['x-botmux-login-url'];
-      const loginUrl = typeof loginHdr === 'string' && /^https?:\/\/[^"'<>\s]+$/.test(loginHdr) ? loginHdr : '';
+      // The central front proxy only injects X-Botmux-Login-Url on the SPA 401
+      // path, never on `/s/` terminal requests — so a read-only web terminal
+      // showed an owner-login banner that was a dead <div> (no href). When the
+      // header is absent, self-derive the platform owner-login URL for THIS
+      // session's terminal path: `/open/<machineId>?next=/s/<sessionId>`. The
+      // `/s/` next routes the platform to the terminal subdomain surface and,
+      // after login, lands the browser back on this terminal WITH the host-only
+      // proxy-session cookie the owner check requires (the cross-subdomain SSO
+      // cookie alone does not make the request writable). Returns '' when this
+      // machine is unbound or remote access is off, so the banner falls back to
+      // its non-link text form rather than a broken link.
+      const headerLoginUrl = typeof loginHdr === 'string' && /^https?:\/\/[^"'<>\s]+$/.test(loginHdr)
+        ? loginHdr
+        : '';
+      const loginUrl = headerLoginUrl
+        || (sessionId ? deriveTerminalLoginUrl(sessionId) : '');
       // Herdr snapshots contain screen cells but not terminal mode state. On a
       // refreshed page an alt-screen CLI would otherwise look like an empty
       // normal buffer until resize causes a redraw. Preserve that mode so

@@ -217,6 +217,18 @@ describe('buildPlatformDashboardLoginUrl', () => {
     setBinding({ platformUrl: 'https://platform.example/base', machineId: 'm/1', machineToken: 'secret' });
     expect(buildPlatformDashboardLoginUrl()).toContain('/open/m%2F1?');
   });
+
+  it('routes a `/s/<sessionId>` next so an owner logging in from the read-only terminal lands back on a writable terminal (#933)', () => {
+    setRemote(true);
+    setBinding({ platformUrl: 'https://platform.example', machineId: 'm-1', machineToken: 'secret' });
+    const url = buildPlatformDashboardLoginUrl('/s/sess-42');
+    // The platform routes a `/s/`-prefixed next to the terminal subdomain
+    // surface and mints the host-only proxy cookie there; the whole next is
+    // percent-encoded as one query value.
+    expect(url).toBe('https://platform.example/open/m-1?next=%2Fs%2Fsess-42');
+    // Default is unchanged — the existing SPA-401 caller must keep landing on /#/.
+    expect(buildPlatformDashboardLoginUrl()).toBe('https://platform.example/open/m-1?next=%2F%23%2F');
+  });
 });
 
 describe('buildV3RunDetailUrl', () => {

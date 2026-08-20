@@ -310,8 +310,18 @@ describe('central terminal front proxy boundary', () => {
               expect(forwarded.grantScope, cell).toBeUndefined();
               expect(forwarded.cookie, cell).toBe('botmux_dashboard_token=ambient-management-cookie');
             }
+          } else if (tokenState.name === 'viewToken' && identity.actor?.terminalCapability === 'owner') {
+            // #933 回归修复：viewToken 只读链接是飞书卡片发给 owner 的那条，owner 登录后
+            // 打开它应恢复「可操作」——proxy 为已验证 owner 补签 WRITE grant（HMAC 签名、
+            // 客户端伪造不了），与 viewToken 的只读能力叠加。这不重开 P1-6：grant 由 actor
+            // 派生，而 owner 身份本身锚在「平台注入的 cookie == 本机 live secret」上，
+            // viewToken 持有者并不具备；且仍不透传任何 ambient cookie/role。
+            expect(forwarded.grantScope, cell).toBe('write');
+            expect(forwarded.cookie, cell).toBeUndefined();
+            expect(forwarded.role, cell).toBeUndefined();
           } else {
             // 显式 query capability（对错皆然）→ 唯一授权依据：无 grant、无 ambient。
+            // （owner×viewToken 例外见上；?token= 写链接一律保持独立能力路径不补 grant。）
             expect(forwarded.grantScope, cell).toBeUndefined();
             expect(forwarded.cookie, cell).toBeUndefined();
             expect(forwarded.role, cell).toBeUndefined();
@@ -478,6 +488,82 @@ describe('central terminal front proxy boundary', () => {
       // H5 logout / session expiry sweeps this auth session — the bridged
       // read socket must die immediately, not at the token's expiry.
       control.releaseByAuthSession('h5-auth-9');
+      await closed;
+    } finally {
+      await close(front);
+      await close(upstream);
+    }
+  });
+
+  it('#933: owner + viewToken gets a WRITE bridge that logout still closes (P1-5 index holds)', async () => {
+    // The #933 regression fix hands a verified platform OWNER a signed WRITE grant
+    // even on a viewToken-only link. That grant is leaseMarker-less, so it does NOT
+    // go through registerWritableSocket — it must instead land in the auth-session
+    // read-socket index via bridgeAuthSession's `proxyGrant ? actor.authSessionId`
+    // fallback, or logout would leave the owner's writable stream alive. Prove both:
+    // (a) the owner IS granted write on a viewToken link, and (b) logout of the
+    // owner's auth session closes that very socket.
+    const control = new TerminalControlManager({ secret: SECRET, audit: { append() {} } });
+    let bridgedGrantScope: 'read' | 'write' | undefined;
+    const upstream = createServer(() => {});
+    upstream.on('upgrade', (req, socket) => {
+      const raw = req.headers[TERMINAL_CONTROL_HEADER];
+      const verified = typeof raw === 'string'
+        ? verifyTerminalControlGrant(SECRET, raw, 's1')
+        : undefined;
+      bridgedGrantScope = verified?.ok ? verified.claims.scope : undefined;
+      socket.write('HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\r\n');
+      socket.on('end', () => socket.destroy());
+      socket.on('error', () => socket.destroy());
+    });
+    const upstreamPort = await listen(upstream);
+    const ownerAuthSession = 'platform:machine:owner';
+    const proxy = createTerminalFrontProxy({
+      resolvePort: () => upstreamPort,
+      // A verified platform owner (its owner role is itself gated on the
+      // dashboard-token cookie === live secret inside resolveDashboardIdentity;
+      // a viewToken holder cannot forge it).
+      resolveActor: () => ({
+        userId: 'platform:machine:owner',
+        authSessionId: ownerAuthSession,
+        expiresAt: Number.MAX_SAFE_INTEGER,
+        terminalCapability: 'owner' as const,
+      }),
+      control,
+      isAuthSessionLive: () => true,
+    });
+    const front = createServer((_req, res) => res.writeHead(404).end());
+    front.on('upgrade', (req, socket, head) => {
+      if (!proxy.handleUpgrade(req, socket, head)) socket.destroy();
+    });
+    const frontPort = await listen(front);
+    try {
+      const client = connect(frontPort, '127.0.0.1');
+      const upgraded = new Promise<void>((resolve, reject) => {
+        let raw = '';
+        client.on('data', chunk => {
+          raw += chunk.toString();
+          if (raw.includes('101')) resolve();
+        });
+        client.on('error', reject);
+        setTimeout(() => reject(new Error(`no 101 upgrade\n${raw}`)), 4_000).unref();
+      });
+      // viewToken-only link (never ?token=) — the exact shape the Feishu card
+      // hands the owner. Any opaque view token; the owner's grant is what carries
+      // write, not the token.
+      client.write(
+        'GET /s/s1/?viewToken=opaque-view-capability HTTP/1.1\r\nHost: front\r\n'
+        + 'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+        + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
+      );
+      await upgraded;
+      // (a) the owner actually received a WRITE grant on the viewToken link.
+      expect(bridgedGrantScope).toBe('write');
+      // (b) logging out the owner's auth session closes this writable bridge now.
+      // Without the :203 carve-out, proxyGrant would be undefined → the socket is
+      // never indexed → this close never fires and the test times out.
+      const closed = new Promise<void>(resolve => client.on('close', () => resolve()));
+      control.releaseByAuthSession(ownerAuthSession);
       await closed;
     } finally {
       await close(front);

@@ -200,7 +200,25 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
         viewForwardProof = options.viewCapabilityForwardProof?.(viewToken);
       }
     }
-    const proxyGrant = actor && !hasExplicitQueryCapability
+    // P1-6: an explicit `?token=`/`?viewToken=` query capability is normally the
+    // SOLE authorization basis — no proxy grant is injected next to it, so a wrong
+    // token can't borrow the opener's owner ambient. But a `?viewToken=` READ link
+    // is the one the Feishu card hands the owner, and stripping the owner's proxy
+    // grant there regressed the pre-3.16 behavior "owner logs in → can operate":
+    // the viewToken forced read-only and the owner's platform identity was dropped
+    // (#933). Carve out exactly that case — a verified platform OWNER opening a
+    // viewToken-only link (never `?token=`, which keeps its independent-capability
+    // path) still gets the signed WRITE grant. This does NOT reopen P1-6: the grant
+    // is minted here from `actor` — whose owner role is itself gated on the
+    // platform-injected dashboard-token cookie matching this machine's live secret
+    // (resolveDashboardIdentity), a value a viewToken holder does not possess — and
+    // travels as an HMAC-signed `X-Botmux-Terminal-Control` header, never as a
+    // passed-through client cookie/role. A guest/teammate viewToken opener has no
+    // owner actor, so this branch does not fire and they stay read-only.
+    const ownerWithViewToken = actor?.terminalCapability === 'owner'
+      && url.searchParams.has('viewToken')
+      && !url.searchParams.has('token');
+    const proxyGrant = actor && (!hasExplicitQueryCapability || ownerWithViewToken)
       ? options.control.grantForProxy(actor, parsed.sessionId)
       : undefined;
     if (actor && proxyGrant?.scope === 'read') readAuthSessionId = actor.authSessionId;

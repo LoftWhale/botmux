@@ -30,6 +30,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { logger } from '../utils/logger.js';
+import { platformBrowserAuthorities } from '../platform/binding.js';
 
 /** 提交控制类请求时携带 CSRF 票据的头名。`<form>` 设不了自定义头，这是关键。 */
 export const CONTROL_CSRF_HEADER = 'x-botmux-csrf';
@@ -164,7 +165,10 @@ function publicUrlAuthority(): string | undefined {
 }
 
 /** 本请求可能的自身 authority：直连是 `Host`，反代/平台隧道下还有转发头，外加
- *  运维显式声明的对外基址。 */
+ *  运维显式声明的对外基址；绑定中心平台时再加本机可信的平台浏览器子域
+ *  (`m-`/`t-<machineId>.<平台域名>`)——平台隧道反代不透传 `X-Forwarded-Host`，
+ *  这是唯一能让平台浏览器终端的同源校验认出「浏览器实际访问的子域」的候选来源
+ *  （见 {@link platformBrowserAuthorities}，每请求重读 platform.json、fail-closed）。 */
 function requestAuthorities(headers: ControlRequestHeadersLike): Array<string | undefined> {
   const forwarded = headerValue(headers['x-forwarded-host']);
   return [
@@ -172,6 +176,7 @@ function requestAuthorities(headers: ControlRequestHeadersLike): Array<string | 
     // 逗号分隔时第一个才是最初的客户端所见 host。
     forwarded ? forwarded.split(',')[0] : undefined,
     publicUrlAuthority(),
+    ...platformBrowserAuthorities(),
   ];
 }
 
