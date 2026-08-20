@@ -242,6 +242,7 @@ import {
   type BotMentionEntry,
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
+import { registerPromptOverrideResolver } from './skills/effective-builtins.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand } from './im/lark/lark-hosts.js';
 import { mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 import {
@@ -311,6 +312,9 @@ import {
 {
   const cfg = readGlobalConfig();
   if (cfg.lang) setDefaultLocale(cfg.lang);
+  // Wire user prompt-key overrides into t() so CLI-side prompt building (e.g.
+  // `botmux skill show`, catalog rendering) honours customizations. Idempotent.
+  registerPromptOverrideResolver();
 }
 
 // CLI subcommands (send/thread/bots/list/etc) print JSON to stdout for
@@ -14140,6 +14144,14 @@ switch (command) {
   case 'skills': {
     const { runSkillsAdminCommand } = await import('./core/skills/cli-admin-command.js');
     const result = runSkillsAdminCommand(process.argv.slice(3));
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    process.exitCode = result.code;
+    break;
+  }
+  case 'customize': {
+    const { runCustomizeCommand } = await import('./core/skills/customize-command.js');
+    const result = runCustomizeCommand(process.argv.slice(3));
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);
     process.exitCode = result.code;

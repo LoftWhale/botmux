@@ -230,6 +230,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from './types.js';
 import { t, setDefaultLocale } from './i18n/index.js';
+import { registerPromptOverrideResolver } from './skills/effective-builtins.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
 import {
   DEFAULT_RENDER_COLS,
@@ -17505,6 +17506,10 @@ process.on('message', async (raw: unknown) => {
       if (msg.locale === 'zh' || msg.locale === 'en') {
         setDefaultLocale(msg.locale);
       }
+      // Wire user prompt-key overrides into t() so worker-side prompt building
+      // (claude-family `--append-system-prompt` via buildBotmuxSystemPromptText,
+      // mojo catalog, etc.) honours customizations. Idempotent per worker.
+      registerPromptOverrideResolver();
       // Scope session store to this bot's per-bot file.
       // Slice C0: workflow-spawned workers (BOTMUX_WORKFLOW=1) skip this —
       // their `sessionId` is synthetic (`wf-<runId>-<activityId>-...`) and

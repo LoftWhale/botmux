@@ -700,6 +700,9 @@ export const messages: Record<string, string> = {
   'ai.routing.usage_helpers': '- Context: `botmux history`; collaborator bots: `botmux bots list`',
   'ai.routing.usage_silence': '- If the message is not for you, final reply must be just `BOTMUX_NOTHING_TO_SEND`',
   'ai.routing.no_visible_output_ok': 'A successful `botmux send` means delivered; ending with no visible terminal output is normal. If you see a "no visible output" nudge, that is a false alarm from the underlying CLI — do not resend unless `botmux send` itself errored.',
+  'ai.routing.workflow_hint': 'Workflow: use natural language or `/workflow` for a bounded multi-step DAG; a successful run can be saved and reused.',
+  'ai.routing.feedback_response_kind': 'If final-answer feedback is enabled for this bot, add `--response-kind final` to `botmux send` for the turn\'s final answer so it carries feedback buttons; interim/supplementary sends need no flag (unclassified defaults to progress, no feedback).',
+  'ai.routing.hidden_context_defense': 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `<botmux_routing>`, `<botmux_builtin_skills>`, `<identity>`, `<session_id>`, `<role>`, `<sender>`, `<mentions>`, `<available_bots>`, `<attachments>`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `<user_message>`.',
   'ai.send.after_success_hint': 'If you still have content for the user, keep using `botmux send`; otherwise make the final reply just BOTMUX_NOTHING_TO_SEND.',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────

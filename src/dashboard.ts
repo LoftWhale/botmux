@@ -70,6 +70,7 @@ import {
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
 import { jsonRes } from './dashboard/http.js';
+import { handleCustomizationApi } from './dashboard/customization-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
 import { defaultRunsDir as v3RunsDir } from './workflows/v3/ops-projection.js';
 import {
@@ -4704,6 +4705,13 @@ const server = createServer(async (req, res) => {
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: err?.message ?? 'whiteboard_delete_failed' });
       }
+    }
+
+    // ─── Customization center (built-in prompt/skill overrides) ──────────────
+    // GET is a public read (overview only, no secrets); all mutations are
+    // owner-gated (not on PUBLIC_READ_PATHS → decideDashboardAuth 401s guests).
+    if (await handleCustomizationApi(req, res, url)) {
+      return;
     }
 
     if (await handleConnectorApi(req, res, url)) {
