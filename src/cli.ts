@@ -11631,6 +11631,15 @@ botmux create-group — 用一组机器人新建飞书群
     return;
   }
 
+  // Deprecation 闸：--chat 曾经是 create-group 的「往已有群补人」模式，现已拆成独立命令
+  // `bots invite`。若仍传 --chat，必须**报错早退**而不是静默忽略——否则用户本意补人、
+  // 却因 --chat 被丢弃照常建了个新群（真实副作用，多一个群）。放在 team 分流之前拦。
+  if (hasFlagOrEq(rest, '--chat')) {
+    console.error('create-group 不再支持 --chat（往已有群补人已拆成独立命令）。请改用：');
+    console.error('  botmux bots invite --chat <chatId> --team <id> --agent <appId>... [--no-owners]');
+    process.exit(1);
+  }
+
   // 团队模式：走平台端点3 建新群，与本机飞书建群是两条完全不同的路径。必须在 transport
   // 闸门之前分流——平台代建群，本机 bot 不需要飞书传输身份（沙盒/apiOnly 也能发起）。
   // 「往已有群补人」是独立的 `bots invite`，不在这里。
