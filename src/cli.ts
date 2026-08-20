@@ -12830,30 +12830,23 @@ async function tryAutoAddPlatformBot(
   chatId: string, platformAppId: string,
 ): Promise<{ ok: true; proxyName: string } | { ok: false; reason: string }> {
   try {
-    const { loadBotConfigs, registerBot } = await import('./bot-registry.js');
-    const { isInChat, addBotToChat } = await import('./services/groups-store.js');
-    let cfgs: Array<{ larkAppId: string; cliId?: string; apiOnly?: boolean }>;
-    try { cfgs = loadBotConfigs() as any; } catch { return { ok: false, reason: '读 bots.json 失败' }; }
-    // 候选代理：本会话 bot 优先（已在本群、已注册），其余非 apiOnly bot 兜底。
-    const self = process.env.BOTMUX_LARK_APP_ID;
-    const ordered = [
-      ...cfgs.filter(c => c.larkAppId === self),
-      ...cfgs.filter(c => c.larkAppId !== self && c.apiOnly !== true),
-    ];
-    if (ordered.length === 0) return { ok: false, reason: '本机无可用 bot 当代理' };
-    for (const cfg of ordered) {
-      if (cfg.apiOnly === true) continue;
-      try { registerBot(cfg as any); } catch { /* 已注册/凭据缺失 → 下面 isInChat 会失败并跳过 */ }
-      let inChat = false;
-      try { inChat = await isInChat(cfg.larkAppId, chatId); } catch { inChat = false; }
-      if (!inChat) continue;
-      const r = await addBotToChat(cfg.larkAppId, chatId, [platformAppId]);
-      const one = r[0];
-      if (one?.ok) return { ok: true, proxyName: cfg.cliId ? `${cfg.cliId}/${cfg.larkAppId}` : cfg.larkAppId };
-      // 加失败（无 scope / 群需审批 / invalid）→ 记原因，继续试下一个代理。
-      if (one?.error) return { ok: false, reason: `代理 ${cfg.larkAppId} 添加失败：${one.error}` };
-    }
-    return { ok: false, reason: '本机没有已在该群、且有权限的 bot 可当代理' };
+    const { findLocalBotInChat } = await import('./im/lark/client.js');
+    const { addBotToChat } = await import('./services/groups-store.js');
+    // 用安静探测客户端找一个「已在目标群」的本机 bot 当代理（本会话 bot 优先）。
+    // 不在群的 bot 探测 miss 被静音，不刷 axios 400 噪音（见 client.findLocalBotInChat）。
+    const proxy = await findLocalBotInChat(chatId, process.env.BOTMUX_LARK_APP_ID);
+    if (!proxy) return { ok: false, reason: '本机没有已在该群的 bot 可当代理' };
+    // 代理 bot 需已在注册表（getBotClient 可用）——从 bots.json 注册一次（幂等）。
+    try {
+      const { loadBotConfigs, registerBot } = await import('./bot-registry.js');
+      const cfg = loadBotConfigs().find((c: any) => c.larkAppId === proxy.larkAppId);
+      if (cfg) registerBot(cfg);
+    } catch { /* 已注册或读配置失败 → addBotToChat 若拿不到 client 会报错并回退 */ }
+    const r = await addBotToChat(proxy.larkAppId, chatId, [platformAppId]);
+    const one = r[0];
+    if (one?.ok) return { ok: true, proxyName: proxy.cliId ? `${proxy.cliId}/${proxy.larkAppId}` : proxy.larkAppId };
+    // 加失败（无 scope / 群需群主审批 / invalid）→ 回退手动引导。
+    return { ok: false, reason: `代理 ${proxy.larkAppId} 添加失败：${one?.error ?? 'unknown'}` };
   } catch (e: any) {
     return { ok: false, reason: String(e?.message ?? e) };
   }
