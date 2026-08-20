@@ -12865,7 +12865,7 @@ async function tryAutoAddPlatformBot(
  * {ok, chatId, invalidBotIds, invalidOwnerUnionIds, teamId}；invalid* 非空 → 非零退出。
  */
 async function cmdBotsInvite(rest: string[]): Promise<void> {
-  const { addTeamGroupMembers, fetchTeams, describeTeamAgentsFailure, rateLimitRetryHint } =
+  const { addTeamGroupMembers, fetchTeams, describeTeamAgentsFailure, rateLimitRetryHint, shouldTryAutoAddPlatformBot } =
     await import('./platform/team-agents-client.js');
   const jsonStatus = rest.includes('--json-status');
   const chatArg = (argValue(rest, '--chat') ?? '').trim();
@@ -12889,9 +12889,11 @@ async function cmdBotsInvite(rest: string[]): Promise<void> {
   // (a) 自动化：撞 platform_bot_not_in_chat 且平台回传了 platformAppId → 用群里已有的本机 bot
   // 当代理，把平台后端 app 拉进目标群，再自动重试一次补人。让「往任意我在的群补人」尽量无感；
   // 碰到「加 bot 需群主审批 / 代理 bot 无成员管理 scope」时 addBotToChat 会失败，落回下面的手动提示。
-  if (!res.ok && res.reason === 'client' && res.status === 403 && res.error === 'platform_bot_not_in_chat' && res.platformAppId) {
+  let autoAddAttempted = false;
+  if (shouldTryAutoAddPlatformBot(res)) {
     const added = await tryAutoAddPlatformBot(chatArg, res.platformAppId);
     if (added.ok) {
+      autoAddAttempted = true;
       console.error(`（已用群内 bot「${added.proxyName}」把平台应用拉进群，重试补人…）`);
       res = await addTeamGroupMembers({ chatId: chatArg, teamId, appIds });
     } else {
@@ -12912,7 +12914,12 @@ async function cmdBotsInvite(rest: string[]): Promise<void> {
       const which = res.appIds && res.appIds.length ? `（${res.appIds.join('、')}）` : '';
       const appLabel = res.platformAppName ? `${res.platformAppName}（${res.platformAppId ?? ''}）` : (res.platformAppId ?? '平台应用');
       const hint =
-          res.error === 'platform_bot_not_in_chat' ? `平台应用还不在目标群里——请在群设置添加应用：${appLabel}，再补人`
+          res.error === 'platform_bot_not_in_chat'
+            // 已自动拉过还撞它：飞书加 app 通常同步生效，多半是刚加完成员表还没刷新——提示稍等重试，
+            // 别让用户对着刚拉进去的 app 再手动加一遍（pi review nit）。没自动拉过才引导手动添加。
+            ? (autoAddAttempted
+                ? `平台应用已自动拉进群、但补人仍报它不在——飞书成员同步通常几秒内完成，请稍等片刻重试 botmux bots invite`
+                : `平台应用还不在目标群里——请在群设置添加应用：${appLabel}，再补人`)
         : res.error === 'requester_not_in_chat' ? '你本人还不在目标群里——只能往「你自己已在场」的群补人（先加入该群）'
         : res.error === 'requester_bot_not_in_chat' ? '你本人还不在目标群里——只能往「你自己已在场」的群补人（先加入该群）'
         : res.error === 'chat_is_hall' ? '目标群是机器人大厅，不允许往里补人（大厅是 bot-only 身份登记群）'

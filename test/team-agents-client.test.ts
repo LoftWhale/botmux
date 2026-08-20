@@ -11,6 +11,7 @@ import {
   isRetriable,
   describeTeamAgentsFailure,
   rateLimitRetryHint,
+  shouldTryAutoAddPlatformBot,
   type TeamAgentsClientOptions,
 } from '../src/platform/team-agents-client.js';
 
@@ -339,5 +340,42 @@ describe('addTeamGroupMembers（端点4 / B：往现有群补人）', () => {
     const { o } = opts([{ status: 404, json: {} }]);
     const r = await addTeamGroupMembers({ chatId: 'oc_1', teamId: 't1', appIds: ['cli_a'] }, o);
     expect(r).toMatchObject({ ok: false, reason: 'not_deployed', status: 404 });
+  });
+});
+
+describe('shouldTryAutoAddPlatformBot（自动拉平台 app 的触发条件 + 单次性）', () => {
+  const base = { ok: false as const, reason: 'client' as const, status: 403 };
+
+  it('platform_bot_not_in_chat + platformAppId → true', () => {
+    expect(shouldTryAutoAddPlatformBot({ ...base, error: 'platform_bot_not_in_chat', platformAppId: 'cli_plat' })).toBe(true);
+  });
+
+  it('platform_bot_not_in_chat 但无 platformAppId（旧端点未回传）→ false（不拉未知 id 的 app）', () => {
+    expect(shouldTryAutoAddPlatformBot({ ...base, error: 'platform_bot_not_in_chat' })).toBe(false);
+  });
+
+  it('成功结果 → false', () => {
+    expect(shouldTryAutoAddPlatformBot({ ok: true, value: {} })).toBe(false);
+  });
+
+  it('其它 403（requester_not_in_chat / chat_is_hall / not_in_team_bots）→ false', () => {
+    for (const error of ['requester_not_in_chat', 'chat_is_hall', 'not_in_team_bots']) {
+      expect(shouldTryAutoAddPlatformBot({ ...base, error })).toBe(false);
+    }
+  });
+
+  it('非 403（如 429 / forbidden / server）→ false', () => {
+    expect(shouldTryAutoAddPlatformBot({ ok: false, reason: 'rate_limited', status: 429, error: 'x' })).toBe(false);
+    expect(shouldTryAutoAddPlatformBot({ ok: false, reason: 'forbidden', status: 403, error: 'x' })).toBe(false);
+    expect(shouldTryAutoAddPlatformBot({ ok: false, reason: 'server', status: 502, error: 'x' })).toBe(false);
+  });
+
+  it('单次性：重试后即便仍是 platform_bot_not_in_chat，也由调用方「只喂首个结果」保证不再触发——本函数是纯判定，多次调用同输入结果稳定', () => {
+    // 编排层的终止性 = 调用方拉一次+重试一次、重试结果不回喂本函数（见 cmdBotsInvite）。
+    // 这里锁住「同一个仍撞 platform_bot_not_in_chat 的结果，本函数依旧返回 true」——若未来有人
+    // 把重试结果错误地回喂进来，会立刻在评审/测试中暴露成潜在二次触发点。
+    const retryStillFail = { ...base, error: 'platform_bot_not_in_chat', platformAppId: 'cli_plat' };
+    expect(shouldTryAutoAddPlatformBot(retryStillFail)).toBe(true);
+    expect(shouldTryAutoAddPlatformBot(retryStillFail)).toBe(true); // 幂等、无副作用
   });
 });

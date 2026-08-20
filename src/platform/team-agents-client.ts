@@ -326,6 +326,26 @@ export function isRetriable(f: TeamAgentsFailure): boolean {
   return f.reason === 'network' || f.reason === 'rate_limited' || (f.reason === 'server' && f.status >= 500);
 }
 
+/**
+ * 一次 addTeamGroupMembers 结果是否应触发「自动拉平台 app 进群 + 重试」。
+ *
+ * 仅当：失败 + 403 client + error==='platform_bot_not_in_chat' + 平台回传了 platformAppId。
+ * 提出成纯函数是为了**锁死自动拉的触发条件与单次性**：调用方据它决定「拉一次+重试一次」，
+ * 重试后的结果**不再**喂回本函数（调用方不递归），所以无论重试成功、仍撞 platform_bot_not_in_chat、
+ * 还是穿透到 requester_not_in_chat，都不会二次触发自动拉——终止性由「调用一次、不回环」保证。
+ * 缺 platformAppId（旧端点未回传）→ false，回退手动引导，不会尝试拉一个不知道 id 的 app。
+ */
+export function shouldTryAutoAddPlatformBot(
+  res: TeamAgentsClientResult<unknown>,
+): res is TeamAgentsFailure & { reason: 'client'; platformAppId: string } {
+  return !res.ok
+    && res.reason === 'client'
+    && res.status === 403
+    && res.error === 'platform_bot_not_in_chat'
+    && typeof res.platformAppId === 'string'
+    && res.platformAppId.length > 0;
+}
+
 /** 429 的重试提示：优先用平台带回的 retryAfterMs（多 pod 下比写死 30s 诚实），否则中性文案。 */
 export function rateLimitRetryHint(f: Extract<TeamAgentsFailure, { reason: 'rate_limited' }>): string {
   if (f.retryAfterMs !== undefined) {
