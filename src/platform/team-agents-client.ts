@@ -79,10 +79,12 @@ export type TeamAgentsFailure =
    *  （JSON `{error:'not_found'}`）区分开——后者归 client。判据：业务 404 一定带
    *  可解析的 `.error`，路由缺失兜底不带（平台契约明确、稳定）。 */
   | { ok: false; reason: 'not_deployed'; status: number }
-  /** 其余 4xx（400 invalid / 403 not_in_team_bots|chat_not_in_team|chat_is_hall / 404 not_found 业务态）：
-   *  请求本身的问题。`appIds` 是平台在 403 体里带回的「被拒的具体 agent」（如 not_in_team_bots），
-   *  透出后提示能精准到 agent；无则 undefined。 */
-  | { ok: false; reason: 'client'; status: number; error: string; appIds?: string[] }
+  /** 其余 4xx（400 invalid / 403 not_in_team_bots|chat_is_hall|platform_bot_not_in_chat|
+   *  requester_not_in_chat / 404 not_found 业务态）：请求本身的问题。
+   *  · `appIds`：平台在 403 体里带回的「被拒的具体 agent」（如 not_in_team_bots），透出后提示精准到 agent。
+   *  · `platformAppId` / `platformAppName`：仅 `platform_bot_not_in_chat` 带——平台后端 app 的 app_id
+   *    （+ 可选可读名），供客户端「自动把平台 app 拉进群」或引导手动添加。 */
+  | { ok: false; reason: 'client'; status: number; error: string; appIds?: string[]; platformAppId?: string; platformAppName?: string }
   | { ok: false; reason: 'server'; status: number; error: string };
 
 export type TeamAgentsClientResult<T> = { ok: true; value: T } | TeamAgentsFailure;
@@ -107,6 +109,15 @@ function classify(status: number, json: unknown): TeamAgentsFailure {
   const error = hasError ? rawErr : `http_${status}`;
   // 平台在部分 403（如 not_in_team_bots）体里带回被拒的具体 agent appIds，透出以便精准提示。
   const bodyAppIds = strList((json as { appIds?: unknown })?.appIds);
+  // platform_bot_not_in_chat 的 403 体带平台后端 app 身份（自动拉平台 app 进群 / 引导手动加）。
+  const jb = json as { platformAppId?: unknown; platformAppName?: unknown };
+  const platformAppId = typeof jb?.platformAppId === 'string' && jb.platformAppId ? jb.platformAppId : undefined;
+  const platformAppName = typeof jb?.platformAppName === 'string' && jb.platformAppName ? jb.platformAppName : undefined;
+  const clientExtra = {
+    ...(bodyAppIds.length ? { appIds: bodyAppIds } : {}),
+    ...(platformAppId ? { platformAppId } : {}),
+    ...(platformAppName ? { platformAppName } : {}),
+  };
   if (status === 429) {
     // 429 体带 retryAfterMs（建群/补人都带）→ 读它做退避，别写死 30s（多 pod 下真实等待不确定）。
     const ra = (json as { retryAfterMs?: unknown })?.retryAfterMs;
@@ -129,7 +140,7 @@ function classify(status: number, json: unknown): TeamAgentsFailure {
       'not_found',
     ]);
     if (status === 403 && hasError && CLIENT_403.has(rawErr as string)) {
-      return { ok: false, reason: 'client', status, error, ...(bodyAppIds.length ? { appIds: bodyAppIds } : {}) };
+      return { ok: false, reason: 'client', status, error, ...clientExtra };
     }
     return { ok: false, reason: 'forbidden', status, error };
   }
@@ -140,7 +151,7 @@ function classify(status: number, json: unknown): TeamAgentsFailure {
   // getJson/postJson 对非 JSON 响应返回 {}，故「404 且无 .error」即路由未上线，不能误报成业务 404。
   if (status === 404 && !hasError) return { ok: false, reason: 'not_deployed', status };
   if (status >= 400 && status < 500) {
-    return { ok: false, reason: 'client', status, error, ...(bodyAppIds.length ? { appIds: bodyAppIds } : {}) };
+    return { ok: false, reason: 'client', status, error, ...clientExtra };
   }
   return { ok: false, reason: 'server', status, error };
 }

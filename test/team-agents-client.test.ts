@@ -288,6 +288,12 @@ describe('addTeamGroupMembers（端点4 / B：往现有群补人）', () => {
     expect(isRetriable(r as any)).toBe(false);
   });
 
+  it('403 platform_bot_not_in_chat 带 platformAppId(+name) → 透传到 failure（自动拉平台 app 用）', async () => {
+    const { o } = opts([{ status: 403, json: { error: 'platform_bot_not_in_chat', platformAppId: 'cli_plat', platformAppName: '平台应用' } }]);
+    const r = await addTeamGroupMembers({ chatId: 'oc_x', teamId: 't1', appIds: ['cli_a'] }, o);
+    expect(r).toMatchObject({ ok: false, reason: 'client', status: 403, error: 'platform_bot_not_in_chat', platformAppId: 'cli_plat', platformAppName: '平台应用' });
+  });
+
   it('403 requester_not_in_chat（发起方 owner 本人不在该群）→ client', async () => {
     const { o } = opts([{ status: 403, json: { error: 'requester_not_in_chat' } }]);
     const r = await addTeamGroupMembers({ chatId: 'oc_x', teamId: 't1', appIds: ['cli_a'] }, o);

@@ -12819,12 +12819,54 @@ async function cmdBotsListTeam(rest: string[]): Promise<void> {
 }
 
 /**
+ * (a) 自动化辅助：把平台后端 app（platformAppId）拉进目标群 `chatId`。
+ *
+ * 飞书约束：加应用的 app 自己得在群里。所以找一个**已在该群、且本机可用凭据**的 bot 当代理
+ * （addBotToChat proxy）。优先用本会话 bot（它天然在本群且已注册），否则遍历 bots.json 里其它
+ * 非 apiOnly bot、逐个 isInChat 命中即用。全都不在群/加失败（无 scope、群需群主审批）→ 返回失败，
+ * 由调用方回退到手动引导。
+ */
+async function tryAutoAddPlatformBot(
+  chatId: string, platformAppId: string,
+): Promise<{ ok: true; proxyName: string } | { ok: false; reason: string }> {
+  try {
+    const { loadBotConfigs, registerBot } = await import('./bot-registry.js');
+    const { isInChat, addBotToChat } = await import('./services/groups-store.js');
+    let cfgs: Array<{ larkAppId: string; cliId?: string; apiOnly?: boolean }>;
+    try { cfgs = loadBotConfigs() as any; } catch { return { ok: false, reason: '读 bots.json 失败' }; }
+    // 候选代理：本会话 bot 优先（已在本群、已注册），其余非 apiOnly bot 兜底。
+    const self = process.env.BOTMUX_LARK_APP_ID;
+    const ordered = [
+      ...cfgs.filter(c => c.larkAppId === self),
+      ...cfgs.filter(c => c.larkAppId !== self && c.apiOnly !== true),
+    ];
+    if (ordered.length === 0) return { ok: false, reason: '本机无可用 bot 当代理' };
+    for (const cfg of ordered) {
+      if (cfg.apiOnly === true) continue;
+      try { registerBot(cfg as any); } catch { /* 已注册/凭据缺失 → 下面 isInChat 会失败并跳过 */ }
+      let inChat = false;
+      try { inChat = await isInChat(cfg.larkAppId, chatId); } catch { inChat = false; }
+      if (!inChat) continue;
+      const r = await addBotToChat(cfg.larkAppId, chatId, [platformAppId]);
+      const one = r[0];
+      if (one?.ok) return { ok: true, proxyName: cfg.cliId ? `${cfg.cliId}/${cfg.larkAppId}` : cfg.larkAppId };
+      // 加失败（无 scope / 群需审批 / invalid）→ 记原因，继续试下一个代理。
+      if (one?.error) return { ok: false, reason: `代理 ${cfg.larkAppId} 添加失败：${one.error}` };
+    }
+    return { ok: false, reason: '本机没有已在该群、且有权限的 bot 可当代理' };
+  } catch (e: any) {
+    return { ok: false, reason: String(e?.message ?? e) };
+  }
+}
+
+/**
  * `botmux bots invite --chat <chatId> --team <id> --agent <appId>...`
  * —— 往**已存在的团队群**补人（同 team、已 opt-in 的 agent + 各自 owner），打平台端点4。
  *
  * 独立于 create-group（建新群）：语义是「群已经在了，往里加人」，不该跟建群混在一个命令里。
  * 全程 machine-auth、只认 appId（发起人在别人 bot 进群前 @不到它，靠 appId 绕开视角问题）。
  * 授权/opt-in 闸/大厅排除全在平台，CLI 零判断、只如实展示平台判定。
+ * 若平台回 platform_bot_not_in_chat 且带 platformAppId → 自动用群内本机 bot 把平台 app 拉进群、重试。
  *
  * 输出：stdout 单行 chatId（skill 友好，与 create-group 一致）；--json-status 追加
  * {ok, chatId, invalidBotIds, invalidOwnerUnionIds, teamId}；invalid* 非空 → 非零退出。
@@ -12849,7 +12891,25 @@ async function cmdBotsInvite(rest: string[]): Promise<void> {
 
   const teamId = await resolveSingleTeamIdOrExit(fetchTeams, describeTeamAgentsFailure, argValue(rest, '--team'), '补人');
 
-  const res = await addTeamGroupMembers({ chatId: chatArg, teamId, appIds });
+  let res = await addTeamGroupMembers({ chatId: chatArg, teamId, appIds });
+
+  // (a) 自动化：撞 platform_bot_not_in_chat 且平台回传了 platformAppId → 用群里已有的本机 bot
+  // 当代理，把平台后端 app 拉进目标群，再自动重试一次补人。让「往任意我在的群补人」尽量无感；
+  // 碰到「加 bot 需群主审批 / 代理 bot 无成员管理 scope」时 addBotToChat 会失败，落回下面的手动提示。
+  if (!res.ok && res.reason === 'client' && res.status === 403 && res.error === 'platform_bot_not_in_chat' && res.platformAppId) {
+    const added = await tryAutoAddPlatformBot(chatArg, res.platformAppId);
+    if (added.ok) {
+      console.error(`（已用群内 bot「${added.proxyName}」把平台应用拉进群，重试补人…）`);
+      res = await addTeamGroupMembers({ chatId: chatArg, teamId, appIds });
+    } else {
+      // 自动拉失败：给可操作的手动引导（用平台回传的 app 名/id），不静默。
+      const appLabel = res.platformAppName ? `${res.platformAppName}（${res.platformAppId}）` : res.platformAppId;
+      console.error(`补人前置：平台应用不在目标群，且自动添加未成功（${added.reason}）。`);
+      console.error(`请在群设置里手动添加应用：${appLabel}，然后重试 botmux bots invite。`);
+      process.exit(1);
+    }
+  }
+
   if (!res.ok) {
     if (res.reason === 'unbound') console.error('本机未绑定平台。补人需要先 botmux bind。');
     else if (res.reason === 'not_deployed') console.error('平台尚未部署补人端点（/v1/machine/groups/:chatId/members）。等平台上线后重试。');
@@ -12857,8 +12917,9 @@ async function cmdBotsInvite(rest: string[]): Promise<void> {
     else if (res.reason === 'client' && res.status === 403) {
       // 403 分支（平台按 error code 返回）：可行性/归属/opt-in/大厅，各给可操作的提示。
       const which = res.appIds && res.appIds.length ? `（${res.appIds.join('、')}）` : '';
+      const appLabel = res.platformAppName ? `${res.platformAppName}（${res.platformAppId ?? ''}）` : (res.platformAppId ?? '平台应用');
       const hint =
-          res.error === 'platform_bot_not_in_chat' ? '平台机器人（BotmuxPlatform）还不在目标群里——请先把它拉进该群，再补人'
+          res.error === 'platform_bot_not_in_chat' ? `平台应用还不在目标群里——请在群设置添加应用：${appLabel}，再补人`
         : res.error === 'requester_not_in_chat' ? '你本人还不在目标群里——只能往「你自己已在场」的群补人（先加入该群）'
         : res.error === 'requester_bot_not_in_chat' ? '你本人还不在目标群里——只能往「你自己已在场」的群补人（先加入该群）'
         : res.error === 'chat_is_hall' ? '目标群是机器人大厅，不允许往里补人（大厅是 bot-only 身份登记群）'
