@@ -549,6 +549,12 @@ botmux bots list
 - \`mentionable\`：**你能不能可靠地 @ 到它**（关键）
 - \`mentionSource\`：\`cross-ref\` | \`observed\` | \`self\` | \`fallback\`
 
+另外每行还带两块**派活前的只读决策信息**（都是从本地配置推导，不代表运行时在线）：
+- \`dispatch\`：\`trigger\`（唤醒方式，恒为 \`mention\`）+ \`workspace\`（派活要不要指定仓库：\`required\`|\`optional\`|\`none\`|\`unknown\`）
+- \`collaboration\`：\`reachability\`（能否可靠寻址）、\`workspace\`（仓库要求 + 工作区候选来源）、\`authorization\`（\`talk\` 对话授权 / \`operate\` 管理动作授权，两层分开判）、\`session\`（普通群 \`mentionMode\` 要不要 @、\`replyMode\` 回复落哪）、\`runtime\`（\`transport\` 有无飞书通道、\`deployment\` 本地/远端、\`stale\` 健康证据是否过期）
+
+顶层还有一个 \`collaborationHelp\`：**逐字段逐枚举值的中文解释就印在同一份输出里**——不确定某个值什么意思，直接查它，不用来问。
+
 \`\`\`json
 {
   "sessionId": "...",
@@ -556,9 +562,18 @@ botmux bots list
   "bots": [
     { "name": "后端Bot", "openId": "ou_yyy", "isSelf": false, "larkAppId": "cli_b",
       "capability": "服务端排查，擅长日志", "hasTeamRole": true,
-      "mentionable": true, "mentionSource": "cross-ref" }
+      "mentionable": true, "mentionSource": "cross-ref",
+      "dispatch": { "trigger": "mention", "workspace": "required" },
+      "collaboration": {
+        "reachability": "ready",
+        "workspace": { "requirement": "required", "source": "oncall" },
+        "authorization": { "talk": "preflight-required", "operate": false },
+        "session": { "mentionMode": "always", "replyMode": "chat-topic" },
+        "runtime": { "transport": true, "deployment": "local", "stale": "unknown" }
+      } }
   ],
-  "total": 1
+  "total": 1,
+  "collaborationHelp": { "general": "unknown 表示当前命令没有足够证据…", "fields": { "reachability": { "description": "…", "values": { "ready": "…" } } } }
 }
 \`\`\`
 
@@ -566,7 +581,9 @@ botmux bots list
 
 1. **只 @ \`mentionable=true\` 的机器人**。\`mentionable=false\` 表示"知道它在群里，但当前点不准"（飞书 open_id 按 app 隔离）——这种先让它 / 用户在群里 \`/introduce\` 一次，再点名。
 2. 按 \`capability\` 挑合适的队友，而不是乱点。
-3. 配合 botmux send：\`botmux send --mention "ou_yyy:后端Bot" "请帮忙处理"\`
+3. **\`unknown\` ≠ 不可用、更 ≠ 离线**：只是这条命令当前没有足够证据。别把 \`unknown\` 当成"它挂了"而放弃派活；语义拿不准就查 \`collaborationHelp\`。
+4. \`authorization.operate\` 默认按 \`false\`/\`unknown\` 处理：能对话不等于能让它跑 \`/repo\`、\`/restart\` 等管理动作，那类要单独授权。
+5. 配合 botmux send：\`botmux send --mention "ou_yyy:后端Bot" "请帮忙处理"\`
 
 ## 要把任务交棒给别的机器人？
 
@@ -1052,6 +1069,12 @@ botmux ask buttons --options "yes=继续,no=停止" "继续吗？"
 
 兼容 alias：\`botmux ask --options "yes,no" "继续吗？"\` 可以用，但文档和新脚本优先写 \`botmux ask buttons\`，给未来 \`ask text\` / \`ask confirm\` 留空间。
 
+多选加 \`--multi\`，stdout 返回逗号分隔的 key；需要完整结构时加 \`--json\` 读取 \`answers[0]\`（多选下 \`selected\` 恒为 \`null\`，因为它只表示单问单选的兼容值）：
+
+\`\`\`bash
+choices=$(botmux ask buttons --multi --options "lint=Lint,test=测试,build=构建" "要执行哪些检查？")
+\`\`\`
+
 ## JSON 输出
 
 \`\`\`bash
@@ -1062,12 +1085,13 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 同时保留非 0 exit code。脚本判断超时必须看 exit code 或 \`timedOut\` 字段。
 
 \`\`\`json
-{"selected":"yes","by":"ou_xxx","timedOut":false,"comment":null}
+{"selected":"yes","answers":[["yes"]],"by":"ou_xxx","timedOut":false,"comment":null}
 \`\`\`
 
 ## 退出码和 stdout 契约
 
 - 成功：stdout 一行 \`<selected_key>\`，exit 0
+- \`--multi\` 成功：stdout 一行逗号分隔的 \`<selected_key>\`，exit 0
 - \`--json\`：stdout 一行 JSON（包括超时 / 失效），exit code 仍按结果返回
 - 超时：默认模式 stdout 为空，exit 124；\`--json\` 时 \`{"selected":null,"timedOut":true,...}\`
 - 缺少 botmux 环境变量 / 参数错误：stdout 为空，exit 2
@@ -1079,7 +1103,7 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 
 - \`--options\` 必填，至少 2 项，逗号分隔
 - 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
-- 不支持 comment / multi-select / free-form text（v0.1.7 范围外）
+- \`--multi\` 开启多选；\`--json\` 的 \`answers[0]\` 保留完整 key 数组，且 \`selected\` 恒为 \`null\`（多选不要读 \`selected\`）
 - 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
 `;
 

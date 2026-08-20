@@ -23,6 +23,20 @@ function dispatchCommandSource(): string {
 }
 
 describe('botmux report daemon IPC auth wiring', () => {
+  it('strips trailing memory citations before every report delivery and preview path', () => {
+    const source = reportCommandSource();
+    const sanitize = source.indexOf('content = stripTrailingOaiMemoryCitation(content);');
+
+    expect(sanitize).toBeGreaterThan(source.indexOf('content = pos.length ? pos.join'));
+    expect(sanitize).toBeLessThan(source.indexOf('if (!contentFile) rejectLikelyWindowsStdinMojibake(content);'));
+    expect(sanitize).toBeLessThan(source.indexOf('if (!content.trim())'));
+    expect(sanitize).toBeLessThan(source.indexOf('report: content'));
+    expect(sanitize).toBeLessThan(source.indexOf('body: { dispatchRoot: dispatchRootCandidate, content }'));
+    // The delivery-envelope report path widened this call to multi-line; anchor
+    // on the call head so the ordering assertion survives argument growth.
+    expect(sanitize).toBeLessThan(source.indexOf('const paras = buildReportContent({'));
+  });
+
   it('routes through the authenticated source daemon when the host secret is available', () => {
     const source = reportCommandSource();
 
