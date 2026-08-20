@@ -559,6 +559,131 @@ describe('plugin MCP Gateway', () => {
     expect(readMcpGatewayLaunchRecord(dataDir, sessionId)).toBeNull();
   });
 
+  // ─── Worker reattach wiring (source lock) ──────────────────────────────────
+  //
+  // spawnCli is not exported (repo convention: source-lock tests, see
+  // resume-fresh-policy.test.ts). These pin the P0 fix: the pane-reattach-safe
+  // branch MUST re-serve the trusted Gateway host at the deterministic path so
+  // the surviving pane's relay can reconnect. Without it (the shipped bug) the
+  // reattach branch only logged, willReattachPersistent stayed true, and the
+  // sole host starter (prepareCliPluginGenerationAndGateway) was gated out by
+  // `if (!willReattachPersistent)` — the relay then reconnected forever to a
+  // socket nothing binds.
+  describe('reattach-safe branch re-serves the Gateway host (source lock)', () => {
+    const workerSource = readFileSync(resolve('src/worker.ts'), 'utf8');
+
+    it('exposes a host-only starter that does NOT refresh the plugin generation', () => {
+      // The starter must be separate from prepareCliPluginGenerationAndGateway
+      // (which calls refreshCliPluginGeneration) so a warm reattach keeps the
+      // CLI's existing catalog untouched while still binding a fresh host.
+      const start = workerSource.indexOf('async function startAndRecordSessionMcpGatewayHost');
+      expect(start).toBeGreaterThan(-1);
+      const block = workerSource.slice(start, start + 800);
+      expect(block).toContain('startSessionMcpGatewayHost(');
+      expect(block).toContain('writeMcpGatewayLaunchRecord(');
+      // Host-only: must NOT re-run the catalog/plugin refresh on this path.
+      expect(block).not.toContain('refreshCliPluginGeneration(');
+      // Both host-start paths (fresh/resumed via prepare*, and the re-served
+      // reattach host) route through this helper, so it MUST keep #917's
+      // per-turn trusted-caller provider wired — otherwise a warm reattach (and
+      // every spawn) would silently stop injecting the host-signed identity.
+      // The worker-level wiring is not otherwise exercised by a runtime test.
+      expect(block).toContain('trustedTurnIdentity: currentGatewayTrustedTurnIdentity');
+    });
+
+    it('starts the replacement host inside the paneRelayReattachSafe branch', () => {
+      const start = workerSource.indexOf('if (paneRelayReattachSafe) {');
+      expect(start).toBeGreaterThan(-1);
+      // Scope strictly to the reattach-safe branch (ends at the legacy
+      // cold-resume `else if`), so a host start anywhere else can't satisfy this.
+      const branchEnd = workerSource.indexOf('} else if (paneProbe === \'exists\') {', start);
+      expect(branchEnd).toBeGreaterThan(start);
+      const branch = workerSource.slice(start, branchEnd);
+      expect(branch).toContain('startAndRecordSessionMcpGatewayHost(');
+      // Only when this fresh worker has no live host yet — never stomp a host an
+      // in-worker restart already brought up.
+      expect(branch).toContain('if (!sessionMcpGatewayHost)');
+    });
+
+    it('re-serving is awaited and guarded by the spawn-generation fence', () => {
+      const start = workerSource.indexOf('if (paneRelayReattachSafe) {');
+      const branchEnd = workerSource.indexOf('} else if (paneProbe === \'exists\') {', start);
+      const branch = workerSource.slice(start, branchEnd);
+      expect(branch).toContain('await startAndRecordSessionMcpGatewayHost(');
+      // A concurrent restart must not let a superseded generation keep running.
+      expect(branch).toContain('if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();');
+    });
+  });
+
+  it('re-served reattach host binds the same deterministic path a stranded relay reconnects to', async () => {
+    // End-to-end proof of the fix's mechanism: a relay left running after its
+    // host dies (the daemon-restart pane) has an in-flight call HANG, and the
+    // moment a replacement host is bound at the SAME deterministic path — which
+    // is exactly what startAndRecordSessionMcpGatewayHost now does on the
+    // reattach branch — that same in-flight call resolves.
+    const sessionId = 'reattach-reserve-reconnect';
+    const dataDir = join(home, 'custom-botmux', 'data');
+    vi.stubEnv('SESSION_DATA_DIR', dataDir);
+    installFixturePlugin('plugin-a', 'alpha');
+    refreshSessionMcpRuntimeManifest({ sessionId, pluginIds: ['plugin-a'], dataDir });
+
+    const host1 = await startSessionMcpGatewayHost({ sessionId, dataDir });
+    // The worker persists this record when it launches the CLI generation.
+    writeMcpGatewayLaunchRecord(dataDir, sessionId, host1.socketPath);
+
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+      cwd: resolve('.'),
+      env: {
+        ...mcpServeEnvironment(sessionId),
+        SESSION_DATA_DIR: dataDir,
+        [MCP_GATEWAY_SOCKET_ENV]: host1.socketPath,
+        [MCP_GATEWAY_REQUIRED_ENV]: '1',
+        BOTMUX_MCP_RELAY_BACKOFF_MS: '50',
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'reattach-reserve-test', version: '1.0.0' });
+    let host2: Awaited<ReturnType<typeof startSessionMcpGatewayHost>> | undefined;
+    try {
+      await client.connect(transport);
+      expect((await client.listTools()).tools.map(t => t.name).sort()).toEqual(['alpha_unique', 'echo']);
+
+      // The worker's reattach decision, evaluated from the persisted record.
+      expect(mcpGatewayPaneReattachSafe(
+        readMcpGatewayLaunchRecord(dataDir, sessionId),
+        sessionMcpGatewaySocketPath(sessionId, dataDir),
+      )).toBe(true);
+
+      // Daemon restart kills the host; the pane's relay + client live on.
+      await host1.close();
+      await new Promise(r => setTimeout(r, 150));
+
+      // A call during the outage must buffer, not fail.
+      let settled = false;
+      const pendingCall = client.callTool({ name: 'echo', arguments: {} })
+        .then(res => { settled = true; return res; });
+      const duringOutage = await Promise.race([
+        pendingCall.then(() => 'resolved'),
+        new Promise<string>(r => setTimeout(() => r('still-pending'), 1500)),
+      ]);
+      expect(duringOutage).toBe('still-pending');
+      expect(settled).toBe(false);
+
+      // The fix: re-serve the host at the SAME deterministic path (what
+      // startAndRecordSessionMcpGatewayHost does on the reattach branch).
+      host2 = await startSessionMcpGatewayHost({ sessionId, dataDir });
+      expect(host2.socketPath).toBe(host1.socketPath);
+
+      const result = await pendingCall;
+      expect((result.content[0] as { text: string }).text).toContain(`session=${sessionId}`);
+    } finally {
+      await client.close().catch(() => undefined);
+      await host2?.close();
+    }
+  }, 30_000);
+
   it('fails closed when a managed relay loses its worker-owned socket', () => {
     const run = spawnSync(
       process.execPath,
