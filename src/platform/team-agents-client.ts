@@ -115,16 +115,17 @@ function classify(status: number, json: unknown): TeamAgentsFailure {
   }
   if (status === 401 || status === 403) {
     // 403 分型必须**按 error code**，不能「有 error 体就当 client」：
-    //  · 请求对象类（opt-in / 群资格）→ client（请求本身的问题，改参数/前置动作才有意义）：
-    //    not_in_team_bots（bot 没 opt-in）、chat_is_hall（大厅不可补人）、
+    //  · 请求对象类（群资格 / opt-in）→ client（改前置动作/参数才有意义）：
     //    platform_bot_not_in_chat（平台 bot 不在目标群 → 先把平台 bot 拉进群）、
-    //    requester_bot_not_in_chat（群里没有发起方本机的 bot → 不是你在协作的群）。
+    //    requester_not_in_chat（发起方 owner 本人不在该群 → 只能往你自己在的群补人）、
+    //    chat_is_hall（大厅不可补人）、not_in_team_bots（bot 没 opt-in）。
     //  · 其余 403（如 machine_ownership_mismatch：机器 RETIRED/换绑 owner）是**凭证/归属问题** → forbidden，
     //    该去 rebind，不是改参数——归 client 会误导排查方向。纯 401 / 无 error 体的 403 同理 forbidden。
-    //  （旧 chat_not_in_team 随 groupChatIds 判据下线，被上面两个 *_not_in_chat 取代。）
+    //  （归属闸按「人」判：飞书列群成员不返回 bot、不支持 app_id，故验发起方 owner unionId ∈ 群，
+    //   不是 bot ∈ 群。旧 chat_not_in_team / requester_bot_not_in_chat 均下线，保留兼容解析。）
     const CLIENT_403 = new Set([
-      'not_in_team_bots', 'chat_is_hall', 'platform_bot_not_in_chat', 'requester_bot_not_in_chat',
-      'chat_not_in_team', // 兼容：旧端点未升级前仍可能回它
+      'platform_bot_not_in_chat', 'requester_not_in_chat', 'chat_is_hall', 'not_in_team_bots',
+      'chat_not_in_team', 'requester_bot_not_in_chat', // 兼容：端点未升级前的旧码
       'not_found',
     ]);
     if (status === 403 && hasError && CLIENT_403.has(rawErr as string)) {
@@ -281,23 +282,21 @@ export function createTeamGroup(
 }
 
 /**
- * 端点4（B）：往一个**已存在的团队群** `chatId` 补人——把 `appIds` 指定的 agent
- * （+ 默认各自 owner）加进去。与端点3（建新群）互补：这条服务「群已经在了、往里加同 team
- * 别人的 agent」的场景。
+ * 端点4（B）：往一个**已存在的群** `chatId` 补人——把 `appIds` 指定的 agent **+ 各自 owner**
+ * 一起加进去。与端点3（建新群）互补：这条服务「群已经在了、往里加同 team 别人的 agent」的场景。
+ * 补人**恒带 owner**（agent 不进没主人的群），无「只补 bot」选项。
  *
- * 平台侧授权（客户端零判断，只透传）：① 调用者是 teamId 成员（否则 404）；② chatId 必须是
- * 该 team 自己的协作群（∈ groupChatIds，且**排除机器人大厅**）——否则 403 `chat_not_in_team`
- * / `chat_is_hall`，杜绝拿任意 chatId 往别人群塞人；③ opt-in 闸同 team.bots。
- *
- * `includeOwners` 默认 true（对齐端点3「bot 不进没主人的群」）；只加**被加 bot 各自的 owner**
- * （都是 team 成员、同信任域），绝不加任意真人。传 false 则只补 bot、不动人。
+ * 平台侧授权（客户端零判断，只透传）——判据按「人」判（飞书列群成员不返回 bot、不支持 app_id）：
+ *  ① 可行性闸：平台 bot ∈ chat（tenant token is_in_chat）——它不在就根本加不进人，否则 403
+ *     `platform_bot_not_in_chat`；② 归属闸：发起方 owner（machineToken 里的 unionId，不可伪造）
+ *     ∈ chat——「你本人已在这群，只是把队友 bot+owner 拉进来」，否则 403 `requester_not_in_chat`；
+ *  ③ opt-in 闸同 team.bots；④ 大厅排除。杜绝往「你不在的陌生群」塞人。
  */
 export function addTeamGroupMembers(
-  args: { chatId: string; teamId: string; appIds: string[]; includeOwners?: boolean },
+  args: { chatId: string; teamId: string; appIds: string[] },
   opts: TeamAgentsClientOptions = {},
 ): Promise<TeamAgentsClientResult<AddTeamGroupMembersResult>> {
   const body: Record<string, unknown> = { teamId: args.teamId, appIds: args.appIds };
-  if (args.includeOwners !== undefined) body.includeOwners = args.includeOwners;
   return call(
     opts,
     'POST',

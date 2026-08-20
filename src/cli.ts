@@ -11636,7 +11636,7 @@ botmux create-group — 用一组机器人新建飞书群
   // 却因 --chat 被丢弃照常建了个新群（真实副作用，多一个群）。放在 team 分流之前拦。
   if (hasFlagOrEq(rest, '--chat')) {
     console.error('create-group 不再支持 --chat（往已有群补人已拆成独立命令）。请改用：');
-    console.error('  botmux bots invite --chat <chatId> --team <id> --agent <appId>... [--no-owners]');
+    console.error('  botmux bots invite --chat <chatId> --team <id> --agent <appId>...');
     process.exit(1);
   }
 
@@ -12669,7 +12669,7 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
 
   if (sub !== 'list' && sub !== 'ls' && sub !== '') {
     console.error('用法: botmux bots list [--scope chat|team] [--team <id>] [--session-id ID]');
-    console.error('      botmux bots invite --chat <chatId> --team <id> --agent <appId>... [--no-owners]');
+    console.error('      botmux bots invite --chat <chatId> --team <id> --agent <appId>...');
     process.exit(1);
   }
 
@@ -12819,7 +12819,7 @@ async function cmdBotsListTeam(rest: string[]): Promise<void> {
 }
 
 /**
- * `botmux bots invite --chat <chatId> --team <id> --agent <appId>... [--no-owners]`
+ * `botmux bots invite --chat <chatId> --team <id> --agent <appId>...`
  * —— 往**已存在的团队群**补人（同 team、已 opt-in 的 agent + 各自 owner），打平台端点4。
  *
  * 独立于 create-group（建新群）：语义是「群已经在了，往里加人」，不该跟建群混在一个命令里。
@@ -12834,12 +12834,12 @@ async function cmdBotsInvite(rest: string[]): Promise<void> {
     await import('./platform/team-agents-client.js');
   const jsonStatus = rest.includes('--json-status');
   const chatArg = (argValue(rest, '--chat') ?? '').trim();
-  const includeOwnersFalse = rest.includes('--no-owners');
   const appIds = [...new Set(argValues(rest, '--agent').map(s => s.trim()).filter(Boolean))];
 
   if (!chatArg) {
-    console.error('用法: botmux bots invite --chat <chatId> --team <id> --agent <appId>... [--no-owners]');
-    console.error('--chat 必填：目标群 chatId（须已有平台机器人 BotmuxPlatform + 你本机的 bot 在场，非机器人大厅）。');
+    console.error('用法: botmux bots invite --chat <chatId> --team <id> --agent <appId>...');
+    console.error('--chat 必填：目标群 chatId（须已有平台机器人 BotmuxPlatform 在场，且你本人已在该群，非机器人大厅）。');
+    console.error('补人恒把 agent + 各自 owner 一起拉进群。');
     process.exit(1);
   }
   if (appIds.length === 0) {
@@ -12849,10 +12849,7 @@ async function cmdBotsInvite(rest: string[]): Promise<void> {
 
   const teamId = await resolveSingleTeamIdOrExit(fetchTeams, describeTeamAgentsFailure, argValue(rest, '--team'), '补人');
 
-  const res = await addTeamGroupMembers({
-    chatId: chatArg, teamId, appIds,
-    ...(includeOwnersFalse ? { includeOwners: false } : {}),
-  });
+  const res = await addTeamGroupMembers({ chatId: chatArg, teamId, appIds });
   if (!res.ok) {
     if (res.reason === 'unbound') console.error('本机未绑定平台。补人需要先 botmux bind。');
     else if (res.reason === 'not_deployed') console.error('平台尚未部署补人端点（/v1/machine/groups/:chatId/members）。等平台上线后重试。');
@@ -12862,7 +12859,8 @@ async function cmdBotsInvite(rest: string[]): Promise<void> {
       const which = res.appIds && res.appIds.length ? `（${res.appIds.join('、')}）` : '';
       const hint =
           res.error === 'platform_bot_not_in_chat' ? '平台机器人（BotmuxPlatform）还不在目标群里——请先把它拉进该群，再补人'
-        : res.error === 'requester_bot_not_in_chat' ? '目标群里没有你这台机器的 bot——只能往「已有你自己 bot 在场」的群补人（先让你的 bot 进群）'
+        : res.error === 'requester_not_in_chat' ? '你本人还不在目标群里——只能往「你自己已在场」的群补人（先加入该群）'
+        : res.error === 'requester_bot_not_in_chat' ? '你本人还不在目标群里——只能往「你自己已在场」的群补人（先加入该群）'
         : res.error === 'chat_is_hall' ? '目标群是机器人大厅，不允许往里补人（大厅是 bot-only 身份登记群）'
         : res.error === 'chat_not_in_team' ? '目标群不是本团队的协作群'
         : `相关 bot${which} 未由其 owner 在平台「管理机器人」加入该团队`;

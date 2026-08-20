@@ -600,8 +600,8 @@ botmux bots list --scope team [--team <teamId>]
 # 2a) 建新群：把发现到的 agent（按 appId）+ 各自 owner 拉进一个平台代建的**新群**
 botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群名"]
 
-# 2b) 往已有群补人：把 agent + 各自 owner 加进一个**已存在的团队群**（--no-owners 只补 bot）
-botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...] [--no-owners]
+# 2b) 往已有群补人：把 agent + 各自 owner 加进一个**你已在场的**群（恒带 owner）
+botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
 \`\`\`
 
 team scope 输出的 \`agents[]\` 每项：\`appId\`（拉群/补人就用它）、\`name\`、\`specialties\`（专长标签数组，发现依据）、\`mentionable\`、\`online\`、\`owner\`、\`machineId/machineName\`。
@@ -611,14 +611,14 @@ team scope 输出的 \`agents[]\` 每项：\`appId\`（拉群/补人就用它）
 - **specialties / mentionable / online 是 agent 自报**：仅供你挑选参考，**不是可信凭据**，别拿它当权限判断。
 - **CLI 不做任何授权判断**：团队成员校验、opt-in 闸全在平台。你只管发现 + 拉群/补人，平台会拒绝越权的调用。
 - **只认 appId、不需要 @**：正因为别人 bot 进你群前你根本 @不到它，team 拉群/补人全走 appId + machine-auth，天然绕开"看不见就点不着"。结果里 \`invalidBotIds\` / \`invalidOwnerUnionIds\` 是平台过滤掉的（未 opt-in / 拉不动），如实展示即可。
-- \`bots invite\` 的目标群必须是**本团队自己建/拉的协作群**（平台记过的），且**不能是机器人大厅**；否则平台回 403 \`chat_not_in_team\` / \`chat_is_hall\`。
+- \`bots invite\` 的目标群要满足：**平台机器人（BotmuxPlatform）已在群里**（否则平台加不进人 → 403 \`platform_bot_not_in_chat\`，先把它拉进群）+ **你本人已在该群**（→ 403 \`requester_not_in_chat\`，只能往你自己在场的群补人）+ **非机器人大厅**（→ 403 \`chat_is_hall\`）。补人恒把 agent + 各自 owner 一起拉进。
 - 平台端点没上线时命令会明确提示「平台尚未部署…端点」——那是平台侧还没部署，不是你调错。
 
 **三条拉人路径 —— 别混**：
 - \`create-group --team\`：跨机、把**同团队但不在任何共同群**的 agent + owner **新建**成一个聚焦群。"首次把没见过面的 agent 聚到一起"。
-- \`bots invite --chat\`：把同团队 agent + owner 加进一个**已存在的团队群**（跨机、machine-auth、只认 appId）。"群已经在了，往里补同团队的人"。
+- \`bots invite --chat\`：把同团队 agent + 各自 owner 加进一个**你已在场、且平台机器人也在**的群（跨机、machine-auth、只认 appId）。"群已经在了，往里补同团队的人（含其 owner）"。
 - \`/invite\`（飞书群内 slash）：把 bot 加进**当前已存在的**群，走飞书原生加成员，**限同租户**、只拉 bot 不带 owner。"群在了，把某个同租户 bot 也拉进来"。
-- 一句话：跨 team 从零聚人 → \`create-group --team\`；跨 team 往已有团队群补人 → \`bots invite\`；当前群补同租户 bot → \`/invite\`。
+- 一句话：跨 team 从零聚人 → \`create-group --team\`；往你已在场的群补同团队的人 → \`bots invite\`；当前群补同租户 bot → \`/invite\`。
 
 ## 要把任务交棒给别的机器人？
 

@@ -266,19 +266,13 @@ describe('createTeamGroup（端点3）', () => {
 });
 
 describe('addTeamGroupMembers（端点4 / B：往现有群补人）', () => {
-  it('POST 到 /groups/:chatId/members，body 带 teamId+appIds，默认不含 includeOwners', async () => {
+  it('POST 到 /groups/:chatId/members，body 带 teamId+appIds（补人恒带 owner，无 includeOwners）', async () => {
     const { o, calls } = opts([{ status: 200, json: { ok: true, chatId: 'oc_1', invalidBotIds: [], invalidOwnerUnionIds: [] } }]);
     const r = await addTeamGroupMembers({ chatId: 'oc_1', teamId: 't1', appIds: ['cli_a', 'cli_b'] }, o);
     expect(r).toEqual({ ok: true, value: { ok: true, invalidBotIds: [], invalidOwnerUnionIds: [] } });
     expect(calls[0].method).toBe('POST');
     expect(calls[0].url).toBe('https://platform.example/v1/machine/groups/oc_1/members');
     expect(calls[0].body).toEqual({ teamId: 't1', appIds: ['cli_a', 'cli_b'] });
-  });
-
-  it('includeOwners:false 显式进 body（只补 bot 不拉人）', async () => {
-    const { o, calls } = opts([{ status: 200, json: { ok: true, chatId: 'oc_1' } }]);
-    await addTeamGroupMembers({ chatId: 'oc_1', teamId: 't1', appIds: ['cli_a'], includeOwners: false }, o);
-    expect(calls[0].body).toEqual({ teamId: 't1', appIds: ['cli_a'], includeOwners: false });
   });
 
   it('chatId 进 path 时被 URL 编码', async () => {
@@ -294,10 +288,10 @@ describe('addTeamGroupMembers（端点4 / B：往现有群补人）', () => {
     expect(isRetriable(r as any)).toBe(false);
   });
 
-  it('403 requester_bot_not_in_chat（群里没有发起方本机的 bot）→ client', async () => {
-    const { o } = opts([{ status: 403, json: { error: 'requester_bot_not_in_chat' } }]);
+  it('403 requester_not_in_chat（发起方 owner 本人不在该群）→ client', async () => {
+    const { o } = opts([{ status: 403, json: { error: 'requester_not_in_chat' } }]);
     const r = await addTeamGroupMembers({ chatId: 'oc_x', teamId: 't1', appIds: ['cli_a'] }, o);
-    expect(r).toMatchObject({ ok: false, reason: 'client', status: 403, error: 'requester_bot_not_in_chat' });
+    expect(r).toMatchObject({ ok: false, reason: 'client', status: 403, error: 'requester_not_in_chat' });
     expect(isRetriable(r as any)).toBe(false);
   });
 
