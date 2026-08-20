@@ -8,6 +8,7 @@ import {
   claimGoalChatRevive,
   closeGoalChat,
   getGoalChat,
+  isGoalChat,
   registerGoalChat,
 } from '../src/services/goal-chat-store.js';
 
@@ -121,6 +122,21 @@ describe('goal chat store', () => {
       larkAppId: 'cli_main', origin: 'dashboard', parentKind: 'dashboard', now: 1_000,
     })).toThrow('goal_chat_store_corrupt');
     expect(readFileSync(registryPath, 'utf8')).toBe(malformed);
+  });
+
+  it('isGoalChat fails open on a corrupt registry so message routing keeps working', () => {
+    const registryDir = join(dir, 'verified-delivery');
+    mkdirSync(registryDir, { recursive: true });
+    writeFileSync(join(registryDir, 'goal-chats.json'), '{not json');
+    // Leave the in-memory test override: a writer hitting the corrupt file
+    // fails closed and switches the store back to the on-disk registry.
+    expect(() => registerGoalChat('oc_new', { larkAppId: 'cli_main', now: 1_000 }))
+      .toThrow('goal_chat_store_corrupt');
+
+    // The hot routing path (evaluateTalk oncall quota exemption) must not throw.
+    expect(isGoalChat('oc_any')).toBe(false);
+    // Lifecycle accessors still fail closed on the same corrupt registry.
+    expect(() => getGoalChat('oc_any')).toThrow('goal_chat_store_corrupt');
   });
 
   it('serializes registry mutations with a stale-recoverable shared lock', () => {

@@ -323,7 +323,16 @@ export function getGoalChat(chatId: string | undefined): GoalChatRecord | undefi
 
 export function isGoalChat(chatId: string | undefined): boolean {
   if (!chatId) return false;
-  loadIfNeeded();
+  // Best-effort membership probe used on the hot message-routing path
+  // (evaluateTalk oncall quota exemption). A corrupt/unreadable registry must
+  // NOT break routing for every chat on the host — fail open as "not a goal
+  // chat" (quota applies, the pre-goal behavior). Goal lifecycle writers still
+  // fail closed via assertGoalChatStoreReadable / the throwing accessors.
+  try {
+    loadIfNeeded();
+  } catch {
+    return false;
+  }
   return goalChats.has(chatId);
 }
 
