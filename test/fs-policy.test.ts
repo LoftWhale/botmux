@@ -351,6 +351,25 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, `${botHome}/scratch.txt`).access).toBe('readWrite');
   });
 
+  it('LINUX lark-cli key store EXACTLY ON BOT_HOME (store===botHome): store deny outranks the BOT_HOME rw grant — transport', () => {
+    // Equality edge of the nested-authority fix: a deployment can wire the store ONTO
+    // BOT_HOME itself (appId 'lark-cli' — assertSafeAppId is charset-only, no `cli_`
+    // prefix enforcement — plus LARKSUITE_CLI_DATA_DIR=<botmuxHome>/bots). The internal
+    // BOT_HOME readWrite grant then lands on the SAME path as the store deny; the deny
+    // must be tagged `mandatory` (rank 4 > internal 2) or the whole keystore — siblings
+    // included — goes readWrite by same-path source rank. Own-key carve-outs still win by depth.
+    const botHome = '/home/u/.botmux/bots/lark-cli';
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u', botHome, currentAppId: 'lark-cli',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj',
+      larkCliLinuxStore: botHome,
+    }));
+    expect(accessForPath(p.rules, botHome).access).toBe('deny');
+    expect(accessForPath(p.rules, `${botHome}/master.key`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${botHome}/appsecret_lark-cli.enc`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${botHome}/appsecret_cli_other.enc`).access).toBe('deny');
+  });
+
   it('internal injections: workingDir + BOT_HOME rw, own session store + attachments ro; siblings uncovered', () => {
     const p = buildFsPolicy(ctx());
     expect(accessForPath(p.rules, '/Users/u/proj/src/x.ts').access).toBe('readWrite');
@@ -990,6 +1009,24 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, `${store}/appsecret_cli_other.enc`).access).toBe('deny');
     // model CLI's own auth still works (not a Feishu cred)
     expect(accessForPath(p.rules, '/home/u/.codex/auth.json').access).toBe('readWrite');
+  });
+
+  it('LINUX no-transport: store EXACTLY ON BOT_HOME (store===botHome) — hostile user RW at master.key is STILL dropped', () => {
+    // Equality edge of the per-root BOT_HOME exception: when the store root IS botHome,
+    // the exception must NOT fire (it is meant only for STRICT ancestors like the botmux
+    // root), or a hostile userPaths.readWrite straight at master.key escapes dropAuthority
+    // and wins by depth — the exact escape the nested-root fix closed, re-opened at equality.
+    const botHome = '/home/u/.botmux/bots/lark-cli';
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', larkTransportEnabled: false, homeDir: '/home/u', workingDir: '/home/u/proj',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
+      botHome, currentAppId: 'lark-cli', redirectedCliData: false, authPaths: ['/home/u/.codex'],
+      larkCliLinuxStore: botHome,
+      userPaths: { readWrite: [`${botHome}/master.key`, `${botHome}/appsecret_lark-cli.enc`] },
+    }));
+    expect(accessForPath(p.rules, `${botHome}/master.key`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${botHome}/appsecret_lark-cli.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${botHome}/appsecret_cli_other.enc`).access).toBe('deny');
   });
 
   it('LINUX no-transport: BOTH candidate stores frozen when a custom LARKSUITE_CLI_DATA_DIR is set (both-candidate lock)', () => {

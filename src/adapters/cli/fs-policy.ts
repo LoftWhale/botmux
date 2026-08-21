@@ -642,7 +642,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // BOT_HOME AND p is inside BOT_HOME; a root at/under BOT_HOME keeps restricting.
   const insideAuthority = (p: string): boolean =>
     authorityRoots.some(root =>
-      coversPath(root, p) && !(coversPath(root, ctx.botHome) && coversPath(ctx.botHome, p)));
+      coversPath(root, p) && !(root !== ctx.botHome && coversPath(root, ctx.botHome) && coversPath(ctx.botHome, p)));
   // Dropped caller allow paths are RECORDED so the worker can log the suppression
   // (codex: a silently-dropped grant is a diagnosability hole).
   const suppressedAuthorityPaths: string[] = [];
@@ -851,8 +851,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // master stay denied (no leak) and this bot's own keys are readable (auth works) — with
   // ZERO dependence on matching lark-cli's char validator. Deduped when equal (common case:
   // no custom LARKSUITE_CLI_DATA_DIR → resolved == default → one store). `deny` tagged
-  // `baseline` to match darwin (store deny lives in darwinBaseline; can't live in
-  // linuxBaseline — that has no homeDir-independent way to know the resolved store path).
+  // `mandatory` (not `baseline` like darwin's): see the rank-collision note in the loop.
   // No-transport denies both stores wholesale via authorityRoots and gets NO carve-out.
   if (ctx.platform === 'linux' && larkTransport) {
     const stores = new Set<string>();
@@ -861,7 +860,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     const dflt = normalizeFsPath(`${ctx.homeDir}/.local/share/lark-cli`);
     if (dflt) stores.add(dflt);
     for (const larkStore of stores) {
-      push([larkStore], 'deny', 'baseline');
+      // `mandatory` (not `baseline`): if a deployment wires the store onto BOT_HOME
+      // itself (store === botHome — e.g. appId 'lark-cli' + LARKSUITE_CLI_DATA_DIR=<botmuxHome>/bots),
+      // the internal BOT_HOME readWrite grant lands on the SAME path and would otherwise
+      // outrank this deny by source rank (internal 2 > baseline 0), re-opening the whole
+      // keystore rw. mandatory (4) keeps the ceiling; the deeper own-key carve-outs still win by depth.
+      push([larkStore], 'deny', 'mandatory');
       push([`${larkStore}/master.key`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
     }
   }
