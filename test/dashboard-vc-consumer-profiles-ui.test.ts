@@ -457,10 +457,14 @@ describe('VcConsumerProfilesSection · 按 bot 的会议开关', () => {
     expect(botRows(r).findIndex(row => textOf(row).includes('Bot Alpha'))).toBe(0);
 
     const gamma = botRow(r, 'Bot Gamma');
-    // 能力缺口收成一个 ⚠，详情在 title（hover 可见），不再平铺整行长文案。
-    const gammaWarn = gamma.findAllByProps({ className: 'vc-bot-policy-warn' })
-      .find(node => textOf(node) === '⚠');
-    expect(gammaWarn?.props.title).toContain('无飞书连接（apiOnly），收不到会议事件');
+    // 能力缺口收成一个 ⚠，详情走 InfoTip（hover 可靠 tooltip，非原生 title——
+    // 原生 title 在小元素上常触发不了）。文案在 tip 的 label（aria + 可读）里。
+    // InfoTip 根 span 的 className 是 `ui-info-tip vc-bot-policy-warn-tip`（拼接），
+    // 按子串匹配再读 label。
+    const gammaWarnTip = gamma.findAll(node =>
+      typeof node.props.className === 'string'
+      && node.props.className.includes('vc-bot-policy-warn-tip'))[0];
+    expect(gammaWarnTip?.props.label).toContain('无飞书连接（apiOnly），收不到会议事件');
     expect(rowCheckbox(gamma, 'vcEnabled').props.disabled).toBe(true);
     expect(preflightButton(gamma).props.disabled).toBe(true);
 

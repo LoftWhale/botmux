@@ -716,7 +716,15 @@ export function VcConsumerProfilesSection(props: {
                     <span className="vc-bot-policy-name" title={row.appId}>
                       {row.online ? '' : '⚪ '}{row.label}
                       {warnings.length > 0 ? (
-                        <em className="vc-bot-policy-warn" title={warnings.join(' · ')}>⚠</em>
+                        <InfoTip
+                          className="vc-bot-policy-warn-tip"
+                          label={warnings.join(' · ')}
+                          trigger={<em className="vc-bot-policy-warn" aria-hidden="true">⚠</em>}
+                        >
+                          <span className="vc-bot-policy-warn-pop">
+                            {warnings.map((w, i) => <div key={i}>{w}</div>)}
+                          </span>
+                        </InfoTip>
                       ) : null}
                       {preflight ? (
                         <em className={preflight.ok ? 'vc-bot-policy-preflight' : 'vc-bot-policy-warn'}>

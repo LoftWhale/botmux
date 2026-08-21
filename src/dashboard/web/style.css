@@ -27713,6 +27713,10 @@ button.skills-issue-badge:hover {
 .vc-bot-policy-rtv input { accent-color: var(--accent, #4c8dff); }
 .vc-bot-policy-effective { font-size: 11px; white-space: nowrap; }
 .vc-bot-policy-warn { font-style: normal; margin-left: 6px; cursor: help; opacity: .85; }
+/* ⚠ 用 InfoTip(hover 可靠、body 传送门)而非原生 title——原生 title 小元素上常
+   触发不了/延迟长。tip 包裹层内联不撑行,弹层多行分条列出。 */
+.vc-bot-policy-warn-tip { display: inline-flex; align-items: center; }
+.vc-bot-policy-warn-pop { display: flex; flex-direction: column; gap: 2px; text-align: left; }
 .vc-bot-policy-search {
   font-size: 12px; padding: 4px 8px; border-radius: 6px;
   border: 1px solid var(--border, #d0d5dd); min-width: 180px; max-width: 260px;
