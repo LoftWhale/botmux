@@ -189,26 +189,23 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(block).toContain("assertLarkTransport(larkAppId, 'downloadMessageResource')");
   });
 
-  it('worker-pool suppresses ALL aux UI for no-transport sessions at auxUiSuppressedFor', () => {
-    // The check moved out of the `managedAuxUiSuppressed` closure into the shared
-    // auxUiSuppressedFor() so the mojo quarantine notice could not drift from this
-    // policy. The closure now just delegates, so lock BOTH: the delegation and the
-    // no-transport gate in its new home.
+  it('worker-pool suppresses ALL aux UI for no-transport sessions in managedAuxUiSuppressed', () => {
+    // Plan B merge (2026-08): master had refactored this into a shared
+    // auxUiSuppressedFor() that managedAuxUiSuppressed delegated to — but that
+    // shared helper gates on the pre-Plan-B `vcMeetingReceiver` blanket, which
+    // would re-suppress a plain user turn on a meeting-agent chat session (the
+    // "手动@不回复" regression). So the merge KEEPS managedAuxUiSuppressed inline
+    // with the no-transport gate + isMeetingDrivenTurn. Lock the no-transport
+    // gate in its live home (the closure), not the delegation.
     const closure = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
-    expect(closure).toContain('auxUiSuppressedFor(ds, turnId, dispatchAttempt)');
+    expect(closure).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
+    expect(closure).toContain('return true;');
+    // auxUiSuppressedFor still exists for the mojo quarantine caller and keeps its
+    // own no-transport gate (fail-closed behaviour covered behaviourally in
+    // test/mojo-quarantine-notice-policy.test.ts).
     const shared = region(workerPoolSource, 'export function auxUiSuppressedFor(', 'isSilentScheduledTurn');
     expect(shared).toContain('larkTransportEnabled({');
     expect(shared).toContain('apiOnly: getBot(ds.larkAppId).config.apiOnly,');
-    // Fail CLOSED if the bot is gone. The region above spans BOTH `return true;`
-    // statements (the no-transport path, already locked by the two assertions
-    // above, and the catch), so asserting on that text here guarded nothing:
-    // flipping the catch to `return false` — the exact regression the comment
-    // warns about — left all 43 cases green. Narrowed to the catch block itself.
-    // The real guard is behavioural and lives in
-    // test/mojo-quarantine-notice-policy.test.ts ('fails closed when the bot is
-    // deregistered'), which DOES fail on that flip.
-    const catchBlock = region(workerPoolSource, '    // Bot deregistered — fail closed.', '  if (isSilentScheduledTurn');
-    expect(catchBlock).toContain('return true;');
   });
 
   it('managedAuxUiSuppressed no longer special-cases a VC meeting agent (Plan B: ordinary chat session)', () => {

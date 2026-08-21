@@ -9828,7 +9828,7 @@ function setupWorkerHandlers(
     // @mention follow-up — that diagnostic stays fenced to the receipt/retry
     // chain and must never leak out-of-band (a silent delivery especially). A
     // plain user turn on this session has neither marker and notifies normally.
-    // (isMeetingDrivenTurn supersedes the pre-Plan-B `vcMeetingReceiver` blanket
+    // (isMeetingDrivenTurn supersedes the pre-Plan-B per-bot-receiver blanket
     // check that master's auxUiSuppressedFor still uses — keeping this inline is
     // the load-bearing "手动@不回复" fix.)
     if (isMeetingDrivenTurn(ds, turnId, dispatchAttempt)) return true;
