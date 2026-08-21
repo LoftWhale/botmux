@@ -18320,6 +18320,15 @@ process.on('message', async (raw: unknown) => {
         log('Late ready signal after timeout fallback — marking prompt ready now');
         markPromptReady();
       }
+      // CLI 启动确证（SessionStart hook 已跑）：复位连续重启计数——resume 目标
+      // 显然存在且加载成功。这和 prompt 侧复位是同一语义，但更早：2026-08-20
+      // 事故里 resume 后的 CLI 已 ready 二十多秒、还没等到 prompt 复位就被共享
+      // server 抖动误杀，第二次重启因此被 tier-2 强制 FRESH 白丢上下文。到过
+      // ready 的 spawn 崩溃不是「resume 目标不存在」问题，下一轮应有全新预算。
+      if (consecutiveInWorkerRestarts > 0) {
+        log(`SessionStart ready — resetting consecutive restart count (was ${consecutiveInWorkerRestarts})`);
+        consecutiveInWorkerRestarts = 0;
+      }
       if (msg.requestId) {
         send({ type: 'session_ready_ack', requestId: msg.requestId });
       }
