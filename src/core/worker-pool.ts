@@ -2617,8 +2617,14 @@ export const restartCounts = new Map<string, { count: number; lastAt: number }>(
 const skillsInstalledCliIds = new Set<string>();
 
 /**
- * Ensure built-in skills are installed for a given CLI.
- * Synchronous and idempotent — runs once per CLI per daemon lifecycle.
+ * Ensure built-in skills are installed for a given CLI. Synchronous and
+ * idempotent. Two cadences:
+ *   - Skill FILES (whiteboard / workflow family / built-in skills) are
+ *     re-evaluated on EVERY spawn, before the `skillsInstalledCliIds` gate, so
+ *     runtime switches (whiteboard, workflow) and user customization (skill body
+ *     override / disable) take effect on the next session without a restart.
+ *   - Hook install + botmux-ask fallback do not vary at runtime, so they run
+ *     once per CLI per daemon lifecycle (behind the gate).
  */
 export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
@@ -2640,8 +2646,14 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
     // Workflow skill 家族同理：跟随机器级 workflow 开关，每次 spawn 重新评估，
     // 关闭时删除已装的三个 skill，下一个会话即生效。
     ensureWorkflowSkills(cliId, pluginSkillsDir, isWorkflowFeatureEnabled());
-    if (skillsInstalledCliIds.has(cliId)) return;
+    // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
+    // ——与上面白板 / workflow 同样放在 once-cache 之前，否则改了 skill 正文或
+    // 停用某 skill 后，claude 家族（--plugin-dir）的新会话仍读旧文件、要等 daemon
+    // 重启才生效，和自定义页「下一个会话即生效」不符。ensureSkills 幂等（内容相同
+    // 则跳过），每次 spawn 的代价只是几个小文件的读比对。
     ensurePluginSkills(cliId, adapter.pluginDir);
+    if (skillsInstalledCliIds.has(cliId)) return;
+    // Hook 接管与 botmux-ask 兜底 skill 不随自定义变化 → 每个 daemon 生命周期装一次即可。
     if (adapter.hookInstall) {
       try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
       catch (err) { logger.warn(`[hook] install failed for ${cliId}: ${err instanceof Error ? err.message : String(err)}`); }
@@ -2675,11 +2687,14 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string): void {
   // 非 global（prompt/off）由上面的 removeGlobalBotmuxSkills 前缀清理兜底。
   ensureWorkflowSkills(cliId, skillsDir, globalInstall && isWorkflowFeatureEnabled());
   if (!globalInstall && skillsDir) removeGlobalBotmuxSkills(skillsDir);
+  // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
+  // ——同白板 / workflow 放在 once-cache 之前。global 模式落全局盘；幂等（内容相同
+  // 则跳过），停用的 skill 目录会被 ensureSkills 内部清掉，下一个会话即生效。
+  if (globalInstall) ensureSkills(cliId, skillsDir);
 
   if (skillsInstalledCliIds.has(cliId)) return;
-  // 安装是稳定动作，留在 once-cache 里跑一次即可（幂等，内容相同不重写）。
-  if (globalInstall) ensureSkills(cliId, skillsDir);
-  // askUserQuestion 接管策略与 skill 文件无关：hook 该装还得装（Codex 无 hook，
+  // 以下都不随自定义变化 → 每个 daemon 生命周期装一次即可。
+  // askUserQuestion 接管策略与 skill 文件无关：hook 该装还得装（Codex 无 hook,
   // 靠 botmux-ask skill / catalog 兜底）。
   if (adapter.hookInstall) {
     try { installHook(cliId, adapter.hookInstall, hookCommandFor(cliId)); }
