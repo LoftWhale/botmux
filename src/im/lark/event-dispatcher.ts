@@ -936,6 +936,64 @@ export function isVerifiedLocalSiblingBot(
 }
 
 /**
+ * Resolve a foreign bot sender's CURRENT display name from its tenant-stable
+ * `union_id` — rename-proof, unlike the per-app name→open_id cross-ref.
+ *
+ * Why this exists: `lookupForeignBotName` historically read the receiver-local
+ * cross-ref (`bot-openids-<receiverApp>.json`), which only learns a bot's name
+ * when THAT bot is @-mentioned in one of the receiver's own events. When a
+ * renamed bot merely *sends* to us (the `[来自 X 的 @mention]` prefix path), no
+ * mention of X flows through us, so its cross-ref entry stays frozen at the old
+ * name. `union_id` is stamped on every inbound event's `sender.sender_id` and is
+ * stable across renames AND shared tenant-wide, so it maps the sender to the one
+ * locally-configured sibling that learned the same union_id, whose live
+ * `bots-info.json` entry is rewritten by its OWN daemon on every rename
+ * (setBotRenamer → writeBotInfoFile). That is the freshest cross-process name.
+ *
+ * Matches exactly one sibling (same ambiguity guard as isVerifiedLocalSiblingBot).
+ * Returns undefined on empty/unknown union_id, ambiguity, or a missing bots-info
+ * entry, so the caller falls back to the cross-ref / "Bot". Cross-deployment team
+ * peers aren't locally configured, so they return undefined here and rely on the
+ * cross-ref (whose stale aliases the writer now evicts on the next @ by new name).
+ */
+export function resolveSiblingBotNameByUnionId(
+  dataDir: string,
+  larkAppId: string,
+  senderUnionId: string | undefined,
+): string | undefined {
+  const unionId = (senderUnionId ?? '').trim();
+  if (!unionId) return undefined;
+
+  // union_id → the single locally-configured sibling appId that learned it.
+  let siblingAppId: string | undefined;
+  try {
+    for (const cfg of loadBotConfigs()) {
+      const appId = (cfg.larkAppId ?? '').trim();
+      if (!appId || appId === larkAppId) continue;
+      if (getBotUnionId(dataDir, appId) === unionId) {
+        if (siblingAppId) return undefined; // two siblings share a union_id → ambiguous
+        siblingAppId = appId;
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  if (!siblingAppId) return undefined;
+
+  // appId → current botName from the shared, rename-fresh bots-info.json.
+  try {
+    const infoPath = join(dataDir, 'bots-info.json');
+    if (existsSync(infoPath)) {
+      const entries: Array<{ larkAppId?: string; botName?: string | null }> =
+        JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const name = entries.find(e => e.larkAppId === siblingAppId)?.botName;
+      if (typeof name === 'string' && name.trim()) return name.trim();
+    }
+  } catch { /* fall through to caller's cross-ref path */ }
+  return undefined;
+}
+
+/**
  * Should a FOREIGN bot sender be trusted to collaborate (route/spawn a session)
  * WITHOUT `/grant`, because it's a teammate? Two trust sources, both rooted in
  * tenant-stable identity or team-controlled group membership — never a name:
@@ -1002,6 +1060,21 @@ export function updateBotOpenIdCrossRef(
     const openId = mentionOpenId(m);
     if (!name || !openId) continue;
     if (!knownBotNames.has(name.toLowerCase())) continue;
+    // Evict pre-rename aliases before recording the current name. An open_id is
+    // unique to one bot, so any OTHER name key still pointing at this open_id is
+    // a name that bot used before it was renamed. Left in place, the file would
+    // accumulate every historical name and lookupForeignBotName() (which returns
+    // the FIRST name matching an open_id, i.e. the oldest) would keep serving the
+    // stale one. Dropping them keeps the map at exactly the current name per
+    // open_id, and self-heals a table already polluted by past renames the next
+    // time this bot is @-mentioned by its new name. (Object.entries snapshots the
+    // keys, so deleting from `existing` inside the loop is safe.)
+    for (const [existingName, existingOpenId] of Object.entries(existing)) {
+      if (existingOpenId === openId && existingName !== name) {
+        delete existing[existingName];
+        changed = true;
+      }
+    }
     if (existing[name] === openId) continue;
     existing[name] = openId;
     changed = true;
