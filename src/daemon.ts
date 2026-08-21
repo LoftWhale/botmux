@@ -2253,11 +2253,14 @@ function defaultVcMeetingTextOutputPolicy(cfg?: VcMeetingAgentConfig): VcMeeting
 }
 
 function defaultVcMeetingVoiceOutputPolicy(cfg: VcMeetingAgentConfig): VcMeetingOutputPolicy {
-  // Voice stays hard-denied unless realtime voice is enabled for the bot.
-  // Enabling realtimeVoice is itself the explicit opt-in, so once enabled the
-  // default matches text: send without per-utterance approval. An operator may
-  // tighten back to 'approval' or 'deny' via meetingConsumer.voiceOutputPolicy
-  // (dashboard-editable).
+  // Voice is denied only when realtime voice is explicitly OFF. Realtime voice is
+  // now ON BY DEFAULT (vcMeetingRealtimeVoiceEnabled: unset ⇒ enabled), so unless
+  // an operator set realtimeVoice.enabled:false, voice falls through to the
+  // default below. ⚠ That default is 'allow' — matching text — meaning a bot
+  // pulled into a meeting speaks aloud WITHOUT per-utterance approval by default.
+  // Tighten per-bot to 'approval'/'deny' via meetingConsumer.voiceOutputPolicy
+  // (dashboard-editable). 'allow' only drops the per-send approval step; the
+  // managed request-output/action gate + capability check still apply.
   if (!vcMeetingRealtimeVoiceEnabled(cfg)) return 'deny';
   const configured = cfg.meetingConsumer?.voiceOutputPolicy;
   if (configured === 'approval' || configured === 'deny' || configured === 'allow') return configured;
