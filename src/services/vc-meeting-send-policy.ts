@@ -184,7 +184,16 @@ export function isCurrentVcMeetingImTurnOrigin(
 
 /** Resolve a managed output decision from the durable receipt, not mutable
  * process-global "current turn" state. Missing origin evidence on a dedicated
- * receiver fails closed; ordinary sessions stay unchanged. */
+ * receiver fails closed; ordinary sessions stay unchanged.
+ *
+ * Plan B: the receiver marker (`vcMeetingReceiver`) is pure metadata — a
+ * stamped session whose projection never activated (registration failed) or
+ * was removed/paused is effectively an ordinary chat-scope session. Only an
+ * ACTIVE projection keeps the receiver fenced to attributable origins; with
+ * none, the session falls back to `ordinary` so it is not bricked by the
+ * managed-output gate (e.g. a Pi adapter that cannot claim
+ * `reliableTurnTerminal` leaves the auto-start session stamped but unable to
+ * reply to any human message). */
 export function evaluateVcMeetingManagedSend(
   dataDir: string,
   origin: VcMeetingManagedSendOrigin,
@@ -208,6 +217,19 @@ export function evaluateVcMeetingManagedSend(
             memberEpoch: imOrigin.memberEpoch,
           },
         };
+      }
+      // Plan B: no attributable durable/IM origin. If the stamped session has
+      // NO active projection (registration failed, or the projection was
+      // removed/paused/expired), it is an ordinary chat-scope session and must
+      // not be bricked — fall back to `ordinary`. An active projection keeps
+      // the fail-closed gate so a live receiver still cannot emit unattributed
+      // output into the listener group.
+      const activeProjections = listVcMeetingActiveProjectionsForReceiverSession(
+        dataDir,
+        origin.receiverSessionId,
+      );
+      if (activeProjections.length === 0) {
+        return { ok: true, kind: 'ordinary' };
       }
       return {
         ok: false,
