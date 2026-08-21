@@ -14186,6 +14186,50 @@ async function restoreVcMeetingMonitoringAfterObservedJoin(
   logger.info(`[vc-agent] listener monitoring restored from own join event meeting=${session.state.meeting.id}`);
 }
 
+/**
+ * 入会即预热会议 agent 的 CLI 会话——复用「进群自动开工」(handleBotAdded)而不是走
+ * VC delivery 冷 fork,把 bot 刚进监听群时就把会话冷起来待命,首条字幕/弹幕来了秒回
+ * (否则要等选择卡默认生效 + 首次投递,实测 ~28s)。
+ *
+ * 为什么安全复用 handleBotAdded:
+ *  - Plan B 下会议 agent 本就是这个监听群的普通 chat-scope 会话,key = sessionKey(
+ *    chatId, appId);handleBotAdded 普通群 chat-scope 会话同 key。预热出来的正是后面
+ *    VC 投递 `ensureVcMeetingReceiverSession` 会 adopt 的那个(它见已有会话只 stamp
+ *    binding、不另建),零重复会话、零 delivery 机制改动。
+ *  - forcePrompt='' 绕过 autoStartOnGroupJoin 开关(入会预热是我们主动的),D7(群里
+ *    要有 allowedUser)照跑——监听群有 owner,天然过。空 prompt = 模型自己读群上下文
+ *    (与场景① D8 一致),不塞合成指令。
+ *
+ * **只在会落到 chat-scope 时预热**:若这个 bot 的普通群回复模式是 new-topic,
+ * handleBotAdded 会给监听群开一个话题(thread-scope,锚点漂移),就和 VC 固定的
+ * chat key 岔开、可能双开会话。这种情况跳过预热,退回老的懒启动(无回归)。
+ * best-effort:任何失败只 warn,会话仍会在首次投递时冷 fork。
+ */
+async function warmSpawnVcMeetingAgentSession(
+  larkAppId: string,
+  listenerChatId: string,
+  meeting: VcMeetingPushContext['meeting'],
+): Promise<void> {
+  try {
+    // 监听群是新建的普通群(createGroupWithBots),mode='group';只有当这个 bot 的普通群
+    // 回复模式是 new-topic 时 handleBotAdded 才会开话题,那时跳过以免与 VC chat key 岔开。
+    const regularGroupMode = resolveRegularGroupMode(larkAppId, listenerChatId);
+    if (externalEventOpensOwnTopic('group', regularGroupMode)) {
+      logger.info(
+        `[vc-agent] skip warm-spawn for meeting=${meeting.id} chat=${listenerChatId}: `
+        + `bot reply mode opens a topic (would diverge from the chat-scope meeting key)`,
+      );
+      return;
+    }
+    await handleBotAdded(listenerChatId, undefined, larkAppId, { forcePrompt: '' });
+  } catch (err) {
+    logger.warn(
+      `[vc-agent] warm-spawn on join failed meeting=${meeting.id} chat=${listenerChatId}: `
+      + `${err instanceof Error ? err.message : String(err)} (falling back to lazy spawn on first delivery)`,
+    );
+  }
+}
+
 async function startVcMeetingMonitoring(input: {
   larkAppId: string;
   key: string;
@@ -14294,6 +14338,13 @@ async function startVcMeetingMonitoring(input: {
       persistVcMeetingRuntimeSession(session, input.cfg);
       scheduleVcMeetingListenerFlush(currentKey, input.cfg);
       void maybeStartVcMeetingRealtimeVoice(input.larkAppId, session, input.cfg);
+      // 入会即预热 CLI：监听群一建好就把这个 bot 的会话冷起来待命,而不是等第一条
+      // 字幕/弹幕投递才冷 fork(实测那要 ~28s)。复用「进群自动开工」的 handleBotAdded
+      // ——不碰 VC delivery/attribution 机制,且 Plan B 下会议 agent 本就是这个监听群的
+      // 普通 chat-scope 会话(sessionKey(chatId,appId)),与 handleBotAdded 普通群 chat
+      // 会话同 key:预热出来的正是后面 VC 投递会 adopt 的那个,零重复会话。best-effort,
+      // 失败只 warn(会话仍会在首次投递时按老路径冷 fork)。
+      void warmSpawnVcMeetingAgentSession(input.larkAppId, listenerChatId, meeting);
       await sendMessage(
         input.larkAppId,
         listenerChatId,
