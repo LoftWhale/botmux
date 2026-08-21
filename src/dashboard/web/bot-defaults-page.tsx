@@ -4049,6 +4049,13 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const [authBusy, setAuthBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Remote-callback paste fallback (mirrors groups-page / sessions-page): when
+  // set, the overlay is shown so a browser that can't reach the daemon's
+  // 127.0.0.1:9768 loopback (远程 VM / 中心化平台 m-* 子域访问) can still finish
+  // by pasting the callback URL. authUrl also drives the "跳转飞书授权" retry button.
+  const [authUrl, setAuthUrl] = useState('');
+  const [callbackUrl, setCallbackUrl] = useState('');
+  const [submitting, setSubmitting] = useState(false);
   const lifecycle = useRef({ generation: 0, mounted: true });
 
   const fetchStatus = async (generation = lifecycle.current.generation): Promise<boolean> => {
@@ -4071,6 +4078,9 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     setAuthBusy(false);
     setModeBusy(false);
     setErr(null);
+    setAuthUrl('');
+    setCallbackUrl('');
+    setSubmitting(false);
     void fetchStatus(generation);
     return () => {
       lifecycle.current.mounted = false;
@@ -4106,6 +4116,7 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     const generation = ++lifecycle.current.generation;
     setAuthBusy(true);
     setErr(null);
+    setCallbackUrl('');
     try {
       const res = await sendJson('POST', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-auth`, {});
       // A bot switch while the POST was in flight must neither surface the old
@@ -4115,15 +4126,34 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
         setErr(responseErrorText(res));
         return;
       }
-      window.open(res.body.authUrl, '_blank', 'noopener');
-      // 轮询授权结果：3s × 60 次（授权链接 5 分钟有效期同量级）。
+      const url = String(res.body.authUrl);
+      // Show the paste overlay up front (mirrors groups-page / sessions-page):
+      // same-machine browsers finish via the 127.0.0.1:9768 loopback and the
+      // poll below auto-closes it; remote browsers (远程 VM / 中心化平台 m-* 子
+      // 域) can't reach that loopback, so they finish by pasting the callback URL.
+      setAuthUrl(url);
+      window.open(url, '_blank', 'noopener');
+      // 轮询授权结果：3s × 60 次（授权链接 5 分钟有效期同量级）。轮询到 authorized
+      // 即收起弹窗；远程场景轮询不会命中，弹窗保持打开等用户手动粘贴，超时不报错。
       for (let i = 0; i < 60; i++) {
         await new Promise(r => setTimeout(r, 3000));
         if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
-        if (await fetchStatus(generation)) return;
-      }
-      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
-        setErr(tr('botDefaults.sgTagAuthTimeout'));
+        if (await fetchStatus(generation)) {
+          if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+            // 本机 loopback 已完成授权（state 一次即焚、pending 文件已删）。bump
+            // generation 丢弃任何在途的 completeAuth——否则用户几乎同时点了「完成
+            // 授权」，其 POST 会因 pending 已消费而失败，在绿徽标旁弹出假红错。
+            lifecycle.current.generation += 1;
+            setAuthUrl('');
+            setCallbackUrl('');
+            setSubmitting(false);
+            setAuthBusy(false);
+            // 清掉可能残留的 not-confirmed 提示：completeAuth 曾因 status GET 瞬时
+            // 失败弹过提示，此刻轮询自愈翻绿，别把旧提示留在绿徽标旁。
+            setErr(null);
+          }
+          return;
+        }
       }
     } catch (e: any) {
       if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
@@ -4131,6 +4161,57 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
       }
     } finally {
       if (lifecycle.current.mounted && generation === lifecycle.current.generation) setAuthBusy(false);
+    }
+  }
+
+  // Remote-callback fallback: POST the pasted 127.0.0.1 callback URL to the
+  // dashboard's cross-process exchanger. The pending OAuth state (and the
+  // resulting token) are disk-backed, so the exchange completes and the daemon's
+  // status endpoint reflects it regardless of which process minted the auth URL.
+  async function completeAuth(): Promise<void> {
+    const generation = lifecycle.current.generation;
+    const trimmed = callbackUrl.trim();
+    if (!trimmed) return;
+    setSubmitting(true);
+    setErr(null);
+    // Shared closer for both the success path and the "already authorized"
+    // recovery below: bump generation to stop startAuth's in-flight poll, then
+    // clear the overlay.
+    const finish = () => {
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
+      lifecycle.current.generation += 1;
+      setAuthUrl('');
+      setCallbackUrl('');
+      setSubmitting(false);
+      setAuthBusy(false);
+    };
+    try {
+      const res = await sendJson('POST', '/api/feed-groups/oauth-callback', { callbackUrl: trimmed });
+      if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
+      if (!res.ok || !res.body.ok) {
+        // Narrow race: the same-machine loopback may have consumed this one-shot
+        // state moments earlier (pending file deleted) while the poll hasn't
+        // ticked yet — the exchange then fails with "state 不匹配". Re-check
+        // status before surfacing a red error next to what is really a success.
+        if (await fetchStatus(generation)) return void finish();
+        if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+          // 服务端消息自带 ❌/✅ 前缀，剥掉——行内 err 渲染已统一加 ✗，否则双 emoji 叠加。
+          const raw = String(res.body?.message || responseErrorText(res));
+          setErr(raw.replace(/^[❌✅]\s*/u, ''));
+        }
+        return;
+      }
+      // 换 token 成功≠已授予 feed-group scope，且紧跟的 status GET 可能瞬时失败。
+      // 只有复查确认 authorized 才 finish 关弹窗；否则保留弹窗+提示，让用户能重试，
+      // 或看清「登录成功但没给标签权限」(与 groups-page 刷新失败保留弹窗同款)。
+      if (await fetchStatus(generation)) return void finish();
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(tr('botDefaults.sgTagAuthNotConfirmed'));
+      }
+    } catch (e: any) {
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setErr(caughtErrorText(e));
+    } finally {
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setSubmitting(false);
     }
   }
 
@@ -4178,6 +4259,54 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
           {err && <span className="status-error">✗ {err}</span>}
         </div>
       </div>
+      {authUrl ? (
+        <div className="feed-group-auth-overlay">
+          <section className="feed-group-auth-card" role="dialog" aria-modal="true" aria-labelledby="sg-tag-auth-title">
+            <h3 id="sg-tag-auth-title">{tr('botDefaults.sgTagAuthTitle')}</h3>
+            <p>{tr('botDefaults.sgTagAuthHint')}</p>
+            <button type="button" className="primary feed-group-auth-open" onClick={() => window.open(authUrl, '_blank', 'noopener')}>
+              {tr('botDefaults.sgTagAuthOpen')}
+            </button>
+            <label>
+              <span>{tr('botDefaults.sgTagAuthPasteLabel')}</span>
+              <input
+                type="url"
+                data-input="sessionGroupTagCallbackUrl"
+                value={callbackUrl}
+                placeholder="http://127.0.0.1:9768/callback?code=…&state=…"
+                onChange={event => setCallbackUrl(event.currentTarget.value)}
+              />
+            </label>
+            <div className="actions">
+              <button
+                type="button"
+                data-action="session-group-tag-cancel"
+                onClick={() => {
+                  // 取消不仅关弹窗，还要停掉 startAuth 里仍在跑的 60 次轮询——否则
+                  // authBusy 一直为 true，「一键授权」卡在禁用态最长 3 分钟。bump
+                  // generation 让在途轮询的守卫失配即退出。
+                  lifecycle.current.generation += 1;
+                  setAuthUrl('');
+                  setCallbackUrl('');
+                  setSubmitting(false);
+                  setAuthBusy(false);
+                }}
+              >
+                {tr('botDefaults.sgTagAuthCancel')}
+              </button>
+              <button
+                type="button"
+                className="primary"
+                data-action="session-group-tag-complete"
+                disabled={!callbackUrl.trim() || submitting}
+                onClick={() => void completeAuth()}
+              >
+                {submitting ? tr('botDefaults.sgTagAuthSubmitting') : tr('botDefaults.sgTagAuthComplete')}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }
