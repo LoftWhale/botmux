@@ -57,6 +57,7 @@ export const messages: Record<string, string> = {
   'card.body.click_resume_or_run': '点击「恢复会话」继续，或在终端执行：',
   'card.body.click_resume_only': '点击「恢复会话」继续。',
   'card.body.cli_no_cli_resume': '{cliName} 不支持从命令行精确恢复指定会话，可在飞书内 resume。',
+  'card.body.resume_starts_fresh': '点击「恢复会话」可重新激活本话题的消息路由；但 {cliName} 没有可精确恢复的历史会话，下次对话将**新起干净会话**，旧上下文不会带回。',
   'card.body.working_dir': '📁 工作目录：',
   'card.body.choose_label': '选择:',
   'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
@@ -247,6 +248,8 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': '当前话题没有活跃的会话。',
+  'cmd.close.refused': '⚠️ 会话关闭失败：远端会话未能确认取消，已保留 active 记录以便重试（{error}）。远端会话可能仍在运行，请稍后重试 /close。',
+  'cmd.close.refused_with_task': '⚠️ 会话关闭失败：远端会话未能确认取消，已保留 active 记录以便重试（{error}）。远端会话 id：`{taskId}`。远端会话可能仍在运行，请稍后重试 /close。',
   'cmd.insight.operator_only': '⚠️ 仅授权用户（allowedUsers）可以使用 /insight。',
   'cmd.insight.unsupported': 'ℹ️ 该 CLI 暂不支持 insight 分析（目前仅 Claude Code / Codex）。',
   'cmd.insight.no_transcript': 'ℹ️ 还没找到本会话的 transcript，跑几轮后再试。',
@@ -298,8 +301,11 @@ export const messages: Record<string, string> = {
   'cmd.restart.timed_out': '⌛ {cliName} 重启超时，尚未恢复就绪。',
   'cmd.restart.terminated': '{cliName} 进程已终止，下次发消息时将自动恢复。',
   'cmd.restart.riff_unsupported': '⚠️ Riff 会话不支持重启。请先用 /close 关闭当前远程会话，再发送新消息创建会话。',
+  'cmd.restart.remote_unsupported': '⚠️ 远程后端会话（Riff / Mojo）不支持重启：销毁并重建会切断或替换远端 lineage。请先用 /close 关闭当前远程会话，再发送新消息创建会话。',
   'cmd.cd.riff_unsupported': '⚠️ Riff 会话不支持中途切换工作目录或角色。请先用 /close 关闭当前远程会话，再从新目录创建会话。',
+  'cmd.cd.remote_unsupported': '⚠️ 远程后端会话（Riff / Mojo）不支持中途切换工作目录或角色。请先用 /close 关闭当前远程会话，再从新目录创建会话。',
   'cmd.takeover.riff_unsupported': '⚠️ Riff 会话不支持原地接管或导入其他会话。请先用 /close 安全关闭当前远程会话，再新建或导入会话。',
+  'cmd.takeover.remote_unsupported': '⚠️ 远程后端会话（Riff / Mojo）不支持原地接管或导入其他会话。请先用 /close 安全关闭当前远程会话，再新建或导入会话。',
   'cmd.cd.usage': '用法：/cd <path>\n例如：/cd ~/projects/my-app',
   'cmd.cd.switched': '工作目录已切换到 {path}，下次发消息时将在新目录下恢复。',
   'cmd.cd.created_switched': '📁 目录不存在，已自动创建并切换到 {path}，下次发消息时将在新目录下恢复。',
@@ -788,6 +794,7 @@ export const messages: Record<string, string> = {
   'card.action.restarted_fresh': '🔄 已重新启动 {cliName}',
   'card.action.resume_missing_session_id': '⚠️ 缺少 session_id，无法恢复。',
   'card.action.resume_success': '✅ 会话已恢复，发条消息继续与 {cliName} 对话。',
+  'card.action.resume_success_fresh': '✅ 话题路由已重新激活。{cliName} 没有可精确恢复的历史会话，下条消息将**新起干净会话**，旧上下文不会带回。',
   'card.action.resume_not_found': '⚠️ 找不到会话 {short}，可能已被清理。',
   'card.action.resume_not_closed': '会话已是活跃状态，无需恢复。',
   'card.action.resume_anchor_occupied': '⚠️ 当前话题已有新会话{detail}，无法恢复旧会话。',
@@ -821,6 +828,8 @@ export const messages: Record<string, string> = {
   'card.action.write_link_sent': '🔑 操作链接已私密发送，请查收',
   'card.action.write_link_no_permission': '🔒 没有操作权限，无法获取操作链接',
   'card.action.session_gone': '⚠️ 会话已不在线，操作未完成',
+  'card.action.close_refused': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端可能仍在运行，请稍后重试。',
+  'card.action.close_refused_with_task': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端会话 id：{taskId}。远端可能仍在运行，请稍后重试。',
   'card.action.no_output': '(当前无输出内容)',
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
@@ -833,10 +842,12 @@ export const messages: Record<string, string> = {
 
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ /adopt的 CLI 会话已断开',
-  'worker.riff_close_in_progress': '⏳ Riff 远程会话正在关闭，请等待关闭结果后再发送消息。',
+  'worker.remote_close_in_progress': '⏳ {backend} 远程会话正在关闭，请等待关闭结果后再发送消息。',
   'worker.crash_loop_stopped': '⚠️ {cliName} 在 1 分钟内崩溃 {count} 次，已停止自动重启。发消息可触发重新启动。',
   'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
   'worker.crash_recent_output': '最近终端输出：',
+  'worker.mojo_lineage_quarantined': '⚠️ 这个会话创建于 botmux 记录 mojo 控制面（endpoint / workspace）之前，因此无法确认它此前的远端会话跑在哪里。\n该远端会话已被暂存而非丢弃：原有上下文不会延续，你的下一条消息将在当前配置上新建 mojo 会话。暂存的 id 保留在会话上以便人工清理：{lineage}',
+  'worker.mojo_legacy_pinned': '⚠️ 本 mojo 会话创建于「本机执行」升级之前，已被固定在旧的沙箱回退模式——这里的工具和回复基本不可用。这是刻意为之（升级绝不能把活跃会话悄悄切到本机执行）。\n请关闭本会话（❌ 按钮或 /close），再发一条新消息即可用新行为开启全新会话。',
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
   'worker.input_delivery_failed': '⚠️ Worker 未能接收这条消息。Botmux 已在同一 Worker 上自动重试，但仍未完成接收；为避免跨进程重复执行，没有继续重投。请重发本条消息。\nturn: {turnId}',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
@@ -846,11 +857,18 @@ export const messages: Record<string, string> = {
   'worker.raw_input_failed_recovery': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。\n原因：{reason}',
   'worker.raw_input_failed_command_only_recovery': '⚠️ Slash 命令未能确认送达 {cliName}。\n原因：{reason}',
   'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 botmux 没有从终端记录里捕获到最终文本，也没有追踪到本轮的回复。若你已经通过改道发送（--top-level / --into / --override-chat）回复过，可忽略本提示；否则请打开 Web 终端查看最后输出，或直接重发消息让会话继续。',
+  'worker.bridge_restored_turn_notice': '⚠️ 本轮曾因 botmux 重启中断，以下是从终端记录恢复的该轮输出（可能不完整）：',
   'worker.failed_reason_unavailable': '未提供可安全展示的错误摘要',
   'worker.empty_final_failed': '⚠️ {cliName} 本轮执行失败：{reason}\n完整错误已保留在 Web 终端和 daemon 日志中；排除问题后请重发消息。',
   'worker.empty_final_failed_invalid_request': '⚠️ {cliName} 请求被拒绝：{reason}\n请检查 CLI、模型网关和工具 schema 配置，修复后重发消息。',
   'worker.empty_final_failed_auth': '⚠️ {cliName} 认证失败：{reason}\n请检查 CLI 登录状态和模型服务凭证，修复后重发消息。',
   'worker.empty_final_failed_connection': '⚠️ {cliName} 连接模型服务失败：{reason}\n请检查网络与模型服务状态，恢复后重发消息。',
+  'worker.ordinary_recovery_exhausted': '⚠️ Claude 因暂态模型服务故障中断，Botmux 已自动续跑 2 次但仍未恢复。会话已停止自动续跑，避免重复外部操作；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
+  'worker.ordinary_recovery_enqueue_failed': '⚠️ Claude 因暂态模型服务故障中断，但 Botmux 无法安全提交自动续跑。会话已停止自动操作；请检查 Web 终端后，再发送一条消息继续。',
+  'worker.ordinary_recovery_delivery_failed': '⚠️ Claude 因暂态模型服务故障中断，但自动续跑未能送达 Worker。会话已停止自动操作；请检查 Web 终端后，再发送一条消息继续。',
+  'worker.ordinary_recovery_dispatch_interrupted': '⚠️ Botmux 在自动续跑交接期间重启，当前执行状态无法确认。为避免重复外部操作，Botmux 没有重放本次续跑；请检查 Web 终端后，再发送一条消息继续。',
+  'worker.ordinary_recovery_non_retryable': '⚠️ Claude 本轮执行失败，且当前错误不能安全自动续跑。为避免重复外部操作，Botmux 已停止自动处理；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
+  'worker.claude_terminal_failure_unrecovered': '⚠️ Claude 本轮因模型服务错误中断（{errorCode}），当前投递通道未启动自动续跑。请检查 Web 终端后重试，或发送一条消息继续。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',
@@ -963,6 +981,8 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.confirm.close.title': '确认关闭会话？',
   'card.dashboard.sessions.confirm.close.text': '关闭后会话将无法继续，已有进度可能丢失。会话：{title}',
   'card.dashboard.sessions.close_failed': '⚠️ 关闭失败：{reason}',
+  'card.dashboard.sessions.close_residual': '⚠️ **本地已关闭，但远端会话未取消**：`{taskId}`，需人工清理。',
+  'card.dashboard.sessions.close_residual_local': '⚠️ **本地已关闭，但可能残留带凭证的子进程未确认终止**：{taskId}。远端会话已取消，需人工核查本机进程。',
   'card.dashboard.sessions.session_not_found': '⚠️ 会话不存在或已被清理。',
   'card.dashboard.sessions.close.disabled.alreadyClosed': '会话已关闭',
   'card.dashboard.sessions.close.disabled.starting': '会话启动中，暂不可关闭',
@@ -1102,6 +1122,16 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.goto_schedules': '📂 定时任务',
   'card.dashboard.overview.goto_settings': '📂 设置',
   'card.dashboard.overview.goto_groups': '📂 群组',
+  // 「打开工作台」是纯链接按钮（appCenter AppLink），不是 dash_overview_* 回调。
+  'card.dashboard.overview.open_workbench': '打开工作台',
+  // 按钮链接带长期 token、常驻不过期（产品决策，见 core/workbench-link.ts）。这行
+  // 小字承担用户侧的知情权：告诉他这个入口不会过期，也告诉他怀疑泄漏时怎么自己
+  // 作废。卡片里只有按钮、没有明文链接行，所以这里也不写链接本体，只写 rotate。
+  'card.dashboard.overview.workbench.standing_hint':
+    '🔗 常驻入口，不会过期；怀疑泄漏用 <font color="grey">botmux dashboard rotate</font> 轮换 token 立即作废',
+  // 降级路径：读不到 token 时按钮链接不带凭证，如实说明，别吹「常驻不过期」。
+  'card.dashboard.overview.workbench.login_required_hint':
+    '🔗 暂时读不到 Dashboard 凭证，打开后需在浏览器里登录',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.

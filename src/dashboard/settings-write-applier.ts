@@ -101,6 +101,8 @@ export interface ResolvedDashboardSettingsView {
   localDevInstall: boolean;
   autoUpdateSupported?: boolean;
   remoteAccess?: boolean;
+  /** Machine-wide v3 Workflow feature switch. Default ON. */
+  workflow: { enabled: boolean };
   /** Configured schedule-task timezone override (IANA), or null/absent when
    *  unset ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone?: string | null;
@@ -235,6 +237,9 @@ export type ApplySettingsWriteError =
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
   | 'invalid_vcMeetingAgent_enabled'
+  | 'invalid_vcMeetingAgent_listenerBotAppId'
+  | 'invalid_workflow'
+  | 'invalid_workflow_enabled'
   | 'invalid_scheduleTimeZone'
   | 'invalid_whiteboard'
   | 'invalid_whiteboard_enabled'
@@ -539,6 +544,21 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_remoteAccess' };
     }
     deps.mergeGlobalConfig({ remoteAccess: obj.remoteAccess });
+    touched = true;
+  }
+
+  if ('workflow' in obj) {
+    const raw = obj.workflow;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_workflow' };
+    }
+    const wf = raw as Record<string, unknown>;
+    if (typeof wf.enabled !== 'boolean') {
+      return { ok: false, error: 'invalid_workflow_enabled' };
+    }
+    // Merge over existing so a future sibling key in the workflow block survives.
+    const current = deps.readGlobalConfig().workflow ?? {};
+    deps.mergeGlobalConfig({ workflow: { ...current, enabled: wf.enabled } });
     touched = true;
   }
 
