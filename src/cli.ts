@@ -42,15 +42,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
-import {
-  AutostartOperationError,
-  enableAutostart,
-  disableAutostart,
-  autostartStatus,
-  inspectAutostart,
-  refreshAutostart,
-} from './autostart.js';
-import { writeAutostartJsonMutation } from './cli/autostart-json.js';
+import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import {
@@ -13205,35 +13197,13 @@ switch (command) {
     break;
   }
   case 'autostart': {
+    ensureConfigDir();
     const sub = process.argv[3] ?? 'status';
-    const args = process.argv.slice(4);
     const opts = { pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR };
-    try {
-      if ((sub === 'enable' || sub === 'disable') && args.length === 1 && args[0] === '--json') {
-        const result = writeAutostartJsonMutation(opts, sub === 'enable');
-        if (!result.ok) process.exitCode = 1;
-      }
-      else if ((sub === 'enable' || sub === 'install') && args.length === 0) {
-        ensureConfigDir();
-        enableAutostart(opts);
-      }
-      else if ((sub === 'disable' || sub === 'uninstall') && args.length === 0) {
-        ensureConfigDir();
-        disableAutostart(opts);
-      }
-      else if (sub === 'status' && args.length === 1 && args[0] === '--json') {
-        console.log(JSON.stringify(inspectAutostart(opts)));
-      }
-      else if (sub === 'status' && args.length === 0) autostartStatus(opts);
-      else {
-        console.error(`用法: botmux autostart <enable|disable|status>`);
-        process.exitCode = 1;
-      }
-    } catch (error) {
-      if (!(error instanceof AutostartOperationError)) throw error;
-      if (!error.reported) console.error(`❌ ${error.message}`);
-      process.exitCode = 1;
-    }
+    if (sub === 'enable' || sub === 'install') enableAutostart(opts);
+    else if (sub === 'disable' || sub === 'uninstall') disableAutostart(opts);
+    else if (sub === 'status') autostartStatus(opts);
+    else { console.error(`用法: botmux autostart <enable|disable|status>`); process.exit(1); }
     break;
   }
   default:

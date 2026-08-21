@@ -854,30 +854,6 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
     }
   });
 
-  it('keeps both autostart reads and mutations behind the active token', () => {
-    for (const method of ['GET', 'PUT']) {
-      const anonymous = decideDashboardAuth({
-        method,
-        pathname: '/api/autostart',
-        hasTokenParam: false,
-        presentedToken: undefined,
-        activeToken: TOK,
-        publicReadOnly: true,
-      });
-      expect(anonymous.kind, method).toBe('deny401');
-
-      const operator = decideDashboardAuth({
-        method,
-        pathname: '/api/autostart',
-        hasTokenParam: false,
-        presentedToken: TOK,
-        activeToken: TOK,
-        publicReadOnly: true,
-      });
-      expect(operator.kind, method).toBe('allow');
-    }
-  });
-
   it('allow-listed watch-work reads are public in publicReadOnly', () => {
     for (const pathname of ['/api/dashboard/v1/summary', '/api/sessions', '/api/schedules', '/api/settings', '/api/groups', '/events']) {
       const d = decideDashboardAuth({

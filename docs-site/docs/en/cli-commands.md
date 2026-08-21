@@ -27,17 +27,16 @@ local hard kill.
 ## Auto-Start on Boot
 
 ```bash
-botmux autostart enable   # Register (macOS / Linux / Windows, no sudo needed)
+botmux autostart enable   # Register (macOS launchd / Linux user systemd, no sudo needed)
 botmux autostart disable  # Unregister
 botmux autostart status   # Check status
 ```
 
-- **macOS**: `enable` writes `~/Library/LaunchAgents/com.botmux.daemon.plist`; it never reloads or bootstraps the `RunAtLoad` job and takes effect at the next login.
-- **Linux**: writes `~/.config/systemd/user/botmux.service` and runs only `systemctl --user enable` (without `--now`); it takes effect when the user manager next starts, normally at the next login (or at boot when linger is enabled).
+- **macOS**: writes `~/Library/LaunchAgents/com.botmux.daemon.plist` and loads it with `launchctl bootstrap`.
+- **Linux**: writes `~/.config/systemd/user/botmux.service` and runs `systemctl --user enable --now`.
   - On servers / headless environments, logging out stops the service; to keep it running across logout, run `sudo loginctl enable-linger <username>`.
-- **Windows**: registers a per-user Task Scheduler task that runs at login; if task registration fails, it falls back to the current user's Startup folder.
-- The `node`/`cli.js` paths in the unit file come from the current `process.execPath`; after switching versions with nvm/fnm, just run `enable` once to rewrite them (`start`/`restart` also auto-detect path changes and rewrite the future-login file).
-- `enable`/`disable` **only register or unregister the auto-start hook; they do not start, stop, or restart the current PM2 daemon**. Use `botmux start` / `botmux stop` to manage the current process.
+- The `node`/`cli.js` paths in the unit file come from the current `process.execPath`; after switching versions with nvm/fnm, just run `enable` once to rewrite them (`start`/`restart` also auto-detect path changes and refresh in place).
+- `enable`/`disable` **only manage the auto-start hook and don't touch a running daemon** — avoiding the "I just wanted to turn off auto-start but it killed the service too" problem.
 
 ## In-Session Subcommands (for the CLI agent)
 

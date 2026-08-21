@@ -259,8 +259,6 @@ const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
 const AUTOSTART_CONFIG_DIR = join(homedir(), '.botmux');
 const dashboardAutostart = createDashboardAutostartController({
   opts: {
-    // Always target the package and Node that own this running Dashboard;
-    // request bodies are never allowed to supply executable paths.
     pkgRoot: botmuxInstallRoot(),
     configDir: AUTOSTART_CONFIG_DIR,
     logDir: join(AUTOSTART_CONFIG_DIR, 'logs'),
@@ -3271,26 +3269,10 @@ const server = createServer(async (req, res) => {
         : { ok: true, settings: result.settings });
     }
 
-    // ─── Host boot registration ─────────────────────────────────────────────
-    // This is intentionally separate from /api/settings: it is live OS state,
-    // not config.json, and must never inherit the public-read settings carve-out.
     if (req.method === 'GET' && url.pathname === '/api/autostart') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
       res.setHeader('cache-control', 'no-store');
-      try {
-        return jsonRes(res, 200, { ok: true, state: await dashboardAutostart.getState() });
-      } catch (error) {
-        if (error instanceof DashboardAutostartError) {
-          logger.warn(`[dashboard-autostart] ${error.code}: ${error.detail ?? error.message}`);
-          return jsonRes(res, dashboardAutostartErrorStatus(error), {
-            ok: false,
-            error: error.code,
-            ...(error.detail ? { detail: error.detail } : {}),
-          });
-        }
-        logger.warn(`[dashboard-autostart] status failed: ${error instanceof Error ? error.message : String(error)}`);
-        return jsonRes(res, 500, { ok: false, error: 'status_failed' });
-      }
+      return jsonRes(res, 200, { ok: true, state: await dashboardAutostart.getState() });
     }
     if (req.method === 'PUT' && url.pathname === '/api/autostart') {
       if (!authed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
@@ -3302,21 +3284,19 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
       const parsed = parseAutostartWrite(body);
-      if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error });
+      if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: 'invalid_body' });
       try {
-        const result = await dashboardAutostart.setEnabled(parsed.enabled);
-        return jsonRes(res, 200, { ok: true, ...result });
+        const state = await dashboardAutostart.setEnabled(parsed.enabled);
+        return jsonRes(res, 200, { ok: true, state });
       } catch (error) {
         if (error instanceof DashboardAutostartError) {
-          logger.warn(`[dashboard-autostart] ${error.code}: ${error.detail ?? error.message}`);
+          logger.warn(`[dashboard-autostart] ${error.code}: ${error.message}`);
           return jsonRes(res, dashboardAutostartErrorStatus(error), {
             ok: false,
             error: error.code,
-            ...(error.detail ? { detail: error.detail } : {}),
           });
         }
-        logger.error('[dashboard-autostart] mutation failed', error);
-        return jsonRes(res, 500, { ok: false, error: 'command_failed' });
+        throw error;
       }
     }
 

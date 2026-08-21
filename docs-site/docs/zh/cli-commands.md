@@ -25,17 +25,16 @@ daemon 拒绝或 IPC 连接失败时命令返回失败，不会继续本地强�
 ## 开机自启
 
 ```bash
-botmux autostart enable   # 注册（macOS / Linux / Windows，无需 sudo）
+botmux autostart enable   # 注册（macOS launchd / Linux user systemd，无需 sudo）
 botmux autostart disable  # 注销
 botmux autostart status   # 查看状态
 ```
 
-- **macOS**：`enable` 只写 `~/Library/LaunchAgents/com.botmux.daemon.plist`，不会重新加载或 bootstrap 这个 `RunAtLoad` 任务；下次登录时生效。
-- **Linux**：写 `~/.config/systemd/user/botmux.service`，只运行 `systemctl --user enable`（不带 `--now`）；在用户服务管理器下次启动时生效，通常为下次登录（启用 linger 时为开机后）。
+- **macOS**：写 `~/Library/LaunchAgents/com.botmux.daemon.plist`，`launchctl bootstrap` 加载。
+- **Linux**：写 `~/.config/systemd/user/botmux.service`，`systemctl --user enable --now`。
   - 服务器/无桌面环境登出会停服务，需跨登出常驻请 `sudo loginctl enable-linger <用户名>`。
-- **Windows**：注册当前用户登录时触发的 Task Scheduler 任务；若任务注册失败，则回退到当前用户的 Startup 文件夹。
-- 单元文件里的 `node`/`cli.js` 路径来自当前 `process.execPath`，nvm/fnm 切版本后跑一次 `enable` 重写即可（`start`/`restart` 也会自动检测路径变化并重写下次登录使用的文件）。
-- `enable`/`disable` **只注册或注销自启钩子，不启动、停止或重启当前 PM2 daemon**；当前进程仍由 `botmux start` / `botmux stop` 管理。
+- 单元文件里的 `node`/`cli.js` 路径来自当前 `process.execPath`，nvm/fnm 切版本后跑一次 `enable` 重写即可（`start`/`restart` 也会自动检测路径变化原地刷新）。
+- `enable`/`disable` **只管自启钩子，不动正在跑的 daemon**——避免"只想关自启结果服务也被干掉"。
 
 ## 会话内子命令（给 CLI agent 用）
 

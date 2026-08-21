@@ -27,9 +27,9 @@ botmux dashboard rotate   # Rotate the token and print the new URL
 
 ## Background-Service Auto-Start
 
-Authenticated administrators can toggle **Start the botmux background service at boot** under **Settings → System & Maintenance**. Both `GET /api/autostart`, which reads the status, and `PUT /api/autostart`, which updates it, require the current Dashboard token. Anonymous users cannot see or change this setting even when `publicReadOnly` is enabled.
+Authenticated administrators can manage botmux background-service auto-start under **Settings → System & Maintenance**. Anonymous users cannot view or change this setting.
 
-The toggle only registers or unregisters the hook for starting the background service at the next boot/login; it does not start, stop, or restart the current daemon. The Desktop App's **Launch App at Login** is a separate feature; avoid enabling both to prevent duplicate starts.
+The toggle reuses the existing `botmux autostart` behavior. It only manages the entry used at the next boot/login and does not start, stop, or restart the current daemon.
 
 ## External read-only queries
 

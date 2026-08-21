@@ -27,9 +27,9 @@ botmux dashboard rotate   # 轮换 token 并输出新 URL
 
 ## 后台服务开机启动
 
-已认证管理员可在「设置 → 系统与维护」中切换「开机启动 botmux 后台服务」。读取状态的 `GET /api/autostart` 和更新状态的 `PUT /api/autostart` 都必须携带当前 Dashboard token；即使开启 `publicReadOnly`，匿名用户也看不到、不能修改这项设置。
+已认证管理员可在「设置 → 系统与维护」中管理 botmux 后台服务的开机自启；匿名用户不能查看或修改这项设置。
 
-该开关只注册或注销下次开机/登录时启动后台服务的钩子，不会启动、停止或重启当前 daemon。Desktop App 的「开机启动 App」是另一套能力；请勿同时开启两者，避免重复启动。
+该开关复用现有 `botmux autostart` 能力，只管理下次开机/登录时使用的启动项，不会启动、停止或重启当前 daemon。
 
 ## 对外只读查询
 

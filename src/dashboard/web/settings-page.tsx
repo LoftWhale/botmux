@@ -6,8 +6,6 @@ import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { store } from './store.js';
 import { ui } from './ui.js';
-import { readDashboardClientShell } from './client-shell.js';
-import type { AutostartState, AutostartWarning } from '../../autostart.js';
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -129,50 +127,17 @@ interface ReleaseNote { version: string; name: string; body: string; url: string
 
 type StatusMessage = { text: string; cls?: string } | null;
 
-const AUTOSTART_PLATFORMS = new Set(['macos', 'linux', 'windows', 'unsupported']);
-const AUTOSTART_MANAGERS = new Set(['launchd', 'systemd-user', 'task-scheduler', 'startup-folder', 'unsupported']);
-const AUTOSTART_REGISTRATIONS = new Set(['enabled', 'disabled', 'partial', 'unknown']);
-const AUTOSTART_WARNINGS = new Set<AutostartWarning>([
-  'manager_unavailable',
-  'registration_partial',
-  'pending_login',
-  'linger_disabled',
-  'target_missing',
-  'target_mismatch',
-  'local_dev_target',
-]);
+interface AutostartState {
+  supported: boolean;
+  enabled: boolean;
+}
 
 function parseAutostartState(value: unknown): AutostartState | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const state = value as Record<string, any>;
-  if (
-    typeof state.supported !== 'boolean'
-    || !AUTOSTART_PLATFORMS.has(state.platform)
-    || !AUTOSTART_MANAGERS.has(state.manager)
-    || state.scope !== 'user-login'
-    || !AUTOSTART_REGISTRATIONS.has(state.registration)
-    || (state.enabled !== null && typeof state.enabled !== 'boolean')
-    || typeof state.installed !== 'boolean'
-    || (state.loaded !== null && typeof state.loaded !== 'boolean')
-    || (state.active !== null && typeof state.active !== 'boolean')
-    || typeof state.managerReachable !== 'boolean'
-    || typeof state.manageable !== 'boolean'
-    || (state.lingerEnabled !== null && typeof state.lingerEnabled !== 'boolean')
-    || typeof state.targetExists !== 'boolean'
-    || (state.targetMatchesCurrentRuntime !== null && typeof state.targetMatchesCurrentRuntime !== 'boolean')
-    || typeof state.localDevTarget !== 'boolean'
-    || !Array.isArray(state.warnings)
-    || state.warnings.some((warning: unknown) => !AUTOSTART_WARNINGS.has(warning as AutostartWarning))
-  ) return null;
-  return state as AutostartState;
-}
-
-function isDesktopDashboardShell(): boolean {
-  if (readDashboardClientShell() === 'desktop') return true;
-  if (typeof location === 'undefined') return false;
-  const queryIndex = location.hash.indexOf('?');
-  if (queryIndex < 0) return false;
-  return new URLSearchParams(location.hash.slice(queryIndex + 1)).get('shell') === 'desktop';
+  const state = value as Record<string, unknown>;
+  return typeof state.supported === 'boolean' && typeof state.enabled === 'boolean'
+    ? { supported: state.supported, enabled: state.enabled }
+    : null;
 }
 
 /** Map a `herdrTraexInstall` result (returned by PUT /api/settings when the
@@ -310,10 +275,9 @@ function SettingsPage() {
 
   const [autostartState, setAutostartState] = useState<AutostartState | null>(null);
   const [autostartLoading, setAutostartLoading] = useState(false);
-  const [autostartError, setAutostartError] = useState<string | null>(null);
+  const [autostartError, setAutostartError] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [autostartMsg, setAutostartMsg] = useState<StatusMessage>(null);
-  const desktopShell = useMemo(isDesktopDashboardShell, []);
 
   const clearTimers = useCallback(() => {
     for (const id of timersRef.current) window.clearTimeout(id);
@@ -348,26 +312,21 @@ function SettingsPage() {
     }
   }, []);
 
-  const fetchAutostart = useCallback(async (showLoading = true): Promise<AutostartState | null> => {
-    if (showLoading) setAutostartLoading(true);
+  const fetchAutostart = useCallback(async () => {
+    setAutostartLoading(true);
     try {
       const response = await fetch('/api/autostart', { cache: 'no-store' });
       const body = await response.json().catch(() => ({}));
-      if (!mountedRef.current) return null;
-      if (!response.ok || body.ok === false) {
-        throw new Error(String(body?.detail ?? body?.error ?? `HTTP ${response.status}`));
-      }
-      const state = parseAutostartState(body.state);
+      const state = response.ok ? parseAutostartState(body.state) : null;
       if (!state) throw new Error('invalid_state');
+      if (!mountedRef.current) return;
       setAutostartState(state);
-      setAutostartError(null);
-      return state;
-    } catch (error) {
-      if (!mountedRef.current) return null;
-      setAutostartError(error instanceof Error ? error.message : String(error));
-      return null;
+      setAutostartError(false);
+    } catch {
+      if (!mountedRef.current) return;
+      setAutostartError(true);
     } finally {
-      if (mountedRef.current && showLoading) setAutostartLoading(false);
+      if (mountedRef.current) setAutostartLoading(false);
     }
   }, []);
 
@@ -413,10 +372,6 @@ function SettingsPage() {
     if (canWrite) {
       void fetchStatus();
       void fetchAutostart();
-    } else {
-      setAutostartState(null);
-      setAutostartLoading(false);
-      setAutostartError(null);
     }
   }, [canWrite, fetchAutostart, fetchStatus, settingsLoaded]);
 
@@ -424,8 +379,8 @@ function SettingsPage() {
     if (!autostartState || autostartBusy) return;
     const before = autostartState;
     setAutostartBusy(true);
-    setAutostartError(null);
-    setAutostartMsg({ text: tr(enabled ? 'settings.autostartEnabling' : 'settings.autostartDisabling') });
+    setAutostartState({ ...before, enabled });
+    setAutostartMsg({ text: tr('settings.autostartSaving') });
     try {
       const response = await fetch('/api/autostart', {
         method: 'PUT',
@@ -433,34 +388,16 @@ function SettingsPage() {
         body: JSON.stringify({ enabled }),
       });
       const body = await response.json().catch(() => ({}));
-      if (!response.ok || body.ok === false) {
-        const code = String(body?.error ?? `HTTP ${response.status}`);
-        let message = tr('settings.autostartErrorGeneric');
-        if (code === 'operation_in_progress') message = tr('settings.autostartErrorBusy');
-        else if (code === 'manager_unavailable') message = tr('settings.autostartErrorManagerUnavailable');
-        else if (code === 'unsupported_platform') message = tr('settings.autostartErrorUnsupported');
-        else if (code === 'command_timeout') message = tr('settings.autostartErrorTimeout');
-        else if (code === 'state_mismatch') message = tr('settings.autostartErrorMismatch');
-        else if (code === 'target_unavailable') message = tr('settings.autostartErrorTargetUnavailable');
-        const detail = typeof body?.detail === 'string' && body.detail ? `: ${body.detail}` : '';
-        throw new Error(`${message}${detail}`);
-      }
-      const state = parseAutostartState(body.state);
-      if (!state) throw new Error(tr('settings.autostartErrorInvalidState'));
+      const state = response.ok ? parseAutostartState(body.state) : null;
+      if (!state) throw new Error('save_failed');
       if (!mountedRef.current) return;
       setAutostartState(state);
-      setAutostartMsg({
-        text: tr(enabled ? 'settings.autostartEnabledSaved' : 'settings.autostartDisabledSaved'),
-        cls: 'hint-ok',
-      });
-    } catch (error) {
+      setAutostartMsg({ text: tr('settings.autostartSaved'), cls: 'hint-ok' });
+    } catch {
       if (!mountedRef.current) return;
       setAutostartState(before);
-      const detail = error instanceof Error ? error.message : String(error);
-      setAutostartMsg({ text: detail, cls: 'hint-warn-inline' });
-      // The host action may have committed before the HTTP response was lost.
-      // Reconcile in the background and adopt only an authoritative response.
-      await fetchAutostart(false);
+      setAutostartMsg({ text: tr('settings.autostartSaveFailed'), cls: 'hint-warn-inline' });
+      void fetchAutostart();
     } finally {
       if (mountedRef.current) setAutostartBusy(false);
     }
@@ -651,7 +588,6 @@ function SettingsPage() {
   const autostartBlock = (
     <AutostartCard
       canWrite={canWrite}
-      desktopShell={desktopShell}
       state={autostartState}
       loading={autostartLoading}
       error={autostartError}
@@ -1612,146 +1548,44 @@ function TraexPluginEditor(props: {
   );
 }
 
-function autostartManagerLabel(manager: AutostartState['manager'], tr: ReturnType<typeof useT>): string {
-  if (manager === 'launchd') return tr('settings.autostartManagerLaunchd');
-  if (manager === 'systemd-user') return tr('settings.autostartManagerSystemd');
-  if (manager === 'task-scheduler') return tr('settings.autostartManagerTaskScheduler');
-  if (manager === 'startup-folder') return tr('settings.autostartManagerStartupFolder');
-  return tr('settings.autostartManagerUnsupported');
-}
-
-function autostartRegistrationLabel(state: AutostartState, tr: ReturnType<typeof useT>): string {
-  if (state.registration === 'enabled') return tr('settings.autostartStatusEnabled');
-  if (state.registration === 'disabled') return tr('settings.autostartStatusDisabled');
-  if (state.registration === 'partial') return tr('settings.autostartStatusPartial');
-  return tr('settings.autostartStatusUnknown');
-}
-
-function autostartWarningLabel(warning: AutostartWarning, tr: ReturnType<typeof useT>): string {
-  if (warning === 'manager_unavailable') return tr('settings.autostartWarningManagerUnavailable');
-  if (warning === 'registration_partial') return tr('settings.autostartWarningPartial');
-  if (warning === 'pending_login') return tr('settings.autostartWarningPendingLogin');
-  if (warning === 'linger_disabled') return tr('settings.autostartWarningLinger');
-  if (warning === 'target_missing') return tr('settings.autostartWarningTargetMissing');
-  if (warning === 'target_mismatch') return tr('settings.autostartWarningTargetMismatch');
-  return tr('settings.autostartWarningLocalDev');
-}
-
-function autostartTargetStatus(state: AutostartState, tr: ReturnType<typeof useT>): {
-  kind: 'healthy' | 'ready' | 'missing' | 'mismatch' | 'unknown';
-  text: string;
-  warning: boolean;
-} {
-  if (!state.targetExists) {
-    return { kind: 'missing', text: tr('settings.autostartTargetMissingStatus'), warning: true };
-  }
-  if (state.targetMatchesCurrentRuntime === false) {
-    return { kind: 'mismatch', text: tr('settings.autostartTargetMismatchStatus'), warning: true };
-  }
-  if (state.targetMatchesCurrentRuntime === true) {
-    return { kind: 'healthy', text: tr('settings.autostartTargetHealthy'), warning: false };
-  }
-  if (state.supported && state.registration === 'disabled') {
-    return { kind: 'ready', text: tr('settings.autostartTargetReady'), warning: false };
-  }
-  return { kind: 'unknown', text: tr('settings.autostartTargetUnknownStatus'), warning: true };
-}
-
-export function AutostartCard(props: {
+function AutostartCard(props: {
   canWrite: boolean;
-  desktopShell: boolean;
   state: AutostartState | null;
   loading: boolean;
-  error: string | null;
+  error: boolean;
   busy: boolean;
   message: StatusMessage;
   onChange(enabled: boolean): void;
   onRetry(): void;
 }) {
   const tr = useT();
-  let inner: ReactNode;
+  let content: ReactNode;
 
   if (!props.canWrite) {
-    inner = <p className="hint-warn">{tr('settings.autostartLoginRequired')}</p>;
+    content = <p className="hint-warn">{tr('settings.autostartLoginRequired')}</p>;
   } else if (props.loading && !props.state) {
-    inner = <LoadingState label={tr('settings.autostartLoading')} compact />;
-  } else if (!props.state) {
-    inner = (
+    content = <LoadingState label={tr('settings.autostartLoading')} compact />;
+  } else if (props.error && !props.state) {
+    content = (
       <>
-        <p className="hint-warn">{tr('settings.autostartLoadFailed')}: {props.error ?? tr('settings.autostartErrorGeneric')}</p>
+        <p className="hint-warn">{tr('settings.autostartLoadFailed')}</p>
         <div className="update-actions">
-          <button type="button" disabled={props.loading} onClick={props.onRetry}>{tr('settings.autostartRefresh')}</button>
+          <button type="button" onClick={props.onRetry}>{tr('settings.autostartRetry')}</button>
         </div>
       </>
     );
-  } else {
-    const state = props.state;
-    const blocked = props.busy || !state.manageable;
-    const repairable = state.enabled === true && state.targetMatchesCurrentRuntime === false;
-    const enableBlocked = blocked || !state.targetExists;
-    const targetStatus = autostartTargetStatus(state, tr);
-    inner = (
+  } else if (props.state?.supported === false) {
+    content = <p className="hint-warn">{tr('settings.autostartUnsupported')}</p>;
+  } else if (props.state) {
+    content = (
       <>
-        <p className="update-version">
-          <span><strong>{autostartManagerLabel(state.manager, tr)}</strong> · {autostartRegistrationLabel(state, tr)}</span>
-        </p>
-        <p
-          className={targetStatus.warning ? 'hint-warn-inline' : 'settings-subfield-hint'}
-          data-autostart-target-status={targetStatus.kind}
-        >
-          {targetStatus.text}
-        </p>
-        {props.desktopShell ? (
-          <p className="hint-warn">{tr('settings.autostartDesktopManaged')}</p>
-        ) : state.supported && state.enabled !== null ? (
-          <ToggleRow
-            title={tr('settings.autostartToggle')}
-            help={tr('settings.autostartHelp')}
-            checked={state.enabled}
-            disabled={blocked || (state.enabled === false && !state.targetExists)}
-            onChange={props.onChange}
-          />
-        ) : state.supported ? (
-          <div className="update-actions">
-            <button
-              type="button"
-              className="page-primary-action"
-              disabled={enableBlocked}
-              onClick={() => props.onChange(true)}
-            >
-              {tr('settings.autostartEnable')}
-            </button>
-            <button type="button" disabled={blocked} onClick={() => props.onChange(false)}>
-              {tr('settings.autostartDisable')}
-            </button>
-          </div>
-        ) : (
-          <p className="hint-warn">{tr('settings.autostartUnsupported')}</p>
-        )}
-        {props.desktopShell && !state.supported
-          ? <p className="hint-warn-inline">{tr('settings.autostartUnsupported')}</p>
-          : null}
-        {state.warnings
-          .filter(warning => warning !== 'target_missing' && warning !== 'target_mismatch')
-          .map(warning => (
-            <p
-              key={warning}
-              className={warning === 'pending_login' ? 'settings-subfield-hint' : 'hint-warn-inline'}
-            >
-              {autostartWarningLabel(warning, tr)}
-            </p>
-          ))}
-        {props.error ? <p className="hint-warn-inline">{tr('settings.autostartLoadFailed')}: {props.error}</p> : null}
-        <div className="update-actions">
-          {!props.desktopShell && repairable ? (
-            <button type="button" disabled={enableBlocked} onClick={() => props.onChange(true)}>
-              {tr('settings.autostartRepair')}
-            </button>
-          ) : null}
-          <button type="button" disabled={props.busy || props.loading} onClick={props.onRetry}>
-            {tr('settings.autostartRefresh')}
-          </button>
-        </div>
+        <ToggleRow
+          title={tr('settings.autostartToggle')}
+          help={tr('settings.autostartHelp')}
+          checked={props.state.enabled}
+          disabled={props.busy}
+          onChange={props.onChange}
+        />
         {props.message ? (
           <p className={`oncall-status ${props.message.cls ?? ''}`} role="status" aria-live="polite">
             {props.message.text}
@@ -1759,16 +1593,11 @@ export function AutostartCard(props: {
         ) : null}
       </>
     );
+  } else {
+    content = null;
   }
 
-  return (
-    <SettingsBlock
-      className="settings-autostart-block"
-      title={tr('settings.sectionAutostart')}
-    >
-      {inner}
-    </SettingsBlock>
-  );
+  return <SettingsBlock title={tr('settings.sectionAutostart')}>{content}</SettingsBlock>;
 }
 
 function UpdateCard(props: {
