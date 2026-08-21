@@ -77,7 +77,6 @@ describe('writer: updateBotOpenIdCrossRef evicts pre-rename name aliases', () =>
   it('keeps exactly one current name per open_id after a rename', () => {
     // Sibling was first seen as "OldName", then renamed to "NewName". Both names
     // are "known bot names" (bots-info.json) so both would match the guard.
-    seedBotsInfo('NewName'); // used only as the knownBotNames source here
     writeFileSync(join(dataDir, 'bots-info.json'), JSON.stringify([
       { larkAppId: RECEIVER_APP, botOpenId: 'ou_receiver_self', botName: 'Receiver', cliId: 'claude-code' },
       { larkAppId: SIBLING_APP, botOpenId: 'ou_sibling_self', botName: 'NewName', cliId: 'codex' },
