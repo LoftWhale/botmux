@@ -189,9 +189,14 @@ export function bindVcMeetingConsumerCatalogToBot(
       enabled: cfg.meetingConsumer?.enabled ?? true,
       consumerProfiles: bound,
       // per-bot override 选中角色 → agents;否则跟随全局 defaultMode。
+      // listenOnly 分支必须**显式清空 defaultConsumerIds**:cfg 若是 v2 播种残留,
+      // 它自带 defaultConsumerIds:['minutes'] 会经上面的 `...cfg.meetingConsumer`
+      // spread 存活;共享目录配成 listenOnly(保留 minutes 供会中切换)时,初始默认
+      // 选择 resolveVcMeetingConsumerProfiles(cfg, undefined) 会拿这个残留把 minutes
+      // 选成默认角色→被播种过的 bot 无视操作者的 listenOnly 自动激活(pi 复现坐实)。
       ...(selected.length > 0
         ? { defaultMode: 'agents' as const, defaultConsumerIds: selected }
-        : { defaultMode: 'listenOnly' as const }),
+        : { defaultMode: 'listenOnly' as const, defaultConsumerIds: [] }),
     },
   };
 }

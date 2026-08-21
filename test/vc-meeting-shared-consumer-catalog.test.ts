@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { resolveVcMeetingConsumerProfiles } from '../src/bot-registry.js';
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class FakeClient {} }));
 
@@ -400,6 +401,24 @@ describe('bindVcMeetingConsumerCatalogToBot', () => {
     expect(out.meetingConsumer?.defaultMode).toBe('listenOnly');
     const appIds = (out.meetingConsumer?.consumerProfiles ?? []).map(p => p.agentAppId);
     expect(appIds).not.toContain(OTHER);
+  });
+
+  it('clears a v2 seeded defaultConsumerIds on the listenOnly main path (no auto-activate)', async () => {
+    // pi 复审阻断(同类第三处):v2 播种块自带 defaultConsumerIds:['minutes'],共享目录
+    // 配成 listenOnly(保留 minutes 供会中切换)时,它会经 spread 存活,初始默认选择
+    // resolveVcMeetingConsumerProfiles(cfg, undefined) 把 minutes 选成默认→被播种过的
+    // bot 无视操作者 listenOnly 自动激活。修:listenOnly 分支显式 defaultConsumerIds:[]。
+    const bind = await bindModule();
+    const out = bind.bindVcMeetingConsumerCatalogToBot(SELF, seededV2Cfg(), {
+      // 目录保留 minutes 角色但全局默认 listenOnly(纪要角色仍可会中手动切)。
+      readCatalog: () => catalog({ defaultMode: 'listenOnly', defaultConsumerIds: [] }),
+    });
+    expect(out.meetingConsumer?.defaultMode).toBe('listenOnly');
+    // 关键:残留的 ['minutes'] 必须被清空,否则 resolver 会拿它当默认选中。
+    expect(out.meetingConsumer?.defaultConsumerIds).toEqual([]);
+    const resolution = resolveVcMeetingConsumerProfiles(out.meetingConsumer!, undefined);
+    expect(resolution.ok).toBe(true);
+    if (resolution.ok) expect(resolution.selectedProfiles).toEqual([]);
   });
 
   it('lets a pre-provenance (v1) seeded block fall back too, but keeps a near miss', async () => {

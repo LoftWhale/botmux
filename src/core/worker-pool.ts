@@ -8134,7 +8134,18 @@ export function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: Moj
 const mojoQuarantineNoticeInFlight = new Set<string>();
 
 /**
- * THE auxiliary-UI suppression policy. One definition, two call sites.
+ * Auxiliary-UI suppression policy for the **mojo quarantine notice** path.
+ *
+ * NOTE (Plan B merge, 2026-08): setupWorkerHandlers' `managedAuxUiSuppressed`
+ * no longer delegates here — it keeps its own inline copy that gates on
+ * `isMeetingDrivenTurn` instead of this function's pre-Plan-B blanket
+ * `ds.session.vcMeetingReceiver` check. That blanket check would re-suppress a
+ * plain user turn on a meeting-agent chat session (the "手动@不回复" regression),
+ * which is exactly why the streaming/aux path had to diverge. This function is
+ * therefore currently the mojo-quarantine caller's policy only; migrating it to
+ * `isMeetingDrivenTurn` (so the two converge again without the regression) is a
+ * tracked follow-up. ordinaryTurnRecoveryEligible (below) carries the same
+ * pre-Plan-B blanket and is on the same follow-up.
  *
  * Previously setupWorkerHandlers held this as a closure and the quarantine notice
  * COPIED three of its four checks — dropping `ordinaryManagedSuppression`, so a
