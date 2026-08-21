@@ -885,6 +885,49 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     }
   });
 
+  it('tears down when panes read missing AND the cross-check says the server is DOWN (no server running)', () => {
+    // Regression guard for the sole-session hang: when a managed session is the
+    // only session on its socket, its pane dying makes tmux exit, so BOTH the
+    // pane probe and the list-sessions cross-check return authoritative
+    // "no server running" — NOT a connection-level error. That is 'down'
+    // (server gone ⇒ this pane provably gone), so teardown must proceed.
+    // The earlier cross-check collapsed 'down' into "not answering" and stayed
+    // attached forever: each authoritative-missing probe reset the outage
+    // clock, so the 60s escalation never fired and the worker hung until the
+    // next write. Distinct from the connection-level case above (stay attached).
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      mockedExecFileSync.mockImplementation(PANE_OK);
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      // Sole session's pane died → tmux server exited. EVERY tmux invocation
+      // (pane probe AND list-sessions cross-check) now returns authoritative
+      // "no server running".
+      mockedExecFileSync.mockImplementation((_bin: any, _args: any) => {
+        throw Object.assign(new Error('no server'), {
+          status: 1,
+          signal: null,
+          stderr: Buffer.from('no server running on /tmp/tmux-0/default'),
+        });
+      });
+
+      // Well past the ~13s backed-off teardown window, but far short of the 60s
+      // escalation clock — proving teardown comes from the 'down' cross-check,
+      // not from the outage escalation.
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 15_000);
+      expect(exits).toEqual([[1, null]]);
+      expect(errSpy.mock.calls.some(call => String(call[0]).includes('pane gone after'))).toBe(true);
+      // Must NOT have stayed attached via the outage path.
+      expect(errSpy.mock.calls.some(call => String(call[0]).includes('treating as server outage'))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
+
   it('never detaches when tmux probes time out or fail to spawn (unknown, not missing)', () => {
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     vi.useFakeTimers();

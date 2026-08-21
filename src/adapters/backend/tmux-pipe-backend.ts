@@ -760,11 +760,21 @@ export class TmuxPipeBackend implements SessionBackend {
       return;
     }
     // Server-level circuit breaker: destroying worker/session state over a
-    // "missing" verdict is only safe when the SERVER itself demonstrably
-    // answers. An independent list-sessions cross-check catches any
-    // still-misclassified server failure mode (unrecognised stderr wording,
-    // future tmux message changes) before it becomes a mass teardown.
-    if (!TmuxPipeBackend.tmuxServerAnswers(3000)) {
+    // "missing" verdict is only safe when the SERVER is not merely UNREACHABLE.
+    // The cross-check distinguishes the server's two failure modes:
+    //   - 'unreachable' (connect refused / lost server / timeout / spawn fail):
+    //     the client never reached the server, which may be a live-but-stalled
+    //     shared server — stay attached and let the outage clock run.
+    //   - 'down' ("no server running"): the server answered that it is not
+    //     running. For a SOLE-SESSION socket that happens precisely BECAUSE
+    //     this pane died (its session was the server's last, so the server
+    //     exited) — the pane is authoritatively gone, so fall through to
+    //     teardown. Collapsing 'down' into "not answering" hung a sole-session
+    //     worker forever: the authoritative-missing branch above reset
+    //     serverUnreachableSince every probe, so the 60s escalation never
+    //     accrued and this cross-check blocked teardown on every pass.
+    const reach = TmuxPipeBackend.tmuxServerReachability(3000);
+    if (reach === 'unreachable') {
       this.livenessGate.reset();
       if (this.serverUnreachableSince === null) this.serverUnreachableSince = Date.now();
       process.stderr.write(
@@ -778,22 +788,38 @@ export class TmuxPipeBackend implements SessionBackend {
     this.handlePaneExit();
   }
 
-  /** Does the shared tmux server answer at all? A running server always has at
-   *  least one session (tmux exits when its last session closes), so a clean
-   *  `list-sessions` success is proof the server is up and processing clients.
-   *  Any failure — connect refused, no server, timeout — reads as "not
-   *  answering". Used purely as a pre-teardown cross-check; never destructive
-   *  on its own. */
-  private static tmuxServerAnswers(timeoutMs: number): boolean {
+  /** Three-state server reachability cross-check. A running server always has
+   *  at least one session (tmux exits when its last session closes), so a clean
+   *  `list-sessions` success ⇒ 'up'. The two failure modes must NOT be
+   *  collapsed, or the pre-teardown cross-check hangs a sole-session worker:
+   *   - 'down': the server answered that it is not running ("no server
+   *     running"). Authoritative; for a sole-session socket this happens
+   *     because the pane died. Teardown is safe.
+   *   - 'unreachable': connect refused / lost server / timeout / spawn failure
+   *     — the client never got an answer, so the server may be live-but-stalled.
+   *     Stay attached.
+   *  Uses the same connection-level classifier as the pane probe so both agree
+   *  on what "the client never reached the server" looks like. Never
+   *  destructive on its own. */
+  private static tmuxServerReachability(timeoutMs: number): 'up' | 'down' | 'unreachable' {
     try {
       execFileSync('tmux', ['list-sessions'], {
         stdio: ['ignore', 'ignore', 'pipe'],
         timeout: timeoutMs,
         env: tmuxEnv(),
       });
-      return true;
-    } catch {
-      return false;
+      return 'up';
+    } catch (err: any) {
+      if (err && typeof err.status === 'number' && !err.signal) {
+        const stderr = (err.stderr?.toString?.() ?? '').trim();
+        // Connection-level wording ("error connecting", "lost server") ⇒ the
+        // client never reached the server ⇒ unreachable. Anything else the
+        // server actually answered — "no server running" included ⇒ down.
+        return isTmuxServerLevelErrorText(stderr) ? 'unreachable' : 'down';
+      }
+      // Timeout (signal/killed) or spawn failure (ENOENT/EACCES — no numeric
+      // exit status) ⇒ no answer ever reached us.
+      return 'unreachable';
     }
   }
 
