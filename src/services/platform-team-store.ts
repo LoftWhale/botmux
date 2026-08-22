@@ -46,7 +46,8 @@ export interface PlatformTeamSyncTeam {
   groupChatIds: string[];
   bots: PlatformTeamBot[];
   /** Team members' (people's) union_ids — the human talk-免grant leg: a member
-   *  is trusted to TALK (never operate) inside this team's group chats. */
+   *  is trusted to TALK (never operate) to any bot on the SAME team, in any chat
+   *  they share with it (not scoped to this team's group chats). */
   memberUnionIds: string[];
 }
 

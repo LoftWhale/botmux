@@ -1593,8 +1593,8 @@ export function canTalk(
  *   锁定为「飞书盖章的 bot 发送方」（daemon 的 teamTrustUnionId），否则恶意成员把
  *   真人 union 报成 bot 就能让真人继承 bot 信任。
  * @param memberUnionId  发送方 union（teamMember 腿）——可为真人 union（未锁 bot）。
- *   仅授 chat 作用域内的 talk、不授 operate，且要求 union 在该团队的成员名单里
- *   （memberUnionIds 来自平台鉴权的团队成员，非机器自报），故喂真人 union 是安全的。
+ *   授 talk、不授 operate，要求 union 与本 bot 同属一个平台团队（memberUnionIds
+ *   来自平台鉴权的团队成员，非机器自报），不限 chat，故喂真人 union 是安全的。
  * @param chatType  当前会话类型。**仅 p2pOpen 腿读它**；省略时该腿不生效（fail-closed），
  *   所以拿不到 chatType 的调用点保持原语义、不会误放行。
  */
