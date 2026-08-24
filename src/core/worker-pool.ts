@@ -460,6 +460,11 @@ import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
 import { REMOTE_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
 import {
+  MAX_STARTUP_AUTO_RETRIES,
+  isTransientStartupFailure,
+  startupAutoRetryDelayMs,
+} from './worker-startup-retry.js';
+import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
 } from './managed-origin-capability.js';
@@ -10005,6 +10010,63 @@ function setupWorkerHandlers(
       logger.error(`[${t}] Failed to deliver worker startup failure to Lark: ${err?.message ?? err}`);
     }
   };
+  /**
+   * Daemon-side self-heal for TRANSIENT startup/relaunch failures (see
+   * worker-startup-retry.ts; 2026-08-23 tmux restart-storm incident). Returns
+   * true when a silent bounded retry was scheduled INSTEAD of a user-visible
+   * notify. Scope is deliberately narrow:
+   *   - only turn-less failures — a turn-carrying failure has a waiting sender
+   *     and (for durable VC/at-most-once turns) its own delivery state machine
+   *     that must keep owning retries;
+   *   - only reasons the classifier deems transient host/backend pressure;
+   *   - bounded by MAX_STARTUP_AUTO_RETRIES per failing streak (reset on a
+   *     worker generation reaching `ready`), so a persistent failure still
+   *     surfaces to the user with the standard card.
+   * The retry itself is a blank re-fork (`forkWorker(ds, '', true)`) — exactly
+   * what a daemon restart or the next inbound message would do: re-attach when
+   * the backing pane survived (the 08-23 case — pane and CLI were alive, only
+   * the worker had died), cold `--resume` otherwise.
+   */
+  const scheduleTransientStartupRetry = (
+    reason: string,
+    turnId?: string,
+    dispatchAttempt?: number,
+  ): boolean => {
+    if (turnId !== undefined || dispatchAttempt !== undefined) return false;
+    if (startupState.failureNotified) return false;
+    if (!isTransientStartupFailure(reason)) return false;
+    if (ds.session.status !== 'active') return false;
+    const attempts = (ds.startupAutoRetry?.attempts ?? 0) + 1;
+    if (attempts > MAX_STARTUP_AUTO_RETRIES) return false;
+    // Mark this generation handled so the pre-ready exit guard cannot post a
+    // duplicate start_exited_early card behind the scheduled retry.
+    startupState.failureNotified = true;
+    const delayMs = startupAutoRetryDelayMs(ds.session.sessionId, attempts);
+    logger.warn(
+      `[${t}] Transient worker startup failure (${reason}); `
+      + `auto-retry ${attempts}/${MAX_STARTUP_AUTO_RETRIES} in ${Math.round(delayMs / 1000)}s`,
+    );
+    const timer = setTimeout(() => {
+      if (ds.startupAutoRetry?.timer === timer) ds.startupAutoRetry.timer = undefined;
+      // Lifecycle guards: the session may have been closed, replaced in the
+      // registry, or revived by an inbound message while the timer slept.
+      if (ds.session.status !== 'active') return;
+      if (ds.worker && !ds.worker.killed) return;
+      if (activeSessionsRegistry && activeSessionsRegistry.get(activeSessionKey(ds)) !== ds) return;
+      logger.info(
+        `[${t}] Auto-retrying worker start (${attempts}/${MAX_STARTUP_AUTO_RETRIES}) `
+        + 'after transient startup failure',
+      );
+      try {
+        forkWorker(ds, '', true);
+      } catch (err: any) {
+        logger.error(`[${t}] Startup auto-retry fork failed: ${err?.message ?? err}`);
+      }
+    }, delayMs);
+    timer.unref?.();
+    ds.startupAutoRetry = { attempts, timer };
+    return true;
+  };
 
   // Adopt mode flags — computed once, used in all buildStreamingCard calls.
   // Bridge mode (the v3 default for /adopt) hides the legacy takeover button.
@@ -10170,6 +10232,13 @@ function setupWorkerHandlers(
         }
         startupState.ready = true;
         ds.workerReady = true;
+        // A generation reached ready: the transient-startup failing streak is
+        // over. Clear the budget and any still-pending retry timer (an inbound
+        // message may have revived the session while a retry slept).
+        if (ds.startupAutoRetry) {
+          if (ds.startupAutoRetry.timer) clearTimeout(ds.startupAutoRetry.timer);
+          ds.startupAutoRetry = undefined;
+        }
         // Restore the daemon-owned display mode BEFORE any card handling: a
         // fresh worker always boots with displayMode='hidden', and every early
         // break below (managed / replyAlreadySent / streamingCardDisabled /
@@ -11523,7 +11592,11 @@ function setupWorkerHandlers(
         logger.error(`[${t}] Worker error: ${msg.message}`);
         // `error` is a fatal launch-generation signal. It normally arrives
         // during init, but can also follow a previously-ready worker whose CLI
-        // recovery/restart fails; that later failure must remain user-visible.
+        // recovery/restart fails; that later failure must remain user-visible —
+        // UNLESS it is a turn-less transient (post-outage restart storm), where
+        // a bounded silent re-fork self-heals without waking anyone (08-23:
+        // idle sessions got "会话启动失败" cards while their panes were alive).
+        if (scheduleTransientStartupRetry(msg.message, msg.turnId, msg.dispatchAttempt)) break;
         await notifyStartupFailure(msg.message, msg.turnId, msg.dispatchAttempt);
         break;
       }
