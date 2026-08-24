@@ -255,6 +255,28 @@ describe("worker-pool 'error' transient self-heal wiring", () => {
     expect(ds.startupAutoRetry?.attempts).toBe(1);
   });
 
+  it('clears the previous pending timer when a later generation schedules the next attempt (no orphan timers)', async () => {
+    const ds = makeDs('sid-orphan-timer', makeFakeWorker());
+
+    await failOnce(ds, INCIDENT_REASON);
+    expect(ds.startupAutoRetry?.attempts).toBe(1);
+    const firstTimer = ds.startupAutoRetry!.timer;
+    expect(firstTimer).toBeDefined();
+
+    // An inbound message revives the session, the replacement generation fails
+    // too: attempt 2 must REPLACE the pending attempt-1 timer, not stack an
+    // orphan beside it.
+    const clearSpy = vi.spyOn(globalThis, 'clearTimeout');
+    try {
+      await failOnce(ds, INCIDENT_REASON);
+      expect(ds.startupAutoRetry?.attempts).toBe(2);
+      expect(ds.startupAutoRetry?.timer).not.toBe(firstTimer);
+      expect(clearSpy.mock.calls.some(([handle]) => handle === firstTimer)).toBe(true);
+    } finally {
+      clearSpy.mockRestore();
+    }
+  });
+
   it('the pending retry no-ops (no fork) when another path already revived the session', async () => {
     vi.useFakeTimers();
     const ds = makeDs('sid-revived', makeFakeWorker());

@@ -10064,6 +10064,12 @@ function setupWorkerHandlers(
       }
     }, delayMs);
     timer.unref?.();
+    // An inbound message can revive the session between two failing
+    // generations; if the replacement fails too, the previous generation's
+    // still-pending timer must not survive as an orphan (its guards make a
+    // double blank re-fork merely wasteful, not harmful — but one streak owns
+    // exactly one pending retry).
+    if (ds.startupAutoRetry?.timer) clearTimeout(ds.startupAutoRetry.timer);
     ds.startupAutoRetry = { attempts, timer };
     return true;
   };
