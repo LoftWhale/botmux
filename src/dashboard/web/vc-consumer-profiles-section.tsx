@@ -15,7 +15,6 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, FieldTitle, InfoTip, dropdownLabel } from './dashboard-components.js';
-import { confirm } from './confirm-modal.js';
 import { useDashboardLocale, useT } from './react-hooks.js';
 import type {
   VcMeetingAgentOptionDto,
