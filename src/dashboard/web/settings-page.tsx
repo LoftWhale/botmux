@@ -7,6 +7,8 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { store } from './store.js';
 import { updateResponseNeedsRestart } from './update-action.js';
 import { ui } from './ui.js';
+import { confirm } from './confirm-modal.js';
+import { toast } from './toast.js';
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -122,6 +124,19 @@ interface UpdateStatus {
 interface ReleaseNote { version: string; name: string; body: string; url: string; publishedAt: string | null }
 
 type StatusMessage = { text: string; cls?: string } | null;
+
+interface AutostartState {
+  supported: boolean;
+  enabled: boolean;
+}
+
+function parseAutostartState(value: unknown): AutostartState | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const state = value as Record<string, unknown>;
+  return typeof state.supported === 'boolean' && typeof state.enabled === 'boolean'
+    ? { supported: state.supported, enabled: state.enabled }
+    : null;
+}
 
 /** Map a `herdrTraexInstall` result (returned by PUT /api/settings when the
  *  write triggered a live TraeX plugin install) to a settings status message. */
@@ -255,6 +270,12 @@ function SettingsPage() {
   const [upBusy, setUpBusy] = useState(false);
   const [upMsg, setUpMsg] = useState<StatusMessage>(null);
 
+  const [autostartState, setAutostartState] = useState<AutostartState | null>(null);
+  const [autostartLoading, setAutostartLoading] = useState(false);
+  const [autostartError, setAutostartError] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  const [autostartMsg, setAutostartMsg] = useState<StatusMessage>(null);
+
   const clearTimers = useCallback(() => {
     for (const id of timersRef.current) window.clearTimeout(id);
     timersRef.current.clear();
@@ -285,6 +306,24 @@ function SettingsPage() {
       if (!mountedRef.current) return;
       setUpStatus(null);
       setUpStatusError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  const fetchAutostart = useCallback(async () => {
+    setAutostartLoading(true);
+    try {
+      const response = await fetch('/api/autostart', { cache: 'no-store' });
+      const body = await response.json().catch(() => ({}));
+      const state = response.ok ? parseAutostartState(body.state) : null;
+      if (!state) throw new Error('invalid_state');
+      if (!mountedRef.current) return;
+      setAutostartState(state);
+      setAutostartError(false);
+    } catch {
+      if (!mountedRef.current) return;
+      setAutostartError(true);
+    } finally {
+      if (mountedRef.current) setAutostartLoading(false);
     }
   }, []);
 
@@ -326,8 +365,40 @@ function SettingsPage() {
     setUpBusy(false);
     setUpMsg(null);
     setUpChangelogOpen(false);
-    if (canWrite) void fetchStatus();
-  }, [canWrite, fetchStatus, settingsLoaded]);
+    setAutostartMsg(null);
+    if (canWrite) {
+      void fetchStatus();
+      void fetchAutostart();
+    }
+  }, [canWrite, fetchAutostart, fetchStatus, settingsLoaded]);
+
+  async function setAutostartEnabled(enabled: boolean): Promise<void> {
+    if (!autostartState || autostartBusy) return;
+    const before = autostartState;
+    setAutostartBusy(true);
+    setAutostartState({ ...before, enabled });
+    setAutostartMsg({ text: tr('settings.autostartSaving') });
+    try {
+      const response = await fetch('/api/autostart', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      const body = await response.json().catch(() => ({}));
+      const state = response.ok ? parseAutostartState(body.state) : null;
+      if (!state) throw new Error('save_failed');
+      if (!mountedRef.current) return;
+      setAutostartState(state);
+      setAutostartMsg({ text: tr('settings.autostartSaved'), cls: 'hint-ok' });
+    } catch {
+      if (!mountedRef.current) return;
+      setAutostartState(before);
+      setAutostartMsg({ text: tr('settings.autostartSaveFailed'), cls: 'hint-warn-inline' });
+      void fetchAutostart();
+    } finally {
+      if (mountedRef.current) setAutostartBusy(false);
+    }
+  }
 
   async function saveSettings(
     key: string,
@@ -360,6 +431,10 @@ function SettingsPage() {
       // instead of the generic "saved" toast.
       const traexMsg = traexInstallMessage(body.herdrTraexInstall, tr);
       setSettingsMsg(traexMsg ?? { text: tr('settings.saved'), cls: 'hint-ok' });
+      // 成功轻反馈 1.5s 后淡出；错误/安装结果不自动清
+      if (!traexMsg) {
+        setTimer(() => { if (mountedRef.current) setSettingsMsg(null); }, 1500);
+      }
     } catch (e) {
       if (!mountedRef.current) return;
       // The PUT may have committed before a proxy/browser timeout dropped its
@@ -474,26 +549,26 @@ function SettingsPage() {
     const s = upStatus;
     if (!s) return;
     if (!s.node.ok) {
-      window.alert(tr('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required }));
+      toast(tr('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required }), { kind: 'warning' });
       return;
     }
     const localDev = s.localDevInstall === true;
     if (localDev) {
-      if (!s.localDevUpdatable) { window.alert(tr('update.localDev')); return; }
+      if (!s.localDevUpdatable) { toast(tr('update.localDev'), { kind: 'warning' }); return; }
     } else if (!s.updateSupported || !s.updateCommand) {
-      window.alert(tr('update.unsupportedInstall'));
+      toast(tr('update.unsupportedInstall'), { kind: 'warning' });
       return;
     }
     if (s.installs.multiple) {
       const paths = s.installs.entries.map(e => `• ${e.binPath} (${installKindLabel(e.kind, tr)})`).join('\n');
-      if (!window.confirm(tr('update.confirmMultiInstall', { paths }))) return;
+      if (!await confirm({ title: tr('update.confirmMultiInstallTitle'), message: tr('update.confirmMultiInstall', { paths }), confirmLabel: tr('update.btnContinue'), cancelLabel: tr('update.btnCancel') })) return;
     }
     const confirmMsg = localDev
       ? tr('update.confirmUpdateLocalDev')
       : s.latest
         ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand! })
         : tr('update.confirmUpdateNoVer', { command: s.updateCommand! });
-    if (!window.confirm(confirmMsg)) return;
+    if (!await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
     setUpBusy(true);
     setUpMsg({ text: localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
     try {
@@ -526,7 +601,7 @@ function SettingsPage() {
             : tr('update.builtNeedsRestart'),
           cls: 'hint-ok',
         });
-        if (window.confirm(tr('update.confirmRestart'))) {
+        if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnLater') })) {
           await doRestart({ oldVersion: body.oldVersion, newVersion: body.newVersion });
         } else if (mountedRef.current) {
           setUpMsg({ text: tr('update.noRestartHint'), cls: 'hint-ok' });
@@ -542,6 +617,19 @@ function SettingsPage() {
       setUpMsg({ text: tr('update.updateFailed', { detail: e instanceof Error ? e.message : String(e) }), cls: 'hint-warn-inline' });
     }
   }
+
+  const autostartBlock = (
+    <AutostartCard
+      canWrite={canWrite}
+      state={autostartState}
+      loading={autostartLoading}
+      error={autostartError}
+      busy={autostartBusy}
+      message={autostartMsg}
+      onChange={enabled => { void setAutostartEnabled(enabled); }}
+      onRetry={() => { void fetchAutostart(); }}
+    />
+  );
 
   const updateBlock = (
     <UpdateCard
@@ -569,7 +657,7 @@ function SettingsPage() {
         if (next && upChangelog === null) void loadChangelog();
       }}
       onUpdate={() => void doUpdate()}
-      onRestart={() => { if (window.confirm(tr('update.confirmPlainRestart'))) void doRestart(null); }}
+      onRestart={() => { void (async () => { if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmPlainRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnCancel') })) void doRestart(null); })(); }}
     />
   );
 
@@ -580,6 +668,7 @@ function SettingsPage() {
       bound={bound}
       savingKey={savingKey}
       message={settingsMsg}
+      autostartBlock={autostartBlock}
       updateBlock={updateBlock}
       feishuLoginQr={feishuLoginQr}
       onCloseFeishuLoginQr={() => setFeishuLoginQr(null)}
@@ -611,6 +700,7 @@ function SettingsBody(props: {
   bound: boolean;
   savingKey: string | null;
   message: StatusMessage;
+  autostartBlock: ReactNode;
   updateBlock: ReactNode;
   feishuLoginQr: string | null;
   onCloseFeishuLoginQr(): void;
@@ -659,6 +749,8 @@ function SettingsBody(props: {
   ], [tr]);
   return (
     <div className="settings-layout">
+      <SettingsNav tr={tr} />
+      <div className="settings-content">
       {canWrite ? null : (
         <article className="bd-card settings-card settings-alert-card">
           <p className="hint-warn">{tr('settings.readOnlyVisitor')}</p>
@@ -669,7 +761,7 @@ function SettingsBody(props: {
         description={tr('settings.moduleGeneralHelp')}
       >
       <SettingsGroup className="settings-group-main">
-        <SettingsBlock title={tr('settings.sectionAccess')}>
+        <SettingsBlock id="settings-access" title={tr('settings.sectionAccess')}>
           <ToggleRow
             title={tr('settings.publicReadOnly')}
             help={tr('settings.publicReadOnlyHelp')}
@@ -687,7 +779,7 @@ function SettingsBody(props: {
             />
           ) : null}
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionCards')}>
+        <SettingsBlock id="settings-cards" title={tr('settings.sectionCards')}>
           <ToggleRow
             title={tr('settings.openTerminalInFeishu')}
             help={tr('settings.openTerminalInFeishuHelp')}
@@ -717,7 +809,7 @@ function SettingsBody(props: {
             />
           </div>
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionGroupCreation')}>
+        <SettingsBlock id="settings-group-creation" title={tr('settings.sectionGroupCreation')}>
           <GroupNamePrefixRow
             value={settings.groupNamePrefix}
             disabled={dis || savingKey === 'groupNamePrefix'}
@@ -728,7 +820,7 @@ function SettingsBody(props: {
             )}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionExperimental')}>
+        <SettingsBlock id="settings-experimental" title={tr('settings.sectionExperimental')}>
           <ToggleRow
             title={tr('settings.chatBotDiscovery')}
             help={tr('settings.chatBotDiscoveryHelp')}
@@ -778,7 +870,7 @@ function SettingsBody(props: {
             onChange={value => saveBoolean('noVisibleOutputHint', value)}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionHostOverloadAlert')}>
+        <SettingsBlock id="settings-overload" title={tr('settings.sectionHostOverloadAlert')}>
           <HostOverloadAlertSettingsEditor
             value={settings.hostOverloadAlert}
             disabled={dis}
@@ -786,7 +878,7 @@ function SettingsBody(props: {
             onSave={saveHostOverloadAlert}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionWhiteboard')}>
+        <SettingsBlock id="settings-whiteboard" title={tr('settings.sectionWhiteboard')}>
           <ToggleRow
             title={tr('settings.whiteboardEnable')}
             help={tr('settings.whiteboardEnableHelp')}
@@ -808,7 +900,7 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionRepoPicker')}>
+        <SettingsBlock id="settings-repo-picker" title={tr('settings.sectionRepoPicker')}>
           <div className="settings-field-row">
             <FieldTitle help={tr('settings.repoPickerModeHelp')}>{tr('settings.repoPickerMode')}</FieldTitle>
             <DropdownMenu
@@ -824,7 +916,7 @@ function SettingsBody(props: {
             />
           </div>
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionSchedule')}>
+        <SettingsBlock id="settings-schedule" title={tr('settings.sectionSchedule')}>
           <TimeZoneRow
             value={settings.scheduleTimeZone}
             host={settings.hostTimeZone}
@@ -847,7 +939,7 @@ function SettingsBody(props: {
         description={tr('settings.moduleMeetingHelp')}
       >
       <SettingsGroup className="settings-group-meeting">
-        <SettingsBlock className="settings-vc-block" title={tr('settings.sectionVcMeetingAgent')}>
+        <SettingsBlock id="settings-vc" className="settings-vc-block" title={tr('settings.sectionVcMeetingAgent')}>
           <ToggleRow
             title={tr('settings.vcMeetingAgent')}
             help={tr('settings.vcMeetingAgentHelp')}
@@ -888,7 +980,9 @@ function SettingsBody(props: {
         description={tr('settings.moduleSystemHelp')}
       >
       <SettingsGroup className="settings-group-ops">
+        {props.autostartBlock}
         <SettingsBlock
+          id="settings-maintenance"
           title={tr('settings.sectionMaintenance')}
           titleExtra={settings.localDevInstall
             ? <span className="settings-title-note">{tr('settings.autoUpdateLocalDev')}</span>
@@ -946,13 +1040,67 @@ function SettingsBody(props: {
             </div>
           </div>
         </SettingsBlock>
-        {props.updateBlock}
+        <div id="settings-update">{props.updateBlock}</div>
       </SettingsGroup>
       </SettingsModule>
       <div className="settings-status-row">
         <span className={`oncall-status ${props.message?.cls ?? ''}`} data-settings-status>{props.message?.text ?? ''}</span>
       </div>
+      </div>
     </div>
+  );
+}
+
+function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element {
+  const tr = props.tr;
+  const groups = [
+    {
+      label: tr('settings.moduleGeneral'),
+      items: [
+        { id: 'settings-access', label: tr('settings.sectionAccess') },
+        { id: 'settings-cards', label: tr('settings.sectionCards') },
+        { id: 'settings-group-creation', label: tr('settings.sectionGroupCreation') },
+        { id: 'settings-experimental', label: tr('settings.sectionExperimental') },
+        { id: 'settings-overload', label: tr('settings.sectionHostOverloadAlert') },
+        { id: 'settings-whiteboard', label: tr('settings.sectionWhiteboard') },
+        { id: 'settings-repo-picker', label: tr('settings.sectionRepoPicker') },
+        { id: 'settings-schedule', label: tr('settings.sectionSchedule') },
+      ],
+    },
+    {
+      label: tr('settings.moduleMeeting'),
+      items: [
+        { id: 'settings-vc', label: tr('settings.sectionVcMeetingAgent') },
+      ],
+    },
+    {
+      label: tr('settings.moduleSystem'),
+      items: [
+        { id: 'settings-maintenance', label: tr('settings.sectionMaintenance') },
+        { id: 'settings-update', label: tr('settings.sectionUpdate') },
+      ],
+    },
+  ];
+  return (
+    <nav className="settings-nav" aria-label={tr('settings.title')}>
+      {groups.map(group => (
+        <div key={group.label} className="settings-nav-group">
+          <p className="settings-nav-group-label">{group.label}</p>
+          {group.items.map(item => (
+            <button
+              key={item.id}
+              type="button"
+              className="settings-nav-link"
+              onClick={() => {
+                document.getElementById(item.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+      ))}
+    </nav>
   );
 }
 
@@ -1009,13 +1157,14 @@ function SettingsGroup(props: {
 
 function SettingsBlock(props: {
   className?: string;
+  id?: string;
   title: ReactNode;
   titleExtra?: ReactNode;
   children: ReactNode;
 }): React.JSX.Element {
   const cls = ['settings-block', props.className].filter(Boolean).join(' ');
   return (
-    <section className={cls}>
+    <section className={cls} id={props.id}>
       <article className="bd-card settings-card">
         <div className="settings-block-title-row">
           <h2 className="bd-section-title">{props.title}</h2>
@@ -1469,6 +1618,58 @@ function TraexPluginEditor(props: {
       </div>
     </div>
   );
+}
+
+function AutostartCard(props: {
+  canWrite: boolean;
+  state: AutostartState | null;
+  loading: boolean;
+  error: boolean;
+  busy: boolean;
+  message: StatusMessage;
+  onChange(enabled: boolean): void;
+  onRetry(): void;
+}) {
+  const tr = useT();
+  let content: ReactNode;
+
+  if (!props.canWrite) {
+    content = <p className="hint-warn">{tr('settings.autostartLoginRequired')}</p>;
+  } else if (props.loading && !props.state) {
+    content = <LoadingState label={tr('settings.autostartLoading')} compact />;
+  } else if (props.error && !props.state) {
+    content = (
+      <>
+        <p className="hint-warn">{tr('settings.autostartLoadFailed')}</p>
+        <div className="update-actions">
+          <button type="button" onClick={props.onRetry}>{tr('settings.autostartRetry')}</button>
+        </div>
+      </>
+    );
+  } else if (props.state?.supported === false) {
+    content = <p className="hint-warn">{tr('settings.autostartUnsupported')}</p>;
+  } else if (props.state) {
+    content = (
+      <>
+        <ToggleRow
+          title={tr('settings.autostartToggle')}
+          help={tr('settings.autostartHelp')}
+          checked={props.state.enabled}
+          disabled={props.busy}
+          onChange={props.onChange}
+        />
+        {props.message ? (
+          <p className={`oncall-status ${props.message.cls ?? ''}`} role="status" aria-live="polite">
+            {props.message.text}
+          </p>
+        ) : null}
+      </>
+    );
+  } else {
+    content = null;
+  }
+
+  return <SettingsBlock title={tr('settings.sectionAutostart')}>{content}</SettingsBlock>;
 }
 
 function UpdateCard(props: {
