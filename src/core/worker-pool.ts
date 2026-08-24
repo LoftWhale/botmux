@@ -96,7 +96,7 @@ import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, 
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
-import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
@@ -1659,6 +1659,21 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
   } catch {
     return owner;
   }
+}
+
+/** 失败兜底卡片（turnFailed final_output）的兜底 @ 对象。仅当会话没有任何真人
+ *  footer 收件人时使用（典型：bot-to-bot 派发的 ownerless 会话遇到模型网关故障，
+ *  没人被 @，故障静默滑过）——回退到 bot 管理员（首个已授权真人 open_id，与
+ *  「缺权限警告私信对象」同口径）。返回 undefined = 没有可 @ 的真人，不加提及。 */
+function failureNoticeFallbackMentionOpenId(ds: DaemonSession): string | undefined {
+  const admin = getOwnerOpenId(ds.larkAppId);
+  if (!admin) return undefined;
+  try {
+    // 管理员名单里混入 bot open_id 时不 @：卡片里 @ 一个 bot 会触发它的新一轮，
+    // 失败通知不该产生二次派发。fail closed。
+    if (loadKnownBotOpenIdsForApp(ds.larkAppId).has(admin)) return undefined;
+  } catch { /* cross-ref 读取失败 → 仍然 @ 配置的管理员（admin 名单本就是真人为主） */ }
+  return admin;
 }
 
 export function clearUsageLimitState(ds: DaemonSession): void {
@@ -13008,6 +13023,15 @@ function deliverFinalOutput(
         ? undefined
         : imOrigin?.replyTargetSenderOpenId
           ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+      // 失败兜底通知正文 @ 真人。有 footer 收件人（真人 owner / 触发者）时其 <at>
+      // 已经会提醒，不重复；仅当没有任何真人收件人时（bot-to-bot 派发的会话）回退
+      // @ bot 管理员，让模型网关类故障有人看见而不是静默滑过。
+      const failureMentionOpenId = msg.turnFailed === true && !managedReceiver && !recipientOpenId
+        ? failureNoticeFallbackMentionOpenId(ds)
+        : undefined;
+      const deliveredAssistantText = failureMentionOpenId
+        ? `<at id=${failureMentionOpenId}></at> ${safeAssistantText}`
+        : safeAssistantText;
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
       // forkWorker snapshots the effective policy for this worker lifetime.
       // Keep daemon fallback delivery aligned with the same frozen policy the
@@ -13036,7 +13060,7 @@ function deliverFinalOutput(
             ...(feedback ? { feedback } : {}),
           })
         : buildCanonicalFinalReplyCard({
-            markdown: safeAssistantText,
+            markdown: deliveredAssistantText,
             ...(feedback ? { feedback } : {}),
             recipientOpenId,
             brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),

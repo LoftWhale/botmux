@@ -1305,6 +1305,12 @@ export type WorkerToDaemon =
       // worker stitching label + user + assistant into one markdown blob,
       // which mixes presentation with payload).
       kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
+      /** True when `content` is the worker's FAILED-turn fallback notice (a
+       *  provider/gateway error card), not a model answer. The daemon uses it
+       *  to @mention a human on the failure card when the session has no human
+       *  recipient (bot-to-bot dispatch), so model-service outages don't pass
+       *  silently. Presentation-only — never affects turn settlement. */
+      turnFailed?: boolean;
       userText?: string;
       /** Two-phase Codex App final settlement; daemon persists before ACKing worker. */
       codexAppSettlement?: {
