@@ -8,12 +8,20 @@ const ABSENT_EXIT_CODE = 4;
 type ExistingPm2Mutation =
   | { operation: 'start'; target: string; only?: string; updateEnv?: boolean }
   | { operation: 'restart'; target: string; updateEnv?: boolean }
-  | { operation: 'stop' | 'delete'; target: string };
+  | { operation: 'stop' | 'delete'; target: string }
+  | { operation: 'kill' };
 
 type ExistingPm2Request = ExistingPm2Mutation & { expectedGod: LinuxPm2GodProcess };
 
 function mutationFromArgs(args: string[]): ExistingPm2Mutation {
   const [operation, target] = args;
+  // `pm2 kill` is socket-addressed ("whichever God owns this home"), not
+  // PID-addressed: the helper asks the attested God to shut itself down over
+  // its own RPC socket. It deliberately takes no target.
+  if (operation === 'kill') {
+    if (args.length !== 1) throw new Error(`unsupported PM2 mutation: ${args.join(' ')}`);
+    return { operation: 'kill' };
+  }
   if (!target) throw new Error(`unsupported PM2 mutation without target: ${args.join(' ')}`);
   if (operation === 'stop' || operation === 'delete') {
     if (args.length !== 2) throw new Error(`unsupported PM2 mutation: ${args.join(' ')}`);

@@ -28,14 +28,20 @@
  * DSH_SESSION_ROOT but cross-process resume is not wired up yet).
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 
 const DSH_MARKER = '::botmux-dsh:';
 const DEFAULT_TURN_TIMEOUT_MS = 10 * 60 * 1000;
+// Node's setTimeout delay is a 32-bit signed int of ms; a larger value wraps to
+// ~1ms and warns. Upstream config/IPC/UI already clamp to this bound, but the
+// runner re-validates its own argv so a hand-crafted invocation can't arm an
+// overflowing (effectively ~1ms) turn timeout. Mirrors MAX_TURN_TIMEOUT_MS.
+const MAX_TURN_TIMEOUT_MS = 2_147_483_647;
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const PROMPT_ACK_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 2_000;
@@ -45,8 +51,8 @@ const DEFAULT_MAX_TOKENS = 49152;
 /**
  * Vendored default composition, pinned to the dsh protocol version this
  * runner speaks. Mirrors the wheel's runtime/cordis.yml; bump together with
- * the dsh release. Written once per boot so the runtime always gets an
- * explicit config (it refuses to start without one).
+ * the dsh release. Written to ~/.dsh/botmux/cordis.yml so the runtime always
+ * gets an explicit config (it refuses to start without one).
  */
 const VENDORED_CONFIG = `# Vendored by botmux dsh-runner. Source: deepseek-harness python/sdk-runtime cordis.yml.
 - id: sdk-jsonrpc-server
@@ -129,7 +135,9 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
     else if (key === '--turn-timeout-ms' && val !== undefined) {
       const n = Number(val);
-      if (Number.isFinite(n) && n > 0) out.turnTimeoutMs = n;
+      // Accept only a positive integer within the arm-able bound; anything else
+      // (≤0, non-integer, over-bound) is ignored → falls back to the default.
+      if (Number.isInteger(n) && n > 0 && n <= MAX_TURN_TIMEOUT_MS) out.turnTimeoutMs = n;
       i++;
     }
   }
@@ -147,6 +155,29 @@ function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Keep the wire checks aligned with the official dsh SDK client. A successful
+ *  JSON-RPC envelope with a malformed result is still a protocol failure. */
+function parseInitializeResult(result: unknown): { serverInfo: { name: string; version: string } } {
+  if (!isRecord(result)
+    || !isRecord(result.serverInfo)
+    || typeof result.serverInfo.name !== 'string'
+    || typeof result.serverInfo.version !== 'string') {
+    throw new Error(`dsh protocol error: initialize returned no server identity: ${JSON.stringify(result)}`);
+  }
+  return { serverInfo: { name: result.serverInfo.name, version: result.serverInfo.version } };
+}
+
+function parsePromptMessageId(result: unknown): string {
+  if (!isRecord(result) || typeof result.messageId !== 'string') {
+    throw new Error(`dsh protocol error: session/prompt returned no message id: ${JSON.stringify(result)}`);
+  }
+  return result.messageId;
+}
+
 function emitMarker(kind: string, payload: unknown): void {
   output.marker(kind, payload);
 }
@@ -159,16 +190,158 @@ function prompt(): void {
   output.display('› ');
 }
 
-/** Resolve the dsh config: an explicit DSH_CORDIS_CONFIG wins, otherwise the
- *  vendored composition is materialized under ~/.botmux/dsh. */
-function resolveConfigPath(): string {
-  const fromEnv = process.env.DSH_CORDIS_CONFIG?.trim();
-  if (fromEnv && existsSync(fromEnv)) return fromEnv;
-  const dir = join(homedir(), '.botmux', 'dsh');
+/** Native dsh config resolved from ~/.dsh (settings.yaml + .credentials.yaml).
+ *  When the native settings document exists, the runner generates a composition
+ *  that mounts the user's own pi-ai providers — zero env config in bots.json. */
+interface NativeDshConfig {
+  /** Path to the cordis composition the runtime boots. */
+  configPath: string;
+  /** Provider route for SDK initialize. */
+  provider: string;
+  /** Model for SDK initialize (argv --model > settings.yaml > default). */
+  model: string;
+  /** Credentials injected into the runtime's environment (env wins on conflict). */
+  credentials: Record<string, string>;
+}
+
+/** The botmux-owned subdir under the native dsh home (~/.dsh/botmux). */
+function dshBotmuxDir(): string {
+  return join(homedir(), '.dsh', 'botmux');
+}
+
+/** Write a composition to ~/.dsh/botmux/cordis.yml and return its path. */
+function writeComposition(content: string): string {
+  const dir = dshBotmuxDir();
   mkdirSync(dir, { recursive: true });
   const path = join(dir, 'cordis.yml');
-  writeFileSync(path, VENDORED_CONFIG, 'utf8');
+  writeFileSync(path, content, 'utf8');
   return path;
+}
+
+/** Serialize a JS object to YAML indented `spaces` levels (for embedding in
+ *  a composition template). */
+function indentYaml(obj: unknown, spaces: number): string {
+  const str = stringifyYaml(obj, { indent: 2 }).trim();
+  const pad = ' '.repeat(spaces);
+  return str.split('\n').map(line => line ? pad + line : line).join('\n');
+}
+
+/** Generate a composition that mounts the user's pi-ai providers (translated
+ *  verbatim from ~/.dsh/settings.yaml llm-pi-ai.providers). The wheel bundles
+ *  dsh-llm-pi-ai, so each provider becomes a native llm route. */
+function generatePiAiComposition(providers: Record<string, unknown>): string {
+  const providersYaml = indentYaml(providers, 6);
+  return `# Generated by botmux dsh-runner from ~/.dsh/settings.yaml.
+- id: sdk-jsonrpc-server
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+- id: agent-core
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    workspaceContext:
+      maxBytes: 65536
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+${providersYaml}
+- id: sessions
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
+- id: session-checkpoints
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+- id: bash
+  name: '@deepseek-ai/dsh-bash-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+- id: fs-local
+  name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+`;
+}
+
+/** Load ~/.dsh/.credentials.yaml (flat KEY: value) as a string map. Missing
+ *  file → empty (the runtime then falls back to the ambient environment). */
+function loadCredentials(): Record<string, string> {
+  const credPath = join(homedir(), '.dsh', '.credentials.yaml');
+  if (!existsSync(credPath)) return {};
+  const parsed = parseYaml(readFileSync(credPath, 'utf8')) as unknown;
+  const out: Record<string, string> = {};
+  if (isRecord(parsed)) {
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === 'string') out[k] = v;
+    }
+  }
+  return out;
+}
+
+/** Resolve the composition, provider, model, and credentials.
+ *
+ *  Precedence:
+ *  1. DSH_CORDIS_CONFIG env — explicit override, skip native path entirely.
+ *  2. ~/.dsh/settings.yaml — native config; generate a pi-ai composition.
+ *  3. Fallback — vendored deepseek-official composition (DEEPSEEK_API_KEY env). */
+function resolveNativeDshConfig(): NativeDshConfig {
+  // 1. Explicit DSH_CORDIS_CONFIG wins — full manual override.
+  const fromEnv = process.env.DSH_CORDIS_CONFIG?.trim();
+  if (fromEnv) {
+    if (!existsSync(fromEnv)) {
+      throw new Error(`DSH_CORDIS_CONFIG does not exist: ${fromEnv}`);
+    }
+    return {
+      configPath: fromEnv,
+      provider: 'deepseek-official',
+      model: args.model?.trim() || DEFAULT_MODEL,
+      credentials: {},
+    };
+  }
+
+  // 2. Native ~/.dsh/settings.yaml — translate to a pi-ai composition.
+  const settingsPath = join(homedir(), '.dsh', 'settings.yaml');
+  if (existsSync(settingsPath)) {
+    const settings = parseYaml(readFileSync(settingsPath, 'utf8')) as unknown;
+    const s = isRecord(settings) ? settings : {};
+    const defaultModel = isRecord(s['agent-default-model']) ? s['agent-default-model'] : {};
+    const provider = typeof defaultModel.provider === 'string' ? defaultModel.provider : '';
+    const settingsModel = typeof defaultModel.model === 'string' ? defaultModel.model : '';
+    if (!provider || !settingsModel) {
+      throw new Error('~/.dsh/settings.yaml is missing agent-default-model.provider or agent-default-model.model');
+    }
+
+    // deepseek-official uses the stock llm-deepseek adapter (vendored composition).
+    if (provider === 'deepseek-official') {
+      return {
+        configPath: writeComposition(VENDORED_CONFIG),
+        provider,
+        model: args.model?.trim() || settingsModel,
+        credentials: loadCredentials(),
+      };
+    }
+
+    // Any other provider must be a configured pi-ai route.
+    const piAi = isRecord(s['llm-pi-ai']) ? s['llm-pi-ai'] : {};
+    const providers = isRecord(piAi.providers) ? piAi.providers : undefined;
+    if (!providers || !(provider in providers)) {
+      throw new Error(`provider "${provider}" not found in ~/.dsh/settings.yaml llm-pi-ai.providers`);
+    }
+    return {
+      configPath: writeComposition(generatePiAiComposition(providers)),
+      provider,
+      model: args.model?.trim() || settingsModel,
+      credentials: loadCredentials(),
+    };
+  }
+
+  // 3. Fallback — vendored deepseek-official composition.
+  return {
+    configPath: writeComposition(VENDORED_CONFIG),
+    provider: 'deepseek-official',
+    model: args.model?.trim() || DEFAULT_MODEL,
+    credentials: loadCredentials(),
+  };
 }
 
 /** Map dsh's per-model-call usage onto botmux's four-bucket final usage.
@@ -507,15 +680,16 @@ async function runTurn(content: string): Promise<void> {
   });
 
   try {
-    const ack = await client.request<{ messageId?: string }>('session/prompt', {
+    const ack = await client.request<unknown>('session/prompt', {
       sessionId: dshSessionId,
       contentBlocks: [{ type: 'text', text: promptContent }],
     }, PROMPT_ACK_TIMEOUT_MS);
+    const messageId = parsePromptMessageId(ack);
     // The ACK's messageId correlates this turn's events: notifications may
     // already be buffered (they can precede the response), and a late idle
     // from the previous turn must not settle this one.
-    if (activeTurn && typeof ack.messageId === 'string') {
-      activeTurn.messageId = ack.messageId;
+    if (activeTurn) {
+      activeTurn.messageId = messageId;
       tryClaimReceipt(activeTurn);
     }
     // Commit firstTurn only after the prompt was accepted: a rejected first
@@ -620,11 +794,17 @@ function handleInput(data: Buffer): void {
 }
 
 async function main(): Promise<void> {
-  const configPath = resolveConfigPath();
-  const sessionRoot = join(homedir(), '.botmux', 'dsh', 'sessions', args.sessionId);
+  const native = resolveNativeDshConfig();
+  // Sessions live under the native dsh home (~/.dsh/sessions/botmux/<id>),
+  // not ~/.botmux — the adapter binds ~/.dsh into the sandbox.
+  const sessionRoot = join(homedir(), '.dsh', 'sessions', 'botmux', args.sessionId);
   mkdirSync(sessionRoot, { recursive: true });
 
-  client = new DshJsonRpcClient(args.dshBin, configPath, {
+  // Credentials from ~/.dsh/.credentials.yaml fill gaps; the ambient
+  // environment (bots.json env) wins on conflict, and the runner's
+  // session/cwd always win.
+  client = new DshJsonRpcClient(args.dshBin, native.configPath, {
+    ...native.credentials,
     ...process.env,
     DSH_SESSION_ROOT: sessionRoot,
     DSH_CWD: cwd,
@@ -644,13 +824,13 @@ async function main(): Promise<void> {
   };
   client.start();
 
-  const model = args.model?.trim() || DEFAULT_MODEL;
-  const serverInfo = await client.request<{ serverInfo?: { name?: string; version?: string } }>(
+  const initializeResult = await client.request<unknown>(
     'initialize',
-    { cwd, provider: 'deepseek-official', model, maxTokens: DEFAULT_MAX_TOKENS },
+    { cwd, provider: native.provider, model: native.model, maxTokens: DEFAULT_MAX_TOKENS },
     HANDSHAKE_TIMEOUT_MS,
   );
-  writeLine(`dsh connected (${serverInfo?.serverInfo?.name ?? 'unknown'} ${serverInfo?.serverInfo?.version ?? ''}).`);
+  const { serverInfo } = parseInitializeResult(initializeResult);
+  writeLine(`dsh connected (${serverInfo.name} ${serverInfo.version}).`);
 
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
   process.stdin.resume();

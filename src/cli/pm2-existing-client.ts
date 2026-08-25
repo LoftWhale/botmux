@@ -16,7 +16,8 @@ const MUTATION_TIMEOUT_MS = 25_000;
 type Mutation =
   | { operation: 'start'; target: string; only?: string; updateEnv?: boolean }
   | { operation: 'restart'; target: string; updateEnv?: boolean }
-  | { operation: 'stop' | 'delete'; target: string };
+  | { operation: 'stop' | 'delete'; target: string }
+  | { operation: 'kill' };
 type Request = Mutation & { expectedGod: LinuxPm2GodProcess };
 
 function fail(message: string, code = 1): never {
@@ -108,6 +109,17 @@ pm2.Client.pingDaemon((alive: boolean) => {
         return;
       case 'delete':
         pm2.delete(request.target, complete);
+        return;
+      case 'kill':
+        // Socket-addressed retirement (never a PID signal): the God shuts
+        // itself down over its own RPC socket after the generation check
+        // above. Its exit SIGQUITs this client; killDaemon's 3s fallback
+        // closes us too. Skip complete()'s disconnect — the socket is already
+        // closing and a second close on a dead God would mask success.
+        pm2.Client.killDaemon((killError?: Error | null) => {
+          if (killError) fail(`PM2 existing-daemon kill failed: ${killError.message}`);
+          process.exit(0);
+        });
         return;
       default:
         fail('unsupported PM2 existing-daemon mutation');

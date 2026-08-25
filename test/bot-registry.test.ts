@@ -215,6 +215,24 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
+  it('keeps only a valid sessionOwnerReminder configuration', () => {
+    const reminder = {
+      enabled: true,
+      intervalMinutes: 45,
+      text: '请处理当前会话。',
+      states: ['idle', 'agent_attention'],
+    };
+    const [valid] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', sessionOwnerReminder: reminder },
+    ]));
+    expect(valid.sessionOwnerReminder).toEqual(reminder);
+
+    const [invalid] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'b', larkAppSecret: 's', sessionOwnerReminder: { ...reminder, intervalMinutes: 0 } },
+    ]));
+    expect(invalid.sessionOwnerReminder).toBeUndefined();
+  });
+
   it('keeps a trimmed displayName and drops blank/non-string values', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'a', larkAppSecret: 's', displayName: '  小助手  ' },
@@ -327,6 +345,25 @@ describe('parseBotConfigsFromText — brand', () => {
       wrapperCli: 'gateway codex',
       cliRuntime: runtime,
     }]))).toThrow(/cannot be combined with wrapperCli/);
+  });
+
+  it('accepts existingAppServer on a Codex App bot but rejects unrelated CLIs', () => {
+    const endpoint = 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock';
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'codex-app-share',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      existingAppServer: { endpoint },
+    }]));
+    expect(cfg.cliId).toBe('codex-app');
+    expect(cfg.existingAppServer).toEqual({ endpoint });
+
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'wrong-app-server-cli',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      existingAppServer: { endpoint },
+    }]))).toThrow(/only for cliId "codex" or "codex-app"/);
   });
 
   it('strictly validates a configured cliRuntime instead of silently dropping malformed input', () => {
@@ -493,8 +530,48 @@ describe('parseBotConfigsFromText — brand', () => {
     });
   });
 
-  it('keeps meetingConsumer disabled/listenOnly configuration explicit', () => {
+  it('parses meetingConsumer in/out policies', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        vcMeetingAgent: {
+          enabled: true,
+          realtimeVoice: { enabled: true },
+          meetingConsumer: {
+            enabled: true,
+            defaultMode: 'agents',
+            textOutputPolicy: 'approval',
+            voiceOutputPolicy: 'allow',
+          },
+        },
+      },
+    ]));
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.textOutputPolicy).toBe('approval');
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.voiceOutputPolicy).toBe('allow');
+  });
+
+  it('drops invalid in/out policy values', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        vcMeetingAgent: {
+          enabled: true,
+          meetingConsumer: {
+            enabled: true,
+            defaultMode: 'agents',
+            textOutputPolicy: 'sometimes', // invalid → dropped
+            voiceOutputPolicy: 42, // invalid → dropped
+          },
+        },
+      },
+    ]));
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.textOutputPolicy).toBeUndefined();
+    expect(cfg.vcMeetingAgent?.meetingConsumer?.voiceOutputPolicy).toBeUndefined();
+  });
+
+  it('keeps meetingConsumer disabled/listenOnly configuration explicit', () => {    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {
         larkAppId: 'a',
         larkAppSecret: 's',
@@ -1745,16 +1822,40 @@ describe('vcMeetingAgentConfigActive — apiOnly bots never attend VC meetings',
       .toBeUndefined();
   });
 
-  it('returns undefined when VC is not enabled (normal bot)', () => {
+  it('is active by default for a Feishu bot; only enabled:false opts out', () => {
+    // Bot-agnostic join: any invited Feishu bot should join, so VC is active
+    // unless explicitly disabled. enabled:false is the per-bot opt-out.
     expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: { enabled: false } as any }))
       .toBeUndefined();
-    expect(mod.vcMeetingAgentConfigActive({})).toBeUndefined();
+    // Unset enabled / no vcMeetingAgent block → active with an effective config
+    // (empty object is fine; downstream reads fall back to their own defaults).
+    expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: {} as any })).toEqual({});
+    expect(mod.vcMeetingAgentConfigActive({})).toEqual({});
     expect(mod.vcMeetingAgentConfigActive(undefined)).toBeUndefined();
   });
 
   it('apiOnly wins over enabled regardless of field order / extra keys (fail-closed)', () => {
     expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: enabledVc, apiOnly: true }))
       .toBeUndefined();
+  });
+
+  // 回归(PR#916 codex阻断①):VC/实时语音默认开翻转后,enabled:false 是显式退出,
+  // 必须能 round-trip 存活。这里**过真实 parseBotConfigsFromText → vcMeetingAgentConfigActive**
+  // (而不是手搓对象喂 active),否则 normalizer 丢 false 的 bug 会被假绿掩盖。
+  it('a persisted vcMeetingAgent.enabled:false round-trips through parse and stays opted out', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'cli_off', larkAppSecret: 's', vcMeetingAgent: { enabled: false } },
+    ]));
+    expect(cfg.vcMeetingAgent?.enabled).toBe(false);
+    expect(mod.vcMeetingAgentConfigActive(cfg)).toBeUndefined();
+  });
+
+  it('a persisted realtimeVoice.enabled:false round-trips through parse (voice stays off)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'cli_v', larkAppSecret: 's', vcMeetingAgent: { realtimeVoice: { enabled: false } } },
+    ]));
+    // 顶层不 enabled:false → bot 仍接收会议事件,但实时语音显式关闭必须保留。
+    expect(cfg.vcMeetingAgent?.realtimeVoice?.enabled).toBe(false);
   });
 });
 
@@ -1828,5 +1929,42 @@ describe('loadBotConfigs when bots.json exists but is unreadable', () => {
       throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
     });
     expect(() => mod.loadBotConfigs()).toThrow(/EIO/);
+  });
+});
+
+describe('normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('keeps positive integers within the arm-able bound and rejects everything else', () => {
+    expect(mod.normalizeTurnTimeoutMs(1_800_000)).toBe(1_800_000);
+    expect(mod.normalizeTurnTimeoutMs(90_001)).toBe(90_001); // legal non-whole-minute value
+    expect(mod.normalizeTurnTimeoutMs(mod.MAX_TURN_TIMEOUT_MS)).toBe(mod.MAX_TURN_TIMEOUT_MS);
+    // Rejected: non-positive, non-integer, over-bound, non-number, absent.
+    expect(mod.normalizeTurnTimeoutMs(0)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(-5)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(1.5)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(mod.MAX_TURN_TIMEOUT_MS + 1)).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs('1800000')).toBeUndefined();
+    expect(mod.normalizeTurnTimeoutMs(undefined)).toBeUndefined();
+  });
+
+  it('parseBotConfigsFromText drops an over-bound turnTimeoutMs', () => {
+    const [ok] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', cliId: 'dsh', turnTimeoutMs: 90_001 },
+    ]));
+    expect(ok.turnTimeoutMs).toBe(90_001);
+    const [over] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'b', larkAppSecret: 's', cliId: 'dsh', turnTimeoutMs: mod.MAX_TURN_TIMEOUT_MS + 1 },
+    ]));
+    expect(over.turnTimeoutMs).toBeUndefined();
+  });
+
+  it('the dashboard UI mirror of the bound stays equal to the shared constant', async () => {
+    const { DASHBOARD_MAX_TURN_TIMEOUT_MS } = await import('../src/dashboard/web/bot-defaults-page.js');
+    expect(DASHBOARD_MAX_TURN_TIMEOUT_MS).toBe(mod.MAX_TURN_TIMEOUT_MS);
   });
 });

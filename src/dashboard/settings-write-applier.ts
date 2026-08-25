@@ -93,14 +93,6 @@ export interface ResolvedDashboardSettingsView {
   noVisibleOutputHint: boolean;
   vcMeetingAgent: {
     enabled: boolean;
-    listenerBotAppId?: string | null;
-    listenerBotOptions?: Array<{
-      larkAppId: string;
-      botName?: string | null;
-      cliId?: string;
-      vcMeetingAgentEnabled?: boolean;
-      hasLarkCliProfile?: boolean;
-    }>;
     larkCliVersion?: string | null;
     larkCliMeetsRequirement?: boolean;
     larkCliMinVersion?: string;
@@ -109,6 +101,8 @@ export interface ResolvedDashboardSettingsView {
   localDevInstall: boolean;
   autoUpdateSupported?: boolean;
   remoteAccess?: boolean;
+  /** Machine-wide v3 Workflow feature switch. Default ON. */
+  workflow: { enabled: boolean };
   /** Configured schedule-task timezone override (IANA), or null/absent when
    *  unset ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone?: string | null;
@@ -152,10 +146,6 @@ export interface SettingsWriteApplierDeps {
   isLocale: (v: unknown) => v is 'zh' | 'en';
   /** Fan out locale reload to all online daemons. */
   reloadLocaleOnAllDaemons?: () => Promise<void>;
-  /** Validate a global VC listener bot selection before mutating bot/global config. */
-  validateVcMeetingListenerBotAppId?: (appId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
-  /** Sync per-bot meeting-listener config after validation passes or when clearing the selection. */
-  syncVcMeetingListenerBotConfig?: (listenerBotAppId: string | null, previousListenerBotAppId?: string | null) => Promise<{ ok: true } | { ok: false; error: string; feishuLoginQr?: string }>;
   /** 校验通知 Bot；保存关闭态配置时只校验静态配置，启用时再要求 daemon 与收件人就绪。 */
   validateCodexNotifierTargetBotAppId?: (
     appId: string,
@@ -248,6 +238,8 @@ export type ApplySettingsWriteError =
   | 'invalid_vcMeetingAgent'
   | 'invalid_vcMeetingAgent_enabled'
   | 'invalid_vcMeetingAgent_listenerBotAppId'
+  | 'invalid_workflow'
+  | 'invalid_workflow_enabled'
   | 'invalid_scheduleTimeZone'
   | 'invalid_whiteboard'
   | 'invalid_whiteboard_enabled'
@@ -555,6 +547,21 @@ export async function applySettingsWrite(
     touched = true;
   }
 
+  if ('workflow' in obj) {
+    const raw = obj.workflow;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_workflow' };
+    }
+    const wf = raw as Record<string, unknown>;
+    if (typeof wf.enabled !== 'boolean') {
+      return { ok: false, error: 'invalid_workflow_enabled' };
+    }
+    // Merge over existing so a future sibling key in the workflow block survives.
+    const current = deps.readGlobalConfig().workflow ?? {};
+    deps.mergeGlobalConfig({ workflow: { ...current, enabled: wf.enabled } });
+    touched = true;
+  }
+
   if ('vcMeetingAgent' in obj) {
     const raw = obj.vcMeetingAgent;
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -569,29 +576,12 @@ export async function applySettingsWrite(
       }
       next.enabled = vc.enabled;
     }
-    if ('listenerBotAppId' in vc) {
-      if (vc.listenerBotAppId === null || vc.listenerBotAppId === '') {
-        if (deps.syncVcMeetingListenerBotConfig) {
-          const synced = await deps.syncVcMeetingListenerBotConfig(null, currentVcMeetingAgent.listenerBotAppId ?? null);
-          if (!synced.ok) return { ok: false, error: synced.error, feishuLoginQr: (synced as any).feishuLoginQr };
-        }
-        delete next.listenerBotAppId;
-      } else if (typeof vc.listenerBotAppId === 'string' && vc.listenerBotAppId.trim()) {
-        const listenerBotAppId = vc.listenerBotAppId.trim();
-        if (deps.validateVcMeetingListenerBotAppId) {
-          const validation = await deps.validateVcMeetingListenerBotAppId(listenerBotAppId);
-          if (!validation.ok) return { ok: false, error: validation.error };
-        }
-        if (deps.syncVcMeetingListenerBotConfig) {
-          const synced = await deps.syncVcMeetingListenerBotConfig(listenerBotAppId, currentVcMeetingAgent.listenerBotAppId ?? null);
-          if (!synced.ok) return { ok: false, error: synced.error, feishuLoginQr: (synced as any).feishuLoginQr };
-        }
-        next.listenerBotAppId = listenerBotAppId;
-      } else {
-        return { ok: false, error: 'invalid_vcMeetingAgent_listenerBotAppId' };
-      }
-    }
-    if (!('enabled' in vc) && !('listenerBotAppId' in vc)) {
+    // 全局「会议事件接收 Bot」已退役（daemon 侧 2026-08 起忽略该 pin，见
+    // vcMeetingAgentGlobalListenerAppId）：每个 VC-active 的 bot 处理自己收到的
+    // 会议事件，接不接收改由 bots.json 的 per-bot `vcMeetingAgent.enabled` 控制。
+    // 这里显式擦掉历史残留，避免配置里留一个谁都不读的字段误导人。
+    if (next.listenerBotAppId !== undefined) delete next.listenerBotAppId;
+    if (!('enabled' in vc)) {
       return { ok: false, error: 'invalid_vcMeetingAgent_enabled' };
     }
     deps.mergeGlobalConfig({ vcMeetingAgent: next });

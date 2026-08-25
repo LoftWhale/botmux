@@ -56,6 +56,9 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotClient: vi.fn(),
   getBotBrand: vi.fn(() => undefined),
   resolveBrandLabel: vi.fn(() => undefined),
+  // Bot admin (first resolved human allowedUser) — the failure-notice fallback
+  // @ target. Tests that exercise turnFailed override this per case.
+  getOwnerOpenId: vi.fn(() => undefined),
   // Reply-card footer usage only renders in 'footer' mode; tests override this
   // per case. Default 'footer' keeps the positive usage-render tests below green.
   resolveUsageDisplay: vi.fn(() => 'footer'),
@@ -103,9 +106,10 @@ import {
   getDaemonReplyCardUsageSnapshot,
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
+  setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
-import type { DaemonSession } from '../src/core/types.js';
+import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
 import { homedir, tmpdir } from 'node:os';
@@ -122,7 +126,7 @@ import {
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
-import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
+import { getBot, getOwnerOpenId, resolveUsageDisplay } from '../src/bot-registry.js';
 import {
   clearMessageListenerRunPreviewStore,
   createMessageListenerRunPreview,
@@ -250,6 +254,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   afterEach(async () => {
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
+    setActiveSessionsRegistry(undefined);
     rmSync('/tmp/test-sessions', { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
     vi.useRealTimers();
@@ -298,6 +303,46 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
     expect(sessionReply.mock.calls[0][4]).toBe('turn-1');
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('turnFailed final_output on a session WITHOUT a human recipient @mentions the bot admin', async () => {
+    // Bot-to-bot dispatched sessions are ownerless: a model-gateway failure
+    // card would otherwise ping nobody and scroll by silently.
+    vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+    const sessionReply = vi.fn(async () => 'om_failed_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs(); // no session.ownerOpenId → no footer recipient
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content: '⚠️ 模型网关故障', turnFailed: true }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).toContain('<at id=ou_admin_human></at>');
+  });
+
+  it('turnFailed final_output with a human footer recipient does NOT add the admin fallback mention', async () => {
+    // The owner is already addressed by the card footer's <at>; a second
+    // body mention would double-ping.
+    vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+    const sessionReply = vi.fn(async () => 'om_failed_owner_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_session_owner';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content: '⚠️ 模型网关故障', turnFailed: true }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    const sent = String(sessionReply.mock.calls[0][1]);
+    expect(sent).not.toContain('ou_admin_human');
+    expect(sent).toContain('<at id=ou_session_owner></at>');
+  });
+
+  it('ordinary (non-failed) final_output never adds the admin fallback mention', async () => {
+    vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+    const sessionReply = vi.fn(async () => 'om_ok_answer');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_admin_human');
   });
 
   it('records a feedback Delivery only after the canonical final_output send returns its platform message id', async () => {
@@ -406,6 +451,33 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), kind: 'local-turn', userText: 'question' }, 'tag', 0);
     await vi.advanceTimersByTimeAsync(10);
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+  });
+
+  it('keeps the terminal-local title for a traditional adopted local turn', async () => {
+    const sessionReply = vi.fn(async () => 'om_terminal_local_turn');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), kind: 'local-turn', userText: 'question' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String(sessionReply.mock.calls[0][1])).toContain('终端本地对话（在 adopted pane 中直接输入，已同步至飞书）');
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('Codex App 共享对话');
+  });
+
+  it('labels a Codex App shared local turn without calling it an adopted pane', async () => {
+    const sessionReply = vi.fn(async () => 'om_codex_app_shared_turn');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.existingAppServerEndpoint = 'unix:///tmp/codex-app-server.sock';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), kind: 'local-turn', userText: 'question' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String(sessionReply.mock.calls[0][1])).toContain('Codex App 共享对话（已同步至飞书）');
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('在 adopted pane 中直接输入');
   });
 
   it('routes synthetic Codex App identities through their frozen reply turn and uses dispatch-stable Lark UUIDs', async () => {
@@ -1710,6 +1782,43 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     )).toBeUndefined();
   });
 
+  it('delivers a listener-thread result when the receiver uses its dedicated active-session key', async () => {
+    const sessionReply = vi.fn(async () => 'om_vc_receiver_fallback');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      memberId: 'member-1',
+      memberEpoch: 1,
+    };
+    seedReceiverReceipt('listener_thread');
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...listenerFinalOutputMsg(),
+      sessionId: ds.session.sessionId,
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      targetChatId: ds.chatId,
+    })).toEqual(['om_vc_receiver_fallback']);
+  });
+
   it('treats a valid skip decision as a successful no-message outcome', async () => {
     const sessionReply = vi.fn(async () => 'om_forbidden');
     initWorkerPool({
@@ -2041,6 +2150,72 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // Reply-card footer is context-only now; the cumulative token line is not
     // rendered here (it lives on the live streaming card).
     expect(cards[0]).not.toContain('Token ↑');
+  });
+
+  it('keeps a stable Lark uuid across ordinary final_output retries so an ambiguous first attempt cannot duplicate the answer', async () => {
+    // Regression (duplicate-reply incident): the daemon retries final_output
+    // delivery up to 3 times on transient failure. The ordinary (non-VC,
+    // non-Codex-App) path used to carry NO Lark `uuid`, so an ambiguous first
+    // attempt — the server accepted the reply but the client saw a network
+    // error — created a brand-new copy on each retry. With 3 attempts the
+    // user saw the same answer up to 3 times. Every retry must now carry one
+    // stable uuid so the Feishu server (uuid field, 1h idempotent TTL)
+    // collapses retries into the original message.
+    const sessionReply = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('ambiguous: server accepted, response lost'))
+      .mockResolvedValueOnce('om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+
+    // Attempt 1 (delay 0) — ambiguous failure.
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    // Attempt 2 (delay 5000) — success, carrying the SAME uuid as attempt 1.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+
+    const firstOpts = sessionReply.mock.calls[0][5] as { uuid?: string } | undefined;
+    const secondOpts = sessionReply.mock.calls[1][5] as { uuid?: string } | undefined;
+    expect(firstOpts?.uuid).toMatch(/^bf_[0-9a-f]{46}$/);
+    expect(secondOpts?.uuid).toBe(firstOpts!.uuid);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('derives a distinct Lark uuid per ordinary turn so different answers are never collapsed', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    __testOnly_deliverFinalOutput(
+      ds,
+      { ...finalOutputMsg(), lastUuid: 'uuid-2', turnId: 'turn-2' },
+      'tag',
+      0,
+    );
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    const firstUuid = (sessionReply.mock.calls[0][5] as { uuid?: string }).uuid;
+    const secondUuid = (sessionReply.mock.calls[1][5] as { uuid?: string }).uuid;
+    expect(firstUuid).toMatch(/^bf_[0-9a-f]{46}$/);
+    expect(secondUuid).toMatch(/^bf_[0-9a-f]{46}$/);
+    expect(secondUuid).not.toBe(firstUuid);
   });
 
   it('reads a sandboxed Claude transcript through the daemon reply-card boundary', async () => {

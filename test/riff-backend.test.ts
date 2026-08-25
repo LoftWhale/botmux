@@ -877,6 +877,9 @@ describe('RiffBackend', () => {
       });
       (be as any).currentTaskId = 'task-A';
       const p = (be as any).fetchDirectAccessUrl('task-A');
+      // getJwt is now async, so the task-detail fetch (which assigns resolveDetail)
+      // only fires after a microtask. Flush before driving the response.
+      await flush();
       (be as any).currentTaskId = 'task-B';
       resolveDetail(Response.json({ success: true, data: { task: { directAccessUrl: 'https://old-a.example/' } } }));
       await p;
@@ -924,6 +927,46 @@ describe('RiffBackend', () => {
       be.write('hello');
       await flush();
       expect(done).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('JWT resolved after attachment prep (safety-window sampling point)', () => {
+    it('reads the JWT AFTER slow attachment reads, right before fetch', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.spawn('', [], {} as any);
+
+      const order: string[] = [];
+      // Slow attachment read: records its ordering and yields to the event loop.
+      (be as any).readFileAsBlob = async (_p: string) => {
+        order.push('readFileAsBlob');
+        await new Promise((r) => setTimeout(r, 5));
+        return new Blob(['x']);
+      };
+      // getJwt must be sampled AFTER the attachment prep so the safety-window
+      // freshness check reflects the token that actually goes on the wire.
+      const realGetJwt = (be as any).getJwt.bind(be);
+      (be as any).getJwt = () => { order.push('getJwt'); return realGetJwt(); };
+
+      be.write('hello <attachments><file path="/tmp/a.bin" name="a.bin"/></attachments>');
+      // The write runs through the async writeChain, then a 5ms attachment read,
+      // then fetch — give it enough turns to reach the (manually-resolved) fetch.
+      for (let i = 0; i < 6; i++) await flush();
+      await new Promise((r) => setTimeout(r, 10));
+      for (let i = 0; i < 4; i++) await flush();
+      resolvers.shift()?.(taskResponse('task-1'));
+      await flush();
+
+      // The upload actually carried the JWT header…
+      const exec = calls.find((c) => c.url.includes('/api/task-execute'));
+      expect(exec, `no task-execute; calls=${calls.map((c) => c.url).join(',')}; order=${JSON.stringify(order)}`).toBeTruthy();
+      expect((exec!.init?.headers as any)?.['x-jwt-token']).toBe('test-jwt');
+      // …and the create-path JWT was sampled AFTER the attachment read (a later
+      // getJwt from the SSE stream connection may follow — we only require that
+      // the FIRST getJwt, the one on the create request, comes after the read).
+      const firstRead = order.indexOf('readFileAsBlob');
+      const firstJwt = order.indexOf('getJwt');
+      expect(firstRead).toBeGreaterThanOrEqual(0);
+      expect(firstJwt).toBeGreaterThan(firstRead);
     });
   });
 
@@ -1461,6 +1504,65 @@ describe('RiffBackend', () => {
       expect(urls[urls.length - 1]).toBe(`${BASE}/sandbox-access?sessionId=z`);
       await flush();
       expect(urls[urls.length - 1]).toBe('https://port-8080-z.sandbox.example.com/');
+    });
+  });
+
+  describe('create/follow-up 401 retry with refreshed JWT (申晗: startup must actually get a JWT)', () => {
+    /** A task-execute fetch mock: first POST 401s, the retry (if any) 200s.
+     *  task-stream stays pending; task-detail/cancel resolve instantly. */
+    function authRetryFetch(): { execHeaders: Array<string | undefined> } {
+      const execHeaders: Array<string | undefined> = [];
+      let execCount = 0;
+      const mock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes('/api/task-execute')) {
+          execCount += 1;
+          const h = (init?.headers ?? {}) as Record<string, string>;
+          execHeaders.push(h['x-jwt-token']);
+          return execCount === 1
+            ? new Response('unauthorized', { status: 401 })
+            : Response.json({ success: true, data: { id: 'task-ok', status: 'running' } });
+        }
+        if (u.includes('/api2/task-stream')) return pendingSseResponse();
+        return Response.json({ success: true, data: {} });
+      });
+      vi.stubGlobal('fetch', mock);
+      return { execHeaders };
+    }
+
+    it('retries ONCE with a freshly-refreshed token after a 401 and succeeds', async () => {
+      const { execHeaders } = authRetryFetch();
+      const be = makeBackend();
+      // Script getJwt: stale token first, forced refresh yields a different one.
+      const gj = vi.spyOn(be as any, 'getJwt').mockImplementation(async (opts: any) => {
+        return opts?.forceRefresh ? 'JWT-FRESH' : 'JWT-STALE';
+      });
+      be.spawn('', [], {} as any);
+      be.write('hello');
+      await flush(); await flush();
+
+      // Two task-execute POSTs: the stale-token attempt (401), then the refreshed retry.
+      expect(execHeaders).toEqual(['JWT-STALE', 'JWT-FRESH']);
+      // The retry used a forced refresh.
+      expect(gj.mock.calls.some(c => (c[0] as any)?.forceRefresh === true)).toBe(true);
+      // Task adopted → currentTaskId set from the successful retry.
+      expect((be as any).currentTaskId).toBe('task-ok');
+    });
+
+    it('does NOT retry when the forced refresh yields the SAME token (no pointless replay)', async () => {
+      const { execHeaders } = authRetryFetch();
+      const be = makeBackend();
+      // Refresh produces nothing new — same token both times.
+      vi.spyOn(be as any, 'getJwt').mockResolvedValue('JWT-SAME');
+      const emitErr = vi.spyOn(be as any, 'emitError');
+      be.spawn('', [], {} as any);
+      be.write('hello');
+      await flush(); await flush();
+
+      // Only the first POST happened; no retry because the token was unchanged.
+      expect(execHeaders).toEqual(['JWT-SAME']);
+      // The 401 surfaces as a turn-ending error (unchanged pre-existing behaviour).
+      expect(emitErr).toHaveBeenCalled();
     });
   });
 });

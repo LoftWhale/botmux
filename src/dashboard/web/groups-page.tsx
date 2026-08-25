@@ -1,3 +1,4 @@
+import { describeCloseResidual } from '../../core/close-residual.js';
 import {
   memo,
   useCallback,
@@ -13,6 +14,8 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import { copyText } from './clipboard.js';
+import { toast } from './toast.js';
+import { confirm } from './confirm-modal.js';
 import { FeedGroupPicker } from './feed-group-picker.js';
 import { BotMultiSelect } from './bot-multi-select.js';
 import {
@@ -1094,8 +1097,8 @@ function ManageDialog(props: {
 
   async function leaveSelected(): Promise<void> {
     const checked = [...leaveSelection];
-    if (checked.length === 0) { alert('至少选一个机器人'); return; }
-    if (!confirm(`确定让 ${checked.length} 个机器人退出群聊？该 bot 在此群的会话会一并关闭。`)) return;
+    if (checked.length === 0) { toast('至少选一个机器人', { kind: 'warning' }); return; }
+    if (!await confirm({ title: '退出群聊', message: `确定让 ${checked.length} 个机器人退出群聊？该 bot 在此群的会话会一并关闭。`, danger: true })) return;
     try {
       const r = await fetch(`/api/groups/${encodeURIComponent(chat.chatId)}/leave`, {
         method: 'POST',
@@ -1108,15 +1111,20 @@ function ManageDialog(props: {
         const closed = (x.closedSessions ?? []) as any[];
         const failed = closed.filter(c => !c.ok).length;
         const ok = closed.length - failed;
+        // Closed locally but the remote session survived: not a failure, but it
+        // must not disappear into the plain "closed N" tally.
+        const residuals = closed.filter(c => c.ok && c.residual)
+          .map(c => describeCloseResidual(c.residual));
         const note = closed.length === 0
           ? ''
-          : failed === 0 ? `（关闭 ${ok} 个会话）` : `（关闭 ${ok} 个，${failed} 个失败）`;
+          : `（关闭 ${ok} 个会话${failed ? `，${failed} 个失败` : ''}`
+            + `${residuals.length ? `，${residuals.length} 个有残留需人工清理：${residuals.join(', ')}` : ''}）`;
         return `${x.larkAppId}: OK${note}`;
       }).join('\n');
-      alert(lines || `Unexpected: ${JSON.stringify(respBody)}`);
+      toast(lines || `Unexpected: ${JSON.stringify(respBody)}`, { kind: 'success' });
       await props.onReloadGroups({ force: true });
     } catch (err) {
-      alert('Network error: ' + err);
+      toast('Network error: ' + err, { kind: 'error' });
     } finally {
       props.onClose();
     }
@@ -1124,7 +1132,7 @@ function ManageDialog(props: {
 
   async function disband(): Promise<void> {
     if (inChat.length === 0) return;
-    if (!confirm(`确定解散群聊「${chat.name ?? chat.chatId}」？此操作不可恢复，本群所有机器人会话也会一并关闭。`)) return;
+    if (!await confirm({ title: '解散群聊', message: `确定解散群聊「${chat.name ?? chat.chatId}」？此操作不可恢复，本群所有机器人会话也会一并关闭。`, danger: true })) return;
     const ordered = [...inChat].sort((a, b) =>
       (b.larkAppId === ownerAppId ? 1 : 0) - (a.larkAppId === ownerAppId ? 1 : 0),
     );
@@ -1141,10 +1149,13 @@ function ManageDialog(props: {
           const closed = (respBody.closedSessions ?? []) as any[];
           const failed = closed.filter(c => !c.ok).length;
           const ok = closed.length - failed;
+          const residuals = closed.filter(c => c.ok && c.residual)
+            .map(c => describeCloseResidual(c.residual));
           const closedNote = closed.length === 0
             ? ''
-            : failed === 0 ? `\n关闭了 ${ok} 个会话。` : `\n关闭了 ${ok} 个会话，${failed} 个会话关闭失败。`;
-          alert(`已解散（由 ${member.botName ?? member.larkAppId} 执行）${closedNote}`);
+            : `\n关闭了 ${ok} 个会话${failed ? `，${failed} 个会话关闭失败` : ''}`
+              + `${residuals.length ? `\n⚠️ ${residuals.length} 个有残留需人工清理：${residuals.join(', ')}` : ''}。`;
+          toast(`已解散（由 ${member.botName ?? member.larkAppId} 执行）${closedNote}`, { kind: 'success' });
           await props.onReloadGroups({ force: true });
           props.onClose();
           return;
@@ -1154,7 +1165,7 @@ function ManageDialog(props: {
         errs.push(`${member.botName ?? member.larkAppId}: ${err}`);
       }
     }
-    alert(`所有在群机器人均无法解散：\n${errs.join('\n')}\n\n建议改用「退出群聊」。`);
+    toast(`所有在群机器人均无法解散：\n${errs.join('\n')}\n\n建议改用「退出群聊」。`, { kind: 'error' });
   }
 
   return (
@@ -1411,10 +1422,15 @@ function GroupsPage() {
     };
   }, [reloadGroups]);
 
-  const rows = useMemo(
+  // 会话群（p2pMode=group 自动创建，session-groups-store 分型标记）与常驻群
+  // 分开管理：主列表只展示常驻群，会话群收进下方折叠区——它们由 bot 自动
+  // 创建/命名/管理，数量随会话增长，混排会淹没真正需要人工管理的常驻群。
+  const allMatched = useMemo(
     () => filterGroupChats(snapshot.chats, filters),
     [snapshot.chats, filters],
   );
+  const rows = useMemo(() => allMatched.filter(c => !(c as any).sessionGroup), [allMatched]);
+  const sessionRows = useMemo(() => allMatched.filter(c => (c as any).sessionGroup), [allMatched]);
   const pageWindow = useMemo(
     () => paginateGroupRows(rows, page),
     [rows, page],
@@ -1437,7 +1453,7 @@ function GroupsPage() {
 
   async function openCreateDialog(): Promise<void> {
     if (snapshotRef.current.bots.length === 0) {
-      alert(tr('groups.noBotsOnline'));
+      toast(tr('groups.noBotsOnline'), { kind: 'warning' });
       return;
     }
     let roleProfiles: RoleProfileSummaryLike[] = [];
@@ -1464,7 +1480,7 @@ function GroupsPage() {
     const inChatSet = new Set((chat.memberBots ?? []).filter(member => member.inChat).map(member => member.larkAppId));
     const missing = snapshotRef.current.bots.filter(bot => !inChatSet.has(bot.larkAppId));
     if (!missing.length) {
-      alert('All configured bots are already in this chat.');
+      toast('All configured bots are already in this chat.', { kind: 'warning' });
       return;
     }
     setDialog({ type: 'add-bots', chat });
@@ -1583,6 +1599,28 @@ function GroupsPage() {
           </div>
         )}
       </section>
+      {!loading && sessionRows.length > 0 ? (
+        <details className="overview-block groups-session-section" open={!!filters.q} data-session-groups>
+          <summary style={{ cursor: 'pointer', padding: '10px 4px', fontWeight: 600, opacity: 0.85 }}>
+            🤖 {tr('groups.sessionSection')}（{sessionRows.length}）
+            <span style={{ fontWeight: 400, opacity: 0.7, marginLeft: 8 }}>{tr('groups.sessionSectionHint')}</span>
+          </summary>
+          <OverviewList id="g-session-body" className="groups-list">
+            {sessionRows.map(chat => (
+              <GroupListRow
+                chat={chat}
+                bots={snapshot.bots}
+                roleContext={roleContext}
+                tr={tr}
+                key={chat.chatId}
+                onAddBots={openAddBotsDialog}
+                onSaveProfile={openSaveProfileDialog}
+                onManage={openManageDialog}
+              />
+            ))}
+          </OverviewList>
+        </details>
+      ) : null}
       <DialogHost
         dialog={dialog}
         snapshot={snapshot}
