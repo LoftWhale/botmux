@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  canSubmitSchedule,
   checkSchedule,
   filterSchedules,
   fmtScheduleDate,
@@ -53,6 +54,11 @@ describe('dashboard schedules React page helpers', () => {
     '工作日每天 09:00',
   ])('accepts the server-supported Chinese schedule prefix %s', input => {
     expect(checkSchedule(input, tr, 'Asia/Shanghai').ok).toBe(true);
+  });
+
+  it('lets an unchanged legacy schedule save while still rejecting a new unknown value', () => {
+    expect(canSubmitSchedule('legacy daily syntax', 'legacy daily syntax', tr, 'Asia/Shanghai')).toBe(true);
+    expect(canSubmitSchedule('new unknown syntax', 'legacy daily syntax', tr, 'Asia/Shanghai')).toBe(false);
   });
 
   it('reveals schedule validation errors when submitting an untouched legacy value', () => {

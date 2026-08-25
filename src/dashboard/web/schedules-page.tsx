@@ -148,6 +148,21 @@ export function checkSchedule(
   return { ok: false, error: tr('schedules.form.errFormat') };
 }
 
+export function canSubmitSchedule(
+  input: string,
+  original: string | undefined,
+  tr: ReturnType<typeof useT>,
+  timeZone?: string,
+): boolean {
+  const normalized = input.trim();
+  if (!normalized) return false;
+  // Existing tasks may contain syntax authored by an older release. The
+  // server only re-parses schedule when it changes, so an unchanged legacy
+  // value must not prevent edits to the task's other fields.
+  if (original !== undefined && normalized === original.trim()) return true;
+  return checkSchedule(normalized, tr, timeZone).ok;
+}
+
 function ScheduleRowCard(props: {
   schedule: ScheduleRow;
   scheduleTimeZone?: string;
@@ -687,12 +702,7 @@ function ScheduleFormModal(props: {
     if (!name.trim() || !prompt.trim()) return;
     if (!localDelivery && !chatId.trim()) return;
     if (!localDelivery && executionPosition === 'topic' && !rootMessageId.trim()) return;
-    if (schedule.trim()) {
-      const sc = checkSchedule(schedule, tr, scheduleTimeZone);
-      if (!sc.ok) return;
-    } else {
-      return;
-    }
+    if (!canSubmitSchedule(schedule, editing?.schedule, tr, scheduleTimeZone)) return;
     props.onSubmit({
       name: name.trim(),
       schedule: schedule.trim(),
