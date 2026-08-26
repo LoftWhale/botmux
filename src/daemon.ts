@@ -3136,6 +3136,32 @@ function sessionHasReplyThreadAlias(s: Pick<Session, 'scope' | 'replyThreadAlias
   return s.scope === 'chat' && !!s.replyThreadAliases?.[rootId];
 }
 
+/**
+ * True when `rootId` is a message this chat-scope session ALREADY answered as a
+ * flat top-level turn (`turnReplyContexts[rootId].target.mode === 'plain'`).
+ *
+ * Why this exists: a user can @ the bot at group top level (bot answers flat,
+ * recording mode='plain' for that turn) and only afterwards open a native Lark
+ * 话题 ON that very message. Lark then delivers follow-ups inside that topic as
+ * root_id=<the original top-level om_ message> + thread_id=<the new omt_>. The
+ * regular-group fold correctly keeps the turn in the group chat-scope session,
+ * but if it also anchors the visible reply at that root, the answer lands in a
+ * topic the user never @'d the bot in (user-reported bug).
+ *
+ * A genuine "@ inside an existing topic" turn can never match: that root was
+ * never answered by this session as a plain top-level turn — it is either an
+ * unseen root or already recorded as mode='thread'. So this predicate isolates
+ * the after-the-fact case without touching the intended topic-anchoring
+ * contract (see event-dispatcher's chat/shared fold tests).
+ */
+function chatSessionAnsweredRootAtTopLevel(
+  s: Pick<Session, 'scope' | 'turnReplyContexts'>,
+  rootId: string,
+): boolean {
+  if (s.scope !== 'chat') return false;
+  return s.turnReplyContexts?.[rootId]?.target?.mode === 'plain';
+}
+
 function reconcileDeferredTopicBinding(ds: DaemonSession): string | undefined {
   const run = ds.session.deferredScheduleRun;
   if (!run) return undefined;
@@ -22347,6 +22373,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       beforeSessionTurn: (data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(data, ctx),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
       resolveReplyThreadAlias: (rootId, chatId, appId) => findChatReplyAlias(rootId, chatId, appId),
+      chatSessionAnsweredRootAtTopLevel: (rootId, chatId, appId) => {
+        for (const ds of activeSessions.values()) {
+          if (ds.larkAppId !== appId || ds.scope !== 'chat' || ds.chatId !== chatId) continue;
+          if (chatSessionAnsweredRootAtTopLevel(ds.session, rootId)) return true;
+        }
+        return sessionStore.listSessions().some(s =>
+          s.status === 'active'
+          && s.larkAppId === appId
+          && s.chatId === chatId
+          && chatSessionAnsweredRootAtTopLevel(s, rootId));
+      },
       // Chat was converted 普通群 → 话题群 while we held a chat-scope session.
       // Idle legacy owners are evicted so subsequent inbound messages land on
       // fresh thread-scope sessions. Owners with accepted/pending work remain

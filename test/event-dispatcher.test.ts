@@ -868,6 +868,7 @@ function setupBotState(opts?: {
   isSessionOwner: ReturnType<typeof vi.fn>;
   onChatModeConverted: ReturnType<typeof vi.fn>;
   resolveReplyThreadAlias: ReturnType<typeof vi.fn>;
+  chatSessionAnsweredRootAtTopLevel: ReturnType<typeof vi.fn>;
   handleVcMeetingPush: ReturnType<typeof vi.fn>;
 } {
   return {
@@ -877,6 +878,7 @@ function setupBotState(opts?: {
     handleVcMeetingPush: vi.fn(async () => {}),
     isSessionOwner: vi.fn(() => false),
     resolveReplyThreadAlias: vi.fn(() => null),
+    chatSessionAnsweredRootAtTopLevel: vi.fn(() => false),
     onChatModeConverted: vi.fn(),
   };
 }
@@ -4300,6 +4302,53 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('chat mode: a topic opened ON an earlier top-level @ keeps the reply at top level (root_id is an om_ message, not the omt_ thread)', async () => {
+    // Regression (user-reported): 顶层 @bot 建立 chat-scope 会话后，用户在**同一条
+    // 顶层消息上手动「开启话题」**。飞书随后把该话题内的消息投递成
+    // root_id = 那条原顶层 om_ 消息、thread_id = 新建的 omt_ 话题 —— 即
+    // root_id !== thread_id，且 root_id 是一条普通 om_ 消息。
+    //
+    // 与上一个用例（root_id === thread_id === 既有话题根，回复必须留在话题里）
+    // 的区别就在这里：那是「消息本就诞生在既有话题内」，而这里的话题是在 bot 已
+    // 按顶层建立会话之后才出现的。此时 fold 判定折叠回群是对的（scope=chat），
+    // 但不能再把可见回复钉进这个事后创建的话题 —— 否则用户在顶层 @ 得到的回复
+    // 会跑进一个他并未在其中 @ 过 bot 的话题里。
+    setupBotState({ regularGroupReplyMode: 'chat', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-after-topic');
+    // 前提:bot 此前已按顶层平铺答过 om_earlier_top_level_at 这条消息
+    // (daemon 侧即 turnReplyContexts[root].target.mode === 'plain')。
+    handlers.chatSessionAnsweredRootAtTopLevel.mockImplementation(
+      (rootId: string) => rootId === 'om_earlier_top_level_at',
+    );
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA follow up after I opened a topic' }),
+      // root_id 指向此前那条顶层 @ 消息（om_ 前缀），thread_id 是事后新建的话题
+      rootId: 'om_earlier_top_level_at',
+      threadId: 'omt_opened_afterwards',
+      messageId: 'msg-after-topic-opened',
+      chatId: 'chat-after-topic',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    const call = handlers.handleThreadReply.mock.calls.find(c => c[0] === event)
+      ?? handlers.handleNewTopic.mock.calls.find(c => c[0] === event);
+    expect(call).toBeTruthy();
+    // 会话仍折叠回群 chat-scope（这部分本来就是对的）
+    expect(call![1]).toEqual(expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-after-topic',
+      larkAppId: MY_APP_ID,
+    }));
+    // 关键断言：不得把回复钉进事后创建的话题
+    expect(call![1].replyRootId).toBeUndefined();
   });
 
   it('new-topic mode keeps @ inside a regular-group topic as an independent thread session', async () => {

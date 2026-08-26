@@ -2402,6 +2402,13 @@ export interface EventHandlers {
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
   /** Resolve a persisted topic reply alias back to its owning chat-scope session. */
   resolveReplyThreadAlias?: (rootId: string, chatId: string, larkAppId: string) => { chatId: string; sessionId: string; anchor?: string } | null;
+  /** True when this chat's chat-scope session already answered `rootId` as a FLAT
+   *  top-level turn. Identifies the "user @'d at top level, then opened a 话题 on
+   *  that same message" case, where the regular-group fold must keep the turn in
+   *  the group session (as it already does) but must NOT anchor the visible reply
+   *  into the after-the-fact topic. Genuine "@ inside an existing topic" turns
+   *  never match. Best-effort: absent handler ⇒ legacy behavior. */
+  chatSessionAnsweredRootAtTopLevel?: (rootId: string, chatId: string, larkAppId: string) => boolean;
   /** Fired when the dispatcher detects that a chat with a live chat-scope
    *  session has been converted to topic mode (chat_mode 'group' → 'topic'
    *  via Lark group settings). Daemon should evict the stale chat-scope
@@ -2580,8 +2587,10 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   forceTopicApplied?: boolean;
   mentionedThisBot: boolean;
   ownsThreadSession?: boolean;
+  /** See EventHandlers.chatSessionAnsweredRootAtTopLevel. */
+  answeredRootAtTopLevel?: (rootId: string) => boolean;
 }): Promise<string | undefined> {
-  const { larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot, ownsThreadSession } = input;
+  const { larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot, ownsThreadSession, answeredRootAtTopLevel } = input;
   if (forceTopicApplied || ownsThreadSession) return undefined;
   if (!mentionedThisBot) return undefined;
   if (chatType !== 'group') return undefined;
@@ -2618,6 +2627,21 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   if (freshMode !== 'group') return undefined;
   routing.scope = 'chat';
   routing.anchor = chatId;
+  // 用户先在顶层 @ 了 bot（bot 已按 mode='plain' 平铺答过这条消息），之后才在
+  // **同一条消息上手动开启话题**：飞书把话题内的后续消息投递成
+  // root_id=<那条原顶层消息> + thread_id=<新建 omt_>。会话折叠回群是对的（上面
+  // 已完成），但此时不能再把可见回复钉进这个事后创建的话题 —— 否则用户在顶层
+  // @ 得到的回复会跑进一个他并未在其中 @ 过 bot 的话题里。
+  //
+  // 「@ 在既有话题里」永不命中：那种 root 不曾被本会话以顶层平铺方式答过。
+  // 因此既有的话题锚定契约（chat/shared fold 用例）保持不变。
+  if (answeredRootAtTopLevel?.(rootId)) {
+    logger.info(
+      `[reply-mode] thread root=${rootId.substring(0, 12)} was answered flat at top level; ` +
+      `folding into chat=${chatId.substring(0, 12)} WITHOUT anchoring the reply into the after-the-fact topic`,
+    );
+    return undefined;
+  }
   logger.info(`[reply-mode] mentioned thread root=${rootId.substring(0, 12)} folds into chat=${chatId.substring(0, 12)}`);
   return rootId;
 }
@@ -3356,6 +3380,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
         let replyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
           larkAppId, chatId, chatType, message, routing: ctx, forceTopicApplied: forcedTopic, mentionedThisBot: botTalk.allowed, ownsThreadSession,
+          answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
         });
         if (!replyRootId) {
           replyRootId = await maybeApplySharedTopicSeed({
@@ -3677,6 +3702,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         : false;
       const foldedReplyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
         larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot: explicitlyMentionedThisBot, ownsThreadSession: ownsThreadSessionBeforeFold,
+        answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
       });
       if (foldedReplyRootId) {
         replyRootId = foldedReplyRootId;
