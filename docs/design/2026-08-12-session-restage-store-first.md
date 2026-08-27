@@ -2,10 +2,10 @@
 title: Session 架构拆解回收与 store-first 重新分步
 type: design
 date: 2026-08-12
-updated: 2026-08-20（Step 3 第一 PR rebase 到 origin/master@3d84aaad 后，按现行基线修订口径与收益判定）
+updated: 2026-08-27（Step 3 第一 PR rebase 到 origin/master@06db2b48；会话库改走 sqlite-compat，engines 跟 master）
 topic: session-restage-store-first
 status: proposed
-baseline: origin/master@3d84aaad（0820 复核基线；0819 复核基线 47b2c11a；0813 复核基线 16fde8a27；原始基线 723c79ade）
+baseline: origin/master@06db2b48（0827 复核基线；0820 复核基线 3d84aaad；0819 复核基线 47b2c11a；0813 复核基线 16fde8a27；原始基线 723c79ade）
 references:
   - feat/virtual_actor_stage2@b6a4982ea（不合入；仅作参考实现、竞态清单与写点地图）
   - docs/design/2026-08-08-virtual-actor-session-runtime.md（原始提案；本目录保留未跟踪副本）
@@ -44,6 +44,18 @@ references:
 > 同日补记：残余 `findDaemon` probe-vs-publish TOCTOU 的消法是 **store 内占位
 > 租约**（与行写同一 `BEGIN IMMEDIATE`），不是 virtual actor / SessionRuntime；
 > 见 Step 4 候选 (f)。本 PR 不实施。
+>
+> **2026-08-27 修订**：#852 再 rebase 到 `origin/master@06db2b48`。master 在
+> 0820 之后把运行时切到 bun 单二进制，并把所有 SQLite 打开收进
+> `sqlite-compat`（Node: `node:sqlite` / Bun: `bun:sqlite`，见 `005ce0ae`）。
+> 会话库若仍 `createRequire('node:sqlite')`，会在编译态把 Step 3 硬门打成假
+> 失败——这是「干净 rebase 不是正确 rebase」（traex-transcript 已写过的
+> 同一类合并坑）。本 PR 改走 compat：引擎缺失抛 `SessionStoreSqliteUnavailableError`；
+> 损坏 `.db` 仍是普通打开失败，扫描可 skip。`engines` 跟 master 的 `node: >=22`，
+> 真门仍是 daemon `assertSqliteSupported()`。原则 1–5 与 Step 2 唯一门、混合窗口
+> `owner: false`、`abortIf`+`findDaemon`、非目标（不回流 actor / 不卷旁路 store）
+> 均未被后续 master 提交破坏；#889 `/cli`、#1017 发信人、#1008 schedule、#946
+> pending-turn journal 要么走 store 字段、要么是设计允许的旁路文件。
 
 ## 0. 背景与决策
 
@@ -150,9 +162,10 @@ idempotency-store、vc-meeting-* 系列）不动——它们各自有独立文�
 
 ### Step 3 — SQLite 引擎替换（1~2 个 PR）
 
-在 Step 2 的门后把 JSON 换成 per-bot SQLite（`node:sqlite`：免 flag 线
-v22.13.0 / v23.4.0；仓库先例 `adapters/cli/opencode.ts`，但现行门是 daemon
-`assertSqliteSupported()`，不是 opencode 注释里的 experimental）。
+在 Step 2 的门后把 JSON 换成 per-bot SQLite。打开库必须走 `sqlite-compat`
+（Node 的 `node:sqlite` / Bun 的 `bun:sqlite`），禁止再直连 `node:sqlite`。
+Node 免 flag 线仍是 v22.13.0 / v23.4.0，但仓库 `engines` 跟 master 的
+`>=22`（bun 分发）；现行门是 daemon `assertSqliteSupported()` 经 compat 探测。
 
 【master 复核 ⚠️ 前提表述需修正，但修正后收益更大】
 
@@ -214,9 +227,12 @@ v22.13.0 / v23.4.0；仓库先例 `adapters/cli/opencode.ts`，但现行门是 d
   单文件 inode 钉死 WAL sidecar）；legacy 无 appId 库保持平铺、不进沙盒。
 - worker `owner: false`：混合窗口内旧 daemon 从新 dist spawn 的 worker 不得
   首启导入。
-- Node 门：`node:sqlite` 免 flag 线为 v22.13.0 / v23.4.0；`engines` 收紧为
-  `^22.13.0 || >=23.4.0`，daemon 启动 `assertSqliteSupported()` 才是真门
-  （opencode.ts 仍标注 experimental，那是先例不是现行能力边界）。
+- 运行时门：打开库走 `src/services/sqlite-compat.ts`（与 feedback / opencode /
+  traex 同一入口）。Node 免 flag 线仍是 v22.13.0 / v23.4.0，但 `package.json`
+  `engines` **不收紧**——跟 master `node: >=22`（bun 单二进制用 `bun:sqlite`）。
+  真门是 daemon 启动 `assertSqliteSupported()`：模块加载失败才算引擎不可用；
+  损坏 `.db` 不得收成 Unavailable（否则身份扫描会把坏库误判成整机无 SQLite）。
+  opencode.ts 仍标注 experimental，那是先例不是现行能力边界。
 - 经 npm canary 渠道灰度；稳定后删除 JSON 会话持久化路径（第二 PR）。
 
 验收：第一 PR = 引擎互换 + 混合窗口 + 行为等价（含 0819 基线新增 API）；
@@ -235,6 +251,20 @@ v22.13.0 / v23.4.0；仓库先例 `adapters/cli/opencode.ts`，但现行门是 d
 - 体量：0813 master `session-store.ts` 1390 行 → 本 PR ~2161 行。这是「JSON 机器
   + SQLite 机器」共存的中间态，印证原则 1 的兑现点在第二 PR，不在本 PR。
 - src 无 SessionRuntime / virtual-actor 缝隙回流。
+
+**执行结果（2026-08-27，#852 rebase onto origin/master@06db2b48）**：
+
+- 会话库不再直连 `node:sqlite`，经 `sqliteEngineAvailable` +
+  `openDatabaseSyncOrThrow` 打开；与 master bun 分发同一运行时原则。
+- `engines` 恢复 master 的 `>=22`；硬门文案同时覆盖 Node 升级线与 Bun
+  `bun:sqlite`。损坏库与引擎缺失分型：扫描 skip vs 穿透抛错。
+- 原则自检（对照 3d84aaad..06db2b48）：唯一门仍在（src 无 `sessions*.json`
+  直写绕过；CLI 只委托 store）；worker `owner: false`、fs-policy 授
+  `session-stores/<appId>` 目录、descriptor 后再 `listSessions()` +
+  `BEGIN IMMEDIATE`、`abortIf`+`findDaemon` 均保住。#889 会话级 `/cli` 写的是
+  Session 字段经 `updateSession`；#1017 发信人仍走
+  `readSessionRowCopiesAcrossStores`；#946 journal / #1008 schedule 仍是旁路
+  文件，符合非目标。无 SessionRuntime 回流，Step 4(f) 占位租约仍未实施。
 
 ### Step 4 — 按痛点上事务（N 个独立小 PR，ROI gate）
 

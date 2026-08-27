@@ -4,10 +4,11 @@
  *  - .db.tmp 原子出现（读者绝不见半成品；残留 tmp 被清理）
  *  - JSON 原地冻结（导入后 daemon 写不再碰 JSON —— 回滚方案的前提）
  *  - 混合窗口 db-else-json（跨进程读 + CLI 离线写，含「冻结 JSON 不算第二份拷贝」）
- *  - Node 能力探测报错路径（daemon 硬门；CLI 有 .db 硬报错 / 无 .db 走 JSON）
+ *  - SQLite 能力探测报错路径（daemon 硬门；CLI 有 .db 硬报错 / 无 .db 走 JSON；
+ *    损坏 .db 不得收成「引擎不可用」）
  *  - worker（owner:false）不触发导入
  *
- * Run:  pnpm vitest run test/session-store-sqlite.test.ts
+ * Run:  bunx vitest run test/session-store-sqlite.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from 'fs';
@@ -402,14 +403,15 @@ describe('first-load serialization against an in-flight offline writer', () => {
 
 // ─── Node 能力探测 ───────────────────────────────────────────────────────────
 
-describe('node:sqlite capability gate', () => {
+describe('SQLite capability gate', () => {
   it('daemon startup probe fails with an actionable upgrade message', () => {
     __testOnly_setSqliteUnavailable(true);
     expect(() => assertSqliteSupported()).toThrow(SessionStoreSqliteUnavailableError);
     expect(() => assertSqliteSupported()).toThrow(/22\.13/);
+    expect(() => assertSqliteSupported()).toThrow(/bun:sqlite/);
   });
 
-  it('CLI paths fail hard when a .db exists but node:sqlite is missing', () => {
+  it('CLI paths fail hard when a .db exists but the SQLite engine is missing', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
     init('appA');
     listSessions(); // 首次访问触发导入 → .db
@@ -426,7 +428,7 @@ describe('node:sqlite capability gate', () => {
     )).toThrow(SessionStoreSqliteUnavailableError);
   });
 
-  it('CLI paths keep working on plain JSON stores when node:sqlite is missing (no .db yet)', () => {
+  it('CLI paths keep working on plain JSON stores when the SQLite engine is missing (no .db yet)', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
     __testOnly_setSqliteUnavailable(true);
 
@@ -439,5 +441,18 @@ describe('node:sqlite capability gate', () => {
       { dataDir: tempDir },
     );
     expect(published?.status).toBe('closed');
+  });
+
+  it('a corrupt .db is a skippable store, not a missing-engine error', () => {
+    mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
+    writeFileSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'), 'this is not a database');
+    // A sibling JSON store (no .db) is the readable copy. The empty legacy
+    // sessions.db that beforeEach init() may have created does not hold s1.
+    seedJson('sessions-appB.json', { s1: row('s1', { title: 'other-bot' }) });
+
+    expect(() => assertSqliteSupported()).not.toThrow();
+    const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
+    expect(copies).toHaveLength(1);
+    expect(copies[0]?.title).toBe('other-bot');
   });
 });

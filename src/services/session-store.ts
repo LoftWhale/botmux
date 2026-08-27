@@ -1,13 +1,18 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { createRequire } from 'node:module';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
+import {
+  openDatabaseSyncOrThrow,
+  sqliteEngineAvailable,
+  type DatabaseSyncLike,
+  type StatementLike,
+} from './sqlite-compat.js';
 import type { Session } from '../types.js';
 
 let sessions: Map<string, Session> = new Map();
@@ -55,19 +60,8 @@ export function stripLegacyPendingCardFields(session: Record<string, unknown>): 
 // cross-process reader and CLI offline write path resolves each store as
 // "use the .db when it exists, else the .json".
 
-interface SqliteStatementLike {
-  get(...params: unknown[]): unknown;
-  all(...params: unknown[]): unknown[];
-  run(...params: unknown[]): unknown;
-}
-interface SqliteDatabaseLike {
-  exec(sql: string): void;
-  prepare(sql: string): SqliteStatementLike;
-  close(): void;
-}
-type SqliteModuleLike = {
-  DatabaseSync: new (path: string, opts?: { readOnly?: boolean }) => SqliteDatabaseLike;
-};
+type SqliteStatementLike = StatementLike;
+type SqliteDatabaseLike = DatabaseSyncLike;
 
 const SQLITE_BUSY_TIMEOUT_MS = 3000;
 const SQLITE_NODE_VERSION_HINT = 'Node ≥ 22.13.0（23.x 需 ≥ 23.4.0）';
@@ -86,54 +80,46 @@ CREATE INDEX IF NOT EXISTS idx_sessions_root_message_id ON sessions(root_message
 CREATE INDEX IF NOT EXISTS idx_sessions_chat_scope ON sessions(chat_id, scope, status);
 `;
 
-let sqliteModule: SqliteModuleLike | null | undefined;
-/** Simulate a Node runtime without node:sqlite (createRequire bypasses the
- *  vitest module graph, so a mock cannot intercept it). */
+let sqliteForcedUnavailable = false;
+/** Simulate a runtime without a SQLite engine. The real probe lives in
+ *  sqlite-compat (Node: node:sqlite / Bun: bun:sqlite); tests flip this
+ *  because createRequire bypasses the vitest module graph. */
 export function __testOnly_setSqliteUnavailable(unavailable: boolean): void {
-  sqliteModule = unavailable ? null : undefined;
-}
-function loadSqliteModule(): SqliteModuleLike | null {
-  if (sqliteModule !== undefined) return sqliteModule;
-  // ESM 下没有裸 require，必须走 createRequire（同 adapters/cli/opencode.ts 的教训）。
-  try {
-    const req = createRequire(import.meta.url);
-    sqliteModule = req('node:sqlite') as SqliteModuleLike;
-  } catch {
-    sqliteModule = null;
-  }
-  return sqliteModule;
+  sqliteForcedUnavailable = unavailable;
 }
 
-/** node:sqlite is unavailable on this Node runtime but a SQLite store exists
- *  (or must be created). Distinct class so best-effort scan loops can rethrow
- *  it instead of degrading a capability failure into "file skipped". */
+/** SQLite engine cannot be loaded but a SQLite store exists (or must be
+ *  created). Distinct class so best-effort scan loops can rethrow it instead
+ *  of degrading a capability failure into "file skipped". A corrupt .db is
+ *  NOT this error — that is a regular open failure the scan may skip. */
 export class SessionStoreSqliteUnavailableError extends Error {
   override readonly name = 'SessionStoreSqliteUnavailableError';
 }
 
-function requireSqliteModule(context: string): SqliteModuleLike {
-  const mod = loadSqliteModule();
-  if (!mod) {
-    throw new SessionStoreSqliteUnavailableError(
-      `${context}需要 node:sqlite，但当前 Node ${process.version} 不提供。请升级 ${SQLITE_NODE_VERSION_HINT} 后重试。`,
-    );
-  }
-  return mod;
+function sqliteUnavailableMessage(context: string): string {
+  return `${context}需要 SQLite 引擎（Node 的 node:sqlite 或 Bun 的 bun:sqlite），但当前运行时不可用。Node 请升级到 ${SQLITE_NODE_VERSION_HINT}；编译版请使用支持 bun:sqlite 的 Bun。当前 runtime: ${process.version}。`;
 }
 
-/** Startup capability gate for the daemon. npm only WARNS on an engines
- *  mismatch, so this probe is the real gate: fail fast with an actionable
- *  message instead of failing later on the first store touch. */
+function requireSqliteEngine(context: string): void {
+  if (sqliteForcedUnavailable || !sqliteEngineAvailable()) {
+    throw new SessionStoreSqliteUnavailableError(sqliteUnavailableMessage(context));
+  }
+}
+
+/** Startup capability gate for the daemon. package.json engines is only
+ *  `node: >=22` (npm WARNS on mismatch; bun binaries use bun:sqlite). This
+ *  probe is the real gate: fail fast with an actionable message instead of
+ *  failing later on the first store touch. */
 export function assertSqliteSupported(): void {
-  requireSqliteModule('botmux 会话存储（SQLite 引擎）');
+  requireSqliteEngine('botmux 会话存储（SQLite 引擎）');
 }
 
 /** Open the store the daemon/worker owns for read-write use (WAL + NORMAL +
  *  busy_timeout, schema ensured). Durability matches the previous JSON
  *  tmp+rename (no fsync) — deliberately not upgraded in this step. */
 function openDbForOwnStore(path: string): SqliteDatabaseLike {
-  const mod = requireSqliteModule(`会话存储 ${basename(path)} `);
-  const db = new mod.DatabaseSync(path);
+  requireSqliteEngine(`会话存储 ${basename(path)} `);
+  const db = openDatabaseSyncOrThrow(path);
   db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA synchronous = NORMAL;');
@@ -146,12 +132,12 @@ function openDbForOwnStore(path: string): SqliteDatabaseLike {
  *  readers whose grant on the .db is read-only (a live daemon maintains the
  *  -shm they piggyback on). Callers must only SELECT. */
 function openDbForRead(path: string): SqliteDatabaseLike {
-  const mod = requireSqliteModule(`会话存储 ${basename(path)} `);
+  requireSqliteEngine(`会话存储 ${basename(path)} `);
   let db: SqliteDatabaseLike;
   try {
-    db = new mod.DatabaseSync(path);
+    db = openDatabaseSyncOrThrow(path);
   } catch {
-    db = new mod.DatabaseSync(path, { readOnly: true });
+    db = openDatabaseSyncOrThrow(path, { readOnly: true });
   }
   db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
   return db;
@@ -193,7 +179,7 @@ function sessionStatusText(value: unknown): string {
 
 let testOnlyBeforeRowPersist: ((sessionId: string) => void) | undefined;
 /** Failure injection for the SQLite row write (the JSON engine was injectable
- *  through a node:fs mock; node:sqlite bypasses node:fs). */
+ *  through a node:fs mock; the sqlite-compat handle bypasses node:fs). */
 export function __testOnly_setBeforeRowPersist(hook: ((sessionId: string) => void) | undefined): void {
   testOnlyBeforeRowPersist = hook;
 }
@@ -519,13 +505,13 @@ function readJsonEntriesForImport(jsonFp: string): [string, Session][] {
  *  so the imported snapshot cannot race a concurrent JSON writer. The source
  *  JSON is left frozen in place (the rollback path for the upgrade window). */
 function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
-  const mod = requireSqliteModule(`会话存储 ${basename(dbFp)} 首次导入`);
+  requireSqliteEngine(`会话存储 ${basename(dbFp)} 首次导入`);
   const tmpFp = `${dbFp}.tmp`;
   for (const suffix of ['', '-wal', '-shm']) {
     try { unlinkSync(`${tmpFp}${suffix}`); } catch { /* no leftover from a crashed import */ }
   }
   const entries = readJsonEntriesForImport(jsonFp);
-  const tmp = new mod.DatabaseSync(tmpFp);
+  const tmp = openDatabaseSyncOrThrow(tmpFp);
   try {
     tmp.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
     tmp.exec('PRAGMA journal_mode = WAL;');
