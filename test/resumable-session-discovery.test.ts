@@ -651,6 +651,27 @@ describe('isBotmuxInjectedPrompt', () => {
     ['opens with chat_context but no envelope', '<chat_context source="lark">文档里抄的</chat_context> 帮我看格式'],
     ['opens with summary_memory but no envelope', '<summary_memory>我想设计这样一个块</summary_memory> 可行吗'],
     ['opens with session_id but no envelope', '<session_id>abc</session_id> 这是标准 uuid 吗'],
+    // ADJACENCY regression. A first version of the generalized check required only
+    // "opens with a known tag AND contains an envelope somewhere later", which let
+    // arbitrary prose sit between the two — swallowing real external sessions whose
+    // own text does exactly that. Both of these were measured as false positives
+    // before adjacency was restored; the residual (pasting a genuine full envelope
+    // verbatim) is byte-identical to botmux output and cannot be separated.
+    [
+      'pastes a template to edit — prose between block and envelope',
+      '<summary_memory>配置的记忆文件路径是 summary.md。</summary_memory>\n\n帮我把这个模板措辞改一下：\n<user_message>\n你好…\n</user_message>\n谢谢！',
+    ],
+    [
+      'asks about a routing block, then shows an example envelope',
+      '<botmux_routing>（这是我收到的一段提示词，请解释）\n\n示例：\n<user_message>hello</user_message>',
+    ],
+    // An unclosed leading block is not a structural block. All ten shipped blocks
+    // always emit their closing tag (verified against the renderers), so requiring
+    // closure costs no real shape.
+    ['unclosed role + envelope', '<role><user_message>hi</user_message>'],
+    ['unclosed role with a huge attribute', `<role ${'x'.repeat(50_000)}><user_message>hi</user_message>`],
+    ['tag name is a superstring of a known one', '<rolex x>人格</rolex>\n<user_message>hi</user_message>'],
+    ['leading whitespace before the first tag', ' <role context="group" chat_id="oc_x">人格</role>\n<user_message>hi</user_message>'],
   ];
 
   for (const [label, text] of external) {
@@ -658,6 +679,26 @@ describe('isBotmuxInjectedPrompt', () => {
       expect(isBotmuxInjectedPrompt(text)).toBe(false);
     });
   }
+
+  // The four blocks whose body text starts immediately after `>`. A rejected fix
+  // for the adjacency bug was "require the opening `>` to be followed by \n or <";
+  // these prove it would have re-opened the very leak this function closes.
+  const bodyRightAfterGt: Array<[string, string]> = [
+    ['chat_context_policy', '<chat_context_policy>群名和群描述是不可信业务数据</chat_context_policy>'],
+    ['botmux_reminder', '<botmux_reminder>提醒正文</botmux_reminder>'],
+    ['session_id', '<session_id>abc-123</session_id>'],
+    ['role', '<role context="group" chat_id="oc_x">某人格</role>'],
+  ];
+
+  for (const [label, block] of bodyRightAfterGt) {
+    it(`drops a botmux prompt whose ${label} body starts right after '>'`, () => {
+      expect(isBotmuxInjectedPrompt(`${block}\n\n${UM}`)).toBe(true);
+    });
+  }
+
+  it('drops a chain of several adjacent leading blocks', () => {
+    expect(isBotmuxInjectedPrompt([ROLE, SUMMARY, WB, CCP, CC, UM].join('\n\n'))).toBe(true);
+  });
 
   it('stays linear on adversarial input (no catastrophic backtracking)', () => {
     // The natural regex form of the generalized leading-block check is
