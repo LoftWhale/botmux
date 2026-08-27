@@ -112,6 +112,47 @@ describe('handleCotThinkingUpdate', () => {
     expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_fold_root', reply_in_thread: true });
   });
 
+  it('uses the FROZEN per-turn context, so a pruned live entry cannot flatten the bubble', async () => {
+    // replyTargets is capped at 32 (REPLY_TARGETS_MAX) while turnReplyContexts
+    // holds 256, and the live entry is written at message-arrival while the
+    // bubble is created on the turn's first thinking_update. On a busy session
+    // the live entry can be pruned in that window: the frozen context still
+    // says {thread, om_fold} where resolveSessionReplyTarget has degraded to
+    // {plain} — which would resurrect this very bug in the fold-back case.
+    const ds = makeDs({
+      scope: 'chat',
+      currentReplyTarget: { rootMessageId: 'om_other', turnId: 'om_other_turn', updatedAt: new Date().toISOString() },
+      session: {
+        // Live per-turn entry for om_turn1 is GONE (pruned); only the frozen one remains.
+        replyTargets: {},
+        turnReplyContexts: { om_turn1: { target: { mode: 'thread', rootMessageId: 'om_fold_root' } } },
+        currentReplyTarget: { rootMessageId: 'om_other', turnId: 'om_other_turn', updatedAt: new Date().toISOString() },
+      },
+    });
+    handleCotThinkingUpdate(ds, upd([think('x')]));
+    await flush();
+    const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_fold_root', reply_in_thread: true });
+  });
+
+  it('degrades to a chat-level bubble when the thread anchor is not an om_ message id', async () => {
+    // session.rootMessageId is NOT always a message id on a thread-scope
+    // session: a silent new-topic schedule stores `schedule-run:<task>:<uuid>`,
+    // and `schedule add --topic --root-msg-id <any string>` is unvalidated (the
+    // cross-thread fire path anchors it verbatim without probing, so it does
+    // not self-heal). Feishu rejects a non-om_ origin and a failed create kills
+    // thinking for the WHOLE turn — a chat-level bubble is strictly better.
+    for (const bad of ['schedule-run:task1:uuid1', 'oc_chat1']) {
+      request.mockClear();
+      const ds = makeDs({ session: { rootMessageId: bad } });
+      handleCotThinkingUpdate(ds, upd([think('x')], 'schedule:task1:uuid1'));
+      await flush();
+      const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+      expect(create.data, `non-om_ anchor ${bad} must not reach Feishu`)
+        .toEqual({ receive_id: 'oc_chat1' });
+    }
+  });
+
   it('chat-scope quote-only reply target anchors to the quote WITHOUT reply_in_thread', async () => {
     const ds = makeDs({ scope: 'chat', session: { replyTargets: { om_turn1: { rootMessageId: 'om_quote_tgt', quoteOnly: true } } } });
     handleCotThinkingUpdate(ds, upd([think('x')]));

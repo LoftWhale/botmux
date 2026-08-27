@@ -37,7 +37,7 @@
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getBotClient } from '../../bot-registry.js';
-import { resolveSessionReplyTarget } from '../../core/reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -182,14 +182,34 @@ function ev(eventType: string, content: unknown): CotEvent {
  * Lark id (synthetic scheduler ids → bare chat-level bubble). The flag must
  * NEVER ride a plain-group anchor: reply_in_thread on a non-topic message
  * spawns a brand-new topic.
+ *
+ * Resolution goes through `frozenReplyContextForTurn × fallbackTurnId` — the
+ * EXACT composition the streaming card uses (captureStreamingCardReplyTarget),
+ * not the live `resolveSessionReplyTarget`. The two diverge on a busy session:
+ * `replyTargets` is capped at 32 (REPLY_TARGETS_MAX) while `turnReplyContexts`
+ * holds 256, so a turn registered at message-arrival can have its live entry
+ * pruned before its first `thinking_update` creates the bubble — the frozen
+ * context still says `{thread, om_fold}` where the live one has degraded to
+ * `{plain}`. That would resurrect this very bug in the chat-scope fold-back
+ * case. `fallbackTurnId` additionally covers entries with no turn context of
+ * their own (`/cot show`), which then follow the session's current target.
+ *
+ * The `om_` shape check is a fuse, not decoration: `session.rootMessageId` is
+ * NOT always a message id on a thread-scope session — a silent new-topic
+ * schedule stores a virtual `schedule-run:<task>:<uuid>` anchor, chat-scope
+ * keeps the chatId there as an audit seed, and `schedule add --topic
+ * --root-msg-id <any string>` has no `om_` validation on the way in (the
+ * cross-thread fire path at session-manager.ts:3255 anchors it verbatim
+ * without ever probing it, so it does not self-heal). Feishu rejects a
+ * non-`om_` origin, and a failed create disables thinking for the WHOLE turn —
+ * strictly worse than a chat-level bubble. So degrade instead of throwing it
+ * over the wire. (See the same constraint recorded in ask-card.ts:49.)
  */
 function cotPlacement(ds: DaemonSession, state: CotState): { origin_message_id?: string; reply_in_thread?: boolean } {
-  const target = resolveSessionReplyTarget(ds, state.turnId);
+  const target = frozenReplyContextForTurn(ds, fallbackTurnId(ds, state.turnId)).target;
   if (target.mode === 'thread' || target.mode === 'quote') {
-    // Thread-scope sessions always have rootMessageId; the turn-id fallback
-    // covers degenerate restores (a thread trigger id still threads correctly).
-    const anchor = target.rootMessageId ?? (state.turnId.startsWith('om_') ? state.turnId : undefined);
-    if (!anchor) return {};
+    const anchor = target.rootMessageId;
+    if (!anchor.startsWith('om_')) return {};
     return target.mode === 'thread'
       ? { origin_message_id: anchor, reply_in_thread: true }
       : { origin_message_id: anchor };
