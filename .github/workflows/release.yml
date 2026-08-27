@@ -60,8 +60,10 @@ jobs:
         with:
           node-version: 22
 
-      - run: npm install -g pnpm@9.5.0
-      - run: pnpm install --frozen-lockfile
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
 
       - name: Sync version from git tag to package.json
         run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
@@ -72,9 +74,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
 
-      - run: pnpm build
-      - run: pnpm desktop:bundle
-      - run: pnpm desktop:runtime
+      - run: bun run build
+      - run: bun run desktop:bundle
+      - run: bun run desktop:runtime
 
       - name: Decode App Store Connect API key
         env:
@@ -91,7 +93,7 @@ jobs:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
-          pnpm exec electron-builder --mac dmg zip --universal --publish never \
+          ./node_modules/.bin/electron-builder --mac dmg zip --universal --publish never \
             --config electron-builder.yml \
             -c.forceCodeSigning=true \
             -c.mac.notarize=true \
@@ -300,8 +302,10 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - run: npm install -g pnpm@9.5.0
-      - run: pnpm install --frozen-lockfile
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
 
       - name: Upgrade npm for Trusted Publishing
         # npm Trusted Publishing (OIDC) 要求 npm CLI >= 11.5.1（需 Node >= 22.14.0）。
@@ -398,9 +402,9 @@ jobs:
           fi
           echo "OK: tagged commit contains origin/master ($(git rev-parse --short origin/master))."
 
-      - run: pnpm build
+      - run: bun run build
 
-      - run: pnpm workflow-core:test
+      - run: bun run workflow-core:test
 
       - name: Publish workflow core to npm
         # npm Trusted Publishing (OIDC) 流程:actions/setup-node 已配置 registry-url,
@@ -414,7 +418,7 @@ jobs:
         # package. The four `optionalDependencies` are NOT committed to
         # package.json, for two measured reasons:
         #
-        #  1. `pnpm install --frozen-lockfile` (used by every job in this repo)
+        #  1. `bun install --frozen-lockfile` (used by every job in this repo)
         #     fails with ERR_PNPM_OUTDATED_LOCKFILE when package.json names a
         #     dependency the lockfile does not — it would turn all of CI red.
         #  2. `npm version` does not rewrite dependency ranges, so a committed
@@ -600,13 +604,13 @@ jobs:
     # WHY a per-OS matrix instead of one cross-compile job: node-pty's native
     # `pty.node` (and macOS `spawn-helper`) must match the target OS. Bun can
     # cross-compile the JS + runtime, but the embedded `.node` has to be the one
-    # `pnpm install` compiled ON that OS. So we build each OS's binaries on its
+    # `bun install` compiled ON that OS. So we build each OS's binaries on its
     # own native runner (linux -> ubuntu, darwin -> macos-14), where build/Release
     # is correct; each runner emits both of its architectures.
     needs: [preflight]
     # WHY a per-OS **and per-arch** matrix: node-pty's native `pty.node` (and
     # macOS `spawn-helper`) must match the target. Bun can cross-compile the JS +
-    # runtime, but the embedded `.node` has to be the one `pnpm install` produced
+    # runtime, but the embedded `.node` has to be the one `bun install` produced
     # for that platform.
     #
     # darwin: node-pty SHIPS prebuilds (`prebuilds/darwin-{x64,arm64}/`), so one
@@ -648,16 +652,14 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.0
-
-      - run: npm install -g pnpm@9.5.0
       # --frozen-lockfile + the platform's own install compiles node-pty's
       # build/Release/pty.node for THIS OS/arch, which the embed plugin bundles.
-      - run: pnpm install --frozen-lockfile
+      - run: bun install --frozen-lockfile
 
       - name: Sync version from git tag to package.json
         run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
 
-      - run: pnpm build
+      - run: bun run build
 
       - name: Compile Bun single-file executables
         # Build each target this runner is responsible for. The script fails
