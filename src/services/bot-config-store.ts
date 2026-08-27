@@ -28,6 +28,11 @@ import { parseStartupCommandsInput } from '../core/startup-commands.js';
 import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
+import {
+  cliModelSupportsReasoningEffort,
+  isCodexReasoningEffort,
+  isConfigurableReasoningCliId,
+} from './codex-reasoning-effort.js';
 
 /**
  * 生效时机：
@@ -71,6 +76,7 @@ export interface ConfigFieldSpec {
 export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'displayName', configKey: 'displayName', kind: 'string', effect: 'immediate', clearable: true, maxLen: 64, hint: '自定义展示名（dashboard 名册/会话列表用，≤64 字符）；不改飞书群内应用名；unset 回飞书名称' },
   { key: 'model', configKey: 'model', kind: 'string', effect: 'next-session', clearable: true, hint: 'CLI 模型名（如 opus）；unset 回 CLI 默认' },
+  { key: 'reasoningEffort', configKey: 'reasoningEffort', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], hint: '支持的 CLI 上新会话默认思考强度 low|medium|high|xhigh|max|ultra；unset 回 CLI 默认' },
   { key: 'cli', configKey: 'cliId', kind: 'cli', effect: 'next-session', clearable: false, hint: 'CLI 适配器（序号 1-16 或 id，如 claude-code）' },
   { key: 'launchShell', configKey: 'launchShell', kind: 'string', effect: 'next-session', clearable: true, hint: '启动 CLI 用的 shell（zsh|bash|fish|sh 或绝对路径），覆盖 $SHELL；用于 .bashrc/.zshrc 里 exec 切到别的 shell 导致会话起不来的场景；fish 用户把 PATH/nvm 放进 ~/.config/fish/config.fish，无需回填 bash/zsh；unset 回 $SHELL' },
   { key: 'lang', configKey: 'lang', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['zh', 'en'], hint: '机器人 UI 语言 zh|en；unset 回全局默认' },
@@ -228,7 +234,39 @@ export async function applyConfigField(
   // 空数组（stringList 全被过滤）等价清除，bots.json 保持干净。
   const effective = spec.kind === 'stringList' && Array.isArray(value) && value.length === 0 ? null : value;
 
-  const r = await rmwBotEntry<null>(larkAppId, (entry) => {
+  const r = await rmwBotEntry<string | null>(larkAppId, (entry) => {
+    const currentCliId = typeof entry.cliId === 'string' && entry.cliId.trim()
+      ? entry.cliId.trim()
+      : bot.config.cliId;
+    const nextCliId = spec.configKey === 'cliId' && effective !== null && typeof effective === 'string'
+      ? effective.trim()
+      : currentCliId;
+    const currentModel = typeof entry.model === 'string' && entry.model.trim()
+      ? entry.model.trim()
+      : undefined;
+    const nextModel = spec.configKey === 'model'
+      ? typeof effective === 'string' && effective.trim()
+        ? effective.trim()
+        : undefined
+      : currentModel;
+    const currentReasoningEffort = isCodexReasoningEffort(entry.reasoningEffort)
+      ? entry.reasoningEffort
+      : undefined;
+    const nextReasoningEffort = spec.configKey === 'reasoningEffort'
+      ? effective === null
+        ? undefined
+        : isCodexReasoningEffort(effective)
+          ? effective
+          : undefined
+      : currentReasoningEffort;
+    if (spec.configKey === 'reasoningEffort' && effective !== null
+        && (!nextReasoningEffort || !isConfigurableReasoningCliId(nextCliId))) {
+      return { write: false, result: 'reasoning_effort_not_supported' };
+    }
+    if (nextReasoningEffort && isConfigurableReasoningCliId(nextCliId)
+        && !cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort)) {
+      return { write: false, result: 'reasoning_effort_not_supported_by_model' };
+    }
     if (effective === null) {
       delete entry[spec.configKey];
     } else if (spec.kind === 'boolean') {
@@ -244,9 +282,13 @@ export async function applyConfigField(
     } else {
       entry[spec.configKey] = effective;
     }
+    if (spec.configKey === 'cliId' && !isConfigurableReasoningCliId(nextCliId)) {
+      delete entry.reasoningEffort;
+    }
     return { write: true, result: null };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
+  if (r.result) return { ok: false, reason: r.result };
 
   // 同步内存 config（与 oncall/grant-prefs store 一致，路由/spawn 不重启即生效）。
   if (effective === null) {
@@ -259,6 +301,9 @@ export async function applyConfigField(
     (bot.config as any)[spec.configKey] = effective;
   } else {
     (bot.config as any)[spec.configKey] = effective;
+  }
+  if (spec.configKey === 'cliId' && !isConfigurableReasoningCliId(String(effective ?? bot.config.cliId))) {
+    bot.config.reasoningEffort = undefined;
   }
   const newText = formatFieldValue(spec, (bot.config as any)[spec.configKey]);
   if (spec.configKey === 'feedback') {
