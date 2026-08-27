@@ -115,11 +115,21 @@ async function stageNodePty() {
     );
   }
   await rm(target, { recursive: true, force: true });
-  // EXCLUDE build/ — and this is not tidiness, it is correctness. The builder is
-  // Linux, so its node_modules carries a Linux-ELF `build/Release/pty.node`
-  // (verified with `file`). node-pty's loader tries `build/Release` FIRST, so
-  // copying it would make the macOS app prefer a Linux binary over the correct
-  // darwin prebuild and fail to load the native module at all.
+  // EXCLUDE build/ — correctness, not tidiness. node-pty's loader tries
+  // `build/Release` BEFORE `prebuilds/<platform>-<arch>`, so any compiled artifact
+  // sitting in the builder's own tree gets copied in and SHADOWS the prebuild we
+  // actually want.
+  //
+  // How a stray build/ appears: node-pty's install script (scripts/prebuild.js)
+  // exits 0 when `prebuilds/<platform>-<arch>` exists and only falls through to
+  // `node-gyp rebuild` when it does not. So the release runner (macOS, prebuilds
+  // present) normally has no build/ — but a Linux dev box does (no linux prebuild),
+  // `npm_config_build_from_source=true` forces one, and a future node-pty could drop
+  // a darwin prebuild. Any of those leaves an artifact for this cp to pick up.
+  //
+  // Worst case is silent and arch-specific: a macOS builder produces a SINGLE-arch
+  // Mach-O, which would shadow the OTHER arch's prebuild inside the Universal app —
+  // terminals dead on half the machines, with nothing failing at build time.
   await cp(source, target, {
     recursive: true,
     dereference: true,

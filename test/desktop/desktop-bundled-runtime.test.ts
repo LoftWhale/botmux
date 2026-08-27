@@ -114,10 +114,12 @@ describe('bundled desktop runtime', () => {
     // runtime tree gets it by copy instead. If this call disappears, the desktop app
     // ships with no terminal support and nothing else notices.
     expect(script).toContain('await stageNodePty();');
-    // Copying build/ would be actively WRONG, not merely wasteful: the builder is
-    // Linux, so build/Release/pty.node is a Linux ELF, and node-pty's loader tries
-    // build/Release BEFORE prebuilds/<platform>-<arch> — macOS would prefer the Linux
-    // binary and fail to load the native module.
+    // Copying build/ would be actively WRONG, not merely wasteful: node-pty's loader
+    // tries build/Release BEFORE prebuilds/<platform>-<arch>, so a compiled artifact
+    // in the builder's own tree shadows the prebuild we want. The release runner
+    // (macOS, prebuilds present) normally has none, but a Linux dev box does, and
+    // `npm_config_build_from_source=true` forces one — and in a Universal app a
+    // single-arch Mach-O would shadow the OTHER arch's prebuild silently.
     //
     // Assert the filter is WIRED INTO the copy, not merely that the helper exists:
     // a first version of this test only checked for the identifier, and deleting the
