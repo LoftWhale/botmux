@@ -107,23 +107,44 @@ export class SessionStoreNotImportedError extends Error {
   override readonly name = 'SessionStoreNotImportedError';
 }
 
-/** Refuse a store that still has an un-imported JSON predecessor. The source
- *  set mirrors `readJsonEntriesForImport`: this store's own file, else — for a
- *  per-bot store — the legacy `sessions.json` the import would read its rows
- *  from. A data dir with neither is simply empty and stays silent (a remote
- *  sandbox has no local store at all). */
-function assertStoreImported(appId: string | undefined, dataDir: string): void {
-  if (existsSync(storeDbPath(appId, dataDir))) return;
+/** A per-bot store that still has its own un-imported `sessions-<appId>.json`.
+ *
+ *  Deliberately narrow. It does NOT consult the legacy `sessions.json`, for two
+ *  reasons: that file is never deleted by the legacy→per-bot migration, so it
+ *  survives on every upgraded install forever; and no daemon will ever import
+ *  it (production daemons always start with an appId, so nothing owns the flat
+ *  store). Treating it as "pending" would fire on every freshly added bot —
+ *  which has nothing to import at all — and tell its operator to restart a
+ *  daemon that is already current. A store with no own JSON is simply new. */
+function unimportedStoreJsonPath(appId: string, dataDir: string): string | undefined {
+  if (existsSync(storeDbPath(appId, dataDir))) return undefined;
   const ownJsonFp = join(dataDir, storeJsonFileName(appId));
-  const legacyJsonFp = join(dataDir, 'sessions.json');
-  const pendingJsonFp = existsSync(ownJsonFp) ? ownJsonFp
-    : appId && existsSync(legacyJsonFp) ? legacyJsonFp
-      : undefined;
+  return existsSync(ownJsonFp) ? ownJsonFp : undefined;
+}
+
+function assertStoreImported(appId: string | undefined, dataDir: string): void {
+  if (!appId) return;
+  const pendingJsonFp = unimportedStoreJsonPath(appId, dataDir);
   if (!pendingJsonFp) return;
   throw new SessionStoreNotImportedError(
     `会话库尚未迁移到 SQLite：${pendingJsonFp} 存在但 ${storeDbPath(appId, dataDir)} 不存在。`
     + `拥有该 bot 的 daemon 仍在跑迁移前的版本——请重启 daemon（botmux restart）让它完成一次性导入。`,
   );
+}
+
+/** Every per-bot store whose own JSON is still waiting to be imported. Used to
+ *  explain an empty cross-store scan instead of reporting "row not found". */
+function listUnimportedStoreJsonPaths(dataDir: string): string[] {
+  let names: string[];
+  try { names = readdirSync(dataDir); } catch { return []; }
+  const pending: string[] = [];
+  for (const name of names) {
+    if (!name.startsWith('sessions-') || !name.endsWith('.json')) continue;
+    const appId = name.slice('sessions-'.length, -'.json'.length);
+    const jsonFp = unimportedStoreJsonPath(appId, dataDir);
+    if (jsonFp) pending.push(jsonFp);
+  }
+  return pending;
 }
 
 function sqliteUnavailableMessage(context: string): string {
@@ -419,6 +440,7 @@ export function __testOnly_setAfterRemoteBatchRename(hook: (() => void) | undefi
 export function init(appId?: string, opts: { owner?: boolean } = {}): void {
   currentAppId = appId;
   sqliteBootstrapAllowed = opts.owner !== false;
+  warnedUnimportedOwnStore = false;
   loaded = false;
   sessions = new Map();
   loadFailure = undefined;
@@ -516,21 +538,31 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
   const tmp = openDatabaseSyncOrThrow(tmpFp);
   try {
     tmp.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
-    tmp.exec('PRAGMA journal_mode = WAL;');
+    // The staging database is deliberately NOT in WAL mode. `renameSync` below
+    // publishes ONE file, so every imported row has to live inside it by the
+    // time we rename — and closing a WAL connection does not reliably fold the
+    // -wal sidecar back into the main file on both engines. Under bun:sqlite it
+    // does not: the rows stay in `<db>.tmp-wal`, the rename publishes a 4 KB
+    // header-only database, and every later open fails with "disk I/O error".
+    // Because the import gate is `existsSync(db)`, that shell is never
+    // rebuilt — the store is bricked and every pre-SQLite session is
+    // unreachable. The rollback journal keeps the staging file self-contained;
+    // the real store still runs WAL (see openDbForOwnStore).
+    tmp.exec('PRAGMA journal_mode = DELETE;');
     tmp.exec('PRAGMA synchronous = NORMAL;');
     tmp.exec(SESSIONS_SCHEMA_SQL);
     tmp.exec('BEGIN');
     const insert = tmp.prepare('INSERT OR REPLACE INTO sessions (session_id, status, row) VALUES (?, ?, ?)');
     for (const [key, value] of entries) {
-      // Convergence happens HERE, once, instead of on every write: a JSON file
-      // key that disagrees with the row's own sessionId (historical corruption)
-      // is normalised to the row's id, so the primary key and the row always
-      // agree from this point on. The old whole-file offline write dropped such
-      // rows; keying them correctly keeps the data and fixes the lookup.
-      const rowId = typeof (value as { sessionId?: unknown } | null)?.sessionId === 'string'
-        ? (value as unknown as { sessionId: string }).sessionId
-        : key;
-      insert.run(rowId, sessionStatusText(value), JSON.stringify(value));
+      // Import under the file's OWN key, never the row's sessionId. Re-keying
+      // looks like a cleanup for the historical "key disagrees with
+      // row.sessionId" corruption, but two entries can carry the SAME
+      // sessionId — and then the later one silently replaces the earlier,
+      // letting a stale closed ghost overwrite the live row, irreversibly
+      // (the import runs once and the JSON is frozen afterwards). A
+      // mis-keyed row stays inert instead: identity scans already skip rows
+      // whose sessionId disagrees with the key they were found under.
+      insert.run(key, sessionStatusText(value), JSON.stringify(value));
     }
     tmp.exec('COMMIT');
     tmp.close();
@@ -942,11 +974,28 @@ export function getOwnedSession(sessionId: string): Session | undefined {
   return sessions.get(sessionId);
 }
 
+let warnedUnimportedOwnStore = false;
+
 /** Cross-process fresh read: a point SELECT observes the last committed write
  *  (WAL orders the daemon against offline CLI writers). */
 export function getSessionFresh(sessionId: string): Session | undefined {
   const dbFp = getDbPath();
-  if (!existsSync(dbFp)) return undefined;
+  if (!existsSync(dbFp)) {
+    // Callers here (worker `authorizeManagedSend`) treat undefined as "no such
+    // row" and degrade quietly — a codex-app turn ends up refused as
+    // `origin_mismatch` with nothing in the log pointing at the real cause.
+    // Throwing is not an option (the worker's IPC handler has no catch), so at
+    // least say it once.
+    if (currentAppId && !warnedUnimportedOwnStore
+        && unimportedStoreJsonPath(currentAppId, config.session.dataDir)) {
+      warnedUnimportedOwnStore = true;
+      logger.warn(
+        `会话库尚未迁移到 SQLite：${dbFp} 不存在，本进程的所有会话读取都会落空。`
+        + `请重启拥有该 bot 的 daemon 完成一次性导入。`,
+      );
+    }
+    return undefined;
+  }
   try {
     return readStoreRowByKey({ appId: currentAppId, path: dbFp }, sessionId);
   } catch (err) {
@@ -1745,6 +1794,19 @@ export function readSessionRowCopiesAcrossStores(
     if (!session || typeof session !== 'object' || Array.isArray(session)) continue;
     if (session.sessionId !== sessionId) continue;
     matches.push(session);
+  }
+  if (matches.length === 0) {
+    // "Row not found" and "that bot's store was never imported" are the same
+    // empty scan but completely different actions. Callers turn a zero match
+    // into 「未找到当前进程所属 session」, which sends the operator hunting for a
+    // lost process marker instead of restarting one daemon.
+    const pending = listUnimportedStoreJsonPaths(dataDir);
+    if (pending.length > 0) {
+      throw new SessionStoreNotImportedError(
+        `会话库尚未迁移到 SQLite：${pending.join('、')} 仍未导入，扫描结果不可信。`
+        + `请重启对应 bot 的 daemon（botmux restart）完成一次性导入。`,
+      );
+    }
   }
   return matches;
 }

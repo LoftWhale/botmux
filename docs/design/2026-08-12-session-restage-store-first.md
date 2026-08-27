@@ -289,8 +289,12 @@ Node 免 flag 线仍是 v22.13.0 / v23.4.0，但仓库 `engines` 跟 master 的
   map 级修补函数与它在每次 load 里那次「修完再写回」的额外事务。
   唯一保留的读侧调用在 `loadAllSessionsSnapshot`：它读的是**别人的 store**，
   这个进程既不拥有也修不了那些行，一次纯内存归一化是合理的，且不写盘。
-  原先只在「恰好对该 store 做过一次离线写」时才发生的 key-mismatch 收敛，
-  改成导入时按行自身的 `sessionId` 归位——修好而不是丢掉。
+  原先只在「恰好对该 store 做过一次离线写」时才发生的 key-mismatch 收敛
+  （旧实现是 `delete data[key]`）**不再发生，也不改成导入期重键**：两条 JSON 记录
+  可能带同一个 `sessionId`，按 `sessionId` 重键会让后写的那条 `INSERT OR REPLACE`
+  掉前一条——陈旧的 closed 幽灵行覆盖活行，而且导入只跑一次、JSON 随后冻结，
+  不可逆。按文件原 key 导入，错键行保持惰性（身份扫描本来就跳过 key 与
+  `sessionId` 不符的行）。这一条是复核时用两个 checkout 跑同一份输入实测出来的。
 - **未导入的 store 一律 fail-closed**，不再静默空投影。新增 `SessionStoreNotImportedError`：
   「有 `sessions*.json` 但没有 `.db`」意味着拥有该 bot 的 daemon 还在跑迁移前的版本，
   `loadAllSessionsSnapshot`（仅针对调用方自己的 store）、`mutateSessionRowOffline`、
@@ -330,7 +334,14 @@ Node 免 flag 线仍是 v22.13.0 / v23.4.0，但仓库 `engines` 跟 master 的
 - 跨 bot 发现（`findActiveSessionsByRoot` / `findActiveChatScopeSessionsByChat` /
   `countActiveSessionsOnDisk` / `collectBotmuxSessionIdentities`）只看 `.db`：未导入的
   peer 不可见，不报错。
-- 离线写不再顺手收敛整个 store（行级写只碰一行）。收敛点上移到导入。
+- 离线写不再顺手收敛整个 store（行级写只碰一行）：错键的脏行不再被删除，
+  保持惰性存在。
+- **legacy `sessions.json` 里没有 `larkAppId` 的行（多 bot 拆分之前的遗留）不再可见。**
+  实测对照确认：master 上 `loadAllSessionsSnapshot` 经 db-else-json 还能读到它们，
+  db-only 下读不到。这类行本来就不归任何 per-bot store 所有——#852 的导入按
+  `larkAppId === currentAppId` 过滤，从来不收它们；生产 daemon 一律带 appId 启动，
+  扁平 legacy 库只在单 bot 开发/测试下才会建。所以它们此前也只是 CLI 还能列出、
+  还能离线关闭的惰性墓碑，没有 daemon 能恢复或投递。
 
 ### Step 4 — 按痛点上事务（N 个独立小 PR，ROI gate）
 

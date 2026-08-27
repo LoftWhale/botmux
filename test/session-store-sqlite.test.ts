@@ -10,7 +10,7 @@
  * Run:  bunx vitest run test/session-store-sqlite.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync } from 'fs';
 import { spawn } from 'node:child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -170,6 +170,27 @@ describe('first-start JSON import', () => {
     const rows = readPersistedSessionRows(tempDir, 'appA');
     expect(rows.s1.title).toBe('renamed');
     expect(Object.keys(rows)).toHaveLength(2);
+  });
+
+  it('publishes a SELF-CONTAINED store: no WAL sidecar may hold imported rows', () => {
+    // The staging db is renamed as ONE file, so the rows have to be inside it
+    // at rename time. Staging in WAL mode leaves them in `<db>.tmp-wal`, the
+    // rename publishes a 4 KB header-only shell, and every later open fails
+    // with "disk I/O error" — permanently, because `existsSync(db)` then keeps
+    // the import from ever re-running. Engine-dependent (bun:sqlite does not
+    // fold the sidecar back on close), so this Node-run assertion pins the
+    // observable invariant: nothing of the staging db survives the publish.
+    seedJson('sessions-appA.json', { s1: row('s1'), s2: row('s2', { status: 'closed' }) });
+    init('appA');
+    expect(listSessions()).toHaveLength(2);
+
+    const storeDir = join(tempDir, 'session-stores', 'appA');
+    expect(readdirSync(storeDir).filter(n => n.includes('.tmp'))).toEqual([]);
+
+    // Reopen from scratch: a shell db would throw instead of yielding the rows.
+    init();
+    init('appA');
+    expect(listSessionsStrict().map(s => s.sessionId).sort()).toEqual(['s1', 's2']);
   });
 
   it('a non-owning process (worker under an old daemon) never bootstraps the .db', () => {
@@ -439,6 +460,34 @@ describe('SQLite capability gate', () => {
       () => true,
       { dataDir: tempDir },
     )).toThrow(SessionStoreSqliteUnavailableError);
+  });
+
+  it('does not mistake a brand-new bot for an un-imported one', () => {
+    // The legacy→per-bot migration never deletes `sessions.json`, so it is
+    // present on every upgraded install and NO daemon will ever import it
+    // (production daemons always carry an appId). Treating it as pending would
+    // fire on every freshly added bot — which has nothing to import — and tell
+    // its operator to restart an already-current daemon.
+    seedJson('sessions.json', { old: row('old') });
+    seedPersistedSessionRows(tempDir, 'appA', { a1: row('a1', { larkAppId: 'appA' }) });
+
+    expect(loadAllSessionsSnapshot({ dataDir: tempDir, fallbackAppId: 'appNew' }).size).toBe(1);
+    expect(mutateSessionRowOffline(
+      { sessionId: 'nope', larkAppId: 'appNew' },
+      () => true,
+      { dataDir: tempDir },
+    )).toBeUndefined();
+  });
+
+  it('explains an empty identity scan caused by an un-imported store', () => {
+    // 「行不存在」和「那个 bot 的库还没导入」是同一个空扫描，但动作完全不同。
+    // 调用方会把 0 命中变成「未找到当前进程所属 session」，把人引去查进程标记。
+    seedJson('sessions-appOld.json', { o1: row('o1', { larkAppId: 'appOld' }) });
+    seedPersistedSessionRows(tempDir, 'appA', { a1: row('a1', { larkAppId: 'appA' }) });
+
+    expect(readSessionRowCopiesAcrossStores('a1', tempDir)).toHaveLength(1);
+    expect(() => readSessionRowCopiesAcrossStores('missing', tempDir))
+      .toThrow(SessionStoreNotImportedError);
   });
 
   it('an un-imported store is a migration error, never an engine capability error', () => {

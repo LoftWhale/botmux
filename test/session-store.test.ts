@@ -1249,23 +1249,30 @@ describe('import-time convergence', () => {
     expect(onDisk.s1).not.toHaveProperty('lastPatchedResponseCardId');
   });
 
-  it('keys an imported row by its own sessionId when the JSON key disagrees', () => {
-    // Historical corruption: the file key and the row's sessionId diverged. The
-    // pre-SQLite engine only cleaned this up if someone happened to make an
-    // offline write against that store (a side effect of rewriting the whole
-    // file). The import now normalises it once — keeping the row rather than
-    // dropping it, and making the lookup work.
+  it('never lets a duplicate-sessionId ghost overwrite the live row', () => {
+    // Two entries can carry the SAME sessionId under different file keys.
+    // Importing under `row.sessionId` would collapse them and let whichever
+    // comes last win — a stale closed ghost silently replacing the live row,
+    // irreversibly (the import runs once, the JSON is frozen afterwards).
+    // Rows are imported under their own file key; a mis-keyed row stays inert.
     mkdirSync(tempDir, { recursive: true });
     writeFileSync(join(tempDir, 'sessions.json'), JSON.stringify({
-      wrongKey: {
-        sessionId: 'realId', chatId: 'c1', rootMessageId: 'r1', title: 'Mislabelled',
+      realId: {
+        sessionId: 'realId', chatId: 'c1', rootMessageId: 'r1', title: 'CURRENT',
         status: 'active', createdAt: '2026-01-01T00:00:00.000Z',
+      },
+      wrongKey: {
+        sessionId: 'realId', chatId: 'c1', rootMessageId: 'r1', title: 'STALE-DUP',
+        status: 'closed', createdAt: '2026-01-01T00:00:00.000Z',
       },
     }));
 
     init();
-    expect(getSession('realId')?.title).toBe('Mislabelled');
-    expect(Object.keys(readPersistedRows(tempDir))).toEqual(['realId']);
+    expect(getSession('realId')?.title).toBe('CURRENT');
+    expect(getSession('realId')?.status).toBe('active');
+    const onDisk = readPersistedRows(tempDir);
+    expect(onDisk.realId.title).toBe('CURRENT');
+    expect(onDisk.wrongKey.title).toBe('STALE-DUP');
   });
 });
 
