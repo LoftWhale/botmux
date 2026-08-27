@@ -324,6 +324,14 @@ Node 免 flag 线仍是 v22.13.0 / v23.4.0，但仓库 `engines` 跟 master 的
 今天任何能往 dataDir 写文件的进程放一个 `sessions-evil.json`，若目标 session 所在 store
 尚无 `.db`，它就是唯一命中并被当作身份来源。
 
+**顺带修掉的 master 活 bug（#852 引入，非本步回归）**：一次性导入的暂存库原本开
+WAL，而 `renameSync` 只搬走一个文件。`bun:sqlite` 关连接时不把 `-wal` 折回主文件，
+于是行全留在 `sessions.db.tmp-wal` 里，发布出去的是 4KB 只有文件头的库，之后每次
+打开报 `disk I/O error`；导入门是 `existsSync(db)`，这个壳再也不会被重建——迁移前的
+会话在所有活路径上消失。两个 checkout 同一份输入实测复现。暂存改用回滚日志
+（`journal_mode = DELETE`）让文件自包含，真正的库仍跑 WAL。本 PR 把 JSON 引擎删掉
+之后导入是唯一迁移路径，所以必须在这里修。
+
 **已知边界（本步接受并明写）**：
 
 - 从**迁移前**版本直接升到 db-only 版本、且旧 daemon 仍在跑时，该 bot 的 store 没有
@@ -336,6 +344,10 @@ Node 免 flag 线仍是 v22.13.0 / v23.4.0，但仓库 `engines` 跟 master 的
   peer 不可见，不报错。
 - 离线写不再顺手收敛整个 store（行级写只碰一行）：错键的脏行不再被删除，
   保持惰性存在。
+- **沙盒内的未导入检测失效**：`fs-policy` 撤掉了 `sessions-<appId>.json` 授权，
+  bwrap 内的 `existsSync` 看不到那个文件，所以窗口期沙盒里的 `botmux send`
+  仍然是「找不到 session」而不是「请重启 daemon」。保留那条授权能让检测在沙盒里
+  生效，但那等于为一个本步假设已关闭的窗口永久留一个沙盒授权；这里选了减负。
 - **legacy `sessions.json` 里没有 `larkAppId` 的行（多 bot 拆分之前的遗留）不再可见。**
   实测对照确认：master 上 `loadAllSessionsSnapshot` 经 db-else-json 还能读到它们，
   db-only 下读不到。这类行本来就不归任何 per-bot store 所有——#852 的导入按
