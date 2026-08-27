@@ -20,7 +20,7 @@
 //     NAPI_RS_NATIVE_LIBRARY_PATH; handled by the runtime bootstrap the plugin
 //     injects. Absent native → card render degrades, daemon still runs.
 //
-// PREREQ: `pnpm build` first — this bundles from dist/ (the same artifact npm
+// PREREQ: `bun run build` first — this bundles from dist/ (the same artifact npm
 // ships); it does NOT recompile TypeScript.
 //
 // MATRIX: --all cross-compiles darwin/linux × arm64/x64. Only the host-arch
@@ -94,7 +94,7 @@ function resolveNodePtyNative(platform, arch) {
     throw new Error(
       `node-pty native not found for ${platform}-${arch}: checked ${prebuilt} and ${localBuild}. ` +
       `Cross-compiling a target whose prebuild isn't present fails closed — build that target on its ` +
-      `own runner (where \`pnpm install\` compiles build/Release/pty.node), as CI does.`,
+      `own runner (where \`bun install\` compiles build/Release/pty.node), as CI does.`,
     );
   }
   const spawnHelper = platform === 'darwin'
@@ -109,7 +109,7 @@ async function buildOne({ target, out }) {
 
   const entry = join(REPO_ROOT, 'dist', 'cli.js');
   if (!existsSync(entry)) {
-    throw new Error('dist/cli.js missing — run `pnpm build` first (this bundles from dist/, it does not run tsc).');
+    throw new Error('dist/cli.js missing — run `bun run build` first (this bundles from dist/, it does not run tsc).');
   }
 
   const outfile = out ?? join(REPO_ROOT, 'dist-bin', target ? target.replace(/^bun-/, 'botmux-') : 'botmux');
