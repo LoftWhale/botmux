@@ -10,9 +10,11 @@
  *
  * Lifecycle per turn, driven by the worker's `thinking_update` IPC:
  *
- *   1. First update → POST create (chat-addressed; `origin_message_id` set to
- *      the triggering message so the bubble lands inside the topic) →
- *      `{cot_id, message_id}` → push RUN_STARTED + REASONING_START prologue.
+ *   1. First update → POST create (chat-addressed; placement mirrors
+ *      sessionReply's reply-target routing — thread targets create with
+ *      `origin_message_id` + `reply_in_thread` so the bubble lands INSIDE the
+ *      topic, see {@link cotPlacement}) → `{cot_id, message_id}` → push
+ *      RUN_STARTED + REASONING_START prologue.
  *   2. Subsequent updates → PUT AG-UI events. The worker sends the FULL
  *      cumulative ENTRY LIST (thinking paragraphs + tool calls/results in
  *      transcript order, append-only); this module pushes each unseen entry
@@ -35,6 +37,7 @@
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getBotClient } from '../../bot-registry.js';
+import { resolveSessionReplyTarget } from '../../core/reply-target.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -165,6 +168,35 @@ function ev(eventType: string, content: unknown): CotEvent {
   return { event_type: eventType, content: JSON.stringify(content), timestamp: Date.now() };
 }
 
+/**
+ * Create-time placement, mirroring sessionReply's reply-target routing.
+ *
+ * `origin_message_id` alone only PARENTS the bubble (message.get shows
+ * parent/root but no thread_id) — in a topic group it renders at CHAT level,
+ * outside the topic. Landing inside requires `reply_in_thread: true` on the
+ * create, same semantics as the ordinary reply API (verified empirically:
+ * origin+flag → thread_id=omt_*, origin alone → none). So thread targets
+ * (topic sessions, and chat-scope turns folded into a topic) set the flag on
+ * their anchor; quote targets anchor without the flag; plain chat-scope turns
+ * keep the old behavior — anchor to the triggering message when it is a real
+ * Lark id (synthetic scheduler ids → bare chat-level bubble). The flag must
+ * NEVER ride a plain-group anchor: reply_in_thread on a non-topic message
+ * spawns a brand-new topic.
+ */
+function cotPlacement(ds: DaemonSession, state: CotState): { origin_message_id?: string; reply_in_thread?: boolean } {
+  const target = resolveSessionReplyTarget(ds, state.turnId);
+  if (target.mode === 'thread' || target.mode === 'quote') {
+    // Thread-scope sessions always have rootMessageId; the turn-id fallback
+    // covers degenerate restores (a thread trigger id still threads correctly).
+    const anchor = target.rootMessageId ?? (state.turnId.startsWith('om_') ? state.turnId : undefined);
+    if (!anchor) return {};
+    return target.mode === 'thread'
+      ? { origin_message_id: anchor, reply_in_thread: true }
+      : { origin_message_id: anchor };
+  }
+  return state.turnId.startsWith('om_') ? { origin_message_id: state.turnId } : {};
+}
+
 async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
   const c = getBotClient(ds.larkAppId);
   const res = await c.request({
@@ -173,10 +205,7 @@ async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
     params: { receive_id_type: 'chat_id' },
     data: {
       receive_id: ds.chatId,
-      // Placement: the bubble inherits the topic of the message it originates
-      // from. Turn ids are the triggering Lark message ids for ordinary turns;
-      // synthetic ids (scheduler etc.) are skipped → bubble lands at chat level.
-      ...(state.turnId.startsWith('om_') ? { origin_message_id: state.turnId } : {}),
+      ...cotPlacement(ds, state),
     },
     timeout: COT_REQUEST_TIMEOUT_MS,
   } as any);

@@ -32,7 +32,14 @@ const flush = async (): Promise<void> => {
   for (let i = 0; i < 10; i++) await Promise.resolve();
 };
 
-const makeDs = (): any => ({ larkAppId: 'app1', chatId: 'oc_chat1', session: { sessionId: 's1' } });
+/** Default: a thread-scope (topic) session — scope undefined ≠ 'chat', with
+ *  the topic root as rootMessageId, matching real topic sessions. */
+const makeDs = (over: any = {}): any => ({
+  larkAppId: 'app1',
+  chatId: 'oc_chat1',
+  ...over,
+  session: { sessionId: 's1', rootMessageId: 'om_root1', ...(over.session ?? {}) },
+});
 
 const think = (text: string): any => ({ kind: 'thinking', text });
 const upd = (entries: any[], turnId = 'om_turn1'): any => ({ type: 'thinking_update', entries, turnId });
@@ -56,13 +63,15 @@ beforeEach(() => {
 });
 
 describe('handleCotThinkingUpdate', () => {
-  it('creates the CoT with topic origin, sends the AG-UI prologue and the first segment node', async () => {
+  it('topic session: creates INSIDE the topic (root anchor + reply_in_thread), sends the AG-UI prologue', async () => {
     const ds = makeDs();
     expect(handleCotThinkingUpdate(ds, upd([think('step 1')]))).toBe(true);
     await flush();
     const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
     expect(create.params).toEqual({ receive_id_type: 'chat_id' });
-    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_turn1' });
+    // origin_message_id alone parents the bubble but leaves it at chat level
+    // (outside the topic) — reply_in_thread is what actually threads it.
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_root1', reply_in_thread: true });
     const events = pushedEvents();
     expect(events.map(e => e.type)).toEqual([
       'RUN_STARTED', 'REASONING_START',
@@ -71,12 +80,44 @@ describe('handleCotThinkingUpdate', () => {
     expect(events[3].content.delta).toBe('step 1');
   });
 
-  it('skips origin_message_id for synthetic (non om_) turn ids', async () => {
+  it('topic session with a synthetic (non om_) turn id still threads via the topic root', async () => {
     const ds = makeDs();
     handleCotThinkingUpdate(ds, upd([think('x')], 'sched-123'));
     await flush();
     const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_root1', reply_in_thread: true });
+  });
+
+  it('chat-scope session: anchors to the triggering message WITHOUT reply_in_thread (a plain-group anchor must not spawn a topic)', async () => {
+    const ds = makeDs({ scope: 'chat' });
+    handleCotThinkingUpdate(ds, upd([think('x')]));
+    await flush();
+    const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_turn1' });
+  });
+
+  it('chat-scope session skips origin_message_id for synthetic turn ids', async () => {
+    const ds = makeDs({ scope: 'chat' });
+    handleCotThinkingUpdate(ds, upd([think('x')], 'sched-123'));
+    await flush();
+    const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
     expect(create.data).toEqual({ receive_id: 'oc_chat1' });
+  });
+
+  it('chat-scope turn folded into a topic (per-turn thread reply target) threads into that topic', async () => {
+    const ds = makeDs({ scope: 'chat', session: { replyTargets: { om_turn1: { rootMessageId: 'om_fold_root' } } } });
+    handleCotThinkingUpdate(ds, upd([think('x')]));
+    await flush();
+    const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_fold_root', reply_in_thread: true });
+  });
+
+  it('chat-scope quote-only reply target anchors to the quote WITHOUT reply_in_thread', async () => {
+    const ds = makeDs({ scope: 'chat', session: { replyTargets: { om_turn1: { rootMessageId: 'om_quote_tgt', quoteOnly: true } } } });
+    handleCotThinkingUpdate(ds, upd([think('x')]));
+    await flush();
+    const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_quote_tgt' });
   });
 
   it('pushes each new thinking entry as its own reasoning message (one node per entry)', async () => {
