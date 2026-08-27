@@ -182,13 +182,34 @@ const BOTMUX_LEADING_BLOCK_TAGS: readonly string[] = [
  *  positive, but that input is byte-identical to botmux's own output, so no
  *  content-based check can separate them; accepted as residual.
  *
+ *  KNOWN RESIDUAL FALSE NEGATIVE (pre-existing, not introduced here): the close
+ *  lookup takes the FIRST `</tag>`, so a block whose own body contains that
+ *  literal string ends early and the walk then hits prose and bails. Reachable
+ *  only through `<role>`: `renderRoleContextBlock` interpolates persona text
+ *  unescaped, so a persona containing `</role>` (nested or bare) truncates the
+ *  block. Measured: such prompts leak, while the same shape without the literal
+ *  is correctly dropped. Deliberately NOT fixed — the two candidate fixes are
+ *  both worse:
+ *    - depth-counting `<role …>` vs `</role>` only handles the NESTED variant; a
+ *      bare `</role>` in the body has no opening tag to count, so it still leaks;
+ *    - taking the LAST `</tag>` before the envelope fixes both but introduces a
+ *      real false positive — an external prompt discussing two of the same block
+ *      (`<session_id>abc</session_id> 请解释 <session_id>def</session_id>` +
+ *      envelope) then gets swallowed, which is the failure direction that
+ *      actually costs the user something.
+ *  Failure direction here is a session merely APPEARING in the /adopt list, and
+ *  these prompts leaked before this function existed too, so the residual is
+ *  strictly narrower than the pre-existing behavior.
+ *
  *  Deliberately NOT a regex. The natural regex form
  *  (`^<(?:tag|…)\b[^>]*>[\s\S]*?<user_message>[\s\S]*?<\/user_message>`) is
  *  quadratic: both lazy scans restart at every `<user_message>` occurrence, so
  *  a prompt of repeated `<user_message>` opens with no close took 374ms at 100k
  *  chars and 5969ms at 400k (4× input → 16× time), against 0.3ms for the
  *  pre-existing patterns on the same input. Every scan below is `startsWith` /
- *  `indexOf` over a strictly advancing cursor — linear, cannot backtrack. */
+ *  `indexOf` over a strictly advancing cursor — linear, cannot backtrack. A
+ *  failed `indexOf` returns immediately, so at most one full-length scan happens
+ *  per call: a 50k-block chain measured 20.7ms, a 1.5MB adversarial input ~3ms. */
 function startsWithBotmuxLeadingBlock(text: string): boolean {
   if (!text.startsWith('<')) return false;
   let i = 0;

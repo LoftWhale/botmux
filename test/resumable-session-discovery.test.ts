@@ -700,6 +700,67 @@ describe('isBotmuxInjectedPrompt', () => {
     expect(isBotmuxInjectedPrompt([ROLE, SUMMARY, WB, CCP, CC, UM].join('\n\n'))).toBe(true);
   });
 
+  // Nested children are normal: <chat_context> wraps <chat_id>/<name>/<description>
+  // and <whiteboard> can carry markup. The block walk looks for an exact `</tag>`,
+  // so a child element never terminates its parent early.
+  it('drops a botmux prompt whose leading block has nested children', () => {
+    const nested = '<chat_context source="lark" trust="untrusted" fetch_status="ok">\n'
+      + '  <chat_id>oc_x</chat_id>\n  <name>群</name>\n  <description>d</description>\n'
+      + '</chat_context>';
+    expect(isBotmuxInjectedPrompt(`${nested}\n\n${UM}`)).toBe(true);
+  });
+
+  it('keeps an external prompt that only mentions the envelope inside a nested child', () => {
+    // The outer block never closes, so this is prose about botmux, not a botmux turn.
+    expect(isBotmuxInjectedPrompt(
+      '<chat_context source="lark">\n  <description>我在问 <user_message>hi</user_message> 是什么</description>\n</chat_context>',
+    )).toBe(false);
+  });
+
+  it('keeps an external prompt with an unknown block spliced into the chain', () => {
+    // Adjacency means EVERY element up to the envelope must be a known block.
+    expect(isBotmuxInjectedPrompt(
+      `${ROLE}\n<unknown_block>x</unknown_block>\n${UM}`,
+    )).toBe(false);
+  });
+
+  it('drops a botmux prompt whose leading block body is empty', () => {
+    expect(isBotmuxInjectedPrompt(`<session_id></session_id>\n\n${UM}`)).toBe(true);
+  });
+
+  // Documents the known residual false negative rather than asserting it is
+  // desirable: the close lookup takes the FIRST `</tag>`, so a persona containing
+  // that literal truncates its own <role> block. Pre-existing — these shapes
+  // leaked before the generalized check existed too (verified against the
+  // `^`-anchored patterns alone). Pinned so a future "fix" that reopens a real
+  // false positive (see the function's comment) is a visible, deliberate change.
+  const ROLE_OPEN = '<role context="group" chat_id="oc">';
+  it('leaks when a persona body contains a nested </role> (known residual)', () => {
+    expect(isBotmuxInjectedPrompt(
+      `${ROLE_OPEN}外层 <role>内层</role> 人格</role>\n\n${SUMMARY}\n\n${UM}`,
+    )).toBe(false);
+  });
+
+  it('leaks when a persona body contains a bare </role> (known residual)', () => {
+    // Note this needs NO nested opening tag, so depth-counting would not help.
+    expect(isBotmuxInjectedPrompt(
+      `${ROLE_OPEN}格式见 </role> 说明</role>\n\n${SUMMARY}\n\n${UM}`,
+    )).toBe(false);
+  });
+
+  it('drops the same shape when the persona has no </role> literal (control)', () => {
+    expect(isBotmuxInjectedPrompt(
+      `${ROLE_OPEN}外层人格</role>\n\n${SUMMARY}\n\n${UM}`,
+    )).toBe(true);
+  });
+
+  it('keeps an external prompt discussing two same-name blocks', () => {
+    // Guards the rejected "take the LAST </tag>" fix: it would swallow this.
+    expect(isBotmuxInjectedPrompt(
+      `<session_id>abc</session_id> 请解释 <session_id>def</session_id>\n${UM}`,
+    )).toBe(false);
+  });
+
   it('stays linear on adversarial input (no catastrophic backtracking)', () => {
     // The natural regex form of the generalized leading-block check is
     // quadratic: both lazy scans restart at every `<user_message>`. Measured at
