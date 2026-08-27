@@ -2,15 +2,16 @@
 title: Session 架构拆解回收与 store-first 重新分步
 type: design
 date: 2026-08-12
-updated: 2026-08-27（Step 3 第一 PR rebase 到 origin/master@06db2b48；会话库改走 sqlite-compat，engines 跟 master）
+updated: 2026-08-28（Step 3 第一 PR 已合入 master；第二 PR = JSON 净删除 + Step 4(a) 事务化，见「执行结果（2026-08-28）」）
 topic: session-restage-store-first
 status: proposed
-baseline: origin/master@06db2b48（0827 复核基线；0820 复核基线 3d84aaad；0819 复核基线 47b2c11a；0813 复核基线 16fde8a27；原始基线 723c79ade）
+baseline: origin/master@0265234d（0828 复核基线，含已合入的 #852；0827 复核基线 06db2b48；0820 复核基线 3d84aaad；0819 复核基线 47b2c11a；0813 复核基线 16fde8a27；原始基线 723c79ade）
 references:
   - feat/virtual_actor_stage2@b6a4982ea（不合入；仅作参考实现、竞态清单与写点地图）
   - docs/design/2026-08-08-virtual-actor-session-runtime.md（原始提案；本目录保留未跟踪副本）
   - PR #846（Step 1+2 产出）
-  - PR #852（Step 3 第一 PR：引擎替换 + 导入 + 混合窗口；JSON 净删除另立第二 PR）
+  - PR #852（Step 3 第一 PR：引擎替换 + 导入 + 混合窗口；**已合入 master**）
+  - Step 3 第二 PR：JSON 引擎净删除（db-only）+ Step 4(a) 事务化，兑现原则 1
 ---
 
 # Session 架构拆解回收与 store-first 重新分步
@@ -266,6 +267,71 @@ Node 免 flag 线仍是 v22.13.0 / v23.4.0，但仓库 `engines` 跟 master 的
   `readSessionRowCopiesAcrossStores`；#946 journal / #1008 schedule 仍是旁路
   文件，符合非目标。无 SessionRuntime 回流，Step 4(f) 占位租约仍未实施。
 
+**执行结果（2026-08-28，Step 3 第二 PR，基线 `origin/master@0265234d`）**：
+
+原则 1 在本步兑现。`session-store.ts` 从 2154 行降到约 1800 行，且删掉的全部是机器
+而不是注释：
+
+- **JSON 引擎净删除**：`save()` 整份序列化 + byte-identical 跳写、`load()` 的
+  JSON/legacy 迁移分支、`readExistingSessionsFromDisk` / `readSessionsProjectionStrict`、
+  Remote lineage CAS + readback 的 JSON 实现（约 80 行）、`mutateSessionRowOffline`
+  的 JSON 分支、以及 `StoreFileRef.kind` 撑起来的整套 db-else-json 分流。
+  `resolveStoreFile` / `listStoreRefs` / `readStoreEntries` / `readStoreRowByKey` /
+  `readStoreActiveRows` / `countActiveSessionsOnDisk` / `getSessionFresh` 一律 db-only。
+- **`withFileLockSync` 只剩导入一处**（编排全部消失）。**没有全删**：导入经固定的
+  `<db>.tmp` 暂存，同一 bot 的两个 owner 进程可能短暂并存（重启撞上尚未回收的前任），
+  两边都会通过 `existsSync(db)`、写同一个 tmp、发布出损坏库。改 per-process tmp 名会换来
+  没人清理的孤儿文件；直接建进最终 `.db` 则会打破本设计赖以成立的不变量——
+  「`.db` 存在」必须等价于「导入已完成」，否则半截导入会静默关掉导入门、丢光迁移前的行。
+- **脏数据修补收敛为导入期一次性**：`stripLegacyPendingCardFields` 与
+  `repairMissingChatScope` 不再挂在每次写、也不再挂在 `load()` 上（`Session` 类型已不含
+  那些字段，SQLite 写出的行天生干净），连带删掉 `repairMissingChatScopes()` 这个
+  map 级修补函数与它在每次 load 里那次「修完再写回」的额外事务。
+  唯一保留的读侧调用在 `loadAllSessionsSnapshot`：它读的是**别人的 store**，
+  这个进程既不拥有也修不了那些行，一次纯内存归一化是合理的，且不写盘。
+  原先只在「恰好对该 store 做过一次离线写」时才发生的 key-mismatch 收敛，
+  改成导入时按行自身的 `sessionId` 归位——修好而不是丢掉。
+- **未导入的 store 一律 fail-closed**，不再静默空投影。新增 `SessionStoreNotImportedError`：
+  「有 `sessions*.json` 但没有 `.db`」意味着拥有该 bot 的 daemon 还在跑迁移前的版本，
+  `loadAllSessionsSnapshot`（仅针对调用方自己的 store）、`mutateSessionRowOffline`、
+  以及 `owner: false` 的 `load()` 都报出可行动的错误。这是删掉 db-else-json 之后
+  「灰度窗口」的诚实形态：把静默降级换成一句「重启 daemon 完成一次性导入」。
+  peer bot 的未导入 store 保持不可见（本来就不是调用方的事）。
+- **两条建库地雷已封**（删 JSON 分支时才暴露出来，master 上靠 db-else-json 的
+  `existsSync` 前置侥幸不可达）：SQLite 的读写 open **会创建文件**，而一个空库会让
+  daemon 的 `existsSync(db)` 导入门判假、静默丢掉整份迁移前的行。现在
+  `openDbForRead` 对不存在的路径直接抛错，`mutateSessionRowOffline` 在 open 前先
+  `existsSync`，`withOwnStoreDb` 不再自开连接而是走 `loadForWrite()` 复用 load 附着的那个。
+- **死参数删除**：Remote 两个批量 API 的 `options.maxWaitMs` 自 #852 起在 SQLite 路径上
+  就已失效（它约束的是文件锁），现在连 JSON 路径也没有了，从签名删除；
+  fleet shutdown 的 deadline 预检（`remaining <= 0` 直接拒绝）保留，仍在干活。
+  等待上限统一由 `busy_timeout`（3s）决定。
+- **沙盒收面**：`fs-policy` 的两处 readOnly 授权不再包含冻结的
+  `sessions-<appId>.json`，只授权 `session-stores/<appId>` 目录；兄弟 bot 仍 deny-by-default。
+- **冻结 JSON 的处置（第二 PR 待决项 6）决定：原地保留，不删不改名。** 它已不被任何
+  运行时路径读取，代码成本为零；而它是回退到迁移前版本时唯一还能读的副本，改名反而会让
+  回退后的旧 daemon 从空库起步、再写出一份新的 JSON。几百 KB 换一条不可逆边界的兜底，
+  值得。
+
+**顺带的正向副作用（身份扫描）**：`readSessionRowCopiesAcrossStores` 的「恰好一次」判定
+在 db-only 下更准。legacy → per-bot 的迁移一直是**复制不删除**，所以
+`{sessions.json 含 X, session-stores/A/sessions.db 含 X}` 是常态，今天会被判成「重复 →
+拒绝推断当前调用者」。冻结 JSON 不再是 store 之后这类假歧义消失；同时也堵掉一个伪造面：
+今天任何能往 dataDir 写文件的进程放一个 `sessions-evil.json`，若目标 session 所在 store
+尚无 `.db`，它就是唯一命中并被当作身份来源。
+
+**已知边界（本步接受并明写）**：
+
+- 从**迁移前**版本直接升到 db-only 版本、且旧 daemon 仍在跑时，该 bot 的 store 没有
+  `.db`：worker（`owner: false`）与 CLI 离线写都会 fail-closed 报错，直到 daemon 重启完成
+  导入。自动更新默认关闭、`botmux upgrade` 也只提示用户自己 `botmux restart`，所以这个
+  窗口没有上界——**本步的前提就是灰度窗口已关闭**（fleet 里每个 bot 都至少在 #852 的
+  版本上重启过一次）。
+- 跨 bot 发现（`findActiveSessionsByRoot` / `findActiveChatScopeSessionsByChat` /
+  `countActiveSessionsOnDisk` / `collectBotmuxSessionIdentities`）只看 `.db`：未导入的
+  peer 不可见，不报错。
+- 离线写不再顺手收敛整个 store（行级写只碰一行）。收敛点上移到导入。
+
 ### Step 4 — 按痛点上事务（N 个独立小 PR，ROI gate）
 
 仅对**在 master 上有实测复现**的竞态，用 SQLite 事务原语逐个重做。
@@ -276,15 +342,26 @@ Node 免 flag 线仍是 v22.13.0 / v23.4.0，但仓库 `engines` 跟 master 的
 【master 复核 ✅ 事务形状的 ad-hoc 防御真实存在，候选素材如下（未验复现，
 仅为「去哪里看」清单）】
 
-- (a) `closeSession`/`reactivateClosedSession` 的手工回滚（session-store.ts
-  `closeSession` / `reactivateClosedSession` / `mutateMojoCloseJournal` 的
-  persistRow 失败还原）——save 抛错时逐字段还原。Step 3 落地后事务化即天然
-  替代，可能不需要独立 PR。行号随 master 漂移，以符号名为准。
+- (a) `closeSession`/`reactivateClosedSession` 的手工回滚 —— **已随 Step 3 第二 PR
+  落地，不再单独立项**（原判断「Step 3 落地后事务化即天然替代」成立）。原实现在活的
+  `Session` 对象上就地改，写失败再逐字段还原：`closeSession` 抄 14 个字段、
+  `reactivateClosedSession` 抄 20 个、`mutateMojoCloseJournal` 抄 2 个——一份靠人肉维护的
+  undo 日志，漏抄一个字段就是一次静默不一致。现在改成**先持久化副本、提交成功后再合并回
+  内存对象**（`persistRow(next)` → `Object.assign(session, next)`），失败路径变成「什么都
+  没发生」，没有可漏抄的东西。用 `Object.assign` 而不是替换 map 里的引用，是因为
+  `DaemonSession` 等模块持有同一个对象的别名——§3「不动内存共享可变语义」在此仍然成立。
+  既有的三条回滚回归用例（Riff lineage / previewTarget / mojo park 在写失败后保持原状）
+  一字未改地继续绿，就是等价性的证明。
 - (b) `reserveWorkerGeneration` 回滚重抛（0819：worker-pool.ts `reserveWorkerGeneration`）
   与 worker exit fence 的**无保护** `updateSession`——后者是 Step 1 分析中发现
   的疑似真实脆弱点。立项前必须在现行 master 重新定位行号并写出能红的测试。
-- (c) `admitQueuedActivationTail` 的 priorTail 回滚舞蹈（0819：worker-pool.ts
-  `admitQueuedActivationTail`）。
+- (c) `admitQueuedActivationTail` 的 priorTail 回滚舞蹈（worker-pool.ts
+  `admitQueuedActivationTail`）。**0828 复核：形状与 (a) 相同，但不能照搬 (a) 的消法。**
+  (a) 在 store 内部，可以「持久化副本 → `Object.assign` 回活对象」；(c) 在 store 外部，
+  只能调 `updateSession(session)`，而它会 `sessions.set(id, session)`——传副本进去会把
+  map 里的条目换成副本，切断 `ds.session` 的别名。要按 (a) 的方式做，得先给 store 加一个
+  「按 patch 更新、不重绑引用」的新 API；为省掉 4 行还原代码而新增一个公共写入口，不划算。
+  暂不立项，除非将来另有独立理由引入该 API。
 - (d) **async tail-admission 整套**（0819：daemon.ts
   `queuedActivationTailAdmissionsOutstanding` / ReleasePending / RetryTimer
   三件套 + DaemonSession 三字段 + gate 分支）——Step 1 候选 5 的降级素材归位处：
