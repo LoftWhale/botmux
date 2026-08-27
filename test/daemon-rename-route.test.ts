@@ -199,8 +199,6 @@ import { admitQueuedActivationTail } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
 
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
