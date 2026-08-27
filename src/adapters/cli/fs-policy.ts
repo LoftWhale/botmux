@@ -763,16 +763,14 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   push(dropAuthority(ctx.extraWritePaths), 'readWrite', 'internal');
   push(dropAuthority(ctx.readonlyRoots), 'readOnly', 'internal');
   // Own routing metadata (`botmux send` reply routing) — read-only. The store
-  // is SQLite in its own per-bot DIRECTORY (db-else-json mixed window keeps
-  // the .json grant): the dir grant is deliberate — a single-file bwrap bind
-  // pins the inode, and SQLite deletes/recreates -wal/-shm across daemon
-  // restarts, so a persistent pane with file binds would keep reading the dead
-  // WAL forever. A directory bind resolves names live. Sibling bots' store
-  // dirs stay uncovered (deny-by-default).
-  push([
-    `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.json`,
-    `${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`,
-  ], 'readOnly', 'internal');
+  // is SQLite in its own per-bot DIRECTORY: the dir grant is deliberate — a
+  // single-file bwrap bind pins the inode, and SQLite deletes/recreates
+  // -wal/-shm across daemon restarts, so a persistent pane with file binds
+  // would keep reading the dead WAL forever. A directory bind resolves names
+  // live. Sibling bots' store dirs stay uncovered (deny-by-default). The
+  // pre-SQLite `sessions-<appId>.json` is NOT granted: it is an import source
+  // the store never reads at runtime.
+  push([`${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`], 'readOnly', 'internal');
   // Own upload bucket — readWRITE: `botmux quoted` / downloadResources writes the
   // downloaded attachment under attachments/<self>/<messageId>/… (not just reads
   // pre-uploaded files). The worker mkdirs it pre-spawn so it survives the
@@ -909,9 +907,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     //    own-app-scoped — NOT the shared secret/port table).
     push([
       `${ctx.sessionDataDir}/bots-info.json`,               // display names for <available_bots> (public-ish)
-      `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.json`,
       // Own SQLite store DIRECTORY (see the larkTransport grant above for why
-      // a dir, not the three files).
+      // a dir, not the three files). The pre-SQLite JSON is not granted.
       `${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`,
       `${ctx.sessionDataDir}/bot-openids-${ctx.currentAppId}.json`,
       // Core-only writes its `botmux` wrapper into <dataDir>/bin (dedicated, NOT

@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
@@ -40,25 +40,26 @@ export class SessionStoreUnavailableError extends Error {
 
 
 // Legacy fields from the removed「处理中」placeholder-card PATCH delivery. They
-// no longer exist on Session and nothing reads them, but sessions persisted
-// before the removal still carry them on disk. Strip on write so the store
-// converges to clean on the first save (daemon + CLI both call this).
+// no longer exist on `Session`, so no code path can produce them any more —
+// only rows persisted before the removal carry them. Stripping happens ONCE,
+// while importing those rows; every row the SQLite engine has ever written is
+// clean by construction, so the write paths do not re-check.
 const LEGACY_PENDING_CARD_FIELDS = ['pendingResponseCardId', 'pendingResponseCardState', 'lastPatchedResponseCardId'] as const;
-export function stripLegacyPendingCardFields(session: Record<string, unknown>): void {
+function stripLegacyPendingCardFields(session: Record<string, unknown>): void {
   for (const f of LEGACY_PENDING_CARD_FIELDS) delete session[f];
 }
 
-// ─── SQLite engine plumbing ──────────────────────────────────────────────────
+// ─── SQLite engine ───────────────────────────────────────────────────────────
 // Per-bot session rows live in `session-stores/<appId>/sessions.db` (legacy
-// no-appId store: `sessions.db`), one table, whole-row JSON column. The TS `Session` type stays
-// the schema authority; the generated columns below only serve hot lookups.
-// The pre-SQLite JSON files are frozen in place on first import and never
-// written again — reinstalling an older botmux and restarting reads them as of
-// the freeze instant (the rollback story for the migration window).
+// no-appId store: `sessions.db`), one table, whole-row JSON column. The TS
+// `Session` type stays the schema authority; the generated columns below only
+// serve hot lookups.
 //
-// Mixed upgrade window (npm upgraded, daemon not yet restarted): every
-// cross-process reader and CLI offline write path resolves each store as
-// "use the .db when it exists, else the .json".
+// SQLite is the ONLY engine. The pre-SQLite `sessions*.json` files are a
+// one-shot IMPORT SOURCE (below) and nothing else: after the import they are
+// frozen in place, never read on any live path and never written again. They
+// are deliberately not deleted — they are the only artifact a downgrade to a
+// pre-SQLite botmux can still read, and they cost a few hundred KB.
 
 type SqliteStatementLike = StatementLike;
 type SqliteDatabaseLike = DatabaseSyncLike;
@@ -94,6 +95,35 @@ export function __testOnly_setSqliteUnavailable(unavailable: boolean): void {
  *  NOT this error — that is a regular open failure the scan may skip. */
 export class SessionStoreSqliteUnavailableError extends Error {
   override readonly name = 'SessionStoreSqliteUnavailableError';
+}
+
+/** A store whose pre-SQLite `sessions*.json` still exists while its `.db` does
+ *  not: the daemon that owns it has not restarted on a SQLite build yet, so
+ *  the one-shot import has not run. Only that daemon may import (the
+ *  `owner: false` contract), so cross-process callers refuse loudly instead of
+ *  reporting an empty store — an offline close that silently no-ops, or a
+ *  `botmux send` that cannot find its own session, is the worse outcome. */
+export class SessionStoreNotImportedError extends Error {
+  override readonly name = 'SessionStoreNotImportedError';
+}
+
+/** Refuse a store that still has an un-imported JSON predecessor. The source
+ *  set mirrors `readJsonEntriesForImport`: this store's own file, else — for a
+ *  per-bot store — the legacy `sessions.json` the import would read its rows
+ *  from. A data dir with neither is simply empty and stays silent (a remote
+ *  sandbox has no local store at all). */
+function assertStoreImported(appId: string | undefined, dataDir: string): void {
+  if (existsSync(storeDbPath(appId, dataDir))) return;
+  const ownJsonFp = join(dataDir, storeJsonFileName(appId));
+  const legacyJsonFp = join(dataDir, 'sessions.json');
+  const pendingJsonFp = existsSync(ownJsonFp) ? ownJsonFp
+    : appId && existsSync(legacyJsonFp) ? legacyJsonFp
+      : undefined;
+  if (!pendingJsonFp) return;
+  throw new SessionStoreNotImportedError(
+    `会话库尚未迁移到 SQLite：${pendingJsonFp} 存在但 ${storeDbPath(appId, dataDir)} 不存在。`
+    + `拥有该 bot 的 daemon 仍在跑迁移前的版本——请重启 daemon（botmux restart）让它完成一次性导入。`,
+  );
 }
 
 function sqliteUnavailableMessage(context: string): string {
@@ -136,6 +166,11 @@ function openDbForOwnStore(path: string): SqliteDatabaseLike {
  *  -shm they piggyback on). Callers must only SELECT. */
 function openDbForRead(path: string): SqliteDatabaseLike {
   requireSqliteEngine(`会话存储 ${basename(path)} `);
+  // A read-write open CREATES a missing file. An empty store planted here
+  // would make the owning daemon's `existsSync(db)` import gate skip the
+  // one-shot JSON import and silently discard every pre-SQLite row, so a
+  // reader must refuse an absent store outright (scan loops skip it).
+  if (!existsSync(path)) throw new Error(`session store ${path} does not exist`);
   let db: SqliteDatabaseLike;
   try {
     db = openDatabaseSyncOrThrow(path);
@@ -191,12 +226,12 @@ export function __testOnly_setBeforeRowPersist(hook: ((sessionId: string) => voi
   testOnlyBeforeRowPersist = hook;
 }
 
-// ─── Store file resolution (db-else-json) ────────────────────────────────────
+// ─── Store resolution ────────────────────────────────────────────────────────
 
 type StoreFileRef = {
   /** undefined = the legacy no-appId store. */
   appId?: string;
-  kind: 'sqlite' | 'json';
+  /** Absolute path of that store's `sessions.db`. */
   path: string;
 };
 
@@ -218,34 +253,25 @@ export function sessionStoreSqliteDir(appId: string, dataDir: string = config.se
 function storeDbPath(appId: string | undefined, dataDir: string): string {
   return appId ? join(sessionStoreSqliteDir(appId, dataDir), 'sessions.db') : join(dataDir, 'sessions.db');
 }
+
+/** Import source only — never read on a live path (see `importJsonStoreToSqlite`). */
 function storeJsonFileName(appId: string | undefined): string {
   return appId ? `sessions-${appId}.json` : 'sessions.json';
 }
 
-/** Per-store rule for every cross-process reader and CLI offline writer:
- *  use the .db when it exists, else the .json. */
 function resolveStoreFile(appId: string | undefined, dataDir: string): StoreFileRef {
-  const dbPath = storeDbPath(appId, dataDir);
-  if (existsSync(dbPath)) return { appId, kind: 'sqlite', path: dbPath };
-  return { appId, kind: 'json', path: join(dataDir, storeJsonFileName(appId)) };
+  return { appId, path: storeDbPath(appId, dataDir) };
 }
 
-/** One ref per store identity across the whole data dir, .db winning: flat
- *  legacy files + per-bot JSON files + per-bot SQLite store directories.
- *  `strict` propagates an unlistable `session-stores/` dir (fail-closed
- *  callers must not mistake an unreadable store set for an empty one);
- *  otherwise it degrades to the JSON view. */
+/** One ref per store that exists on disk: the flat legacy `sessions.db` plus
+ *  every `session-stores/<appId>/sessions.db`. `strict` propagates an
+ *  unlistable `session-stores/` dir (fail-closed callers must not mistake an
+ *  unreadable store set for an empty one); otherwise it degrades to whatever
+ *  could be enumerated. */
 function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreFileRef[] {
   const names = readdirSync(dataDir);
-  const dbPaths = new Map<string, string>();
-  const jsonPaths = new Map<string, string>();
-  for (const name of names) {
-    if (name === 'sessions.db') dbPaths.set('', join(dataDir, name));
-    else if (name === 'sessions.json') jsonPaths.set('', join(dataDir, name));
-    else if (name.startsWith('sessions-') && name.endsWith('.json')) {
-      jsonPaths.set(name.slice('sessions-'.length, -'.json'.length), join(dataDir, name));
-    }
-  }
+  const refs: StoreFileRef[] = [];
+  if (names.includes('sessions.db')) refs.push({ path: join(dataDir, 'sessions.db') });
   if (names.includes(PER_BOT_STORE_DIRNAME)) {
     let appIds: string[] = [];
     try {
@@ -255,29 +281,15 @@ function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreF
     }
     for (const appId of appIds) {
       const dbPath = storeDbPath(appId, dataDir);
-      if (existsSync(dbPath)) dbPaths.set(appId, dbPath);
+      if (existsSync(dbPath)) refs.push({ appId, path: dbPath });
     }
-  }
-  const refs: StoreFileRef[] = [];
-  for (const key of new Set([...dbPaths.keys(), ...jsonPaths.keys()])) {
-    const dbPath = dbPaths.get(key);
-    refs.push({
-      appId: key === '' ? undefined : key,
-      kind: dbPath ? 'sqlite' : 'json',
-      path: dbPath ?? jsonPaths.get(key)!,
-    });
   }
   return refs;
 }
 
-/** All [key, value] entries of one store file. Throws on an unreadable store;
+/** All [key, value] entries of one store. Throws on an unreadable store;
  *  callers decide skip-vs-propagate (capability errors always propagate). */
 function readStoreEntries(ref: StoreFileRef): [string, Session][] {
-  if (ref.kind === 'json') {
-    const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object') return [];
-    return Object.entries(parsed as Record<string, Session>);
-  }
   const db = openDbForRead(ref.path);
   try {
     const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
@@ -291,13 +303,8 @@ function readStoreEntries(ref: StoreFileRef): [string, Session][] {
   }
 }
 
-/** Point-read one key from one store file. Throws on an unreadable store. */
+/** Point-read one key from one store. Throws on an unreadable store. */
 function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | undefined {
-  if (ref.kind === 'json') {
-    const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
-    return (parsed as Record<string, Session>)[sessionId];
-  }
   // The daemon's hot freshness reads hit its own store — reuse the attached
   // connection instead of opening one per call.
   if (ownStore && loaded && ref.appId === currentAppId && ref.path === getDbPath()) {
@@ -313,16 +320,11 @@ function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | unde
   }
 }
 
-/** The active rows of one store file, optionally narrowed by an indexed hint. */
+/** The active rows of one store, optionally narrowed by an indexed hint. */
 function readStoreActiveRows(
   ref: StoreFileRef,
   hint?: { rootMessageId?: string; chatScopeChatId?: string },
 ): Session[] {
-  if (ref.kind === 'json') {
-    const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object') return [];
-    return Object.values(parsed as Record<string, Session>).filter(s => s?.status === 'active');
-  }
   const db = openDbForRead(ref.path);
   try {
     let sql = "SELECT row FROM sessions WHERE status = 'active'";
@@ -426,7 +428,8 @@ export function init(appId?: string, opts: { owner?: boolean } = {}): void {
   }
 }
 
-function getFilePath(): string {
+/** Pre-SQLite JSON file for this store — the one-shot import source. */
+function getImportJsonPath(): string {
   return join(config.session.dataDir, storeJsonFileName(currentAppId));
 }
 
@@ -435,7 +438,7 @@ function getDbPath(): string {
 }
 
 function ensureDir(): void {
-  const dir = dirname(getFilePath());
+  const dir = config.session.dataDir;
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
@@ -461,14 +464,6 @@ export function repairMissingChatScope(session: unknown): boolean {
     return true;
   }
   return false;
-}
-
-function repairMissingChatScopes(): Session[] {
-  const repaired: Session[] = [];
-  for (const session of sessions.values()) {
-    if (repairMissingChatScope(session)) repaired.push(session);
-  }
-  return repaired;
 }
 
 function parseSessionsProjectionStrict(raw: string, fp: string): Record<string, Session> {
@@ -527,7 +522,15 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
     tmp.exec('BEGIN');
     const insert = tmp.prepare('INSERT OR REPLACE INTO sessions (session_id, status, row) VALUES (?, ?, ?)');
     for (const [key, value] of entries) {
-      insert.run(key, sessionStatusText(value), JSON.stringify(value));
+      // Convergence happens HERE, once, instead of on every write: a JSON file
+      // key that disagrees with the row's own sessionId (historical corruption)
+      // is normalised to the row's id, so the primary key and the row always
+      // agree from this point on. The old whole-file offline write dropped such
+      // rows; keying them correctly keeps the data and fixes the lookup.
+      const rowId = typeof (value as { sessionId?: unknown } | null)?.sessionId === 'string'
+        ? (value as unknown as { sessionId: string }).sessionId
+        : key;
+      insert.run(rowId, sessionStatusText(value), JSON.stringify(value));
     }
     tmp.exec('COMMIT');
     tmp.close();
@@ -547,11 +550,40 @@ function load(): void {
   if (loaded) return;
   ensureDir();
   const dbFp = getDbPath();
-  const jsonFp = getFilePath();
 
-  if (!existsSync(dbFp) && sqliteBootstrapAllowed) {
-    // First start on the SQLite engine: import this store's JSON rows (or
-    // create an empty store) under the same lock every JSON writer uses.
+  if (!existsSync(dbFp)) {
+    if (!sqliteBootstrapAllowed) {
+      // `owner: false` (a worker) and no store yet. Only reachable when the
+      // daemon that spawned this process still runs a pre-SQLite build: it
+      // keeps writing its JSON file, and creating the .db behind its back
+      // would fork the two representations. Record the failure instead of
+      // starting from an empty projection, so every write gate
+      // (loadForWrite / listSessionsStrict) fails closed until the daemon
+      // restarts on this build and imports.
+      const err = new SessionStoreNotImportedError(
+        `会话库尚未迁移到 SQLite：${dbFp} 不存在，而本进程（owner: false）不得建库。`
+        + `请重启拥有该 bot 的 daemon 完成一次性导入。`,
+      );
+      logger.error(`Failed to load sessions: ${err.message}`);
+      loadFailure = err;
+      sessions = new Map();
+      loaded = true;
+      return;
+    }
+    // First start on the SQLite engine: import this store's pre-SQLite JSON
+    // rows (or create an empty store).
+    //
+    // This is the ONLY file lock left in the store — the save/load/offline-write
+    // orchestration it used to serialise is gone with the JSON engine. It stays
+    // because the import stages through a FIXED `<db>.tmp` path, and two owning
+    // processes for the same bot can briefly overlap (a restart racing a not-yet
+    // reaped predecessor): both would pass `existsSync(db)`, write the same tmp
+    // file, and publish a corrupt database. A per-process tmp name would trade
+    // that for orphan files no one cleans up, and building straight into the
+    // final `.db` would break the invariant this design rests on — "the .db
+    // exists" must mean "the import completed", or a partial import silently
+    // disables the import gate and drops every pre-SQLite row.
+    const jsonFp = getImportJsonPath();
     mkdirSync(dirname(dbFp), { recursive: true });
     try {
       withFileLockSync(jsonFp, () => {
@@ -571,121 +603,42 @@ function load(): void {
     }
   }
 
-  if (existsSync(dbFp)) {
-    let store: OwnSqliteStore;
-    try {
-      store = attachOwnStore(dbFp);
-    } catch (err) {
-      // Unreadable/corrupt .db: same fail-closed gate as a malformed JSON file.
-      logger.error(`Failed to load sessions: ${err}`);
-      loadFailure = err instanceof Error ? err : new Error(String(err));
-      sessions = new Map();
-      loaded = true;
-      return;
-    }
+  let store: OwnSqliteStore;
+  try {
+    store = attachOwnStore(dbFp);
+  } catch (err) {
+    // Unreadable/corrupt .db: fail-closed for every write gate.
+    logger.error(`Failed to load sessions: ${err}`);
+    loadFailure = err instanceof Error ? err : new Error(String(err));
     sessions = new Map();
-    // 排他读：BEGIN IMMEDIATE 与离线 CLI 写者互斥后再取快照。纯 SELECT 不被
-    // 写事务排斥——若一个已通过双 abortIf 探测、正持有 IMMEDIATE 的离线 CLI
-    // 尚未 commit，普通读会把它提交前的旧行读进终身缓存，随后的行写回就会
-    // 覆盖掉 CLI 的提交（JSON 时代由同一把文件锁保证的 load/离线写串行化）。
-    // daemon 先发布 descriptor 再首次 load：新来的写者在探测处让位，已持锁
-    // 的写者让本读取等到它 commit 之后。
-    try {
-      store.db.exec('BEGIN IMMEDIATE');
-      let committed = false;
-      try {
-        for (const [key, value] of readOwnStoreAllRows(store)) sessions.set(key, value);
-        const repaired = repairMissingChatScopes();
-        try {
-          for (const session of repaired) {
-            store.upsert.run(session.sessionId, sessionStatusText(session), JSON.stringify(session));
-          }
-          store.db.exec('COMMIT');
-          committed = true;
-          if (repaired.length > 0) {
-            logger.info(`Repaired ${repaired.length} scope-less chat session(s) in ${dbFp}`);
-          }
-        } catch (err) {
-          // Loading succeeded, so keep the in-memory sessions available (with
-          // the in-memory repairs) even if the best-effort repair cannot be
-          // persisted yet.
-          logger.error(`Failed to persist repaired chat session scopes: ${err}`);
-        }
-      } finally {
-        if (!committed) { try { store.db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
-      }
-    } catch (err) {
-      // Lock contention (SQLITE_BUSY after busy_timeout) must NOT become
-      // loadFailure + empty cache: daemon startup uses listSessions(), which
-      // would then restore nothing while the durable store is healthy.
-      if (ownStore) {
-        try { ownStore.db.close(); } catch { /* already closed */ }
-        ownStore = undefined;
-      }
-      sessions = new Map();
-      throw err;
-    }
-    logger.info(`Loaded ${sessions.size} sessions from ${dbFp}`);
     loaded = true;
     return;
   }
-
-  // JSON engine (non-owning process before the daemon has imported, or a
-  // pre-SQLite store this process may not bootstrap). Behaviour unchanged.
-  withFileLockSync(jsonFp, () => {
-    if (existsSync(jsonFp)) {
-      try {
-        const data = parseSessionsProjectionStrict(readFileSync(jsonFp, 'utf-8'), jsonFp);
-        sessions = new Map(Object.entries(data));
-        const repaired = repairMissingChatScopes();
-        if (repaired.length > 0) {
-          try {
-            const tmpFp = `${jsonFp}.${process.pid}.${randomUUID()}.tmp`;
-            writeFileSync(tmpFp, JSON.stringify(Object.fromEntries(sessions), null, 2), 'utf-8');
-            renameSync(tmpFp, jsonFp);
-            logger.info(`Repaired ${repaired.length} scope-less chat session(s) in ${jsonFp}`);
-          } catch (err) {
-            // Loading succeeded, so keep the in-memory sessions available even
-            // if the best-effort repair cannot be persisted yet.
-            logger.error(`Failed to persist repaired chat session scopes: ${err}`);
-          }
-        }
-        logger.info(`Loaded ${sessions.size} sessions from ${jsonFp}`);
-      } catch (err) {
-        logger.error(`Failed to load sessions: ${err}`);
-        loadFailure = err instanceof Error ? err : new Error(String(err));
-        sessions = new Map();
-      }
-    } else if (currentAppId) {
-      // Per-bot file doesn't exist — migrate matching legacy rows while still
-      // holding the same lock used by daemon saves and offline CLI mutations.
-      const legacyFp = join(config.session.dataDir, 'sessions.json');
-      if (existsSync(legacyFp)) {
-        try {
-          const data = parseSessionsProjectionStrict(readFileSync(legacyFp, 'utf-8'), legacyFp);
-          sessions = new Map();
-          for (const [k, v] of Object.entries(data)) {
-            if (v.larkAppId === currentAppId) sessions.set(k, v);
-          }
-          if (sessions.size > 0) {
-            const repaired = repairMissingChatScopes();
-            const obj = Object.fromEntries(sessions);
-            const tmpFp = `${jsonFp}.${process.pid}.${randomUUID()}.tmp`;
-            writeFileSync(tmpFp, JSON.stringify(obj, null, 2), 'utf-8');
-            renameSync(tmpFp, jsonFp);
-            logger.info(`Migrated ${sessions.size} sessions from sessions.json to ${jsonFp}`);
-            if (repaired.length > 0) {
-              logger.info(`Repaired ${repaired.length} scope-less chat session(s) during migration`);
-            }
-          }
-        } catch (err) {
-          logger.error(`Failed to migrate sessions from legacy file: ${err}`);
-          loadFailure = err instanceof Error ? err : new Error(String(err));
-          sessions = new Map();
-        }
-      }
+  sessions = new Map();
+  // 排他读：BEGIN IMMEDIATE 与离线 CLI 写者互斥后再取快照。纯 SELECT 不被
+  // 写事务排斥——若一个已通过双 abortIf 探测、正持有 IMMEDIATE 的离线 CLI
+  // 尚未 commit，普通读会把它提交前的旧行读进终身缓存，随后的行写回就会
+  // 覆盖掉 CLI 的提交。daemon 先发布 descriptor 再首次 load：新来的写者在
+  // 探测处让位，已持锁的写者让本读取等到它 commit 之后。
+  try {
+    store.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const [key, value] of readOwnStoreAllRows(store)) sessions.set(key, value);
+    } finally {
+      try { store.db.exec('COMMIT'); } catch { try { store.db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
     }
-  });
+  } catch (err) {
+    // Lock contention (SQLITE_BUSY after busy_timeout) must NOT become
+    // loadFailure + empty cache: daemon startup uses listSessions(), which
+    // would then restore nothing while the durable store is healthy.
+    if (ownStore) {
+      try { ownStore.db.close(); } catch { /* already closed */ }
+      ownStore = undefined;
+    }
+    sessions = new Map();
+    throw err;
+  }
+  logger.info(`Loaded ${sessions.size} sessions from ${dbFp}`);
   loaded = true;
 }
 
@@ -710,22 +663,6 @@ function readOwnStoreAllRows(store: OwnSqliteStore): [string, Session][] {
   return entries;
 }
 
-function readExistingSessionsFromDisk(fp: string): { raw: string; parsed: Record<string, Session> } {
-  if (!existsSync(fp)) return { raw: '', parsed: {} };
-  try {
-    const raw = readFileSync(fp, 'utf-8');
-    return { raw, parsed: JSON.parse(raw) as Record<string, Session> };
-  } catch {
-    return { raw: '', parsed: {} };
-  }
-}
-
-function readSessionsProjectionStrict(fp: string): { raw: string; parsed: Record<string, Session> } {
-  if (!existsSync(fp)) return { raw: '', parsed: {} };
-  const raw = readFileSync(fp, 'utf-8');
-  return { raw, parsed: parseSessionsProjectionStrict(raw, fp) };
-}
-
 function duplicateIds(ids: readonly string[]): string[] {
   const seen = new Set<string>();
   const duplicates = new Set<string>();
@@ -736,19 +673,13 @@ function duplicateIds(ids: readonly string[]): string[] {
   return [...duplicates];
 }
 
-/** Read-write connection to this process's own store for remote/offline-style
- *  fresh access: the attached connection when loaded, else a short-lived one.
- *  Returns undefined when the store is still on the JSON engine. */
-function withOwnStoreDbIfSqlite<T>(fn: (db: SqliteDatabaseLike) => T): T | undefined {
-  if (ownStore) return fn(ownStore.db);
-  const dbFp = getDbPath();
-  if (!existsSync(dbFp)) return undefined;
-  const db = openDbForOwnStore(dbFp);
-  try {
-    return fn(db);
-  } finally {
-    db.close();
-  }
+/** The connection `load()` attached for this process's own store. Going
+ *  through load() is what keeps the import gate and the `owner: false`
+ *  contract in one place instead of opening a second connection here (a
+ *  read-write open would CREATE the store and poison the import gate). */
+function withOwnStoreDb<T>(fn: (db: SqliteDatabaseLike) => T): T {
+  loadForWrite();
+  return fn(ownStore!.db);
 }
 
 /**
@@ -757,7 +688,6 @@ function withOwnStoreDbIfSqlite<T>(fn: (db: SqliteDatabaseLike) => T): T | undef
  */
 export function getActiveRemoteShutdownSnapshotsBatch(
   sessionIds: readonly string[],
-  options: { maxWaitMs?: number } = {},
 ): ActiveRemoteShutdownSnapshot[] {
   if (sessionIds.length === 0) return [];
   const duplicates = duplicateIds(sessionIds);
@@ -769,9 +699,9 @@ export function getActiveRemoteShutdownSnapshotsBatch(
     );
   }
 
-  ensureDir();
+  loadForWrite();
   try {
-    const sqliteResult = withOwnStoreDbIfSqlite((db): ActiveRemoteShutdownSnapshot[] => {
+    return withOwnStoreDb((db): ActiveRemoteShutdownSnapshot[] => {
       db.exec('BEGIN');
       try {
         const select = db.prepare('SELECT row FROM sessions WHERE session_id = ?');
@@ -805,31 +735,6 @@ export function getActiveRemoteShutdownSnapshotsBatch(
         try { db.exec('COMMIT'); } catch { try { db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
       }
     });
-    if (sqliteResult !== undefined) return sqliteResult;
-
-    const fp = getFilePath();
-    return withFileLockSync(fp, () => {
-      const { parsed } = readSessionsProjectionStrict(fp);
-      const invalid = sessionIds.filter((sessionId) => {
-        const session = parsed[sessionId];
-        return !session || session.status !== 'active';
-      });
-      if (invalid.length > 0) {
-        throw new RemoteLineageBatchError(
-          'prewrite_ownership',
-          invalid,
-          `cannot snapshot non-active remote sessions: ${invalid.join(', ')}`,
-        );
-      }
-      return sessionIds.map((sessionId) => {
-        const session = parsed[sessionId]!;
-        return {
-          sessionId,
-          taskId: session.riffParentTaskId ?? null,
-          owner: remoteDurableOwner(session),
-        };
-      });
-    }, { maxWaitMs: options.maxWaitMs });
   } catch (error) {
     if (error instanceof RemoteLineageBatchError) throw error;
     throw new RemoteLineageBatchError(
@@ -846,7 +751,6 @@ export function getActiveRemoteShutdownSnapshotsBatch(
  */
 export function persistActiveRemoteLineagesExactBatch(
   updates: readonly ActiveRemoteLineageBatchUpdate[],
-  options: { maxWaitMs?: number } = {},
 ): ActiveRemoteShutdownSnapshot[] {
   if (updates.length === 0) return [];
   const sessionIds = updates.map(update => update.sessionId);
@@ -860,10 +764,9 @@ export function persistActiveRemoteLineagesExactBatch(
   }
 
   loadForWrite();
-  ensureDir();
   let published = false;
   try {
-    const sqliteResult = withOwnStoreDbIfSqlite((db): ActiveRemoteShutdownSnapshot[] => {
+    return withOwnStoreDb((db): ActiveRemoteShutdownSnapshot[] => {
       const select = db.prepare('SELECT row FROM sessions WHERE session_id = ?');
       const update = db.prepare("UPDATE sessions SET status = ?, row = ? WHERE session_id = ?");
       let inTxn = false;
@@ -900,7 +803,6 @@ export function persistActiveRemoteLineagesExactBatch(
             ...fresh.session,
             riffParentTaskId: u.targetTaskId ?? undefined,
           };
-          stripLegacyPendingCardFields(next as unknown as Record<string, unknown>);
           const json = JSON.stringify(next);
           if (json !== fresh.raw) {
             update.run(sessionStatusText(next), json, u.sessionId);
@@ -952,96 +854,6 @@ export function persistActiveRemoteLineagesExactBatch(
       }
       return verified;
     });
-    if (sqliteResult !== undefined) return sqliteResult;
-
-    const fp = getFilePath();
-    let tmpFp: string | undefined;
-    try {
-      return withFileLockSync(fp, () => {
-        const { raw, parsed } = readSessionsProjectionStrict(fp);
-        const conflicts: string[] = [];
-        for (const update of updates) {
-          const durable = parsed[update.sessionId];
-          const durableTaskId = durable?.riffParentTaskId ?? null;
-          if (!durable
-              || durable.status !== 'active'
-              || !update.expectedCurrentTaskIds.some(candidate => candidate === durableTaskId)
-              || !remoteOwnersEqual(remoteDurableOwner(durable), update.owner)) {
-            conflicts.push(update.sessionId);
-          }
-        }
-        if (conflicts.length > 0) {
-          throw new RemoteLineageBatchError(
-            'prewrite_ownership',
-            conflicts,
-            `Remote lineage batch compare-and-set failed for: ${conflicts.join(', ')}`,
-          );
-        }
-
-        for (const update of updates) {
-          const durable = parsed[update.sessionId]!;
-          const next: Session = {
-            ...durable,
-            riffParentTaskId: update.targetTaskId ?? undefined,
-          };
-          stripLegacyPendingCardFields(next as unknown as Record<string, unknown>);
-          parsed[update.sessionId] = next;
-        }
-
-        const json = JSON.stringify(parsed, null, 2);
-        if (json !== raw) {
-          tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-          writeFileSync(tmpFp, json, 'utf-8');
-          renameSync(tmpFp, fp);
-          tmpFp = undefined;
-          published = true;
-          testOnlyAfterRemoteBatchRename?.();
-        }
-
-        let verifiedProjection: Record<string, Session>;
-        try {
-          verifiedProjection = readSessionsProjectionStrict(fp).parsed;
-        } catch (error) {
-          throw new RemoteLineageBatchError(
-            published ? 'postrename_ambiguity' : 'prewrite_io',
-            [...sessionIds],
-            `failed to read back Remote lineage batch: ${String(error)}`,
-          );
-        }
-
-        const ambiguous = updates.filter((update) => {
-          const durable = verifiedProjection[update.sessionId];
-          return !durable
-            || durable.status !== 'active'
-            || (durable.riffParentTaskId ?? null) !== update.targetTaskId
-            || !remoteOwnersEqual(remoteDurableOwner(durable), update.owner);
-        }).map(update => update.sessionId);
-        if (ambiguous.length > 0) {
-          throw new RemoteLineageBatchError(
-            published ? 'postrename_ambiguity' : 'prewrite_ownership',
-            ambiguous,
-            `Remote lineage batch readback mismatch for: ${ambiguous.join(', ')}`,
-          );
-        }
-
-        const verified = updates.map((update) => ({
-          sessionId: update.sessionId,
-          taskId: update.targetTaskId,
-          owner: remoteDurableOwner(verifiedProjection[update.sessionId]!),
-        }));
-        if (loaded) {
-          for (const update of updates) {
-            const cached = sessions.get(update.sessionId);
-            if (cached) cached.riffParentTaskId = update.targetTaskId ?? undefined;
-          }
-        }
-        return verified;
-      }, { maxWaitMs: options.maxWaitMs });
-    } finally {
-      if (tmpFp) {
-        try { unlinkSync(tmpFp); } catch { /* best-effort orphan cleanup */ }
-      }
-    }
   } catch (error) {
     if (error instanceof RemoteLineageBatchError) throw error;
     throw new RemoteLineageBatchError(
@@ -1052,41 +864,17 @@ export function persistActiveRemoteLineagesExactBatch(
   }
 }
 
-/** Whole-map JSON save — only for a store still on the JSON engine. */
-function save(): void {
-  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
-  ensureDir();
-  const fp = getFilePath();
-  withFileLockSync(fp, () => {
-    const { raw: existingRaw } = readExistingSessionsFromDisk(fp);
-    const obj: Record<string, Session> = {};
-    for (const [k, v] of sessions) {
-      stripLegacyPendingCardFields(v as unknown as Record<string, unknown>);
-      obj[k] = v;
-    }
-    const json = JSON.stringify(obj, null, 2);
-    // The daemon fires several updateSession()/save() calls per inbound message
-    // (activity bump, pid, stream-card state, …) and many leave the serialized
-    // file byte-identical. Skipping the temp-file write + rename in that case
-    // elides the bulk of the redundant disk I/O.
-    if (json === existingRaw) return;
-    const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(tmpFp, json, 'utf-8');
-    renameSync(tmpFp, fp);
-  });
-}
-
-/** Persist ONE changed row. SQLite engine: dirty-row upsert (a redundant
- *  update that leaves the serialized row identical skips the write, the
- *  row-level analogue of the old byte-identical whole-file skip). JSON
- *  engine: the legacy whole-map save. */
+/** Persist ONE changed row: a dirty-row upsert. A redundant update that leaves
+ *  the serialized row identical skips the write — the daemon fires several
+ *  updateSession() calls per inbound message (activity bump, pid, stream-card
+ *  state, …) and many of them change nothing. */
 function persistRow(session: Session): void {
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   if (!ownStore) {
-    save();
-    return;
+    throw new SessionStoreUnavailableError(
+      new Error(`session store ${getDbPath()} is not attached`),
+    );
   }
-  stripLegacyPendingCardFields(session as unknown as Record<string, unknown>);
   testOnlyBeforeRowPersist?.(session.sessionId);
   const json = JSON.stringify(session);
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
@@ -1154,30 +942,17 @@ export function getOwnedSession(sessionId: string): Session | undefined {
   return sessions.get(sessionId);
 }
 
-/** Cross-process fresh read. SQLite engine: a point SELECT observes the last
- *  committed write (WAL orders daemon/CLI writers). JSON engine: ordered
- *  after writers by the shared file lock, as before. */
+/** Cross-process fresh read: a point SELECT observes the last committed write
+ *  (WAL orders the daemon against offline CLI writers). */
 export function getSessionFresh(sessionId: string): Session | undefined {
-  ensureDir();
   const dbFp = getDbPath();
-  if (existsSync(dbFp)) {
-    try {
-      return readStoreRowByKey({ appId: currentAppId, kind: 'sqlite', path: dbFp }, sessionId);
-    } catch (err) {
-      if (err instanceof SessionStoreSqliteUnavailableError) throw err;
-      return undefined;
-    }
+  if (!existsSync(dbFp)) return undefined;
+  try {
+    return readStoreRowByKey({ appId: currentAppId, path: dbFp }, sessionId);
+  } catch (err) {
+    if (err instanceof SessionStoreSqliteUnavailableError) throw err;
+    return undefined;
   }
-  const fp = getFilePath();
-  return withFileLockSync(fp, () => {
-    if (!existsSync(fp)) return undefined;
-    try {
-      const data = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, Session>;
-      return data[sessionId];
-    } catch {
-      return undefined;
-    }
-  });
 }
 
 /**
@@ -1268,21 +1043,15 @@ function mutateMojoCloseJournal(
   if (session.backendType !== 'mojo') {
     throw new Error(`cannot mutate Mojo close journal for non-Mojo session ${sessionId}`);
   }
-  const priorJournal = session.mojoCloseJournal
-    ? { ...session.mojoCloseJournal }
-    : undefined;
-  const priorTaskId = session.riffParentTaskId;
   if (session.mojoCloseJournal && !isValidMojoCloseJournal(session.mojoCloseJournal)) {
     throw new Error(`cannot mutate malformed Mojo close journal for ${sessionId}`);
   }
-  mutate(session);
-  try {
-    persistRow(session);
-  } catch (error) {
-    session.mojoCloseJournal = priorJournal;
-    session.riffParentTaskId = priorTaskId;
-    throw error;
-  }
+  // Durable first: `mutate` works on a copy, and a failed persist leaves the
+  // live row untouched — including when `mutate` itself rejects the transition.
+  const next: Session = { ...session };
+  mutate(next);
+  persistRow(next);
+  Object.assign(session, next);
   return session;
 }
 
@@ -1536,22 +1305,19 @@ export function closeSession(
   loadForWrite();
   const session = sessions.get(sessionId);
   if (session) {
-    const priorStatus = session.status;
-    const priorClosedAt = session.closedAt;
-    const priorRiffParentTaskId = session.riffParentTaskId;
+    // The materialised images are cleaned up AFTER the row commits, so the list
+    // has to be read before it is dropped from the row. Not a rollback copy —
+    // the durable-first commit below has nothing to undo.
     const priorDashboardAttachments = session.dashboardAttachments;
-    const priorQueuedAttachments = session.queuedAttachments;
-    const priorPreviewTarget = session.previewTarget;
-    const priorQuarantinedLineage = session.mojoQuarantinedLineage;
-    const priorQuarantineNoticePending = session.mojoQuarantineNoticePending;
-    const priorLocalResidual = session.mojoLocalResidual;
-    const priorMojoCloseJournal = session.mojoCloseJournal
-      ? { ...session.mojoCloseJournal }
-      : undefined;
-    session.status = 'closed';
-    session.closedAt = new Date().toISOString();
-    session.dashboardAttachments = undefined;
-    session.queuedAttachments = undefined;
+    // Durable first: build the closed row, commit it, and only then merge it
+    // into the live object. A failed write leaves the session exactly as it
+    // was, which is what the hand-written field-by-field restore used to
+    // approximate.
+    const next: Session = { ...session };
+    next.status = 'closed';
+    next.closedAt = new Date().toISOString();
+    next.dashboardAttachments = undefined;
+    next.queuedAttachments = undefined;
     // `previewTarget` is a live loopback (host, port) the session's agent
     // registered with `botmux preview <port>` for its CURRENT worker
     // generation — routing state, not a durable property of the conversation.
@@ -1562,41 +1328,25 @@ export function closeSession(
     // else's service. Drop it in the same atomic save as status='closed'.
     // Cleanup only: registration and proxying are untouched, and a resumed
     // session simply re-runs `botmux preview <port>`.
-    session.previewTarget = undefined;
-    session.mojoCloseJournal = undefined;
+    next.previewTarget = undefined;
+    next.mojoCloseJournal = undefined;
     // Survives close on purpose — the containment handle is still in the durable
     // store, so the row must keep reporting the residual until the handle clears.
-    if (opts.parkLocalResidual) session.mojoLocalResidual = opts.parkLocalResidual;
+    if (opts.parkLocalResidual) next.mojoLocalResidual = opts.parkLocalResidual;
     if (opts.parkMojoLineage) {
       // Keep both ids when a different one was already parked: each is the only
       // handle left for manual cleanup of its remote session.
-      const already = session.mojoQuarantinedLineage;
-      session.mojoQuarantinedLineage = already && already !== opts.parkMojoLineage
+      const already = next.mojoQuarantinedLineage;
+      next.mojoQuarantinedLineage = already && already !== opts.parkMojoLineage
         ? `${already},${opts.parkMojoLineage}`
         : opts.parkMojoLineage;
-      session.mojoQuarantineNoticePending = true;
+      next.mojoQuarantineNoticePending = true;
     }
     // Riff cancellation has already completed before this durable transition.
     // Clear its retry handle in the same atomic save as status='closed'.
-    if (opts.clearRiffParentTaskId) session.riffParentTaskId = undefined;
-    try {
-      persistRow(session);
-    } catch (err) {
-      session.status = priorStatus;
-      session.closedAt = priorClosedAt;
-      session.riffParentTaskId = priorRiffParentTaskId;
-      session.dashboardAttachments = priorDashboardAttachments;
-      session.queuedAttachments = priorQueuedAttachments;
-      session.previewTarget = priorPreviewTarget;
-      // Without these two the row keeps a parked lineage after a FAILED close, so
-      // the next turn treats a still-live remote session as quarantined and starts
-      // a new one — i.e. the "close failed, retry unchanged" guarantee is broken.
-      session.mojoQuarantinedLineage = priorQuarantinedLineage;
-      session.mojoQuarantineNoticePending = priorQuarantineNoticePending;
-      session.mojoLocalResidual = priorLocalResidual;
-      session.mojoCloseJournal = priorMojoCloseJournal;
-      throw err;
-    }
+    if (opts.clearRiffParentTaskId) next.riffParentTaskId = undefined;
+    persistRow(next);
+    Object.assign(session, next);
     if (session.larkAppId && priorDashboardAttachments?.length) {
       try {
         cleanupMaterializedDashboardImages(session.larkAppId, priorDashboardAttachments);
@@ -1637,56 +1387,32 @@ export function reactivateClosedSession(
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
-  const prior = {
-    status: session.status,
-    closedAt: session.closedAt,
-    lastMessageAt: session.lastMessageAt,
-    codexAppDispatchLedger: session.codexAppDispatchLedger,
-    codexAppGenerationCommits: session.codexAppGenerationCommits,
-    queued: session.queued,
-    queuedPrompt: session.queuedPrompt,
-    queuedCodexAppText: session.queuedCodexAppText,
-    queuedCodexAppMessageContext: session.queuedCodexAppMessageContext,
-    queuedActivationPending: session.queuedActivationPending,
-    queuedActivationToken: session.queuedActivationToken,
-    queuedActivationInput: session.queuedActivationInput,
-    queuedActivationTurnId: session.queuedActivationTurnId,
-    queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
-    queuedActivationResume: session.queuedActivationResume,
-    queuedActivationTail: session.queuedActivationTail,
-    queuedActivationTailNextOrder: session.queuedActivationTailNextOrder,
-    pendingRepoSetup: session.pendingRepoSetup,
-    previewTarget: session.previewTarget,
-    mojoCloseJournal: session.mojoCloseJournal,
-  };
+  // Durable first (see closeSession): the reactivated row is committed before
+  // it is merged into the live object, so a failed write is a no-op.
+  const next: Session = { ...session };
+  next.status = 'active';
+  next.closedAt = undefined;
+  next.lastMessageAt = new Date().toISOString();
+  next.codexAppDispatchLedger = undefined;
+  next.codexAppGenerationCommits = undefined;
+  next.queued = undefined;
+  next.queuedPrompt = undefined;
+  next.queuedCodexAppText = undefined;
+  next.queuedCodexAppMessageContext = undefined;
+  next.queuedActivationPending = undefined;
+  next.queuedActivationToken = undefined;
+  next.queuedActivationInput = undefined;
+  next.queuedActivationTurnId = undefined;
+  next.queuedActivationDispatchAttempt = undefined;
+  next.queuedActivationResume = undefined;
+  next.queuedActivationTail = undefined;
+  next.queuedActivationTailNextOrder = undefined;
+  next.pendingRepoSetup = undefined;
+  next.previewTarget = undefined;
+  next.mojoCloseJournal = undefined;
 
-  session.status = 'active';
-  session.closedAt = undefined;
-  session.lastMessageAt = new Date().toISOString();
-  session.codexAppDispatchLedger = undefined;
-  session.codexAppGenerationCommits = undefined;
-  session.queued = undefined;
-  session.queuedPrompt = undefined;
-  session.queuedCodexAppText = undefined;
-  session.queuedCodexAppMessageContext = undefined;
-  session.queuedActivationPending = undefined;
-  session.queuedActivationToken = undefined;
-  session.queuedActivationInput = undefined;
-  session.queuedActivationTurnId = undefined;
-  session.queuedActivationDispatchAttempt = undefined;
-  session.queuedActivationResume = undefined;
-  session.queuedActivationTail = undefined;
-  session.queuedActivationTailNextOrder = undefined;
-  session.pendingRepoSetup = undefined;
-  session.previewTarget = undefined;
-  session.mojoCloseJournal = undefined;
-
-  try {
-    persistRow(session);
-  } catch (err) {
-    Object.assign(session, prior);
-    throw err;
-  }
+  persistRow(next);
+  Object.assign(session, next);
   return { ok: true, session };
 }
 
@@ -1717,9 +1443,6 @@ export function persistActiveRemoteLineageExact(
     expectedOwner?: RemoteDurableOwner;
   } = {},
 ): Session {
-  loadForWrite();
-  ensureDir();
-
   const applyChecksAndBuildNext = (durable: Session | undefined): Session => {
     if (!durable || durable.status !== 'active') {
       throw new RemoteLineageOwnershipError(
@@ -1745,7 +1468,6 @@ export function persistActiveRemoteLineageExact(
       ...durable,
       riffParentTaskId: taskId ?? undefined,
     };
-    stripLegacyPendingCardFields(next as unknown as Record<string, unknown>);
     return next;
   };
 
@@ -1759,7 +1481,7 @@ export function persistActiveRemoteLineageExact(
     return next;
   };
 
-  const sqliteResult = withOwnStoreDbIfSqlite((db): Session => {
+  return withOwnStoreDb((db): Session => {
     const select = db.prepare('SELECT row FROM sessions WHERE session_id = ?');
     let inTxn = false;
     try {
@@ -1780,21 +1502,6 @@ export function persistActiveRemoteLineageExact(
       if (inTxn) { try { db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
       throw err;
     }
-  });
-  if (sqliteResult !== undefined) return sqliteResult;
-
-  const fp = getFilePath();
-  return withFileLockSync(fp, () => {
-    const { raw, parsed } = readExistingSessionsFromDisk(fp);
-    const next = applyChecksAndBuildNext(parsed[sessionId]);
-    parsed[sessionId] = next;
-    const json = JSON.stringify(parsed, null, 2);
-    if (json !== raw) {
-      const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-      writeFileSync(tmpFp, json, 'utf-8');
-      renameSync(tmpFp, fp);
-    }
-    return publishToCache(next);
   });
 }
 
@@ -1863,17 +1570,12 @@ export function countActiveSessionsOnDisk(dataDir: string = config.session.dataD
   let n = 0;
   for (const ref of refs) {
     try {
-      if (ref.kind === 'sqlite') {
-        const db = openDbForRead(ref.path);
-        try {
-          const hit = db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE status = 'active'").get() as { n: number };
-          n += hit.n;
-        } finally {
-          db.close();
-        }
-      } else {
-        const data: Record<string, Session> = JSON.parse(readFileSync(ref.path, 'utf-8'));
-        for (const s of Object.values(data)) if (s?.status === 'active') n++;
+      const db = openDbForRead(ref.path);
+      try {
+        const hit = db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE status = 'active'").get() as { n: number };
+        n += hit.n;
+      } finally {
+        db.close();
       }
     } catch (err) {
       if (err instanceof SessionStoreSqliteUnavailableError) throw err;
@@ -1948,6 +1650,10 @@ export function loadAllSessionsSnapshot(options: {
   fallbackAppId?: string;
 } = {}): Map<string, Session> {
   const dataDir = options.dataDir ?? config.session.dataDir;
+  // Only the caller's own store is asserted: a peer bot that has not migrated
+  // yet is invisible (it was never this caller's business), but the store the
+  // caller belongs to reading as empty would look like "your session is gone".
+  if (options.fallbackAppId) assertStoreImported(options.fallbackAppId, dataDir);
   const out = new Map<string, Session>();
   const readInto = (ref: StoreFileRef): void => {
     let entries: [string, Session][];
@@ -1955,7 +1661,7 @@ export function loadAllSessionsSnapshot(options: {
       entries = readStoreEntries(ref);
     } catch (err) {
       if (err instanceof SessionStoreSqliteUnavailableError) throw err;
-      return; /* missing or corrupt store → skip */
+      return; /* absent or corrupt store → skip */
     }
     // Arrays are deliberately tolerated on the JSON side (Object.entries
     // yields their rows): the historical CLI loader accepted array-shaped
@@ -2068,61 +1774,34 @@ export function mutateSessionRowOffline(
   options: { dataDir?: string; abortIf?: () => boolean } = {},
 ): Session | undefined {
   const dataDir = options.dataDir ?? config.session.dataDir;
+  assertStoreImported(target.larkAppId, dataDir);
   const ref = resolveStoreFile(target.larkAppId, dataDir);
+  // `openDbForOwnStore` is a read-write open: it would CREATE the store and
+  // poison the owning daemon's import gate. A store that does not exist simply
+  // holds no row.
+  if (!existsSync(ref.path)) return undefined;
 
-  if (ref.kind === 'sqlite') {
-    const db = openDbForOwnStore(ref.path);
-    let inTxn = false;
-    try {
-      db.exec('BEGIN IMMEDIATE');
-      inTxn = true;
-      if (options.abortIf?.()) return undefined;
-      const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
-        .get(target.sessionId) as { row: string } | undefined;
-      if (!hit) return undefined;
-      const current = JSON.parse(hit.row) as Session;
-      if (!mutate(current)) return current;
-      stripLegacyPendingCardFields(current as unknown as Record<string, unknown>);
-      if (options.abortIf?.()) return undefined;
-      db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
-        .run(sessionStatusText(current), JSON.stringify(current), target.sessionId);
-      db.exec('COMMIT');
-      inTxn = false;
-      return current;
-    } finally {
-      if (inTxn) { try { db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
-      db.close();
-    }
-  }
-
-  const fp = ref.path;
-  return withFileLockSync(fp, () => {
+  const db = openDbForOwnStore(ref.path);
+  let inTxn = false;
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    inTxn = true;
     if (options.abortIf?.()) return undefined;
-    let data: Record<string, Session> = {};
-    if (existsSync(fp)) {
-      try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
-    }
-    const current = data[target.sessionId];
-    if (!current || !mutate(current)) return current;
-    data[target.sessionId] = current;
-
-    // Clean up entries where the file key doesn't match the entry's sessionId
-    // (data corruption), and strip removed placeholder-card fields — the same
-    // convergence the daemon's save() applies.
-    for (const [key, val] of Object.entries(data)) {
-      if (val && typeof val === 'object' && 'sessionId' in val && (val as Session).sessionId !== key) {
-        delete data[key];
-        continue;
-      }
-      if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
-    }
-
+    const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
+      .get(target.sessionId) as { row: string } | undefined;
+    if (!hit) return undefined;
+    const current = JSON.parse(hit.row) as Session;
+    if (!mutate(current)) return current;
     if (options.abortIf?.()) return undefined;
-    const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
-    renameSync(tmpFp, fp);
+    db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
+      .run(sessionStatusText(current), JSON.stringify(current), target.sessionId);
+    db.exec('COMMIT');
+    inTxn = false;
     return current;
-  });
+  } finally {
+    if (inTxn) { try { db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
+    db.close();
+  }
 }
 
 function findActiveSessionsMatching(
