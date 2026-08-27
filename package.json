@@ -77,9 +77,12 @@
     "yaml": "^2.9.0",
     "zod": "^3.23.0"
   },
+  "optionalDependencies": {
+    "@napi-rs/canvas": "^0.1.65",
+    "node-pty": "^1.1.0"
+  },
   "devDependencies": {
     "@midscene/web": "^1.7.6",
-    "@napi-rs/canvas": "^0.1.65",
     "@playwright/test": "^1.58.2",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.0.0",
@@ -92,7 +95,6 @@
     "electron-builder": "^26.0.0",
     "esbuild": "^0.28.0",
     "memfs": "^4.57.1",
-    "node-pty": "^1.1.0",
     "playwright": "^1.58.2",
     "react-test-renderer": "19.2.7",
     "tsx": "^4.20.5",

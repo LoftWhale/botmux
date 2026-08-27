@@ -77,19 +77,20 @@ function fail(reason, hint) {
  * Detection order is authoritative-first, and deliberately conservative: only claim
  * musl when positively observed, so a glibc box is never blocked by a false
  * positive.
+ *
+ * MEASURED on node:22-alpine: `process.report.getReport().header` has 23 keys and
+ * carries NEITHER `glibcVersionRuntime` NOR any musl key. So the report is only
+ * useful as a NEGATIVE signal ("glibcVersionRuntime present ⇒ definitely glibc,
+ * stop"); on musl it tells us nothing and the loader probe below is what actually
+ * decides. Do not add a `header.musl` branch back — Node does not publish one.
  */
 function isMuslLinux() {
   if (process.platform !== 'linux') return false;
-  // Most authoritative: Node reports the glibc it is linked against. On a musl
-  // build this field is absent entirely (musl reports under a different key).
+  // Negative signal only (see above): a reported glibc runtime settles it.
   try {
-    const header = process.report?.getReport?.()?.header;
-    if (header) {
-      if (header.glibcVersionRuntime) return false;   // definitely glibc
-      if (header.musl || header.muslVersionRuntime) return true;
-    }
+    if (process.report?.getReport?.()?.header?.glibcVersionRuntime) return false;
   } catch { /* report unavailable; fall through to filesystem probes */ }
-  // The ld-musl loader is direct evidence.
+  // The ld-musl loader is the direct positive evidence.
   for (const dir of ['/lib', '/usr/lib']) {
     try {
       if (readdirSync(dir).some(f => f.startsWith('ld-musl-'))) return true;

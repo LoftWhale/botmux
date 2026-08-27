@@ -240,19 +240,123 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
       bin?: unknown;
       dependencies?: Record<string, string>;
       devDependencies?: Record<string, string>;
+      optionalDependencies?: Record<string, string>;
     };
     expect(manifest.bin).toBeUndefined();
-    // node-pty must stay OUT of runtime deps (it has no linux prebuild, so it drags
-    // node-gyp into every install) but IN devDependencies, because
-    // scripts/build-bun-binary.mjs resolves it to embed pty.node into the binary.
-    expect(manifest.dependencies?.['node-pty']).toBeUndefined();
-    expect(manifest.devDependencies?.['node-pty']).toBeTruthy();
-    expect(manifest.dependencies?.['@napi-rs/canvas']).toBeUndefined();
-    expect(manifest.devDependencies?.['@napi-rs/canvas']).toBeTruthy();
+    // The two native deps must be OPTIONAL, and that placement is load-bearing in
+    // two directions at once:
+    //   • NOT `dependencies` — node-pty has no linux prebuild, so a hard runtime dep
+    //     drags a node-gyp toolchain into every `npm i -g`.
+    //   • NOT `devDependencies` either — prepare-desktop-runtime.mjs stages the
+    //     desktop runtime with `bun install --production`, which SKIPS dev deps but
+    //     KEEPS optional ones (measured). Under dev deps the desktop app would ship
+    //     with no node-pty (terminal dead) and no canvas natives.
+    // Optional satisfies both: present for the runtime tree, skippable for users.
+    for (const dep of ['node-pty', '@napi-rs/canvas']) {
+      expect(manifest.dependencies?.[dep], `${dep} must not be a hard dependency`).toBeUndefined();
+      expect(manifest.devDependencies?.[dep], `${dep} must not be a devDependency (--production drops it)`).toBeUndefined();
+      expect(manifest.optionalDependencies?.[dep], `${dep} must be an optionalDependency`).toBeTruthy();
+    }
   });
 
-  it('SOURCE PIN: the guard is a STRICT === "true" comparison', () => {
-    // Behavioral tests above would still pass with `!== "false"` in some shells'
+  /**
+   * musl detection, driven through the REAL script rather than an extracted copy.
+   *
+   * Why this deserves tests at all: a false POSITIVE blocks every ordinary glibc
+   * install, which is worse than the silent-Alpine-failure it prevents. It was only
+   * hand-verified before, so any future "cleanup" of the fs probes would go unnoticed.
+   *
+   * The script probes `/lib` and `/usr/lib` for `ld-musl-*`, which a test cannot
+   * fabricate — so exercise the branch by pointing the script's readdirSync at a
+   * fake root via a tiny loader shim, and pin the negative direction (this box is
+   * glibc) directly.
+   */
+  function runPostinstallWithFakeRoot(muslDir: string | null) {
+    const base = tmp();
+    const home = join(base, 'home');
+    const pkg = join(base, 'pkg');
+    mkdirSync(home, { recursive: true });
+    mkdirSync(join(pkg, 'scripts'), { recursive: true });
+
+    // Rewrite the two probe paths to a directory we control. This keeps the real
+    // decision logic (order, short-circuit, try/catch) under test — only the
+    // filesystem it looks at is redirected.
+    //
+    // The glibc short-circuit must also be neutralised: this test box DOES report
+    // glibcVersionRuntime, so the function would return false before ever reaching
+    // the probe and the fixture could not exercise it. Replacing the report read
+    // with `undefined` simulates "running on a musl Node" (measured on
+    // node:22-alpine: the header carries no glibc field), which is precisely the
+    // situation where the loader probe is the deciding signal.
+    const fakeLib = join(base, 'fakelib');
+    mkdirSync(fakeLib, { recursive: true });
+    if (muslDir) writeFileSync(join(fakeLib, muslDir), '');
+    let src = readFileSync(POSTINSTALL, 'utf-8')
+      .replace("for (const dir of ['/lib', '/usr/lib'])", `for (const dir of ['${fakeLib}'])`)
+      .replace("existsSync('/etc/alpine-release')", 'false');
+    src = src.replace(
+      'if (process.report?.getReport?.()?.header?.glibcVersionRuntime) return false;',
+      'if (undefined) return false;',
+    );
+    writeFileSync(join(pkg, 'scripts', 'postinstall-bin.mjs'), src);
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'botmux', version: '3.20.0' }));
+
+    const r = spawnSync(process.execPath, [join(pkg, 'scripts', 'postinstall-bin.mjs')], {
+      encoding: 'utf-8',
+      env: { PATH: process.env.PATH, HOME: home, npm_config_global: 'true' },
+    });
+    return { ...r, wrote: existsSync(join(home, '.botmux', 'bin', 'botmux')) };
+  }
+
+  it('musl: an ld-musl loader present → refuses with a musl-specific reason', () => {
+    const r = runPostinstallWithFakeRoot('ld-musl-x86_64.so.1');
+    expect(r.status).not.toBe(0);
+    expect(r.wrote).toBe(false);
+    expect(r.stderr).toContain('musl');
+    // Must be the musl message, not the generic "no prebuilt binary" one — the guard
+    // has to run BEFORE subpackage resolution, because on Alpine the glibc
+    // subpackage DOES resolve and the generic path would never fire.
+    expect(r.stderr).toContain('glibc-linked');
+  });
+
+  it('musl: no loader present → does NOT claim musl (the false-positive direction)', () => {
+    // Same fixture with the report short-circuit removed, so the ONLY thing that
+    // could claim musl is the probe — and with an empty fake root it must not.
+    // This is the direction that matters most: a false positive blocks every
+    // ordinary glibc install.
+    const r = runPostinstallWithFakeRoot(null);
+    expect(r.stderr).not.toContain('glibc-linked');
+    // It still fails (no platform subpackage in this fixture), but for the OTHER
+    // reason — proving the musl branch was not taken.
+    expect(r.stderr).toContain('no prebuilt binary package');
+  });
+
+  it('glibc short-circuit: a reported glibc runtime settles it before any probe', () => {
+    // Unmodified script on this (glibc) box: even though the real /lib may contain
+    // anything, glibcVersionRuntime is present so musl must never be claimed.
+    expect(process.report.getReport().header.glibcVersionRuntime).toBeTruthy();
+    const r = runPostinstall({ global: 'true', withSubpackage: false });
+    expect(r.stderr).not.toContain('glibc-linked');
+  });
+
+  it('SOURCE PIN: musl detection keeps both signals (report negative + loader probe)', () => {
+    // Strip comments first: the surrounding docblock deliberately MENTIONS the
+    // rejected `header.musl` idea, and matching prose instead of code would make
+    // this assertion fire on its own explanation.
+    const code = readFileSync(POSTINSTALL, 'utf-8')
+      .split('\n')
+      .filter(l => !/^\s*(\*|\/\/|\/\*)/.test(l))
+      .join('\n');
+    // glibcVersionRuntime is used ONLY as a negative signal. Measured on
+    // node:22-alpine: the header has 23 keys and carries no musl key at all, so a
+    // positive musl branch on the report would be dead code.
+    expect(code).toContain('glibcVersionRuntime');
+    expect(code).not.toMatch(/header\??\.\s*musl/);
+    // The loader probe is what actually decides on Alpine — it must not be removed.
+    expect(code).toContain("startsWith('ld-musl-')");
+  });
+
+  it('SOURCE PIN: the guard is a STRICT === "true" comparison', () => {    // Behavioral tests above would still pass with `!== "false"` in some shells'
     // env handling, so pin the actual comparison. This is the single line that
     // protects a shared HOME's global launcher.
     const src = readFileSync(POSTINSTALL, 'utf-8');
