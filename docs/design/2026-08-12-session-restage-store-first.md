@@ -5,7 +5,7 @@ date: 2026-08-12
 updated: 2026-08-28（Step 3 第一 PR 已合入 master；第二 PR = JSON 净删除 + Step 4(a) 事务化，见「执行结果（2026-08-28）」）
 topic: session-restage-store-first
 status: proposed
-baseline: origin/master@0265234d（0828 复核基线，含已合入的 #852；0827 复核基线 06db2b48；0820 复核基线 3d84aaad；0819 复核基线 47b2c11a；0813 复核基线 16fde8a27；原始基线 723c79ade）
+baseline: origin/master@cc5085b6（0828 复核基线，含已合入的 #852；0828 早先基线 0265234d；0827 复核基线 06db2b48；0820 复核基线 3d84aaad；0819 复核基线 47b2c11a；0813 复核基线 16fde8a27；原始基线 723c79ade）
 references:
   - feat/virtual_actor_stage2@b6a4982ea（不合入；仅作参考实现、竞态清单与写点地图）
   - docs/design/2026-08-08-virtual-actor-session-runtime.md（原始提案；本目录保留未跟踪副本）
