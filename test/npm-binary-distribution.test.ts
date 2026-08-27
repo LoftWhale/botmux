@@ -216,11 +216,39 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     expect(r.wrote).toBe(false);
   });
 
-  it('missing platform subpackage → warns but EXITS 0 (a throw aborts npm i -g)', () => {
+  it('missing platform subpackage → FAILS the install (there is no Node fallback)', () => {
+    // This used to assert exit 0 ("warns but does not abort npm i -g"), which was
+    // correct while `bin: {botmux: "dist/cli.js"}` gave every failure a Node path to
+    // land on. That fallback was removed (it forced node-pty — and a node-gyp
+    // toolchain — into every install), so exiting 0 here would leave the user with a
+    // `botmux` command that does not exist and no hint why.
     const r = runPostinstall({ global: 'true', withSubpackage: false });
-    expect(r.status).toBe(0);
+    expect(r.status).not.toBe(0);
     expect(r.wrote).toBe(false);
     expect(r.stderr).toContain('no prebuilt binary package');
+    // The old hint claimed Node still works. It must not come back.
+    expect(r.stderr).not.toContain('still works via Node');
+    // Windows users need WSL, not a Node install.
+    expect(r.stderr).toContain('WSL2');
+  });
+
+  it('SOURCE PIN: no `bin` field — that entry point IS the Node fallback', () => {
+    // Removing the runtime deps while leaving `bin` wired is the worst combination:
+    // the fallback still resolves and then dies on `require('node-pty')`. Pin the
+    // absence so a well-meaning re-add is caught here.
+    const manifest = JSON.parse(readFileSync(resolve(import.meta.dirname, '../package.json'), 'utf-8')) as {
+      bin?: unknown;
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    expect(manifest.bin).toBeUndefined();
+    // node-pty must stay OUT of runtime deps (it has no linux prebuild, so it drags
+    // node-gyp into every install) but IN devDependencies, because
+    // scripts/build-bun-binary.mjs resolves it to embed pty.node into the binary.
+    expect(manifest.dependencies?.['node-pty']).toBeUndefined();
+    expect(manifest.devDependencies?.['node-pty']).toBeTruthy();
+    expect(manifest.dependencies?.['@napi-rs/canvas']).toBeUndefined();
+    expect(manifest.devDependencies?.['@napi-rs/canvas']).toBeTruthy();
   });
 
   it('SOURCE PIN: the guard is a STRICT === "true" comparison', () => {

@@ -29,14 +29,21 @@
  * daemons). Hence the guard is a STRICT `=== "true"`, and there is a second,
  * independent bail-out when we can see we are inside the source checkout.
  *
- * ── FAIL SOFT, ALWAYS ───────────────────────────────────────────────────────────
- * A postinstall that throws aborts `npm i -g`. Nothing here is worth failing an
- * install over: if we cannot find the binary or cannot write the launcher, we warn
- * with actionable text and exit 0. npm's own `bin` shim still exists as a fallback
- * path, so the user is never left with nothing.
+ * ── FAIL HARD WHEN THERE IS NO BINARY ──────────────────────────────────────────
+ * This used to warn and exit 0, because `bin: {botmux: "dist/cli.js"}` gave every
+ * failure a Node fallback to land on. That fallback is gone (it forced the main
+ * package to depend on node-pty, which has no linux prebuild and so pulled a whole
+ * node-gyp toolchain into every `npm i -g` — an install-time requirement that
+ * simply is not met on many machines). With no fallback, exiting 0 without a
+ * launcher would leave the user with a `botmux` command that does not exist, and
+ * they would find out later with a confusing error. So: no binary → fail the
+ * install, loudly, with the reason.
+ *
+ * The GUARD cases below still exit 0 silently — those are not failures, they are
+ * "this is not a global install, there is nothing to do".
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, renameSync, unlinkSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, chmodSync, renameSync, unlinkSync, realpathSync, statSync } from 'node:fs';
 import { dirname, join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
@@ -44,11 +51,55 @@ import { fileURLToPath } from 'node:url';
 
 const SUBPACKAGE = `botmux-${process.platform}-${process.arch}`;
 
-/** Warn + exit 0. Never fail the install (see header). */
-function bail(reason, hint) {
-  console.warn(`[botmux] ${reason}`);
-  if (hint) console.warn(`[botmux] ${hint}`);
-  process.exit(0);
+/** Abort the install with a reason. There is no Node fallback any more (see header). */
+function fail(reason, hint) {
+  console.error(`[botmux] ${reason}`);
+  if (hint) console.error(`[botmux] ${hint}`);
+  process.exit(1);
+}
+
+/**
+ * Are we on a musl libc distro (Alpine and most slim Docker images)?
+ *
+ * WHY THIS CHECK EXISTS: npm selects platform subpackages by `os`/`cpu`, and both
+ * are identical for glibc and musl (`linux`/`x64`), so on Alpine npm happily
+ * installs `botmux-linux-x64` — a glibc-linked binary that dies at exec time with a
+ * loader error naming no cause. Without this check we would write a launcher
+ * pointing at a binary that cannot run: the worst outcome, because the install
+ * "succeeds" and the failure surfaces much later.
+ *
+ * (npm does support a `libc` field — undocumented in `npm help package-json` but
+ * live in the wild, e.g. `@napi-rs/canvas-linux-x64-musl` publishes `libc: musl`.
+ * Once botmux ships musl subpackages declaring it, npm will pick the right one on
+ * its own and this guard becomes a diagnostic for "the musl package failed to
+ * install" rather than "musl is unsupported".)
+ *
+ * Detection order is authoritative-first, and deliberately conservative: only claim
+ * musl when positively observed, so a glibc box is never blocked by a false
+ * positive.
+ */
+function isMuslLinux() {
+  if (process.platform !== 'linux') return false;
+  // Most authoritative: Node reports the glibc it is linked against. On a musl
+  // build this field is absent entirely (musl reports under a different key).
+  try {
+    const header = process.report?.getReport?.()?.header;
+    if (header) {
+      if (header.glibcVersionRuntime) return false;   // definitely glibc
+      if (header.musl || header.muslVersionRuntime) return true;
+    }
+  } catch { /* report unavailable; fall through to filesystem probes */ }
+  // The ld-musl loader is direct evidence.
+  for (const dir of ['/lib', '/usr/lib']) {
+    try {
+      if (readdirSync(dir).some(f => f.startsWith('ld-musl-'))) return true;
+    } catch { /* unreadable; try the next probe */ }
+  }
+  // Alpine's marker file, for images that moved the loader.
+  try {
+    if (existsSync('/etc/alpine-release')) return true;
+  } catch { /* ignore */ }
+  return false;
 }
 
 // ── Guard 1: only a real `npm i -g` (strict equality; see header) ───────────────
@@ -68,6 +119,19 @@ if (existsSync(join(pkgRoot, '.git')) && existsSync(join(pkgRoot, 'src'))) {
   process.exit(0);
 }
 
+// ── Guard 3: musl (Alpine) would install a glibc binary that cannot exec ────────
+// Checked BEFORE resolving the subpackage, because on Alpine the subpackage does
+// resolve (platform is `linux`) — so the generic "no prebuilt binary" message below
+// would never fire and we would happily point the launcher at a binary that dies at
+// startup. Fail here with the actual reason instead.
+if (isMuslLinux()) {
+  fail(
+    `botmux's prebuilt binaries are glibc-linked and cannot run on musl libc (Alpine).`,
+    'Use a glibc base image (e.g. node:22-bookworm / debian / ubuntu), or build from source. '
+      + 'Tracking musl builds: https://github.com/deepcoldy/botmux/issues',
+  );
+}
+
 // ── Locate the platform binary ─────────────────────────────────────────────────
 // Resolve through Node's own resolver rather than guessing at node_modules layout:
 // npm, pnpm, and yarn lay out global installs differently (nested, hoisted,
@@ -80,15 +144,18 @@ try {
   const manifest = require.resolve(`${SUBPACKAGE}/package.json`);
   binary = join(dirname(manifest), 'botmux');
 } catch {
-  bail(
+  fail(
     `no prebuilt binary package for ${process.platform}-${process.arch} (${SUBPACKAGE}).`,
+    // Do NOT say "it still works via Node" — that fallback is gone (see header).
+    // On Windows the daemon cannot run natively at all (PTY/tmux/Unix signals), so
+    // WSL is the real answer there, not a Node install.
     'Supported: linux-x64, linux-arm64, darwin-x64, darwin-arm64. '
-      + 'The `botmux` command still works via Node if this platform is unsupported.',
+      + 'On Windows, run botmux inside WSL2 (it reports as linux and is fully supported).',
   );
 }
 
 if (!existsSync(binary)) {
-  bail(
+  fail(
     `${SUBPACKAGE} is installed but its binary is missing (${binary}).`,
     'Try reinstalling: npm i -g botmux --force',
   );
@@ -143,9 +210,12 @@ try {
   }
   console.log(`[botmux] launcher → ${binary}`);
 } catch (err) {
-  bail(
+  fail(
     `could not write the launcher at ${launcher}: ${err && err.message ? err.message : String(err)}`,
-    'The `botmux` command may still work via npm\'s own shim.',
+    // NOT "npm's own shim still works" — `bin` was removed with the Node fallback,
+    // so there is no other `botmux` on PATH. Give the user something they can act on.
+    `Fix the permissions on ${binDir} and retry, or set BOTMUX_INSTALL_DIR and use the `
+      + 'standalone installer: curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh',
   );
 }
 
