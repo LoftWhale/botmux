@@ -184,6 +184,7 @@ describe('Riff worker session environment', () => {
           BOTMUX_SESSION_ID: 'sid-riff-env',
           LARK_APP_ID: appId,
           LARK_APP_SECRET: 'secret',
+          BOTMUX_WORKFLOW_ENABLED: 'true',
         },
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       });
@@ -253,8 +254,9 @@ describe('Riff worker session environment', () => {
       expect(request.config?.env?.BOTMUX_OWNER_OPEN_ID).toBe('ou_authenticated_owner');
       expect(request.config?.env?.__OWNER_OPEN_ID).toBe('ou_authenticated_owner');
       // The workflow kill-switch is host-resolved and re-frozen after the merge:
-      // the daemon default (no config / no env override) is ON, so the stale
-      // backendConfig.env `false` must NOT survive into the remote pane.
+      // the host is explicitly forced ON (BOTMUX_WORKFLOW_ENABLED=true in the
+      // worker env), so the stale backendConfig.env `false` must NOT survive
+      // into the remote pane.
       expect(request.config?.env?.BOTMUX_WORKFLOW_ENABLED).toBe('true');
       expect(JSON.parse(request.config?.env?.BOTMUX_FEEDBACK_POLICY)).toMatchObject({
         enabled: true,

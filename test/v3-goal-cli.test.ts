@@ -102,6 +102,7 @@ function harness(baseDir: string, runNode: RunNode) {
     signalEmitter: signals as unknown as GoalCliDependencies['signalEmitter'],
     now: () => new Date('2026-07-22T00:00:00.000Z'),
     newRunId: () => 'generated-goal-run',
+    env: { BOTMUX_WORKFLOW_ENABLED: 'true' },
     stdout: stdout as unknown as GoalCliDependencies['stdout'],
     stderr: stderr as unknown as GoalCliDependencies['stderr'],
   };
