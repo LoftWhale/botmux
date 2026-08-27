@@ -332,6 +332,16 @@ WAL，而 `renameSync` 只搬走一个文件。`bun:sqlite` 关连接时不把 `
 （`journal_mode = DELETE`）让文件自包含，真正的库仍跑 WAL。本 PR 把 JSON 引擎删掉
 之后导入是唯一迁移路径，所以必须在这里修。
 
+**唯一门的一处漏网（本步补上）**：Step 2 的验收写着「src 全仓不再有 session 文件路径
+拼装点（rg 验证为零）」，但 `services/whiteboard-store.ts` 的
+`clearSessionWhiteboardRefs` 是 `readdir` 数据目录 + `startsWith('sessions') &&
+endsWith('.json')` 动态筛名，整份读改写——按名字 grep 命不中，所以历次核查都漏了。
+它在 #852 之后已经静默失效（行搬进 SQLite 后一个文件都匹配不到，`deleteWhiteboard`
+返回 `clearedSessions: 0`，而每一行的 `whiteboardId` 还指着删掉的板）；测试一直绿是
+因为夹具写的正是 JSON。本步改为经 `loadAllSessionsSnapshot` + `mutateSessionRowOffline`。
+**方法论教训**：验证「唯一门」不能只 grep 字面文件名，还要查动态筛名
+（`startsWith`/`endsWith`/正则）与 `readdir` 数据目录的地方。
+
 **已知边界（本步接受并明写）**：
 
 - 从**迁移前**版本直接升到 db-only 版本、且旧 daemon 仍在跑时，该 bot 的 store 没有
