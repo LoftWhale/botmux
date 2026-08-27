@@ -1,12 +1,11 @@
 /**
- * SQLite 引擎替换（Step 3 第一个 PR）的专项回归：
+ * 会话库 SQLite 引擎的专项回归（引擎替换 + JSON 净删除后）：
  *  - 首启确定性自动导入（含 closed 行、legacy sessions.json、幂等/重启不重复导入）
  *  - .db.tmp 原子出现（读者绝不见半成品；残留 tmp 被清理）
- *  - JSON 原地冻结（导入后 daemon 写不再碰 JSON —— 回滚方案的前提）
- *  - 混合窗口 db-else-json（跨进程读 + CLI 离线写，含「冻结 JSON 不算第二份拷贝」）
- *  - SQLite 能力探测报错路径（daemon 硬门；CLI 有 .db 硬报错 / 无 .db 走 JSON；
+ *  - JSON 导入后原地冻结，且**不再是 store**：读者不看它，身份扫描不把它算成第二份
+ *  - 未导入的 store 一律 fail-closed（owner:false 不建库；离线写不静默 no-op）
+ *  - SQLite 能力探测报错路径（daemon 硬门；CLI 有 .db 硬报错；
  *    损坏 .db 不得收成「引擎不可用」）
- *  - worker（owner:false）不触发导入
  *
  * Run:  bunx vitest run test/session-store-sqlite.test.ts
  */
@@ -52,9 +51,16 @@ import {
   mutateSessionRowOffline,
   readSessionRowFromDisk,
   readSessionRowCopiesAcrossStores,
+  listSessionsStrict,
   SessionStoreSqliteUnavailableError,
+  SessionStoreNotImportedError,
+  SessionStoreUnavailableError,
 } from '../src/services/session-store.js';
-import { readPersistedSessionRows, mutatePersistedSessionRow } from './helpers/session-store-disk.js';
+import {
+  readPersistedSessionRows,
+  mutatePersistedSessionRow,
+  seedPersistedSessionRows,
+} from './helpers/session-store-disk.js';
 
 function seedJson(name: string, rows: Record<string, unknown>): string {
   mkdirSync(tempDir, { recursive: true });
@@ -169,9 +175,13 @@ describe('first-start JSON import', () => {
   it('a non-owning process (worker under an old daemon) never bootstraps the .db', () => {
     seedJson('sessions-appA.json', { s1: row('s1') });
 
+    // worker（owner:false）在旧 daemon 还没导入时启动：不许建库，也不许把
+    // 「还没迁移」当成「没有会话」——写门必须挡住，而不是从空投影继续。
     init('appA', { owner: false });
-    expect(getSession('s1')?.title).toBe('s1'); // 读 JSON 照常
+    expect(getSession('s1')).toBeUndefined();
     expect(existsSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'))).toBe(false);
+    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
+    expect(() => listSessionsStrict()).toThrow(/尚未迁移/);
 
     // daemon（owner）随后启动才导入
     init('appA');
@@ -180,10 +190,10 @@ describe('first-start JSON import', () => {
   });
 });
 
-// ─── 混合窗口 db-else-json ───────────────────────────────────────────────────
+// ─── 导入之后：冻结 JSON 不再是 store ───────────────────────────────────────
 
-describe('mixed-window db-else-json resolution', () => {
-  it('readers prefer the .db and treat the frozen JSON as superseded, not a second copy', () => {
+describe('the frozen import source is not a store', () => {
+  it('readers ignore the frozen JSON entirely, and it is not a second identity copy', () => {
     // appA 已切 SQLite（daemon 已重启），冻结 JSON 里留着一份陈旧拷贝
     const jsonFp = seedJson('sessions-appA.json', {
       s1: row('s1', { title: 'stale json copy', larkAppId: 'appA' }),
@@ -207,8 +217,11 @@ describe('mixed-window db-else-json resolution', () => {
     expect(countActiveSessionsOnDisk(tempDir)).toBe(1);
   });
 
-  it('stores still on JSON keep full read behaviour, and mixed stores compose', () => {
-    // appOld 还没重启（只有 JSON）；appNew 已切 SQLite
+  it('a peer bot that has not imported yet is invisible to cross-bot discovery', () => {
+    // 设计上接受的代价：跨 bot 发现只看 .db。某个 peer 的 daemon 还没在
+    // SQLite 版本上重启过时，它对「跨 bot 继承 workingDir / 活跃数统计 /
+    // adopt 去重」都不可见——而不是被当成一份可信但陈旧的拷贝。调用方自己的
+    // store 走的是 fail-closed 那条路（见下面的 assertStoreImported 用例）。
     seedJson('sessions-appOld.json', { o1: row('o1', { larkAppId: 'appOld' }) });
     init('appNew');
     const n1 = createSession('oc_chat', 'om_shared_root', 'new bot session');
@@ -217,16 +230,14 @@ describe('mixed-window db-else-json resolution', () => {
     mutatePersistedSessionRow(tempDir, 'appNew', n1.sessionId, (r) => { r.rootMessageId = 'om_o1'; });
 
     const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
-    expect(snapshot.get('o1')?.larkAppId).toBe('appOld');
+    expect(snapshot.has('o1')).toBe(false);
     expect(snapshot.get(n1.sessionId)?.larkAppId).toBe('appNew');
 
-    // 跨 bot 发现类读者对两种引擎同时可见（sibling json + sibling db）
     init('appThird');
-    const found = findActiveSessionsByRoot('om_o1');
-    expect(found.map(s => s.sessionId).sort()).toEqual(['o1', n1.sessionId].sort());
-    expect(countActiveSessionsOnDisk(tempDir)).toBe(2);
+    expect(findActiveSessionsByRoot('om_o1').map(s => s.sessionId)).toEqual([n1.sessionId]);
+    expect(countActiveSessionsOnDisk(tempDir)).toBe(1);
     const ids = collectBotmuxSessionIdentities(tempDir);
-    expect(ids.has('o1')).toBe(true);
+    expect(ids.has('o1')).toBe(false);
     expect(ids.has(n1.sessionId)).toBe(true);
   });
 
@@ -258,6 +269,7 @@ describe('mixed-window db-else-json resolution', () => {
   it('offline mutation on the .db keeps the abortIf entry + pre-publication probes', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
     init('appA');
+    listSessions(); // 触发导入 → .db
     const before = readPersistedSessionRows(tempDir, 'appA');
 
     let probes = 0;
@@ -282,6 +294,7 @@ describe('mixed-window db-else-json resolution', () => {
   it('offline mutation hands mutate the FRESH .db row, never the caller snapshot', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
     init('appA');
+    listSessions(); // 触发导入 → .db
     mutatePersistedSessionRow(tempDir, 'appA', 's1', (r) => { r.workerGeneration = 7; });
 
     const published = mutateSessionRowOffline(
@@ -428,27 +441,32 @@ describe('SQLite capability gate', () => {
     )).toThrow(SessionStoreSqliteUnavailableError);
   });
 
-  it('CLI paths keep working on plain JSON stores when the SQLite engine is missing (no .db yet)', () => {
+  it('an un-imported store is a migration error, never an engine capability error', () => {
+    // 引擎在不在 与 这个 store 迁没迁 是两件事，报错必须分型：前者要人升级
+    // 运行时，后者只要重启 daemon。混成一个会把「重启就好」误报成「装不上」。
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
-    __testOnly_setSqliteUnavailable(true);
 
-    expect(readSessionRowFromDisk('s1', 'appA', tempDir)?.sessionId).toBe('s1');
-    expect(loadAllSessionsSnapshot({ dataDir: tempDir }).get('s1')?.larkAppId).toBe('appA');
-    expect(readSessionRowCopiesAcrossStores('s1', tempDir)).toHaveLength(1);
-    const published = mutateSessionRowOffline(
+    expect(() => loadAllSessionsSnapshot({ dataDir: tempDir, fallbackAppId: 'appA' }))
+      .toThrow(SessionStoreNotImportedError);
+    expect(() => mutateSessionRowOffline(
       { sessionId: 's1', larkAppId: 'appA' },
       (current) => { current.status = 'closed'; return true; },
       { dataDir: tempDir },
-    );
-    expect(published?.status).toBe('closed');
+    )).toThrow(/尚未迁移/);
+    // 没有 .db 也没有 JSON 的数据目录只是「还没有会话」，静默返回空。
+    const emptyDir = mkdtempSync(join(tmpdir(), 'session-store-empty-'));
+    try {
+      expect(loadAllSessionsSnapshot({ dataDir: emptyDir, fallbackAppId: 'appA' }).size).toBe(0);
+    } finally {
+      rmSync(emptyDir, { recursive: true, force: true });
+    }
   });
 
   it('a corrupt .db is a skippable store, not a missing-engine error', () => {
     mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
     writeFileSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'), 'this is not a database');
-    // A sibling JSON store (no .db) is the readable copy. The empty legacy
-    // sessions.db that beforeEach init() may have created does not hold s1.
-    seedJson('sessions-appB.json', { s1: row('s1', { title: 'other-bot' }) });
+    // 另一个 bot 的 store 是可读的那份拷贝。
+    seedPersistedSessionRows(tempDir, 'appB', { s1: row('s1', { title: 'other-bot' }) });
 
     expect(() => assertSqliteSupported()).not.toThrow();
     const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
