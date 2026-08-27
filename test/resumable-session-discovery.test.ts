@@ -748,6 +748,15 @@ describe('isBotmuxInjectedPrompt', () => {
     )).toBe(false);
   });
 
+  it('still drops role-with-literal when the envelope follows directly', () => {
+    // Isolates WHICH mechanism leaks. The legacy `^<role…>` pattern is not fooled
+    // by a literal `</role>` — its lazy quantifier backtracks to the second one —
+    // so this shape is caught even though the block walk bails on it. The residual
+    // above needs BOTH the literal AND a block (`summary_memory`) that appears in
+    // no `^`-anchored ordering; only that intersection leaks.
+    expect(isBotmuxInjectedPrompt(`${ROLE_OPEN}格式见 </role> 说明</role>\n\n${UM}`)).toBe(true);
+  });
+
   it('drops the same shape when the persona has no </role> literal (control)', () => {
     expect(isBotmuxInjectedPrompt(
       `${ROLE_OPEN}外层人格</role>\n\n${SUMMARY}\n\n${UM}`,

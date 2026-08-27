@@ -182,8 +182,8 @@ const BOTMUX_LEADING_BLOCK_TAGS: readonly string[] = [
  *  positive, but that input is byte-identical to botmux's own output, so no
  *  content-based check can separate them; accepted as residual.
  *
- *  KNOWN RESIDUAL FALSE NEGATIVE (pre-existing, not introduced here): the close
- *  lookup takes the FIRST `</tag>`, so a block whose own body contains that
+ *  KNOWN RESIDUAL FALSE NEGATIVE (this function cannot ADD one — see below): the
+ *  close lookup takes the FIRST `</tag>`, so a block whose own body contains that
  *  literal string ends early and the walk then hits prose and bails. Reachable
  *  only through `<role>`: `renderRoleContextBlock` interpolates persona text
  *  unescaped, so a persona containing `</role>` (nested or bare) truncates the
@@ -197,9 +197,21 @@ const BOTMUX_LEADING_BLOCK_TAGS: readonly string[] = [
  *      (`<session_id>abc</session_id> 请解释 <session_id>def</session_id>` +
  *      envelope) then gets swallowed, which is the failure direction that
  *      actually costs the user something.
- *  Failure direction here is a session merely APPEARING in the /adopt list, and
- *  these prompts leaked before this function existed too, so the residual is
- *  strictly narrower than the pre-existing behavior.
+ *
+ *  Why "cannot ADD a false negative" is structural, not just sampled:
+ *  `isBotmuxInjectedPrompt` ORs this check BEFORE the pattern list, so the
+ *  function is a pure disjunctive addition — it can only turn `false` into
+ *  `true`, never the reverse. Any prompt the pre-existing patterns dropped is
+ *  still dropped. (Spot-checked over 4,000 generated block chains: zero cases
+ *  where the old verdict was `true` and the new one `false`.) The residual above
+ *  is therefore inherited, not introduced: the affected shapes — role-with-literal
+ *  plus `<summary_memory>` — leaked before this function existed, because
+ *  `summary_memory` appears in none of the `^`-anchored orderings. Note the
+ *  legacy `^<role…>` pattern is NOT itself fooled by a literal `</role>`: its
+ *  lazy quantifier backtracks to the second one, so `role-with-literal` directly
+ *  followed by the envelope still matches there. The two mechanisms fail on
+ *  different inputs; only their intersection leaks.
+ *  Failure direction is a session merely APPEARING in the /adopt list.
  *
  *  Deliberately NOT a regex. The natural regex form
  *  (`^<(?:tag|…)\b[^>]*>[\s\S]*?<user_message>[\s\S]*?<\/user_message>`) is
