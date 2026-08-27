@@ -6,6 +6,7 @@ import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { loadAllSessionsSnapshot, mutateSessionRowOffline } from './session-store.js';
 
 export type WhiteboardScope = 'chat' | 'project' | 'custom';
 
@@ -420,24 +421,43 @@ export function appendLog(id: string, entry: { kind: string; actor?: string; to?
   });
 }
 
+/**
+ * Drop a deleted board's id from every session row that still points at it.
+ *
+ * Goes through the session store's offline API. It used to enumerate
+ * `sessions*.json` and rewrite whole files by hand — a second writer outside
+ * the store's single gate, which silently became a no-op the moment the rows
+ * moved into SQLite (the scan simply found no matching files, so
+ * `clearedSessions` reported 0 while every row kept its stale binding).
+ *
+ * `deleteWhiteboard` runs in the dashboard process, which owns no session
+ * store, so the offline row mutation is the correct entry point. A store that
+ * cannot be reached (unreadable, or a bot that has not migrated yet) skips
+ * that one session instead of failing the whole delete.
+ */
 function clearSessionWhiteboardRefs(id: string): number {
+  const dataDir = config.session.dataDir;
+  let snapshot: Map<string, { sessionId: string; larkAppId?: string; whiteboardId?: string }>;
+  try {
+    snapshot = loadAllSessionsSnapshot({ dataDir }) as unknown as Map<string, {
+      sessionId: string; larkAppId?: string; whiteboardId?: string;
+    }>;
+  } catch { return 0; }
   let cleared = 0;
-  let files: string[] = [];
-  try { files = readdirSync(config.session.dataDir); } catch { return 0; }
-  for (const file of files) {
-    if (!file.startsWith('sessions') || !file.endsWith('.json')) continue;
-    const fp = join(config.session.dataDir, file);
-    let data: Record<string, any>;
-    try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { continue; }
-    let dirty = false;
-    for (const session of Object.values(data)) {
-      if (session && typeof session === 'object' && session.whiteboardId === id) {
-        delete session.whiteboardId;
-        dirty = true;
-        cleared++;
-      }
-    }
-    if (dirty) atomicWriteFileSync(fp, JSON.stringify(data, null, 2) + '\n');
+  for (const session of snapshot.values()) {
+    if (session?.whiteboardId !== id) continue;
+    try {
+      const published = mutateSessionRowOffline(
+        { sessionId: session.sessionId, larkAppId: session.larkAppId },
+        (current) => {
+          if ((current as { whiteboardId?: string }).whiteboardId !== id) return false;
+          (current as { whiteboardId?: string }).whiteboardId = undefined;
+          return true;
+        },
+        { dataDir },
+      );
+      if (published && (published as { whiteboardId?: string }).whiteboardId === undefined) cleared++;
+    } catch { /* unreachable store → leave this row alone */ }
   }
   return cleared;
 }
