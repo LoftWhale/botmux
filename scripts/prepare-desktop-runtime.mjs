@@ -6,6 +6,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import https from 'node:https';
 
@@ -54,6 +55,7 @@ async function stageBotmuxRuntime() {
     '--cpu', '*',
   ], runtimeDir);
   await assertBundledCanvasArchitectures();
+  await stageNodePty();
   // electron-builder applies the app-level `!node_modules/**` exclusion to
   // extraResources and expands pnpm symlinks into duplicate dependency trees.
   // A single archive crosses that boundary intact; afterPack expands it before
@@ -81,6 +83,71 @@ async function assertBundledCanvasArchitectures() {
       throw new Error(`Bundled runtime is missing @napi-rs/canvas-darwin-${arch} (looked for ${pkgDir})`);
     }
   }
+}
+
+/**
+ * Copy node-pty into the staged runtime tree.
+ *
+ * WHY A COPY INSTEAD OF A DEPENDENCY: node-pty is a devDependency on purpose. It has
+ * an `install` script (`node scripts/prebuild.js || node-gyp rebuild`) and ships NO
+ * linux prebuild, so any placement npm/bun would install for an end user turns a
+ * node-gyp toolchain into an install prerequisite — measured: `npm i -g botmux` then
+ * compiles pty.node from source on every machine that has a compiler. The CLI does
+ * not need it installed at all (the single-file binary embeds pty.node at compile
+ * time), and the desktop app does not need it BUILT: node-pty's loader tries
+ * `build/Release` → `build/Debug` → `prebuilds/<platform>-<arch>` (lib/utils.js), and
+ * the npm package carries darwin-arm64 + darwin-x64 prebuilds. Under
+ * `--ignore-scripts` `build/Release` never exists, so macOS loads a prebuild.
+ *
+ * So: stage the package as-is from the builder's own node_modules. Its only
+ * dependency (`node-addon-api`) is compile-time headers and is not needed at runtime.
+ */
+async function stageNodePty() {
+  const target = join(runtimeDir, 'node_modules', 'node-pty');
+  const require = createRequire(join(root, 'package.json'));
+  let source;
+  try {
+    source = dirname(require.resolve('node-pty/package.json'));
+  } catch (err) {
+    throw new Error(
+      'Cannot resolve node-pty from the builder checkout — run `bun install` first. '
+      + `(${err && err.message ? err.message : String(err)})`,
+    );
+  }
+  await rm(target, { recursive: true, force: true });
+  // EXCLUDE build/ — and this is not tidiness, it is correctness. The builder is
+  // Linux, so its node_modules carries a Linux-ELF `build/Release/pty.node`
+  // (verified with `file`). node-pty's loader tries `build/Release` FIRST, so
+  // copying it would make the macOS app prefer a Linux binary over the correct
+  // darwin prebuild and fail to load the native module at all.
+  await cp(source, target, {
+    recursive: true,
+    dereference: true,
+    filter: src => !isUnderBuildDir(source, src),
+  });
+
+  // Fail closed, and assert what macOS ACTUALLY loads. Without this the desktop app
+  // could ship with no terminal support at all and nothing would notice until a user
+  // opened a session — the exact silent-failure shape this whole change removes.
+  for (const arch of ['arm64', 'x64']) {
+    const prebuild = join(target, 'prebuilds', `darwin-${arch}`, 'pty.node');
+    if (!existsSync(prebuild)) {
+      throw new Error(`Staged node-pty is missing its darwin-${arch} prebuild (looked for ${prebuild})`);
+    }
+  }
+  // And assert the builder's own platform binary did NOT ride along: its presence
+  // would shadow the prebuilds above (loader order), which is exactly the failure
+  // the filter prevents.
+  const shadowed = join(target, 'build', 'Release', 'pty.node');
+  if (existsSync(shadowed)) {
+    throw new Error(`Staged node-pty carries the builder's build/Release/pty.node (${shadowed}); it would shadow the darwin prebuild`);
+  }
+}
+
+/** True when `candidate` is node-pty's `build/` dir (or anything inside it). */
+function isUnderBuildDir(pkgRoot, candidate) {
+  const buildDir = join(pkgRoot, 'build');
+  return candidate === buildDir || candidate.startsWith(buildDir + sep);
 }
 
 function normalizeVersion(value) {

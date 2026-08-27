@@ -46,7 +46,7 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 
 > npm 包内已经带了对应平台的**自包含二进制**（按 os/arch 只装匹配的那一个），安装时会把 `~/.botmux/bin/botmux` 指向它。所以装完只有**一个** botmux 版本，不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。把 `~/.botmux/bin` 放进 PATH 即可（安装日志会提示命令）。
 >
-> 安装过程**不编译任何原生模块**（不需要 Python / node-gyp / 编译器）：要跑的 PTY 已经嵌在那个二进制里。支持 linux / macOS × x64 / arm64；**Windows 请在 WSL2 里安装**（WSL 报告为 linux，是完整支持的一等环境）。不在支持列表里的平台会在安装时**明确报错**，而不是装上一个跑不起来的命令。
+> 安装过程**不编译任何原生模块**（不需要 Python / node-gyp / 编译器）：要跑的 PTY 已经嵌在那个二进制里，npm 只是把它放到位。支持 linux / macOS × x64 / arm64；**Windows 请在 WSL2 里安装**（WSL 报告为 linux，是完整支持的一等环境）。不在支持列表里的平台会在安装时**明确报错**，而不是装上一个跑不起来的命令。
 
 <details>
 <summary>不想装 Node？直接下单文件可执行（连装包都不需要 Node）</summary>

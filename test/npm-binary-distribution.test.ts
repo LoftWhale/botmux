@@ -243,20 +243,20 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
       optionalDependencies?: Record<string, string>;
     };
     expect(manifest.bin).toBeUndefined();
-    // The two native deps must be OPTIONAL, and that placement is load-bearing in
-    // two directions at once:
-    //   • NOT `dependencies` — node-pty has no linux prebuild, so a hard runtime dep
-    //     drags a node-gyp toolchain into every `npm i -g`.
-    //   • NOT `devDependencies` either — prepare-desktop-runtime.mjs stages the
-    //     desktop runtime with `bun install --production`, which SKIPS dev deps but
-    //     KEEPS optional ones (measured). Under dev deps the desktop app would ship
-    //     with no node-pty (terminal dead) and no canvas natives.
-    // Optional satisfies both: present for the runtime tree, skippable for users.
-    for (const dep of ['node-pty', '@napi-rs/canvas']) {
-      expect(manifest.dependencies?.[dep], `${dep} must not be a hard dependency`).toBeUndefined();
-      expect(manifest.devDependencies?.[dep], `${dep} must not be a devDependency (--production drops it)`).toBeUndefined();
-      expect(manifest.optionalDependencies?.[dep], `${dep} must be an optionalDependency`).toBeTruthy();
-    }
+    // node-pty must be a devDependency and NOTHING else. It has an `install` script
+    // and ships no linux prebuild, so ANY placement an end user's install would honor
+    // (`dependencies` OR `optionalDependencies`) makes npm run node-gyp — measured:
+    // `npm i` then compiles pty.node from source on every machine with a compiler.
+    // Nobody needs it installed: the single-file binary embeds pty.node at compile
+    // time, and the desktop runtime gets it by copy (prepare-desktop-runtime.mjs).
+    expect(manifest.dependencies?.['node-pty'], 'node-pty must not be a hard dependency').toBeUndefined();
+    expect(manifest.optionalDependencies?.['node-pty'], 'node-pty must not be optional either — npm still runs its install script').toBeUndefined();
+    expect(manifest.devDependencies?.['node-pty'], 'node-pty must stay a devDependency (build-bun-binary.mjs resolves it)').toBeTruthy();
+    // canvas is the opposite case: no install script (never compiles), and the
+    // desktop tree needs `--cpu '*'` to pull both darwin arches, which only works for
+    // a dependency `bun install --production` actually installs. Optional fits.
+    expect(manifest.dependencies?.['@napi-rs/canvas'], '@napi-rs/canvas must not be a hard dependency').toBeUndefined();
+    expect(manifest.optionalDependencies?.['@napi-rs/canvas'], '@napi-rs/canvas must be optional (--production keeps optional, drops dev)').toBeTruthy();
   });
 
   /**
