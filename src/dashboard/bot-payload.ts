@@ -102,6 +102,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
     privateCard: j?.privateCard === true,
     thinkingCard: j?.thinkingCard !== false,
+    senderTag: j?.senderTag !== false,
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
     autoStartOnGroupJoin: j?.autoStartOnGroupJoin === true,

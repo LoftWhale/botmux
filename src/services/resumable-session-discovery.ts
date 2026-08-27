@@ -143,9 +143,54 @@ const BOTMUX_INJECTION_PATTERNS: readonly RegExp[] = [
   /用户发送了：\s*\n-{3,}[\s\S]*?\n-{3,}[\s\S]*?Session ID:\s*[0-9a-f]{8}-[0-9a-f]{4}-/i,
 ];
 
+/** Leading blocks botmux may place BEFORE `<user_message>`. Order-independent by
+ *  construction: {@link startsWithBotmuxLeadingBlock} only checks which tag the
+ *  prompt opens with, so a new block needs one entry here rather than a new
+ *  ordering permutation in BOTMUX_INJECTION_PATTERNS. */
+const BOTMUX_LEADING_BLOCK_TAGS: readonly string[] = [
+  'botmux_routing', 'botmux_builtin_skills', 'identity', 'session_id', 'role',
+  'summary_memory', 'botmux_reminder', 'whiteboard', 'chat_context_policy', 'chat_context',
+];
+
+/** True when `text` opens with one of botmux's leading blocks AND later carries
+ *  a complete `<user_message>…</user_message>` envelope.
+ *
+ *  Why this exists: the `^`-anchored patterns above enumerate exact block
+ *  ORDERINGS, so each new leading block multiplies the permutations — and any
+ *  chain nobody spelled out leaked into the /adopt picker as if external.
+ *  Measured: 14 of 30 claude-family combinations leaked (every prefix
+ *  containing `<summary_memory>` or `<chat_context…>`, e.g. `role+summary`,
+ *  `wb+chatctx`) — those match no `^` anchor, and with a bot running
+ *  `senderTag: false` and no @mentions that turn, nothing follows
+ *  `</user_message>` either, so the trailing-adjacency pattern misses too.
+ *
+ *  Deliberately NOT a regex. The natural regex form
+ *  (`^<(?:tag|…)\b[^>]*>[\s\S]*?<user_message>[\s\S]*?<\/user_message>`) is
+ *  quadratic: both lazy scans restart at every `<user_message>` occurrence, so
+ *  a prompt of repeated `<user_message>` opens with no close took 374ms at 100k
+ *  chars and 5969ms at 400k (4× input → 16× time), against 0.3ms for the
+ *  pre-existing patterns on the same input. The `indexOf` scans below are
+ *  linear and cannot backtrack. Still STRUCTURAL, not a bare tag-name match: an
+ *  external session merely DISCUSSING this XML would have to both open with one
+ *  of these exact tags and contain the full envelope. */
+function startsWithBotmuxLeadingBlock(text: string): boolean {
+  if (!text.startsWith('<')) return false;
+  const tagEnd = text.indexOf('>');
+  if (tagEnd < 0) return false;
+  // Tag name ends at the first whitespace or at '>' — whichever comes first.
+  const nameEnd = text.search(/[\s>]/);
+  if (nameEnd < 1) return false;
+  const tag = text.slice(1, nameEnd);
+  if (!BOTMUX_LEADING_BLOCK_TAGS.includes(tag)) return false;
+  const open = text.indexOf('<user_message>', tagEnd);
+  if (open < 0) return false;
+  return text.indexOf('</user_message>', open + 14) > 0;
+}
+
 /** True when `text` is a botmux-generated user turn (structural envelope).
  *  Shared by Claude/Codex/Grok adopt discovery so filters stay consistent. */
 export function isBotmuxInjectedPrompt(text: string): boolean {
+  if (startsWithBotmuxLeadingBlock(text)) return true;
   return BOTMUX_INJECTION_PATTERNS.some((re) => re.test(text));
 }
 

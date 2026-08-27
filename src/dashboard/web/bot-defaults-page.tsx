@@ -698,6 +698,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
     thinkingCard: body.thinkingCard,
+    senderTag: body.senderTag,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
@@ -1070,6 +1071,9 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'claude-code' ? (
               <section className="bd-tile"><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
+                所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
+            <section className="bd-tile"><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -3776,6 +3780,55 @@ export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot:
       <small className="bd-section-note">{tr('botDefaults.envelopeInjectionNote')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-envelope-injection-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+  const tr = useT();
+  const [on, setOn] = useState(props.bot.senderTag !== false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => setOn(props.bot.senderTag !== false), [props.bot.senderTag]);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = on;
+    setOn(next);
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await props.putCardPref({ senderTag: next });
+      if (res.ok) {
+        props.patchBot(props.bot.larkAppId, { senderTag: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setOn(previous);
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setOn(previous);
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section" data-sender-tag>
+      <h3 className="bd-section-title">{tr('botDefaults.senderTag')}</h3>
+      <ToggleRow
+        checked={on}
+        disabled={busy}
+        dataAction="toggle-sender-tag"
+        title={tr('botDefaults.senderTagInject')}
+        help={tr('botDefaults.senderTagHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <small className="bd-section-note">{tr('botDefaults.senderTagNote')}</small>
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-sender-tag-status': '' }} />
       </div>
     </section>
   );
