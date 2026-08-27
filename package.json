@@ -118,8 +118,7 @@
   },
   "license": "MIT",
   "trustedDependencies": [
-    "node-pty",
-    "esbuild",
-    "electron"
+    "electron",
+    "node-pty"
   ]
 }

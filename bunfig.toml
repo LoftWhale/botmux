@@ -1,0 +1,17 @@
+# Pin the PUBLIC npm registry for every `bun install` in this repo.
+#
+# WHY THIS FILE EXISTS (do not delete): unlike pnpm-lock.yaml, **bun.lock records
+# the registry URL of whatever registry produced it**. A lockfile generated on a
+# machine whose npm default points at an internal mirror bakes that hostname into
+# the lockfile — measured: 882 occurrences of an internal mirror — and CI then
+# fails every single tarball with `DNSResolveFailed` (665 of them, exactly the
+# package count) because a public runner cannot resolve an internal host.
+#
+# Regenerating the lockfile once is not enough: the next person who runs
+# `bun install` on a mirror-configured machine writes the mirror straight back in.
+# Pinning it here makes the lockfile reproducible regardless of the machine's own
+# npm/bun defaults.
+#
+# Developers behind a mirror should use a proxy (or a local, uncommitted
+# bunfig override) rather than changing this line.
+registry = "https://registry.npmjs.org/"
