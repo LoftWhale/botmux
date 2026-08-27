@@ -256,7 +256,7 @@ function navClassName(item: NavItem): string | undefined {
 }
 
 /** 侧边栏导航锚点：桌面分组导航与移动端横向 rail 共用同一份渲染。 */
-function renderNavAnchor(item: NavItem): JSX.Element {
+function renderNavAnchor(item: NavItem): React.JSX.Element {
   return (
     <a
       href={item.href}

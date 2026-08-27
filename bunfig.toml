@@ -9,9 +9,17 @@
 #
 # Regenerating the lockfile once is not enough: the next person who runs
 # `bun install` on a mirror-configured machine writes the mirror straight back in.
-# Pinning it here makes the lockfile reproducible regardless of the machine's own
-# npm/bun defaults.
 #
-# Developers behind a mirror should use a proxy (or a local, uncommitted
-# bunfig override) rather than changing this line.
+# SCOPE — this does NOT override a machine-level mirror. `registry=` in
+# `~/.npmrc` takes PRECEDENCE over this file (measured: with an internal mirror in
+# `~/.npmrc`, `bun install` still goes to the mirror despite this line). CI runners
+# have no `~/.npmrc`, so this is what keeps THEIR resolution public and the
+# lockfile honest. A developer behind a mirror must therefore pass
+# `--registry https://registry.npmjs.org/` (or use a proxy, or a local
+# `bunfig.toml` override) when regenerating the lockfile — otherwise the mirror
+# hostname lands back in `bun.lock` and CI fails every tarball.
+#
+# A committed project-level `.npmrc` would win over `~/.npmrc` and fix this
+# outright, but `.npmrc` is deliberately in `.gitignore` next to `.env` — real
+# ones carry `_authToken` lines — so it stays uncommitted on purpose.
 registry = "https://registry.npmjs.org/"
