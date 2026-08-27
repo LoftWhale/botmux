@@ -120,6 +120,7 @@ export function assertSqliteSupported(): void {
 function openDbForOwnStore(path: string): SqliteDatabaseLike {
   requireSqliteEngine(`会话存储 ${basename(path)} `);
   const db = openDatabaseSyncOrThrow(path);
+  // Both engines validate the file at first use, not in the constructor.
   db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA synchronous = NORMAL;');
@@ -139,6 +140,7 @@ function openDbForRead(path: string): SqliteDatabaseLike {
   } catch {
     db = openDatabaseSyncOrThrow(path, { readOnly: true });
   }
+  // First use: file validation (corrupt → throw here, skippable by scan).
   db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
   return db;
 }

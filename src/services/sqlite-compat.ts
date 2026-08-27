@@ -17,8 +17,8 @@
  *     returns null, including a missing module AND a corrupt file.
  *   • `sqliteEngineAvailable` + `openDatabaseSyncOrThrow` — fail-closed
  *     stores (session-store): module-load failure is "no engine"; a
- *     constructor error after the engine loaded is a bad file, not a
- *     missing runtime. Do not collapse the two.
+ *     corrupt/locked file surfaces at first exec/query after the engine
+ *     loaded (not a missing runtime). Do not collapse the two.
  *
  * Kept deliberately synchronous to match the existing feedback store's contract
  * (a synchronous write under a busy_timeout serializes concurrent opens without
@@ -149,11 +149,14 @@ export function openDatabaseSyncNow(path: string, opts: OpenOptions = {}): Datab
 }
 
 /**
- * Synchronous open that distinguishes "no engine" from "engine loaded, open
- * failed". Module-load errors propagate as thrown exceptions from `require`;
- * a corrupt / locked file also throws from the constructor. Fail-closed
- * stores (session-store) use this so SQLITE_NOTADB is not collapsed into
- * "runtime has no SQLite".
+ * Synchronous open that distinguishes "no engine" from "engine loaded, file
+ * unusable". Module-load errors throw from `require`. Both runtimes defer
+ * file validation to first use — a corrupt / locked file does **not** throw
+ * from the constructor; it surfaces at the first `exec` / query
+ * (`file is not a database`). Fail-closed stores (session-store) call this
+ * then immediately `PRAGMA busy_timeout`, so SQLITE_NOTADB still throws
+ * inside the open helper's caller and is not collapsed into "runtime has
+ * no SQLite".
  */
 export function openDatabaseSyncOrThrow(path: string, opts: OpenOptions = {}): DatabaseSyncLike {
   return openWithLoadedEngine(path, opts);
