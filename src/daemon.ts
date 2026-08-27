@@ -278,7 +278,7 @@ import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn 
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -3134,32 +3134,6 @@ function rawExcerptForLog(raw: unknown, limit = 800): string {
 
 function sessionHasReplyThreadAlias(s: Pick<Session, 'scope' | 'replyThreadAliases'>, rootId: string): boolean {
   return s.scope === 'chat' && !!s.replyThreadAliases?.[rootId];
-}
-
-/**
- * True when `rootId` is a message this chat-scope session ALREADY answered as a
- * flat top-level turn (`turnReplyContexts[rootId].target.mode === 'plain'`).
- *
- * Why this exists: a user can @ the bot at group top level (bot answers flat,
- * recording mode='plain' for that turn) and only afterwards open a native Lark
- * 话题 ON that very message. Lark then delivers follow-ups inside that topic as
- * root_id=<the original top-level om_ message> + thread_id=<the new omt_>. The
- * regular-group fold correctly keeps the turn in the group chat-scope session,
- * but if it also anchors the visible reply at that root, the answer lands in a
- * topic the user never @'d the bot in (user-reported bug).
- *
- * A genuine "@ inside an existing topic" turn can never match: that root was
- * never answered by this session as a plain top-level turn — it is either an
- * unseen root or already recorded as mode='thread'. So this predicate isolates
- * the after-the-fact case without touching the intended topic-anchoring
- * contract (see event-dispatcher's chat/shared fold tests).
- */
-function chatSessionAnsweredRootAtTopLevel(
-  s: Pick<Session, 'scope' | 'turnReplyContexts'>,
-  rootId: string,
-): boolean {
-  if (s.scope !== 'chat') return false;
-  return s.turnReplyContexts?.[rootId]?.target?.mode === 'plain';
 }
 
 function reconcileDeferredTopicBinding(ds: DaemonSession): string | undefined {
@@ -17226,6 +17200,9 @@ function deliverPassthroughToExistingSession(
     senderOpenId?: string;
     senderIsBot: boolean;
     substitute: boolean;
+    /** The inbound message carried a Lark thread_id (see
+     *  FrozenSessionReplyContext.inThread). */
+    inThread?: boolean;
     /** raw input 已写入 worker 后回调（worker 不在线的拒绝分支不触发），供 ingress
      *  调用方打接纳标——其后同步收尾（落盘/事件派发）抛错不得再诱导重发，否则
      *  /compact 这类非幂等 passthrough 会被重发重复执行。 */
@@ -17250,6 +17227,7 @@ function deliverPassthroughToExistingSession(
       senderOpenId: turn.senderOpenId,
       participants: passthroughWindow.participants,
       participantsIncomplete: passthroughWindow.incomplete,
+      inThread: turn.inThread,
     });
     if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
       ds.session.lastCallerOpenId = turn.senderOpenId;
@@ -17414,7 +17392,7 @@ async function startInitialPassthroughSession(args: {
     sessionStore.updateSession(ds.session);
   }
   const initialWindow = buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBotTriState, undefined, initialPassthroughSender?.name);
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete });
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete, inThread: !!parsed.threadId });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -18376,7 +18354,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Turn key is the reply anchor (== messageId outside session-group births) so
   // the per-turn reply context and currentReplyTarget.turnId line up with the
   // worker's turn id — current-turn provenance requires that equality.
-  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete });
+  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -19461,6 +19439,7 @@ async function handleThreadReplyAdmitted(
           senderOpenId: threadSenderOpenId,
           senderIsBot: isForeignBot,
           substitute: !!substituteTrigger,
+          inThread: !!parsed.threadId,
           onDelivered: () => markIngressAdmitted(ctx),
         });
       }
@@ -19732,7 +19711,7 @@ async function handleThreadReplyAdmitted(
     // on the double-race (matches the new-topic path's collectPostAtMentions args).
     const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt);
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete });
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -20166,7 +20145,7 @@ async function handleThreadReplyAdmitted(
       : 'thread';
     const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt);
-    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete });
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete, inThread: !!parsed.threadId });
     sessionStore.updateSession(newDs.session);
     const registration = await claimNewDaemonSession(activeSessions, newDs);
     if (!registration.accepted) {
