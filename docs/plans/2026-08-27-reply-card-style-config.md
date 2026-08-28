@@ -33,6 +33,13 @@
 
 `layoutColors` 只允许飞书卡头 template 枚举：`blue` / `wathet` / `turquoise` / `green` / `yellow` / `orange` / `red` / `carmine` / `violet` / `purple` / `indigo` / `grey`。未知档名、非法颜色、非字符串标签一律忽略并打日志，该档回退当前主题缺省，整张卡仍发出、不 fail。微调不能突破底线：不能用这个口子加按钮、进度条或任意 JSON。
 
+长度与安全硬上限（按 Unicode code point 计，避免 emoji 被 UTF-16 腰斩）：
+
+- `recipePrompt` 最多 **4096** 个 code point。超限、含 `NUL`、非字符串 → 忽略该字段并打日志，回退内置配方。
+- `layoutTags` 单档最多 **32** 个 code point。超限、含 `Cc` 控制字符、非字符串、未知档名 → 忽略该档并打日志，回退当前主题缺省。
+
+都是**逐项**忽略回退，不整块拒绝，不阻断 bots.json 加载或发送。`recipePrompt` 非空时**替换**内置配方区，不是追加；空或省略仍用内置文本。
+
 ## 预设主题
 
 五档语义固定，主题只调视觉重量。
@@ -111,17 +118,26 @@
 
 **CLI vs relay：** CLI 层 fail-soft 面向用户输入，保证合法调用「发送不失败」。sandbox relay 的 host 校验面向伪造/篡改的 outbox——沙箱内 CLI 只会转发五个 canonical 名，host 再见到非法 `--layout` 只可能是绕过 child 的请求，硬拒绝（与 `--response-kind` 同门）。两层不矛盾，后人不要当成规格冲突。
 
+**会话快照（自有 pane）：** worker spawn 把归一化后的稀疏对象冻进 `BOTMUX_REPLY_STYLE`。同一 pane 里 `botmux skill show botmux-send` 与 `botmux send` 都读这份快照，避免长会话中途改配置导致指南和渲染分叉。Riff/Mojo 在用户 env 合并后再冻一次，防止旧值/伪造值覆盖。共享持久后端在会话边界清理该键，避免跨 bot 泄漏。
+
+**adopt / restore-adopt（非侵入，按 A 收边界）：** 不向已运行的外部 CLI 注入 env / skill / 动态指南，init **不带** `replyStyle`。不要把这条写成「adopt 不支持 replyStyle」：
+
+- 指南注入不生效；磁盘 native/global 的 `botmux-send` 永远是稳定 loader（不含个性化配方或 `--layout`）
+- `botmux skill show botmux-send` 只有同时存在 `BOTMUX_SESSION_ID`、`BOTMUX_LARK_APP_ID`、`BOTMUX_REPLY_STYLE` 才按快照个性化；缺任一则固定出厂默认指南（忽略环境里残留的无关快照）
+- `botmux send --layout` 照常可用：按该 session 的 `larkAppId` 读 live `bots.json` / 内存 registry（无 worker 快照时，Dashboard 改完即时生效）
+
 ## 切分
 
 ### 本轮终态（本 PR）
 
 1. 五档 layout 薄壳：卡头按上表 + 规定标签 + 正文仍走现有 Markdown（不加原生分栏、不加进度条、不加按钮）
 2. `replyStyle.recipes` / `replyStyle.layout` / `replyStyle.theme`；枚举锁死，非法值忽略并回退缺省，发送不失败
-3. `replyStyle.recipePrompt`：覆写/追加配方引导；空或省略 = 内置文本
-4. `replyStyle.layoutColors` / `replyStyle.layoutTags`：官方色板内每档微调；非法值按档回退主题缺省
+3. `replyStyle.recipePrompt`：非空则**替换**内置配方区；空或省略 = 内置文本；最长 4096 code point，超限/NUL 逐项忽略
+4. `replyStyle.layoutColors` / `replyStyle.layoutTags`：官方色板内每档微调；非法值按档回退主题缺省；单档标签最长 32 code point，超限/`Cc` 控制字符逐项忽略
 5. bots.json 解析 + Dashboard：三个开关/主题下拉、配方多行文本框、每档颜色下拉、每档标签输入
 6. `recipes === false` 时指南去掉配方表和选型信号（自定义 `recipePrompt` 也不注入）；`layout === false` 时指南不提 `--layout`，CLI 忽略 flag，颜色/标签配置不生效
 7. 回读：换主题或微调颜色/标签后 `quoted` / `history` 仍能还原正文、表格、以及被取进 `header.title` / `text_tag_list` 的标题与标签；测例必须用 **live 归一化形态**，不认 builder 原始 JSON
+8. 自有会话冻 `BOTMUX_REPLY_STYLE`；adopt 不注入指南；`skill show` 无完整会话标记则固定默认指南；adopt/global 的 `send --layout` 按 `larkAppId` 读 live 配置
 
 ### 本轮之后
 
