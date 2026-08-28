@@ -792,6 +792,7 @@ jobs:
             -v "$PWD:/work" -w /work \
             -e RELEASE_TAG \
             -e MATRIX_TARGETS="${{ matrix.targets }}" \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             node:22-alpine sh -euc '
               apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
 
@@ -828,11 +829,28 @@ jobs:
               BIN="dist-bin/botmux-linux-${HOST_ARCH}-musl"
               if [ ! -x "$BIN" ]; then echo "musl binary $BIN not built"; exit 1; fi
               node scripts/smoke-bun-binary.mjs "$BIN"
+
+              # Hand dist-bin back to the HOST user before exiting.
+              #
+              # WHY (this broke v3.18.0-canary.5, after the container work itself had
+              # fully succeeded): the container runs as root, so everything it writes
+              # through the bind mount is uid 0. The runner host user is `runner`
+              # (uid 1001) and CANNOT create files inside a root-owned directory:
+              #   dist-bin/botmux-linux-arm64-musl.sha256: Permission denied
+              # Both musl legs built, smoke-passed, and then died in `Checksums`.
+              #
+              # `-v` bind mounts share the host inode, so ownership is not remapped
+              # for us (a `container:` job did not have this problem because GitHub
+              # ran the whole job as the same user). Reproduced and fixed as a
+              # non-root user before committing — my original verification ran as
+              # root, which can write anywhere and therefore could not see it.
+              chown -R "$HOST_UID:$HOST_GID" dist-bin
             '
 
       - name: Checksums
-        # Runs on the host: the binaries are bind-mount writebacks, owned by root
-        # (the container user), but world-readable — verified.
+        # Runs on the host, writing .sha256 files INTO dist-bin — which is why the
+        # container hands ownership back above. Readable is not enough; this step
+        # needs write permission on the directory.
         run: |
           cd dist-bin
           for f in botmux-*; do sha256sum "$f" > "$f.sha256"; done

@@ -165,4 +165,26 @@ describe('release.yml — the musl legs stay wired into the publish chain', () =
     expect(header).not.toMatch(/^\s*container:/m);
     expect(job).toContain('docker run');
   });
+
+  it('hands dist-bin back to the host user (Checksums writes INTO it)', () => {
+    // THE REGRESSION THIS PINS — v3.18.0-canary.5, and note where it struck: both
+    // musl legs BUILT and smoke-PASSED, then `Checksums` died with
+    //   dist-bin/botmux-linux-arm64-musl.sha256: Permission denied
+    // The container runs as root, `-v` bind mounts share the host inode without
+    // remapping ownership, and the runner host user (uid 1001) cannot create files
+    // inside a root-owned directory. A job-level `container:` never had this problem
+    // because GitHub ran every step as the same user — so the problem was INTRODUCED
+    // by moving to `docker run`, and only bites steps that WRITE into dist-bin.
+    //
+    // Asserted on both workflows even though ci.yml has no step after the container:
+    // that asymmetry is how this shipped. Keeping the legs isomorphic means the PR
+    // gate exercises the same ownership handoff the release depends on.
+    for (const code of [RELEASE_CODE, CI_CODE]) {
+      const marker = code.includes('bun-binaries-musl:') ? 'bun-binaries-musl:' : 'bun-binary-musl:';
+      const job = code.slice(code.indexOf(marker));
+      expect(job).toMatch(/chown -R "\$HOST_UID:\$HOST_GID" dist-bin/);
+      // The ids must actually be passed in, or the chown expands to `:` and fails.
+      expect(job).toMatch(/-e HOST_UID="\$\(id -u\)" -e HOST_GID="\$\(id -g\)"/);
+    }
+  });
 });

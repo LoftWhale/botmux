@@ -169,6 +169,7 @@ jobs:
           docker run --rm \
             -v "$PWD:/work" -w /work \
             -e CI_RUN_NUMBER="${{ github.run_number }}" \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             node:22-alpine sh -euc '
               # python3/make/g++ are node-gyp'"'"'s toolchain: node-pty has no linux
               # prebuild and must compile here. binutils supplies readelf.
@@ -210,5 +211,15 @@ jobs:
               # ERR_DLOPEN_FAILED. So running the binary at all proves the musl
               # native loads; no separate PTY step is needed.
               node scripts/smoke-bun-binary.mjs dist-bin/botmux-linux-x64-musl
+
+              # Hand dist-bin back to the HOST user, exactly as the release leg does.
+              #
+              # This job needs it less (nothing after this step touches dist-bin), and
+              # that asymmetry is precisely how the bug shipped: the release leg has a
+              # `Checksums` step that WRITES into dist-bin, and root-owned files made
+              # it fail with `Permission denied` after both musl builds had succeeded.
+              # Keeping the two legs isomorphic means the PR gate exercises the same
+              # ownership handoff the release depends on.
+              chown -R "$HOST_UID:$HOST_GID" dist-bin
             '
 
