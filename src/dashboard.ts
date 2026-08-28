@@ -4685,7 +4685,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'DELETE' && mWhiteboard) {
       try {
         const id = decodeURIComponent(mWhiteboard[1]);
-        return jsonRes(res, 200, deleteWhiteboard(id));
+        return jsonRes(res, 200, await deleteWhiteboard(id));
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: err?.message ?? 'whiteboard_delete_failed' });
       }

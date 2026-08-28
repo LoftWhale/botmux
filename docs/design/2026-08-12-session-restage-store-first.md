@@ -104,11 +104,11 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 
 #1051 已覆盖本 stage 中收益最大的部分（§4）。本 stage 只收尾，不要把 occupancy 放进同一 PR。
 
-建议在本 PR 内补上（范围小，且避免与终态相反的写入路径）：
+已纳入 #1051 的 Stage 0 缺口：
 
-- dashboard 删除白板：daemon 运行中通过 IPC 清除 `whiteboardId`（现有 `POST /api/sessions/:id/whiteboard` 只接受非空 id，不能解绑）。daemon 未运行时才走离线写，且必须传 `abortIf`。当前实现在 daemon 运行时直接 `UPDATE` SQLite，会造成磁盘行与 daemon 内存不一致；相对 #852 之后的 master，这是新增的第二写者。
-- `mutateSessionRowOffline` 在 sqlite 路径调用 `openDbForOwnStore` 之前，若文件不存在则失败。读写 open 会创建空库，导致 `existsSync(db)` 导入门误判为「已导入」。不要只依赖 `resolveStoreFile` 里的一次 `existsSync`。
-- PR 标题与最早一笔 commit 仍写「全仓 db-only」，与 HEAD 不符。以「daemon 不再写 JSON；跨进程在升级窗口内仍可读 JSON」为准。
+- dashboard 删除白板：daemon 运行中经 IPC 发送 `whiteboardId: null` 解绑（路由原先只接受非空 id）。daemon 未运行时才走 `mutateSessionRowOffline`，且传 `abortIf`（探测 `findOnlineDaemon`）。IPC 失败且 daemon 仍可见时不写盘，避免与内存缓存分叉。
+- `mutateSessionRowOffline` 的 sqlite 路径在 `openDbForOwnStore` 前再做一次 `existsSync`：读写 open 会创建空库，导致导入门把尚未导入的 store 当成已导入。
+- PR 标题与描述以「daemon 不再写 JSON；跨进程在升级窗口内仍可读 JSON」为准，不再写全仓 db-only。
 
 升级后自动重启 fleet 合入后，再开一个仍属 Stage 0 的 PR，从代码中删除 JSON 读路径（不必等 occupancy）：
 
@@ -180,19 +180,14 @@ daemon 进程内部可以先于 Stage 2 排队；**对外保证**要等所有外
 - 导入：暂存库使用 `journal_mode=DELETE`（避免 bun:sqlite 在 WAL 下 `rename` 出只有文件头的库）、按文件 key 插入而不按行内 `sessionId` 重键、`owner: false` 只读、不因探测路径创建空库而跳过导入。
 - close 路径先写 SQLite 再合并回内存对象，与单一 apply 方向一致，保留。
 - 测试夹具写入真实 SQLite，不再靠写 JSON 让「唯一写入入口」测试误绿。
+- 删除白板：daemon 运行中 IPC 解绑；未运行时带 `abortIf` 的离线写。sqlite 离线写打开前拒绝缺文件。
 
 本 PR 明确不做、也不应做：
 
 - occupancy（Stage 1）。与「删除 JSON 写路径」风险和范围都不同。
 - 跨进程改为只读 SQLite。在升级后自动重启 fleet 落地前删除 JSON 回落，会让升级窗口内的 `botmux send` 失败。删除条件是「不再存在仍在写 JSON 的 daemon」，放在 Stage 0 收尾，不是本 PR 的前置。
 
-建议合入前补上（仍属 Stage 0）：
-
-- 删除白板：IPC 解绑 + `abortIf`，见 §3 Stage 0。目的是避免本 PR 新增一条与终态相反的第二写路径，不是提前做 occupancy。
-- sqlite 离线写在打开连接前拒绝缺失文件。
-- 标题与 commit 与 HEAD 一致：daemon 不再写 JSON ≠ 所有进程只使用 SQLite。
-
-合入后的实际状态：daemon 只写 SQLite；其它进程在升级窗口内仍可能读 JSON；occupancy 仍在心跳文件；apply 仍有两套。之后按 Stage 1 → 2 → 3 推进，不再使用「按单个竞态加事务、不实现 per-session 串行」的旧 Step 4。
+合入后的实际状态：daemon 只写 SQLite；其它进程在升级窗口内仍可能读 JSON；occupancy 仍在心跳文件；apply 仍有两套（删白板在 daemon 运行时走 IPC，未运行时走带 `abortIf` 的离线写）。之后按 Stage 1 → 2 → 3 推进。
 
 ## 5. 建议顺序
 
@@ -201,11 +196,9 @@ daemon 进程内部可以先于 Stage 2 排队；**对外保证**要等所有外
  |               |                    |                    |              |              |
  |-- Stage 0 ----+-- Stage 0 收尾 -----|                    |              |              |
  |  (本 PR)      |  删除 JSON 读路径   |------ Stage 1 ------+-- Stage 2 ---+-- Stage 3 ---|
-                 |  白板 IPC 若未进入本 PR 则单独跟一个 PR
 ```
 
-- **#1051**：补上白板解绑与「打开前拒绝缺文件」后合入。这是删除 daemon JSON 写路径的主 PR。
-- **若未打进 #1051**：白板解绑 IPC 单独跟 PR，不等 Stage 1。
+- **#1051**：删除 daemon JSON 写路径；含白板 IPC 解绑与离线写打开前拒绝缺文件。
 - **与升级后自动重启 fleet 对齐**：从代码删除 JSON 读路径。fleet 实现不在本文范围，但它是删除 JSON 分支的前提。
 - **下一个架构主 PR**：Stage 1 occupancy。先写能失败的测试覆盖「读心跳文件与写会话行之间的窗口」，合入后 `findDaemon` 不再用于所有权判断。
 - **再下一个**：Stage 2，daemon 未运行时获取租约并执行同一 apply，删除第二套对外写协议。这一阶段减少的概念最多。

@@ -2131,9 +2131,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params)
   let body: { whiteboardId?: unknown };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  if (typeof body.whiteboardId !== 'string'
-    || body.whiteboardId.length === 0
-    || body.whiteboardId.length > 256) {
+  const unbind = body.whiteboardId === null;
+  const bindId = typeof body.whiteboardId === 'string' ? body.whiteboardId : '';
+  const bind = !unbind
+    && bindId.length > 0
+    && bindId.length <= 256;
+  if (!unbind && !bind) {
     return jsonRes(res, 400, { ok: false, error: 'bad_whiteboard_id' });
   }
   const session = findSessionRecord(params.sessionId);
@@ -2143,9 +2146,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params)
   return withBotTurnAdmission(larkAppId, async () => {
     const current = findSessionRecord(params.sessionId);
     if (!current) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-    current.whiteboardId = body.whiteboardId as string;
+    if (unbind) current.whiteboardId = undefined;
+    else current.whiteboardId = bindId;
     sessionStore.updateSession(current);
-    jsonRes(res, 200, { ok: true, whiteboardId: current.whiteboardId });
+    jsonRes(res, 200, { ok: true, whiteboardId: current.whiteboardId ?? null });
   });
 });
 

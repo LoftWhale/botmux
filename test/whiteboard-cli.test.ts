@@ -225,7 +225,7 @@ describe('botmux whiteboard CLI', () => {
     const prevDataDir = process.env.SESSION_DATA_DIR;
     process.env.SESSION_DATA_DIR = dataDir;
     const { deleteWhiteboard } = await import('../dist/services/whiteboard-store.js');
-    const result = deleteWhiteboard('delete_board');
+    const result = await deleteWhiteboard('delete_board');
     if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
     else process.env.SESSION_DATA_DIR = prevDataDir;
     expect(result).toMatchObject({ ok: true, id: 'delete_board', clearedSessions: 1 });

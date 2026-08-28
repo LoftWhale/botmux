@@ -6,6 +6,8 @@ import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { fetchDaemonIpc, loadDaemonIpcSecret } from '../core/daemon-ipc-auth.js';
+import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { loadAllSessionsSnapshot, mutateSessionRowOffline } from './session-store.js';
 
 export type WhiteboardScope = 'chat' | 'project' | 'custom';
@@ -421,50 +423,87 @@ export function appendLog(id: string, entry: { kind: string; actor?: string; to?
   });
 }
 
+type SessionWhiteboardRef = {
+  sessionId: string;
+  larkAppId?: string;
+  whiteboardId?: string;
+};
+
+/** Daemon running: IPC so the in-memory row is the one that persists.
+ *  Daemon down: locked offline write, aborted if a daemon appears mid-flight. */
+async function unbindSessionWhiteboard(
+  session: SessionWhiteboardRef,
+  boardId: string,
+  dataDir: string,
+): Promise<boolean> {
+  const larkAppId = session.larkAppId;
+  if (larkAppId) {
+    try {
+      const daemon = findOnlineDaemon(larkAppId);
+      if (daemon) {
+        const res = await fetchDaemonIpc(
+          daemon.ipcPort,
+          `/api/sessions/${encodeURIComponent(session.sessionId)}/whiteboard`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ whiteboardId: null }),
+          },
+          loadDaemonIpcSecret(),
+        );
+        if (res.ok) return true;
+      }
+    } catch { /* fall through to offline write */ }
+  }
+  const published = mutateSessionRowOffline(
+    { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) },
+    (current) => {
+      if ((current as SessionWhiteboardRef).whiteboardId !== boardId) return false;
+      (current as SessionWhiteboardRef).whiteboardId = undefined;
+      return true;
+    },
+    {
+      dataDir,
+      ...(larkAppId
+        ? {
+            abortIf: () => {
+              try { return !!findOnlineDaemon(larkAppId); } catch { return false; }
+            },
+          }
+        : {}),
+    },
+  );
+  return !!published && (published as SessionWhiteboardRef).whiteboardId === undefined;
+}
+
 /**
  * Drop a deleted board's id from every session row that still points at it.
  *
- * Goes through the session store's offline API. It used to enumerate
- * `sessions*.json` and rewrite whole files by hand — a second writer outside
- * the store's single gate, which silently became a no-op the moment the rows
- * moved into SQLite (the scan simply found no matching files, so
- * `clearedSessions` reported 0 while every row kept its stale binding).
- *
- * `deleteWhiteboard` runs in the dashboard process, which owns no session
- * store, so the offline row mutation is the correct entry point. A store that
- * cannot be reached (unreadable, or a bot that has not migrated yet) skips
- * that one session instead of failing the whole delete.
+ * Used to enumerate `sessions*.json` and rewrite whole files — a second writer
+ * outside the store gate, and a no-op once rows moved into SQLite. Now: if the
+ * owning daemon is running, clear via IPC (the daemon's cache is authoritative);
+ * if not, `mutateSessionRowOffline` with `abortIf` so a daemon that appears
+ * mid-flight is not raced. Unreadable stores skip that one session.
  */
-function clearSessionWhiteboardRefs(id: string): number {
+async function clearSessionWhiteboardRefs(id: string): Promise<number> {
   const dataDir = config.session.dataDir;
-  let snapshot: Map<string, { sessionId: string; larkAppId?: string; whiteboardId?: string }>;
+  let snapshot: Map<string, SessionWhiteboardRef>;
   try {
-    snapshot = loadAllSessionsSnapshot({ dataDir }) as unknown as Map<string, {
-      sessionId: string; larkAppId?: string; whiteboardId?: string;
-    }>;
+    snapshot = loadAllSessionsSnapshot({ dataDir }) as unknown as Map<string, SessionWhiteboardRef>;
   } catch { return 0; }
   let cleared = 0;
   for (const session of snapshot.values()) {
     if (session?.whiteboardId !== id) continue;
     try {
-      const published = mutateSessionRowOffline(
-        { sessionId: session.sessionId, larkAppId: session.larkAppId },
-        (current) => {
-          if ((current as { whiteboardId?: string }).whiteboardId !== id) return false;
-          (current as { whiteboardId?: string }).whiteboardId = undefined;
-          return true;
-        },
-        { dataDir },
-      );
-      if (published && (published as { whiteboardId?: string }).whiteboardId === undefined) cleared++;
+      if (await unbindSessionWhiteboard(session, id, dataDir)) cleared++;
     } catch { /* unreachable store → leave this row alone */ }
   }
   return cleared;
 }
 
-export function deleteWhiteboard(id: string): { ok: true; id: string; clearedSessions: number } {
+export async function deleteWhiteboard(id: string): Promise<{ ok: true; id: string; clearedSessions: number }> {
   const clean = safeId(id);
-  return withIndexLock(() => {
+  withIndexLock(() => {
     const index = readIndex();
     delete index.boards[clean];
     for (const [key, boardId] of Object.entries(index.bindings)) {
@@ -478,10 +517,10 @@ export function deleteWhiteboard(id: string): { ok: true; id: string; clearedSes
     // sessions at a missing board.md. Index-first means a crash can at worst
     // leave an orphaned dir with no index entry (harmless), never a ghost.
     writeIndex(index);
-    const clearedSessions = clearSessionWhiteboardRefs(clean);
     rmSync(boardDir(clean), { recursive: true, force: true });
-    return { ok: true, id: clean, clearedSessions };
   });
+  const clearedSessions = await clearSessionWhiteboardRefs(clean);
+  return { ok: true, id: clean, clearedSessions };
 }
 
 export function whiteboardPath(id: string): { dir: string; board: string; log: string; meta: string } {

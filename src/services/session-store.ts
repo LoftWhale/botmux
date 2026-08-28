@@ -1839,6 +1839,11 @@ export function mutateSessionRowOffline(
   const ref = resolveStoreFile(target.larkAppId, dataDir);
 
   if (ref.kind === 'sqlite') {
+    // resolveStoreFile already probed existsSync, but a read-write open CREATES
+    // a missing file. The window between that probe and this open must not
+    // plant an empty store: that would make the daemon's import gate skip the
+    // one-shot JSON import and silently drop every pre-SQLite row.
+    if (!existsSync(ref.path)) return undefined;
     const db = openDbForOwnStore(ref.path);
     let inTxn = false;
     try {
