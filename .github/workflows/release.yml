@@ -732,7 +732,8 @@ jobs:
           retention-days: 7
 
   bun-binaries-musl:
-    # The musl (Alpine) legs, in a CONTAINER rather than on the runner.
+    # The musl (Alpine) legs. The build runs inside Alpine via `docker run`; the
+    # job itself runs on the plain glibc runner.
     #
     # WHY A SEPARATE JOB: `pty.node` is embedded into the binary at build time, and
     # node-pty ships NO linux prebuild — so the builder compiles it against whatever
@@ -742,11 +743,22 @@ jobs:
     # glibc native and fail at PTY spawn on Alpine — at RUNTIME, silently, not at
     # build time. So the musl targets must be compiled on musl.
     #
-    # Verified end-to-end before this job existed: inside node:22-alpine, building
-    # with scripts/build-bun-binary.mjs --target bun-linux-x64-musl and then running
-    # the result spawned a real PTY (`PTY_OK_FROM_MUSL`). That check matters because
-    # a binary that merely STARTS proves nothing — a libc mismatch fails at the
-    # moment the native module loads.
+    # WHY `docker run` AND NOT A JOB-LEVEL `container:` (this cost a failed release):
+    # with `container: node:22-alpine`, the arm64 leg died before running anything:
+    #   JavaScript Actions in Alpine containers are only supported on x64 Linux
+    #   runners. Detected Linux Arm64
+    # actions/checkout is a JS action, and GitHub cannot inject its Node runtime
+    # into a musl container on arm64. The x64 leg was unaffected, which is why the
+    # PR gate (x64-only) stayed green while the release failed. Running JS actions
+    # on the HOST and only the build inside `docker run` sidesteps the limitation
+    # entirely and keeps both arches on one code path.
+    #
+    # Verified end-to-end: inside node:22-alpine, building with
+    # scripts/build-bun-binary.mjs --target bun-linux-x64-musl and then running the
+    # result spawned a real PTY (`PTY_OK_FROM_MUSL`). That check matters because a
+    # binary that merely STARTS proves nothing — a libc mismatch fails at the moment
+    # the native module loads. The bind-mount writeback (artifact readable back on
+    # the host for upload-artifact) was verified with the same shape.
     if: github.event_name == 'push'
     strategy:
       fail-fast: false
@@ -759,61 +771,68 @@ jobs:
             targets: bun-linux-arm64-musl
             artifact: linux-arm64-musl
     runs-on: ${{ matrix.os }}
-    # node:22-alpine gives us musl + a Node for the scripts. bun is installed below
-    # (setup-bun does not support musl containers).
-    container: node:22-alpine
     permissions:
       contents: read
     env:
       RELEASE_TAG: ${{ github.ref_name }}
     steps:
-      # git is not in the base image, and checkout needs it for a real clone.
-      - name: Install toolchain (musl needs node-gyp deps for node-pty)
-        run: apk add --no-cache git python3 make g++ libstdc++ bash tar
-
+      # Runs on the HOST (glibc), so the JS action works on both arches.
       - uses: actions/checkout@v6
 
-      - name: Install bun
-        # oven-sh/setup-bun does not run in a musl container; npm's bun package does.
-        run: npm i -g bun@1.4.0 --loglevel=error
-
-      # Compiles node-pty against MUSL — the whole point of this job.
-      - run: bun install --frozen-lockfile
-
-      - name: Verify the native is musl-linked
-        # Fail closed rather than shipping a glibc native inside a musl binary. That
-        # mistake would survive the build and only surface when a user spawns a PTY.
+      - name: Build the musl binary inside Alpine
+        # Every musl-side step in one container invocation: toolchain, bun, install
+        # (this is what compiles pty.node against musl), the fail-closed linkage
+        # check, version stamp, build, compile, and the shared smoke script.
+        #
+        # `--platform` is deliberately NOT passed: the image resolves to the
+        # runner's own architecture, which is the whole point — the native must be
+        # built for the arch it will ship on, not emulated.
         run: |
-          f=node_modules/node-pty/build/Release/pty.node
-          test -f "$f" || { echo "node-pty native missing at $f"; exit 1; }
-          apk add --no-cache binutils >/dev/null
-          if ! readelf -d "$f" | grep -q 'libc\.musl'; then
-            echo "REFUSING: $f is not musl-linked:"; readelf -d "$f" | grep NEEDED; exit 1
-          fi
-          echo "ok: $(readelf -d "$f" | grep NEEDED | tr -s ' ')"
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            -e RELEASE_TAG \
+            -e MATRIX_TARGETS="${{ matrix.targets }}" \
+            node:22-alpine sh -euc '
+              apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
 
-      - name: Sync version from git tag to package.json
-        run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+              # setup-bun does not support musl, and npm ships musl builds of bun
+              # (@oven/bun-linux-{x64,aarch64}-musl), so npm is the way in.
+              npm i -g bun@1.4.0 --loglevel=error
+              echo "bun $(bun --version) on $(uname -m)"
 
-      - run: bun run build
+              # Compiles node-pty against MUSL — the whole point of this job.
+              bun install --frozen-lockfile
 
-      - name: Compile Bun single-file executables (musl)
-        run: |
-          mkdir -p dist-bin
-          for t in ${{ matrix.targets }}; do
-            bun scripts/build-bun-binary.mjs --target "$t" --out "dist-bin/botmux-${t#bun-}"
-          done
+              # Fail closed rather than shipping a glibc native inside a musl
+              # binary: that mistake survives the build and only surfaces when the
+              # native is loaded, on a user machine.
+              f=node_modules/node-pty/build/Release/pty.node
+              test -f "$f" || { echo "node-pty native missing at $f"; exit 1; }
+              if ! readelf -d "$f" | grep -q "libc\.musl"; then
+                echo "REFUSING: $f is not musl-linked:"; readelf -d "$f" | grep NEEDED; exit 1
+              fi
+              echo "ok: $(readelf -d "$f" | grep NEEDED | tr -s " ")"
 
-      - name: Smoke-test the musl binary
-        # Runs the binary this container just built, on musl — the only place it can
-        # be executed. Same shared script as the glibc legs and the PR gate.
-        run: |
-          HOST_ARCH="$(node -e 'process.stdout.write(process.arch)')"
-          BIN="dist-bin/botmux-linux-${HOST_ARCH}-musl"
-          if [ ! -x "$BIN" ]; then echo "musl binary $BIN not built"; exit 1; fi
-          node scripts/smoke-bun-binary.mjs "$BIN"
+              npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+              bun run build
+
+              mkdir -p dist-bin
+              for t in $MATRIX_TARGETS; do
+                bun scripts/build-bun-binary.mjs --target "$t" --out "dist-bin/botmux-${t#bun-}"
+              done
+
+              # Run the binary this container just built, on musl — the only place
+              # it can be executed. Same shared script as the glibc legs and the PR
+              # gate, so no leg is gated more weakly than another.
+              HOST_ARCH="$(node -e "process.stdout.write(process.arch)")"
+              BIN="dist-bin/botmux-linux-${HOST_ARCH}-musl"
+              if [ ! -x "$BIN" ]; then echo "musl binary $BIN not built"; exit 1; fi
+              node scripts/smoke-bun-binary.mjs "$BIN"
+            '
 
       - name: Checksums
+        # Runs on the host: the binaries are bind-mount writebacks, owned by root
+        # (the container user), but world-readable — verified.
         run: |
           cd dist-bin
           for f in botmux-*; do sha256sum "$f" > "$f.sha256"; done

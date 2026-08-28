@@ -47,20 +47,49 @@ describe('ci.yml — the musl artifact is gated on PRs, not only at release', ()
     expect(CI_CODE).toMatch(/^ {2}bun-binary-musl:/m);
   });
 
-  it('runs that job in a musl container (GitHub has no Alpine runner)', () => {
-    // Without a musl container the job would compile on glibc and prove nothing:
-    // the native is whatever libc the builder has.
-    expect(CI_CODE).toMatch(/container:\s*node:22-alpine/);
+  // ── MECHANISM vs MEANS ───────────────────────────────────────────────────────
+  // A cautionary note earned the hard way. The FIRST version of this suite asserted
+  //     expect(CI_CODE).toMatch(/container:\s*node:22-alpine/)
+  // which was green, and went red when mutated — "has teeth" by the usual test. But
+  // `container:` WAS the P0: on an arm64 runner it makes actions/checkout fail
+  // outright, and v3.18.0-canary.4's release died on it. That assertion had locked
+  // the defect in as the expected shape, so fixing the bug REQUIRED reversing it.
+  //
+  // Reverse-mutation cannot catch this: an assertion pinning a wrong implementation
+  // is indistinguishable from one pinning a right one — both go red when deleted.
+  // The lesson is to assert the INVARIANT (the build happens on musl, and we prove
+  // the native is musl-linked) rather than the MEANS of achieving it. The means-level
+  // checks below are kept deliberately, but only as labelled REGRESSION PINS for one
+  // specific known-bad implementation — never as the primary guarantee.
+
+  it('MECHANISM: builds in a musl environment and proves the native is musl-linked', () => {
+    // Implementation-agnostic on purpose: satisfied by `docker run`, by a job-level
+    // container on an all-x64 matrix, or by a future musl-capable runner. What it
+    // does NOT tolerate is compiling the musl target on glibc, which is the actual
+    // hazard — `pty.node` is embedded at build time and would be the wrong libc.
+    const job = CI_CODE.slice(CI_CODE.indexOf('bun-binary-musl:'));
+    expect(job).toMatch(/alpine|musl/);                       // a musl environment
+    expect(job).toMatch(/readelf[\s\S]*libc/);                // linkage proven, not assumed
+    expect(job).toContain('--target bun-linux-x64-musl');     // the musl artifact
   });
 
-  it('compiles the musl TARGET (not the glibc one it sits next to)', () => {
-    expect(CI_CODE).toContain('--target bun-linux-x64-musl');
+  it('REGRESSION PIN: no job-level container (arm64 cannot run JS actions in one)', () => {
+    // Not the mechanism — one known-bad way of achieving it. GitHub refuses:
+    //   "JavaScript Actions in Alpine containers are only supported on x64 Linux
+    //    runners. Detected Linux Arm64"
+    // The x64 leg was unaffected, which is precisely why this PR gate stayed green
+    // while the release's arm64-musl leg died before a single build step ran.
+    const job = CI_CODE.slice(CI_CODE.indexOf('bun-binary-musl:'));
+    const jobHeader = job.slice(0, job.indexOf('steps:'));
+    expect(jobHeader).not.toMatch(/^\s*container:/m);
   });
 
-  it('asserts the native is musl-linked before compiling around it', () => {
-    // The fail-closed readelf gate. A glibc `pty.node` embedded in a musl binary
-    // survives the build; this is the only cheap place it is unambiguous.
-    expect(CI_CODE).toMatch(/readelf -d .*grep -q 'libc\\\.musl'/);
+  it('REGRESSION PIN: does NOT pin --platform (would emulate the wrong arch)', () => {
+    // Also a means-level pin. `--platform` would pull a foreign-arch image under
+    // qemu and embed a native for the WRONG architecture — the same class of defect
+    // as cross-compiling from glibc, reached by a different route.
+    const job = CI_CODE.slice(CI_CODE.indexOf('bun-binary-musl:'));
+    expect(job).not.toContain('--platform');
   });
 
   it('EXECUTES the musl binary through the shared smoke script', () => {
@@ -110,5 +139,30 @@ describe('release.yml — the musl legs stay wired into the publish chain', () =
     const subpackages = RELEASE_CODE.slice(RELEASE_CODE.indexOf('binary-subpackages:'));
     const needsLine = subpackages.slice(0, subpackages.indexOf('runs-on'));
     expect(needsLine).toContain('bun-binaries-musl');
+  });
+
+  it('MECHANISM: each musl leg builds on musl and proves the linkage', () => {
+    // Implementation-agnostic, like its ci.yml counterpart: what must hold is that
+    // the musl artifacts are built in a musl environment with the linkage verified,
+    // not that any particular container mechanism is used.
+    const job = RELEASE_CODE.slice(RELEASE_CODE.indexOf('bun-binaries-musl:'));
+    expect(job).toMatch(/alpine|musl/);
+    expect(job).toMatch(/readelf[\s\S]*libc/);
+  });
+
+  it('REGRESSION PIN: musl legs carry no job-level container (arm64 breaks in one)', () => {
+    // THE REGRESSION THIS PINS, and it is not hypothetical: v3.18.0-canary.4's
+    // release failed here. With `container: node:22-alpine`, the arm64-musl leg
+    // died at actions/checkout ("JavaScript Actions in Alpine containers are only
+    // supported on x64 Linux runners"), before a single build step ran. Because
+    // `binary-subpackages` and `release` both need this job, the entire publish
+    // chain skipped — correctly, but the release produced nothing.
+    //
+    // Reverting to a job-level container would break arm64 again while leaving the
+    // x64 PR gate green, which is exactly how it slipped through the first time.
+    const job = RELEASE_CODE.slice(RELEASE_CODE.indexOf('bun-binaries-musl:'));
+    const header = job.slice(0, job.indexOf('steps:'));
+    expect(header).not.toMatch(/^\s*container:/m);
+    expect(job).toContain('docker run');
   });
 });
