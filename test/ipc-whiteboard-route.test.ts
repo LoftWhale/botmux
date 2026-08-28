@@ -69,6 +69,43 @@ describe('POST /api/sessions/:sessionId/whiteboard', () => {
     expect(update).toHaveBeenCalledOnce();
   });
 
+  it('clears only when expectWhiteboardId still matches', async () => {
+    const session = { sessionId: 's-wb-cas', larkAppId: 'app-1', whiteboardId: 'wb_old' as string | undefined };
+    mockOwnedSession(session);
+    const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => undefined);
+
+    const res = await postWhiteboard('s-wb-cas', { whiteboardId: null, expectWhiteboardId: 'wb_old' });
+    expect(res.status).toBe(200);
+    expect(session.whiteboardId).toBeUndefined();
+    expect(update).toHaveBeenCalledOnce();
+  });
+
+  it('refuses with 409 when the session was rebound after the caller looked', async () => {
+    // Deleting a board removes it from the index, so the daemon's
+    // ensureSessionWhiteboard mints a replacement on the next turn. A late
+    // unconditional clear would drop that fresh binding and orphan the board.
+    const session = { sessionId: 's-wb-rebound', larkAppId: 'app-1', whiteboardId: 'wb_new' as string | undefined };
+    mockOwnedSession(session);
+    const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => undefined);
+
+    const res = await postWhiteboard('s-wb-rebound', { whiteboardId: null, expectWhiteboardId: 'wb_deleted' });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ ok: false, error: 'whiteboard_changed', whiteboardId: 'wb_new' });
+    expect(session.whiteboardId).toBe('wb_new');
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-string expectWhiteboardId', async () => {
+    const session = { sessionId: 's-wb-bad-expect', larkAppId: 'app-1', whiteboardId: 'wb_keep' };
+    mockOwnedSession(session);
+    const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => undefined);
+
+    const res = await postWhiteboard('s-wb-bad-expect', { whiteboardId: null, expectWhiteboardId: 7 });
+    expect(res.status).toBe(400);
+    expect(session.whiteboardId).toBe('wb_keep');
+    expect(update).not.toHaveBeenCalled();
+  });
+
   it('rejects an empty string (unbind is null, not "")', async () => {
     const session = { sessionId: 's-wb-empty', larkAppId: 'app-1', whiteboardId: 'wb_keep' };
     mockOwnedSession(session);

@@ -8,7 +8,8 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from '../core/daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
-import { loadAllSessionsSnapshot, mutateSessionRowOffline } from './session-store.js';
+import { loadAllSessionsSnapshot } from './session-store.js';
+import { mutateSessionRowWhenUnowned } from './session-offline-write.js';
 
 export type WhiteboardScope = 'chat' | 'project' | 'custom';
 
@@ -429,17 +430,39 @@ type SessionWhiteboardRef = {
   whiteboardId?: string;
 };
 
-/** Daemon running: IPC so the in-memory row is the one that persists.
- *  Daemon down: locked offline write, aborted if a daemon appears mid-flight. */
+/** A loopback daemon that answers its heartbeat but not its socket must not
+ *  hold the caller's HTTP request open. Generous for a same-host call, short
+ *  enough that a wedged daemon degrades to the offline path. */
+const UNBIND_IPC_TIMEOUT_MS = 5_000;
+
+/** `cleared` — this call removed the binding. `already_changed` — the row no
+ *  longer pointed at this board (someone rebound it first); nothing to do.
+ *  `unresolved` — the owning daemon is reachable-but-unusable, so the row was
+ *  deliberately left alone rather than written behind a live cache. */
+type UnbindOutcome = 'cleared' | 'already_changed' | 'unresolved';
+
+/**
+ * Clear one session's binding to a board that is being deleted.
+ *
+ * Daemon up: send the command, so the row that persists is the daemon's own.
+ * Daemon down: publish the row here, under the store's write exclusion and the
+ * liveness re-probe in {@link mutateSessionRowWhenUnowned}.
+ *
+ * Both paths are compare-and-set against `boardId`. Deletion has already
+ * removed the board from the index by the time this runs, so the daemon's
+ * `ensureSessionWhiteboard` will mint a REPLACEMENT board for the session on
+ * its very next turn — an unconditional clear would drop that fresh binding
+ * and orphan the board the daemon just created.
+ */
 async function unbindSessionWhiteboard(
   session: SessionWhiteboardRef,
   boardId: string,
   dataDir: string,
-): Promise<boolean> {
+): Promise<UnbindOutcome> {
   const larkAppId = session.larkAppId;
   if (larkAppId) {
     try {
-      const daemon = findOnlineDaemon(larkAppId);
+      const daemon = findOnlineDaemon(larkAppId, dataDir);
       if (daemon) {
         const res = await fetchDaemonIpc(
           daemon.ipcPort,
@@ -447,61 +470,73 @@ async function unbindSessionWhiteboard(
           {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ whiteboardId: null }),
+            body: JSON.stringify({ whiteboardId: null, expectWhiteboardId: boardId }),
+            signal: AbortSignal.timeout(UNBIND_IPC_TIMEOUT_MS),
           },
           loadDaemonIpcSecret(),
         );
-        if (res.ok) return true;
+        // 409 is the daemon reporting a different binding — authoritative, and
+        // not something the offline path should try to overrule.
+        if (res.status === 409) return 'already_changed';
+        if (res.ok) return 'cleared';
       }
-    } catch { /* fall through to offline write */ }
+    } catch { /* fall through: the re-probe below decides whether we may write */ }
   }
-  const published = mutateSessionRowOffline(
+  let changed = false;
+  const published = mutateSessionRowWhenUnowned(
     { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) },
     (current) => {
-      if ((current as SessionWhiteboardRef).whiteboardId !== boardId) return false;
-      (current as SessionWhiteboardRef).whiteboardId = undefined;
+      const row = current as unknown as SessionWhiteboardRef;
+      if (row.whiteboardId !== boardId) return false;
+      row.whiteboardId = undefined;
+      changed = true;
       return true;
     },
-    {
-      dataDir,
-      ...(larkAppId
-        ? {
-            abortIf: () => {
-              try { return !!findOnlineDaemon(larkAppId); } catch { return false; }
-            },
-          }
-        : {}),
-    },
+    { dataDir },
   );
-  return !!published && (published as SessionWhiteboardRef).whiteboardId === undefined;
+  if (!published) return 'unresolved';
+  return changed ? 'cleared' : 'already_changed';
 }
 
 /**
  * Drop a deleted board's id from every session row that still points at it.
  *
  * Used to enumerate `sessions*.json` and rewrite whole files — a second writer
- * outside the store gate, and a no-op once rows moved into SQLite. Now: if the
- * owning daemon is running, clear via IPC (the daemon's cache is authoritative);
- * if not, `mutateSessionRowOffline` with `abortIf` so a daemon that appears
- * mid-flight is not raced. Unreadable stores skip that one session.
+ * outside the store gate, and a no-op once rows moved into SQLite. Now it goes
+ * through {@link unbindSessionWhiteboard} per row. A store this process cannot
+ * read skips that one session.
  */
-async function clearSessionWhiteboardRefs(id: string): Promise<number> {
+async function clearSessionWhiteboardRefs(
+  id: string,
+): Promise<{ cleared: number; unresolved: number }> {
   const dataDir = config.session.dataDir;
   let snapshot: Map<string, SessionWhiteboardRef>;
   try {
     snapshot = loadAllSessionsSnapshot({ dataDir }) as unknown as Map<string, SessionWhiteboardRef>;
-  } catch { return 0; }
+  } catch { return { cleared: 0, unresolved: 0 }; }
   let cleared = 0;
+  let unresolved = 0;
   for (const session of snapshot.values()) {
     if (session?.whiteboardId !== id) continue;
-    try {
-      if (await unbindSessionWhiteboard(session, id, dataDir)) cleared++;
-    } catch { /* unreachable store → leave this row alone */ }
+    let outcome: UnbindOutcome;
+    try { outcome = await unbindSessionWhiteboard(session, id, dataDir); }
+    catch { outcome = 'unresolved'; }
+    if (outcome === 'cleared') cleared++;
+    else if (outcome === 'unresolved') unresolved++;
   }
-  return cleared;
+  return { cleared, unresolved };
 }
 
-export async function deleteWhiteboard(id: string): Promise<{ ok: true; id: string; clearedSessions: number }> {
+/**
+ * `unresolvedSessions` counts rows whose binding could NOT be cleared because
+ * their owning daemon was visible but unusable. Those rows are not corrupt:
+ * the binding points at a board that no longer exists, and the daemon's
+ * `ensureSessionWhiteboard` replaces it on the session's next turn. The count
+ * is reported so a caller can say so instead of showing a bare `0`.
+ */
+export async function deleteWhiteboard(
+  id: string,
+): Promise<{ ok: true; id: string; clearedSessions: number; unresolvedSessions: number }> {
   const clean = safeId(id);
   withIndexLock(() => {
     const index = readIndex();
@@ -519,8 +554,10 @@ export async function deleteWhiteboard(id: string): Promise<{ ok: true; id: stri
     writeIndex(index);
     rmSync(boardDir(clean), { recursive: true, force: true });
   });
-  const clearedSessions = await clearSessionWhiteboardRefs(clean);
-  return { ok: true, id: clean, clearedSessions };
+  // Outside the index lock: unbinding awaits daemon IPC, and the lock is
+  // synchronous. Nothing here reads the index.
+  const { cleared, unresolved } = await clearSessionWhiteboardRefs(clean);
+  return { ok: true, id: clean, clearedSessions: cleared, unresolvedSessions: unresolved };
 }
 
 export function whiteboardPath(id: string): { dir: string; board: string; log: string; meta: string } {

@@ -2128,7 +2128,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
 // short-lived `botmux whiteboard` process rewriting a stale whole Session row
 // over a concurrent Codex App FIFO transition.
 ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params) => {
-  let body: { whiteboardId?: unknown };
+  let body: { whiteboardId?: unknown; expectWhiteboardId?: unknown };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   const unbind = body.whiteboardId === null;
@@ -2139,6 +2139,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params)
   if (!unbind && !bind) {
     return jsonRes(res, 400, { ok: false, error: 'bad_whiteboard_id' });
   }
+  // Optional compare-and-set. Board deletion needs it: between the deleter's
+  // snapshot and this request the daemon may have rebound the session
+  // (`ensureSessionWhiteboard` mints a replacement as soon as the old board
+  // leaves the index), and an unconditional clear would drop that new binding
+  // and orphan the board the daemon just created.
+  const hasExpect = body.expectWhiteboardId !== undefined;
+  const expect = typeof body.expectWhiteboardId === 'string' ? body.expectWhiteboardId : undefined;
+  if (hasExpect && expect === undefined) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_expect_whiteboard_id' });
+  }
   const session = findSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   const larkAppId = session.larkAppId || cachedLarkAppId;
@@ -2146,6 +2156,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params)
   return withBotTurnAdmission(larkAppId, async () => {
     const current = findSessionRecord(params.sessionId);
     if (!current) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+    if (expect !== undefined && current.whiteboardId !== expect) {
+      return jsonRes(res, 409, {
+        ok: false,
+        error: 'whiteboard_changed',
+        whiteboardId: current.whiteboardId ?? null,
+      });
+    }
     if (unbind) current.whiteboardId = undefined;
     else current.whiteboardId = bindId;
     sessionStore.updateSession(current);
