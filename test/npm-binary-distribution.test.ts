@@ -85,14 +85,19 @@ describe('inject-optional-binaries — release-time version wiring', () => {
     return { ...r, manifest: after };
   }
 
-  it('injects all four platform packages pinned to the release version', () => {
+  it('injects all six platform packages pinned to the release version', () => {
     const { status, manifest } = run('3.20.0', '3.20.0');
     expect(status).toBe(0);
+    // Six, not four: the two -musl entries are what give npm anything to select on
+    // Alpine. Publishing the musl subpackages without listing them here leaves them
+    // on the registry with nothing referencing them — npm never even considers them.
     expect(manifest.optionalDependencies).toEqual({
       'botmux-darwin-arm64': '3.20.0',
       'botmux-darwin-x64': '3.20.0',
       'botmux-linux-arm64': '3.20.0',
+      'botmux-linux-arm64-musl': '3.20.0',
       'botmux-linux-x64': '3.20.0',
+      'botmux-linux-x64-musl': '3.20.0',
     });
   });
 
@@ -308,15 +313,20 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     return { ...r, wrote: existsSync(join(home, '.botmux', 'bin', 'botmux')) };
   }
 
-  it('musl: an ld-musl loader present → refuses with a musl-specific reason', () => {
+  it('musl: an ld-musl loader present → looks for the -musl subpackage', () => {
+    // INVERTED from the previous contract. This used to assert a hard refusal
+    // ("glibc-linked and cannot run on musl"), which was correct only while no musl
+    // binary existed. musl subpackages now ship, so refusing would block the very
+    // platform we added; instead the lookup must agree with what npm installed —
+    // npm selects by each subpackage's `libc` field, so on Alpine that is the
+    // `-musl` name.
     const r = runPostinstallWithFakeRoot('ld-musl-x86_64.so.1');
+    // The fixture stages the plain (glibc) subpackage only, so resolution fails —
+    // but the point is WHICH name it looked for.
     expect(r.status).not.toBe(0);
-    expect(r.wrote).toBe(false);
-    expect(r.stderr).toContain('musl');
-    // Must be the musl message, not the generic "no prebuilt binary" one — the guard
-    // has to run BEFORE subpackage resolution, because on Alpine the glibc
-    // subpackage DOES resolve and the generic path would never fire.
-    expect(r.stderr).toContain('glibc-linked');
+    expect(r.stderr).toContain('botmux-linux-x64-musl');
+    // The old lie must not come back.
+    expect(r.stderr).not.toContain('cannot run on musl');
   });
 
   it('musl: no loader present → does NOT claim musl (the false-positive direction)', () => {

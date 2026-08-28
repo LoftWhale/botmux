@@ -62,10 +62,22 @@ function detectAsset(opts: { lddOutput?: string | null; muslLoader?: boolean; al
 
   const script = join(base, 'probe.sh');
   writeFileSync(script, `os_tag=linux\narch_tag=x64\nasset="botmux-\${os_tag}-\${arch_tag}"\n${body}\necho "$asset"\n`);
-  // PATH carries only our shim dir (+ coreutils) so `ldd` resolution is controlled.
+  // PATH carries ONLY our shim dir (plus a busybox-ish minimum) so that
+  // `command -v ldd` is genuinely false when the test says "no ldd". Including
+  // /usr/bin:/bin here would always find the system ldd and make the
+  // no-ldd fixtures untestable — they would silently exercise the ldd branch.
+  const shellBins = join(base, 'shbin');
+  mkdirSync(shellBins, { recursive: true });
+  for (const cmd of ['grep', 'ls', 'sh', 'printf']) {
+    // Symlink the few utilities the block itself needs, without dragging in ldd.
+    try {
+      const real = execFileSync('sh', ['-c', `command -v ${cmd}`], { encoding: 'utf-8' }).trim();
+      if (real) writeFileSync(join(shellBins, cmd), `#!/bin/sh\nexec ${real} "$@"\n`, { mode: 0o755 });
+    } catch { /* command absent; the block tolerates it */ }
+  }
   return execFileSync('sh', [script], {
     encoding: 'utf-8',
-    env: { PATH: `${bin}:/usr/bin:/bin` },
+    env: { PATH: `${bin}:${shellBins}` },
   }).trim();
 }
 
@@ -77,6 +89,21 @@ describe('install.sh — musl vs glibc asset selection', () => {
   it('ldd reporting GNU libc → picks the plain (glibc) asset', () => {
     // THE false-positive direction: ordinary Linux must never be sent to -musl.
     expect(detectAsset({ lddOutput: 'ldd (GNU libc) 2.36' })).toBe('botmux-linux-x64');
+  });
+
+  it('REGRESSION: glibc distro WITH musl installed → still the plain asset', () => {
+    // Debian/Ubuntu `musl` / `musl-tools` (common for Rust/Go musl cross-compiling)
+    // drops /lib/ld-musl-x86_64.so.1 at TOP LEVEL. An earlier version of this block
+    // treated "ldd did not say musl" as "unknown, keep probing", so the loader
+    // overturned ldd's correct glibc answer — measured on debian:bookworm-slim +
+    // musl-tools, which selected the musl asset and would have installed a binary
+    // that dies in the loader on first run.
+    //
+    // Rule now: when ldd EXISTS its answer is authoritative in BOTH directions;
+    // filesystem probes are only for images with no ldd at all.
+    expect(detectAsset({ lddOutput: 'ldd (GNU libc) 2.36', muslLoader: true })).toBe('botmux-linux-x64');
+    // Same with Alpine's marker file also present — still glibc, because ldd said so.
+    expect(detectAsset({ lddOutput: 'ldd (GNU libc) 2.36', muslLoader: true, alpineFile: true })).toBe('botmux-linux-x64');
   });
 
   it('no ldd at all, but an ld-musl loader present → -musl', () => {

@@ -49,8 +49,6 @@ import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-const SUBPACKAGE = `botmux-${process.platform}-${process.arch}`;
-
 /** Abort the install with a reason. There is no Node fallback any more (see header). */
 function fail(reason, hint) {
   console.error(`[botmux] ${reason}`);
@@ -120,18 +118,19 @@ if (existsSync(join(pkgRoot, '.git')) && existsSync(join(pkgRoot, 'src'))) {
   process.exit(0);
 }
 
-// ── Guard 3: musl (Alpine) would install a glibc binary that cannot exec ────────
-// Checked BEFORE resolving the subpackage, because on Alpine the subpackage does
-// resolve (platform is `linux`) — so the generic "no prebuilt binary" message below
-// would never fire and we would happily point the launcher at a binary that dies at
-// startup. Fail here with the actual reason instead.
-if (isMuslLinux()) {
-  fail(
-    `botmux's prebuilt binaries are glibc-linked and cannot run on musl libc (Alpine).`,
-    'Use a glibc base image (e.g. node:22-bookworm / debian / ubuntu), or build from source. '
-      + 'Tracking musl builds: https://github.com/deepcoldy/botmux/issues',
-  );
-}
+// ── musl (Alpine): select the -musl subpackage ──────────────────────────────────
+// This used to be a hard FAIL ("botmux's prebuilt binaries are glibc-linked and
+// cannot run on musl"), which was true while only glibc binaries shipped. musl
+// binaries now exist, so that message became a lie and the guard would have blocked
+// the very platform we just added support for. The #1047 comment predicted this:
+// "Once botmux ships musl subpackages declaring it, npm will pick the right one on
+// its own and this guard becomes a diagnostic".
+//
+// npm does the actual selection via each subpackage's `libc` field, so on Alpine it
+// installs `botmux-linux-<arch>-musl`. We only have to look for the same name — the
+// detection below is what makes the lookup agree with what npm installed.
+const MUSL = isMuslLinux();
+const SUBPACKAGE = `botmux-${process.platform}-${process.arch}${MUSL ? '-musl' : ''}`;
 
 // ── Locate the platform binary ─────────────────────────────────────────────────
 // Resolve through Node's own resolver rather than guessing at node_modules layout:
