@@ -813,6 +813,7 @@ function setupBotState(opts?: {
 	  grantDefaultDurationMs?: number;
 	  messageListeners?: Record<string, unknown>;
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
+	  chatMentionModes?: Record<string, 'always' | 'topic' | 'never' | 'ambient'>;
 	  p2pMode?: 'thread' | 'chat';
 	  summaryRange?: { limit?: number; sinceHours?: number };
 	  summaryMemory?: boolean;
@@ -846,6 +847,7 @@ function setupBotState(opts?: {
 	      grantDefaultDurationMs: opts?.grantDefaultDurationMs,
 	      messageListeners: opts?.messageListeners,
 	      chatReplyModes: opts?.chatReplyModes,
+	      chatMentionModes: opts?.chatMentionModes,
 	      p2pMode: opts?.p2pMode,
 	      summaryRange: opts?.summaryRange,
 	      summaryMemory: opts?.summaryMemory,
@@ -5223,6 +5225,94 @@ describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | 
       anchor: 'chat-tri-flat',
       larkAppId: MY_APP_ID,
     }));
+  });
+});
+
+describe('im.message.receive_v1 — per-chat mention mode (chatMentionModes overrides regularGroupMentionMode)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    setupBotState();
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetCachedChatMode.mockReset();
+    mockGetCachedChatMode.mockReturnValue(undefined);
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  // The per-chat override is the whole point of /mention-mode: this chat answers
+  // non-@ messages even though the per-bot default still demands an @.
+  it('per-chat never answers a non-@ message while the per-bot default stays always', async () => {
+    setupBotState({
+      regularGroupMentionMode: 'always',
+      chatMentionModes: { 'chat-mm-never': 'never' },
+      allowedUsers: [USER_OPEN_ID],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '不 @ 也该回我' }),
+      messageId: 'msg-mm-never',
+      chatId: 'chat-mm-never',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      chatId: 'chat-mm-never',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  // Same bot, same turn shape, a DIFFERENT chat: without an override the per-bot
+  // default governs, so this one is still dropped. Pins that the override is
+  // keyed by chat rather than flipping the policy bot-wide.
+  it('a chat without an override still requires an @ under the same per-bot default', async () => {
+    setupBotState({
+      regularGroupMentionMode: 'always',
+      chatMentionModes: { 'chat-mm-never': 'never' },
+      allowedUsers: [USER_OPEN_ID],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '不 @ 就不该回我' }),
+      messageId: 'msg-mm-other',
+      chatId: 'chat-mm-other',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  // The reverse direction: an explicit per-chat 'always' must be able to opt a
+  // single chat back OUT of a permissive per-bot default.
+  it('per-chat always pins one chat back to @-required under a per-bot never default', async () => {
+    setupBotState({
+      regularGroupMentionMode: 'never',
+      chatMentionModes: { 'chat-mm-pinned': 'always' },
+      allowedUsers: [USER_OPEN_ID],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '这个群我要求必须 @' }),
+      messageId: 'msg-mm-pinned',
+      chatId: 'chat-mm-pinned',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 });
 
