@@ -348,10 +348,13 @@ describe('platform tunnel data bridge — flow control and shutdown', () => {
  *    response while Node received all 64MB — Node's `ws` flushes its queue regardless.
  *    The unit suite runs on Node (and child processes inherit that), so the mutation is
  *    structurally unable to fail here.
- *  • Volume: once the reverse gate exists, FIN-time in-flight bytes sit near the
- *    watermark, so small payloads survive `end → kill` even on Bun (24MB stayed
- *    complete). Truncation needs ~64MB to reappear (14-17MB lost, 27.6MB against a
- *    slow platform) — too slow and too memory-hungry for a unit test.
+ *  • Race: once the reverse gate exists, whether `end → kill` truncates depends on how
+ *    many bytes happen to be sitting in Bun's internal queue at the instant of FIN —
+ *    a function of flood rate, platform consumption pace and scheduling, not of payload
+ *    size. Two independent measurements disagree, which is itself the evidence: one
+ *    setup lost 14-27MB on 64MB (and nothing at 24MB), another lost zero on 64MB with
+ *    both a fast and a rate-limited platform. So there is NO size that reliably
+ *    reproduces it — do not read "just use a bigger payload" into this.
  * Hence the guard below asserts the SHAPE in source. It is cheap, runs everywhere, and
  * is the thing that actually fails if someone routes FIN back to the hard kill.
  */
@@ -385,11 +388,11 @@ describe('platform tunnel data bridge — graceful shutdown shape', () => {
     //    naming a runtime a test never reaches.)
     //  • It is not the regression guard for shutdown truncation. With the reverse
     //    gate in place, FIN-time in-flight bytes are held near the watermark, so at
-    //    this size `end → kill` does NOT truncate — MEASURED under Bun: 24MB stayed
-    //    complete on both fast and slow platforms. Truncation only reappears at
-    //    larger volumes (64MB lost 14.1/14.6/16.9MB across three runs, and 27.6MB
-    //    against a slow platform, versus 0 for the shipped `finish` path). The
-    //    source-shape guard above is what actually holds that line in CI.
+    //    this size `end → kill` does NOT truncate on Bun either. Whether it truncates at
+    //    all is a race on how much sits in Bun's send queue at FIN, not a size threshold:
+    //    one setup measured 14.1/14.6/16.9MB lost on 64MB, another measured zero on 64MB
+    //    against both a fast and a rate-limited platform. A behavioural assertion cannot
+    //    be trusted here — the source-shape guard above is what holds the line in CI.
     //
     // What it does buy: the production function, driven over real sockets in a fresh
     // process, delivers every byte — which fails loudly if the bridge drops or

@@ -529,6 +529,11 @@ export function bridgeDataChannel(winner: WebSocket, dashboardPort: number): voi
    *    close 会抢在排空前生效，实测 4 次里 2 次丢 4~5MB。
    * 所以先用 ping/pong 等到 `unacked` 归零（pong 证明对端真读到了我们的字节），再 close。
    * 实测该顺序 64MB × 5 次全部零丢失。原先 `pipe()` 的 `end:true` 免费提供了这个语义。
+   *
+   * ⚠️⚠️ 别把上面的字节数当成「凑够这个量就能测出来」：丢多少、乃至丢不丢，取决于 FIN 那一
+   * 刻 Bun 队列里恰好压着多少字节（灌速 × 平台消费节奏 × 调度的竞态），**不是尺寸阈值**。
+   * 两次独立测量就不一致：一处 64MB 丢 14~27MB、24MB 不丢；另一处 64MB 在快/限速平台都零丢。
+   * ⟹ 这条不能靠行为断言守，回归防线是测试里那条**源码形态守卫**（别删它）。
    */
   const finish = (): void => {
     if (killed || ending) return;
