@@ -223,3 +223,22 @@ jobs:
               chown -R "$HOST_UID:$HOST_GID" dist-bin
             '
 
+      - name: Prove the host can WRITE into dist-bin (canary.5's actual failure)
+        # Not cosmetic — this is the only place CI can catch the ownership bug.
+        #
+        # v3.18.0-canary.5 failed AFTER both musl builds and all smoke checks passed:
+        # the release leg's `Checksums` step writes .sha256 files INTO dist-bin, and
+        # the container had left it owned by root, so the runner's non-root user got
+        # `Permission denied`. This PR job has no such step, so without the check
+        # below it would stay green while the release breaks — exactly the asymmetry
+        # that let the bug ship.
+        #
+        # Deliberately mirrors what `Checksums` does (create a file in the directory)
+        # rather than merely reading a file: read access was never the problem.
+        run: |
+          echo "dist-bin owner: $(stat -c '%u:%g' dist-bin) (runner is $(id -u):$(id -g))"
+          cd dist-bin
+          for f in botmux-*; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+          echo "✅ host user wrote checksums into a container-produced directory"
+

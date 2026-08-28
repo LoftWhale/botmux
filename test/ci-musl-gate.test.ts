@@ -68,8 +68,19 @@ describe('ci.yml — the musl artifact is gated on PRs, not only at release', ()
     // does NOT tolerate is compiling the musl target on glibc, which is the actual
     // hazard — `pty.node` is embedded at build time and would be the wrong libc.
     const job = CI_CODE.slice(CI_CODE.indexOf('bun-binary-musl:'));
-    expect(job).toMatch(/alpine|musl/);                       // a musl environment
-    expect(job).toMatch(/readelf[\s\S]*libc/);                // linkage proven, not assumed
+
+    // A musl ENVIRONMENT, and note carefully why this is not just /musl/: the word
+    // "musl" also appears in `--target bun-linux-x64-musl`, so a bare /alpine|musl/
+    // is satisfied by a job that compiles the musl target on plain glibc — the exact
+    // hazard. (Measured: against that shape, a bare /alpine|musl/ PASSES.) Match an
+    // actual musl image reference instead.
+    expect(job).toMatch(/(?:container:\s*|docker run[\s\S]{0,400}?)[\w./:-]*alpine/);
+
+    // The linkage must be PROVEN, not assumed. This is the load-bearing assertion:
+    // it is what rejects the glibc-built-musl shape, because the workflow's own
+    // readelf gate then fails closed at build time on a native lacking libc.musl.
+    expect(job).toMatch(/readelf[\s\S]*libc/);
+
     expect(job).toContain('--target bun-linux-x64-musl');     // the musl artifact
   });
 
@@ -144,9 +155,10 @@ describe('release.yml — the musl legs stay wired into the publish chain', () =
   it('MECHANISM: each musl leg builds on musl and proves the linkage', () => {
     // Implementation-agnostic, like its ci.yml counterpart: what must hold is that
     // the musl artifacts are built in a musl environment with the linkage verified,
-    // not that any particular container mechanism is used.
+    // not that any particular container mechanism is used. Same caveat as there —
+    // an alpine IMAGE reference, not a bare /musl/ which the target name satisfies.
     const job = RELEASE_CODE.slice(RELEASE_CODE.indexOf('bun-binaries-musl:'));
-    expect(job).toMatch(/alpine|musl/);
+    expect(job).toMatch(/(?:container:\s*|docker run[\s\S]{0,400}?)[\w./:-]*alpine/);
     expect(job).toMatch(/readelf[\s\S]*libc/);
   });
 
@@ -186,5 +198,17 @@ describe('release.yml — the musl legs stay wired into the publish chain', () =
       // The ids must actually be passed in, or the chown expands to `:` and fails.
       expect(job).toMatch(/-e HOST_UID="\$\(id -u\)" -e HOST_GID="\$\(id -g\)"/);
     }
+  });
+
+  it('ci.yml PROVES the host can write into dist-bin, not just that chown is present', () => {
+    // The chown assertion above is a source pin: it cannot tell whether the chown
+    // actually achieves anything. And CI's own musl job has no step that writes into
+    // dist-bin, so a broken chown would leave this gate green — the same structural
+    // blindness that let canary.5 ship (the release leg writes there, the PR leg
+    // did not). ci.yml therefore carries an explicit host-side write, and it must
+    // CREATE a file (sha256sum > file), because read access was never the problem.
+    const job = CI_CODE.slice(CI_CODE.indexOf('bun-binary-musl:'));
+    const afterContainer = job.slice(job.lastIndexOf('chown -R'));
+    expect(afterContainer).toMatch(/sha256sum[\s\S]*>/);
   });
 });
