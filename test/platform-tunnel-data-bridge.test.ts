@@ -1,7 +1,8 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import { createServer, connect as tcpConnect, type Server as NetServer } from 'node:net';
+import { createServer, type Server as NetServer } from 'node:net';
 import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
+import { bridgeDataChannel } from '../src/platform/tunnel-client.js';
 
 /**
  * The platform tunnel's data channel: WebSocket ↔ local dashboard TCP bridge.
@@ -41,35 +42,22 @@ function toBuffer(data: RawData): Buffer {
 }
 
 /**
- * The bridge under test, in the same shape as tunnel-client.ts's `bridge()`:
- * event-based piping in both directions, no `createWebSocketStream`.
+ * The bridge under test is the PRODUCTION one, imported from src — not a copy.
+ *
+ * This used to be a local re-implementation "in the same shape as" the real
+ * `bridge()`. It passed with real sockets and read convincingly, but it could not
+ * fail: MEASURED, with the copy in place, deleting ALL of production's backpressure,
+ * deleting its `tcp.on('end')` handling, breaking `toBuffer` so fragmented frames
+ * lost bytes, and switching `send()` to a text conversion ALL left this file green.
+ * Only a source-text grep had any teeth. Importing the real function is what makes
+ * those four mutations red — a test that reimplements its subject proves the idea
+ * works, never that the shipped code does.
+ *
+ * Production bridges the WINNING DIAL, i.e. a client socket from `new WebSocket()`.
+ * These tests bridge the SERVER side of a local pair, which is the same object type
+ * in Node. (Under Bun the two differ — server sockets lack `pause` entirely — which
+ * is one more reason the flow control here must not depend on ws-level signals.)
  */
-function bridge(winner: WebSocket, tcpPort: number): void {
-  const tcp = tcpConnect(tcpPort, '127.0.0.1');
-  tcp.setNoDelay(true);
-  let killed = false;
-  const kill = () => {
-    if (killed) return;
-    killed = true;
-    try { winner.terminate(); } catch { /* ignore */ }
-    try { tcp.destroy(); } catch { /* ignore */ }
-  };
-  winner.on('message', (data: RawData) => {
-    const buf = toBuffer(data);
-    if (!buf.length) return;
-    if (!tcp.write(buf)) { try { winner.pause(); } catch { /* ignore */ } }
-  });
-  tcp.on('drain', () => { try { winner.resume(); } catch { /* ignore */ } });
-  tcp.on('data', (chunk: Buffer) => {
-    if (winner.readyState !== winner.OPEN) return;
-    winner.send(chunk, { binary: true });
-  });
-  winner.on('close', kill);
-  winner.on('error', kill);
-  tcp.on('close', kill);
-  tcp.on('error', kill);
-  tcp.on('end', kill);
-}
 
 /** A TCP server standing in for the local dashboard; `handle` sees each chunk. */
 async function startTcpTarget(handle: (chunk: Buffer, reply: (b: Buffer) => void) => void): Promise<number> {
@@ -87,7 +75,7 @@ async function startBridgingWsServer(tcpPort: number): Promise<number> {
   const wss = new WebSocketServer({ port: 0, perMessageDeflate: false });
   servers.push(wss);
   await new Promise<void>((r) => wss.on('listening', () => r()));
-  wss.on('connection', (sock) => { sockets.push(sock); bridge(sock, tcpPort); });
+  wss.on('connection', (sock) => { sockets.push(sock); bridgeDataChannel(sock, tcpPort); });
   return (wss.address() as { port: number }).port;
 }
 
@@ -218,4 +206,198 @@ describe('platform tunnel data bridge', () => {
     // there, and the whole point is to see WHY.
     expect(stdout, `child stderr:\n${String(r.stderr ?? '')}`).toContain('BRIDGED:PARITY');
   }, 40_000);
+});
+
+/**
+ * Behaviours the byte-round-trip tests above CANNOT see.
+ *
+ * Measured gap: with only those tests, deleting the whole reverse backpressure gate,
+ * deleting the `tcp.on('end')` finish path, and breaking `toBuffer`'s fragmented-frame
+ * branch all stayed green — the payloads were small, arrived whole, and nobody checked
+ * what happens at FIN or when the platform stops reading. These three pin the
+ * properties that actually broke in production.
+ */
+describe('platform tunnel data bridge — flow control and shutdown', () => {
+  it('delivers the whole response when the dashboard finishes and FINs', async () => {
+    // The dashboard writing its last byte and closing is the NORMAL end of every
+    // HTTP response through the tunnel. If shutdown discards queued frames, big
+    // responses arrive truncated — measured on Bun: terminate() lost 13.8MB of 64MB,
+    // and even a plain close() lost 4-5MB while frames were still unacknowledged.
+    const size = 6 * 1024 * 1024;
+    const payload = Buffer.alloc(size);
+    for (let i = 0; i < size; i++) payload[i] = (i * 7) & 0xff;
+
+    // Dashboard stand-in: writes the whole body on first byte, then FINs.
+    const srv = createServer((s) => {
+      s.on('error', () => { /* peer teardown is normal */ });
+      s.once('data', () => { s.end(payload); });
+    });
+    servers.push(srv);
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+    const tcpPort = (srv.address() as { port: number }).port;
+    const wsPort = await startBridgingWsServer(tcpPort);
+
+    const c = clientTo(wsPort);
+    const got = await new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      const t = setTimeout(() => reject(new Error(`truncated: only ${total}/${size} bytes arrived`)), 20_000);
+      c.on('open', () => c.send(Buffer.from('GET / HTTP/1.1\r\n\r\n'), { binary: true }));
+      c.on('message', (m) => {
+        const b = toBuffer(m as RawData);
+        chunks.push(b); total += b.length;
+        if (total >= size) { clearTimeout(t); resolve(Buffer.concat(chunks)); }
+      });
+      c.on('error', reject);
+    });
+    expect(got.length).toBe(size);
+    expect(got.equals(payload)).toBe(true);
+  }, 30_000);
+
+  it('stops reading the dashboard when the platform stops consuming', async () => {
+    // THE BACKPRESSURE GUARD. `bufferedAmount` is permanently 0 on Bun and
+    // `ws.pause()` is a no-op there, so the bridge must gate on something that
+    // reflects real delivery. Without a working gate the bridge drains the local
+    // dashboard as fast as it can and queues everything in memory: measured 400MB
+    // read and 575MB RSS on Bun. With the gate it stops after a few MB.
+    const OFFER = 64 * 1024 * 1024;
+    const block = Buffer.alloc(256 * 1024, 0xab);
+    let readFromDashboard = 0;
+
+    // Dashboard stand-in: floods as fast as the bridge will read.
+    const srv = createServer((s) => {
+      s.on('error', () => { /* peer teardown is normal */ });
+      const pump = (): void => {
+        while (readFromDashboard < OFFER) {
+          readFromDashboard += block.length;
+          if (!s.write(block)) { s.once('drain', pump); return; }
+        }
+      };
+      pump();
+    });
+    servers.push(srv);
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+    const tcpPort = (srv.address() as { port: number }).port;
+
+    // Platform stand-in that NEVER reads: accept the upgrade, then pause the raw
+    // socket so nothing is consumed. Note this holds under Node (the runtime this
+    // suite runs on) — Bun's ws server ignores the pause, which is why production
+    // parity is argued from the client side, not from here.
+    const wss = new WebSocketServer({ port: 0, perMessageDeflate: false });
+    servers.push(wss);
+    await new Promise<void>((r) => wss.on('listening', () => r()));
+    wss.on('connection', (sock, req) => { sockets.push(sock); req.socket.pause(); });
+    const platformPort = (wss.address() as { port: number }).port;
+
+    // The bridge under test: production function, platform side stalled.
+    const winner = new WebSocket(`ws://127.0.0.1:${platformPort}`, { perMessageDeflate: false });
+    sockets.push(winner);
+    await new Promise<void>((r, rej) => { winner.on('open', () => r()); winner.on('error', rej); });
+    bridgeDataChannel(winner, tcpPort);
+
+    await new Promise<void>((r) => setTimeout(r, 3_000));
+    // A working gate stops within a few multiples of the 4MB watermark. Without one
+    // the bridge swallows the entire 64MB offer.
+    expect(readFromDashboard).toBeLessThan(OFFER / 2);
+  }, 30_000);
+
+  it('reassembles a fragmented ws payload instead of dropping all but the first piece', async () => {
+    // `ws` hands `message` a Buffer[] when a frame arrived fragmented, so the
+    // bridge's normalizer must concat rather than pick one. A naive `data[0]` looks
+    // correct for every unfragmented payload, which is why byte-round-trip tests
+    // above cannot see it. Drive the normalizer directly with the array shape.
+    const first = Buffer.from([0x01, 0x02, 0x03]);
+    const second = Buffer.from([0xfe, 0xff]);
+    const tcpPort = await startTcpTarget((chunk, reply) => reply(chunk));
+
+    const wss = new WebSocketServer({ port: 0, perMessageDeflate: false });
+    servers.push(wss);
+    await new Promise<void>((r) => wss.on('listening', () => r()));
+    let serverSock: WebSocket | null = null;
+    wss.on('connection', (sock) => { sockets.push(sock); serverSock = sock; bridgeDataChannel(sock, tcpPort); });
+    const wsPort = (wss.address() as { port: number }).port;
+
+    const c = clientTo(wsPort);
+    await new Promise<void>((r, rej) => { c.on('open', () => r()); c.on('error', rej); });
+    await new Promise<void>((r) => setTimeout(r, 100));
+
+    const got = await new Promise<Buffer>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('no echo within 8s')), 8_000);
+      c.on('message', (m) => { clearTimeout(t); resolve(toBuffer(m as RawData)); });
+      // Emit the fragmented shape `ws` itself produces: an array of Buffers.
+      (serverSock as unknown as { emit: (e: string, d: unknown) => void })
+        .emit('message', [first, second]);
+    });
+    expect(got.equals(Buffer.concat([first, second]))).toBe(true);
+  }, 20_000);
+});
+
+/**
+ * The FIN path can only be *behaviourally* tested under Bun.
+ *
+ * MEASURED: with `terminate()` at FIN, Bun's platform side received 50.2MB of a 64MB
+ * response while Node received all 64MB — Node's `ws` flushes its queue regardless,
+ * so under the Node-run unit suite that mutation is structurally UNABLE to fail. Both
+ * checks below exist because of that: one asserts the shape in source (cheap, runs
+ * everywhere), one drives a real Bun child process (proves the actual bytes).
+ */
+describe('platform tunnel data bridge — graceful shutdown is Bun-only observable', () => {
+  it('does not terminate() the tunnel socket on the local FIN path', async () => {
+    const src = await import('node:fs/promises').then((fs) =>
+      fs.readFile(new URL('../src/platform/tunnel-client.ts', import.meta.url), 'utf8'));
+    const code = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|[^:])\/\/.*$/gm, '$1');
+    // FIN must route to the drain-then-close path, never straight to the hard kill.
+    expect(code).toMatch(/tcp\.on\(\s*'end'\s*,\s*finish\s*\)/);
+    expect(code).not.toMatch(/tcp\.on\(\s*'end'\s*,\s*kill\s*\)/);
+    // And the graceful path must actually be graceful: close(), gated on drain.
+    expect(code).toMatch(/winner\.close\(\)/);
+    // 'close' fires immediately after 'end', so an unguarded kill there terminates the
+    // socket mid-flush and undoes the drain. MEASURED on Bun: `tcp.on('close', kill)`
+    // lost 14-17MB of a 64MB response across three runs, while the guarded form lost 0.
+    expect(code).not.toMatch(/tcp\.on\(\s*'close'\s*,\s*kill\s*\)/);
+    expect(code).toMatch(/tcp\.on\(\s*'close'[\s\S]{0,80}?!ending/);
+  });
+
+  it('delivers a large response intact under Bun, where terminate() would truncate it', () => {
+    // Runs the REAL production bridge in a child process. Under Bun this is the exact
+    // path that lost 13.8MB per 64MB before the fix; under Node it is a second, redundant
+    // confirmation. Either way the child reports the platform-side byte total.
+    const snippet = `
+      const net = await import('node:net');
+      const { WebSocket, WebSocketServer } = await import('ws');
+      const { bridgeDataChannel } = await import('./src/platform/tunnel-client.js');
+      const TOTAL = 24 * 1024 * 1024;
+      const block = Buffer.alloc(256 * 1024, 0xab);
+      let sent = 0;
+      const dash = net.createServer((s) => {
+        s.on('error', () => {});
+        const pump = () => {
+          while (sent < TOTAL) {
+            const n = Math.min(block.length, TOTAL - sent); sent += n;
+            if (!s.write(block.subarray(0, n))) { s.once('drain', pump); return; }
+          }
+          s.end();
+        };
+        pump();
+      });
+      await new Promise((r) => dash.listen(0, '127.0.0.1', r));
+      let recv = 0;
+      const wss = new WebSocketServer({ port: 0, perMessageDeflate: false, maxPayload: 64 * 1024 * 1024 });
+      await new Promise((r) => wss.on('listening', r));
+      wss.on('connection', (s) => { s.on('message', (m) => { recv += (Buffer.isBuffer(m) ? m : Buffer.from(m)).length; }); });
+      const winner = new WebSocket('ws://127.0.0.1:' + wss.address().port, { perMessageDeflate: false });
+      await new Promise((r) => winner.on('open', r));
+      bridgeDataChannel(winner, dash.address().port);
+      const deadline = Date.now() + 25000;
+      while (recv < TOTAL && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+      console.log('DELIVERED:' + recv + '/' + TOTAL);
+      process.exit(0);
+    `;
+    const r = spawnSyncTsEvalWithRepoImports(snippet, { encoding: 'utf-8', timeout: 60_000 });
+    const stdout = String(r.stdout ?? '');
+    const total = 24 * 1024 * 1024;
+    expect(stdout, `child stderr:\n${String(r.stderr ?? '')}`).toContain(`DELIVERED:${total}/${total}`);
+  }, 90_000);
 });

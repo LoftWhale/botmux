@@ -68,10 +68,18 @@ const DATA_DIAL_WAVE_BACKOFF_MS = 150;
 const DATA_DIAL_OVERALL_DEADLINE_MS = 8_000;
 
 // 桥接的 WebSocket 侧背压水位：本地 dashboard 读得比平台链路发得快时（下载、长日志），
-// ws 已缓冲超过这个字节数就暂停 TCP 读取，等排空再继续。`pipe()` 原来替我们管背压，
-// 手写事件桥接（见 bridge()：Bun 不支持 createWebSocketStream）就必须自己管，否则
-// 大响应会在内存里堆帧。
+// 未确认送达的字节超过这个水位就暂停 TCP 读取，等确认后继续。`pipe()` 原来替我们管背压，
+// 手写事件桥接（见 bridgeDataChannel()：Bun 不支持 createWebSocketStream）就必须自己管，
+// 否则大响应会在内存里堆帧。
 const WS_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
+
+// 背压确认用的 ping 间隔：超水位后每隔这么久探一次「平台真的收下了吗」。
+// 取值权衡：太小则空转 ping，太大则恢复迟钝、拉长大响应的总时长。
+const WS_BACKPRESSURE_PROBE_MS = 20;
+
+// 本地 dashboard FIN 后，等 WebSocket 把已排队的帧刷完并收到对端 close 的上限；
+// 到点仍未收到就硬收尾，别把 socket 永久挂着。
+const WS_CLOSE_FLUSH_TIMEOUT_MS = 30_000;
 
 // 控制连接并行拨号（happy-eyeballs）：一轮并行拨几条、谁先握手成功用谁，兜住入口 VIP 对新建连接
 // ~35% 的黑洞。单条超时给足 TLS 握手时间（好连接 ~40ms，黑洞则等满超时判负）。
@@ -382,64 +390,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       }
       inflight.clear();
       // 数据流必须关 permessage-deflate（连接创建时已设），否则大文件帧经网关压缩协商错位 → RSV1 断流。
-      //
-      // 手动事件桥接，不用 `ws` 的 createWebSocketStream()：那个 API 在 **Bun 里
-      // 直接抛 `Error("Not supported yet in Bun")`**（实测 bun 1.3.2 抛、node
-      // v22.21.1 正常）。而编译版单文件二进制跑的就是 Bun —— 于是控制通道连上了
-      // （`new WebSocket` 在 Bun 下正常，日志照打「隧道已连接平台」、平台侧显示机器
-      // 在线），但每次真要转发请求都崩在这一行，数据通道永远建不起来：平台侧
-      // Dashboard 整站打不开，而本地直连不经隧道故一切正常。这个「dev 模式能开、
-      // 二进制不能开」的分裂就是它。
-      const tcp = net.connect(opts.getDashboardPort(), '127.0.0.1');
-      // 交互式终端关 Nagle：终端输出常被拆成「回显字符 + 光标/颜色控制序列」这类分帧小包，
-      // Nagle 会把紧随其后的小包扣到对端 delayed-ACK(~40ms)才发出。网页终端经平台隧道中转时
-      // 这条桥接 socket 串在链路中间，用户就感到每隔一下卡 ~40ms；本机直连不经隧道故不卡。
-      tcp.setNoDelay(true);
-      let killed = false;
-      const kill = () => {
-        if (killed) return;      // 双向都会触发 close/error，去重避免重复 destroy
-        killed = true;
-        try { winner.terminate(); } catch { /* ignore */ }
-        try { tcp.destroy(); } catch { /* ignore */ }
-      };
-
-      // ── 平台 → 本地 ──
-      // 背压：`pipe()` 原本替我们做这件事，手写就得自己来。TCP 侧写不动时暂停
-      // WebSocket 读取，drain 后恢复；否则大响应（下载、长日志）会在内存里堆帧。
-      winner.on('message', (data: RawData) => {
-        const buf = toBuffer(data);
-        if (!buf.length) return;
-        if (!tcp.write(buf)) {
-          try { winner.pause(); } catch { /* ignore */ }
-        }
-      });
-      tcp.on('drain', () => { try { winner.resume(); } catch { /* ignore */ } });
-
-      // ── 本地 → 平台 ──
-      // 反向背压用 bufferedAmount：ws 没有 write() 的返回值可依赖。
-      tcp.on('data', (chunk: Buffer) => {
-        if (winner.readyState !== winner.OPEN) return;
-        // binary:true 是显式声明，不是必需的保险：实测 ws 对 Buffer 入参本就发二进制帧
-        // （不加也是 isBinary=true、字节逐字不变）。写出来是为了让「这是裸字节桥、
-        // 不许按文本处理」这件事在代码里可见，避免日后有人换成 string 载荷。
-        winner.send(chunk, { binary: true });
-        if (winner.bufferedAmount > WS_BACKPRESSURE_BYTES) {
-          tcp.pause();
-          const resumeWhenDrained = (): void => {
-            if (killed) return;
-            if (winner.bufferedAmount > WS_BACKPRESSURE_BYTES) { setTimeout(resumeWhenDrained, 20); return; }
-            tcp.resume();
-          };
-          setTimeout(resumeWhenDrained, 20);
-        }
-      });
-
-      winner.on('close', kill);
-      winner.on('error', kill);
-      tcp.on('close', kill);
-      tcp.on('error', kill);
-      // 本地 dashboard 读完即关：半关会让隧道另一头一直等，所以直接收尾。
-      tcp.on('end', kill);
+      bridgeDataChannel(winner, opts.getDashboardPort());
     };
 
     // 每波并行拨 DATA_DIAL_PARALLEL 条，谁先 open 谁胜出；一波全黑洞/失败才进下一波（有界）。
@@ -515,6 +466,139 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       }
     },
   };
+}
+
+/**
+ * 把一条胜出的数据通道 WebSocket 裸桥接到本地 dashboard 的 TCP 端口。
+ *
+ * 手动事件桥接，不用 `ws` 的 `createWebSocketStream()`：那个 API 在 **Bun 里直接抛
+ * `Error("Not supported yet in Bun")`**（实测 bun 1.4.0 抛、node v22.21.1 正常）。
+ * 而编译版单文件二进制跑的就是 Bun —— 于是控制通道连上了（`new WebSocket` 在 Bun 下
+ * 正常，日志照打「隧道已连接平台」、平台侧显示机器在线），但每次真要转发请求都崩在桥接
+ * 那一行，数据通道永远建不起来：平台侧 Dashboard 整站打不开，而本地直连不经隧道故一切
+ * 正常。这个「dev 模式能开、二进制不能开」的分裂就是它。
+ *
+ * ⚠️ 背压信号为什么不用 `bufferedAmount`：**Bun 下它恒为 0**。实测（bun 1.4.0 客户端
+ * + 真 Node `ws` 服务端、对端停读）：连发 400MB 后 `bufferedAmount` 一直是 0、
+ * `pause()` 只打印 `[bun] Warning: ... not implemented in bun` 且暂停期间 400/400 条
+ * 照送、`send(data, cb)` 的回调在「交给内部队列」时就结算（对端应用层实收 0.0MB 时
+ * 400 个回调已全部回来，所以自计数也恒为 0）、`ws` shim 无 `_socket` 可看
+ * `writableLength`、Bun 原生 `globalThis.WebSocket` 的 `bufferedAmount` 同样恒 0。
+ * ⟹ **ws 层没有任何可用的已缓冲量信号**。
+ *
+ * 所以改用**协议层确认**：超水位后 `ping()`，只有收到 `pong` 才继续读 TCP。pong 必须由
+ * 对端真的读到我们的字节后才可能回来，因此它是「平台确实在消费」的证据，且在 Node 与
+ * Bun 下行为一致（两个运行时都实测：对端停读期间 0 个 pong，恢复后收到）。
+ *
+ * 导出而非内联在 `openDataStream` 里，是为了让测试能 import 到**生产这一份**——
+ * 早先测试自己复制了一份桥接，结果删掉整段背压/改成发文本都不报红。
+ */
+export function bridgeDataChannel(winner: WebSocket, dashboardPort: number): void {
+  const tcp = net.connect(dashboardPort, '127.0.0.1');
+  // 交互式终端关 Nagle：终端输出常被拆成「回显字符 + 光标/颜色控制序列」这类分帧小包，
+  // Nagle 会把紧随其后的小包扣到对端 delayed-ACK(~40ms)才发出。网页终端经平台隧道中转时
+  // 这条桥接 socket 串在链路中间，用户就感到每隔一下卡 ~40ms；本机直连不经隧道故不卡。
+  tcp.setNoDelay(true);
+  let killed = false;
+  let ending = false;
+  // 「已发出但未被 pong 确认的字节数」——反向背压水位，同时是 finish() 判断排空的依据。
+  // 声明在 kill/finish 之前：它们会读这个变量，别让顺序变成 TDZ 隐患。
+  let unacked = 0;
+  let probing = false;
+  /**
+   * 硬收尾：双向都会触发 close/error，去重避免重复 destroy。
+   *
+   * 优雅关闭路径不需要在这里额外让路：finish() 已经等到 `unacked` 归零才 `close()`，
+   * 到 winner 'close' 回来时队列本就是空的，此时 terminate 无数据可丢。
+   * （实测过一个「ending 时跳过 terminate」的额外分支：Bun 下 64MB × 4 次、以及平台永不
+   *   回 close 的场景，加与不加逐字同结果 ⟹ 是没有牙的复杂度，删掉。）
+   */
+  const kill = (): void => {
+    if (killed) return;
+    killed = true;
+    try { winner.terminate(); } catch { /* ignore */ }
+    try { tcp.destroy(); } catch { /* ignore */ }
+  };
+  /**
+   * 本地 dashboard 写完并 FIN 时的收尾：**先等排空、再 `close()`**，绝不 `terminate()`。
+   *
+   * ⚠️ 这里实测会真丢数据，且踩了两层：
+   * 1. `terminate()` 直接掐断 socket，Bun 内部队列里没发出去的帧全丢。64MB 响应 A/B
+   *    （本地写满 64MB 后 FIN，平台侧统计实收）：`terminate()` → 只收到 50.2MB。
+   * 2. 光换成 `close()` 也不够：仍有 `unacked > 0`（帧已交给队列但对端未确认）时
+   *    close 会抢在排空前生效，实测 4 次里 2 次丢 4~5MB。
+   * 所以先用 ping/pong 等到 `unacked` 归零（pong 证明对端真读到了我们的字节），再 close。
+   * 实测该顺序 64MB × 5 次全部零丢失。原先 `pipe()` 的 `end:true` 免费提供了这个语义。
+   */
+  const finish = (): void => {
+    if (killed || ending) return;
+    ending = true;
+    const closeWhenDrained = (): void => {
+      if (killed) return;
+      if (winner.readyState !== winner.OPEN) { kill(); return; }
+      if (unacked <= 0) { try { winner.close(); } catch { kill(); } return; }
+      try { winner.ping(); } catch { kill(); return; }
+      setTimeout(closeWhenDrained, WS_BACKPRESSURE_PROBE_MS);
+    };
+    closeWhenDrained();
+    // 关闭帧发出后对端会回 close，届时 winner 的 'close' 走 kill() 收 tcp。
+    // 兜底：对端不回（或迟迟排不空）时别把 socket 永久挂着。
+    setTimeout(kill, WS_CLOSE_FLUSH_TIMEOUT_MS);
+  };
+
+  // ── 平台 → 本地 ──
+  // TCP 侧写不动时暂停 WebSocket 读取，drain 后恢复。⚠️ `winner.pause()` 在 Bun 下是
+  // no-op（见上），所以这个方向在编译版里仍**无法**真正止流；保留是因为它在 Node（源码/npm
+  // 形态）下有效，且无害。真正的兜底是下面反向那条不依赖 ws 层信号的闸门。
+  winner.on('message', (data: RawData) => {
+    const buf = toBuffer(data);
+    if (!buf.length) return;
+    if (!tcp.write(buf)) {
+      try { winner.pause(); } catch { /* ignore */ }
+    }
+  });
+  tcp.on('drain', () => { try { winner.resume(); } catch { /* ignore */ } });
+
+  // ── 本地 → 平台 ──
+  // 水位变量见函数开头（unacked/probing）。不用 bufferedAmount：Bun 下恒为 0。
+  const onPong = (): void => {
+    unacked = 0;                       // 对端读到了我们此前写的字节
+    if (killed) return;
+    tcp.resume();
+  };
+  winner.on('pong', onPong);
+
+  const probeUntilDrained = (): void => {
+    if (killed) return;
+    if (unacked <= WS_BACKPRESSURE_BYTES) { probing = false; tcp.resume(); return; }
+    try { winner.ping(); } catch { /* 连接已废，kill 会收尾 */ }
+    setTimeout(probeUntilDrained, WS_BACKPRESSURE_PROBE_MS);
+  };
+
+  tcp.on('data', (chunk: Buffer) => {
+    if (winner.readyState !== winner.OPEN) return;
+    // binary:true 是显式声明，不是必需的保险：实测 ws 对 Buffer 入参本就发二进制帧
+    // （不加也是 isBinary=true、字节逐字不变）。写出来是为了让「这是裸字节桥、
+    // 不许按文本处理」这件事在代码里可见，避免日后有人换成 string 载荷。
+    winner.send(chunk, { binary: true });
+    unacked += chunk.length;
+    if (unacked > WS_BACKPRESSURE_BYTES && !probing) {
+      probing = true;
+      tcp.pause();                     // 停读本地，直到 pong 证明平台已消费
+      setTimeout(probeUntilDrained, WS_BACKPRESSURE_PROBE_MS);
+    }
+  });
+
+  winner.on('close', kill);
+  winner.on('error', kill);
+  // ⚠️ 不要在 tcp 'close' 上直接 kill：'end'（对端 FIN）之后紧跟就是 'close'，
+  // 那会立刻 terminate 掉正在刷出的 WebSocket，把 finish() 的排空又变回截断。
+  // 本地 socket 关掉后由 finish()/winner 的 close 事件负责收尾。
+  tcp.on('close', () => { if (!ending) kill(); });
+  tcp.on('error', kill);
+  // 本地 dashboard 读完即关：半关会让隧道另一头一直等，所以收尾。走 finish() 而非 kill()，
+  // 否则 Bun 内部队列里未发出的尾部会被丢掉（见 finish() 上的实测数据）。
+  tcp.on('end', finish);
 }
 
 function safeSend(sock: WebSocket, obj: unknown): void {
