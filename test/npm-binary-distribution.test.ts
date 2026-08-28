@@ -1,5 +1,5 @@
 import { describe, expect, it, afterEach } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -187,7 +187,7 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     expect(r.status).toBe(0);
     expect(r.wrote).toBe(true);
     const content = readFileSync(r.launcher, 'utf-8');
-    expect(content).toBe(`#!/bin/sh\nexec "${r.binary}" "$@"\n`);
+    expect(content).toBe(`#!/bin/sh\nexec "${realpathSync(r.binary)}" "$@"\n`);
     // No node anywhere — the binary is self-contained. `node` as a command word,
     // so a path merely containing "node" cannot produce a false pass.
     expect(content).not.toMatch(/(^|\s)node(\s|$)/m);
@@ -298,7 +298,9 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     if (muslDir) writeFileSync(join(fakeLib, muslDir), '');
     let src = readFileSync(POSTINSTALL, 'utf-8')
       .replace("for (const dir of ['/lib', '/usr/lib'])", `for (const dir of ['${fakeLib}'])`)
-      .replace("existsSync('/etc/alpine-release')", 'false');
+      .replace("existsSync('/etc/alpine-release')", 'false')
+      .replaceAll('process.platform', "'linux'")
+      .replaceAll('process.arch', "'x64'");
     src = src.replace(
       'if (process.report?.getReport?.()?.header?.glibcVersionRuntime) return false;',
       'if (undefined) return false;',
@@ -341,7 +343,7 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     expect(r.stderr).toContain('no prebuilt binary package');
   });
 
-  it('glibc short-circuit: a reported glibc runtime settles it before any probe', () => {
+  it.skipIf(process.platform !== 'linux')('glibc short-circuit: a reported glibc runtime settles it before any probe', () => {
     // Unmodified script on this (glibc) box: even though the real /lib may contain
     // anything, glibcVersionRuntime is present so musl must never be claimed.
     expect(process.report.getReport().header.glibcVersionRuntime).toBeTruthy();

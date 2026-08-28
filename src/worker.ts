@@ -14213,6 +14213,10 @@ async function spawnCli(
     // the checkout root. Exposed readOnly so `botmux` + claude hooks can exec
     // `node <checkout>/dist/cli.js`.
     const botmuxInstallRoot = canonical(dirname(dirname(fileURLToPath(import.meta.url))));
+    // A development worktree may share dependencies through a node_modules
+    // symlink. Seatbelt resolves that link before matching policy rules, so the
+    // checkout grant alone does not cover the canonical dependency tree.
+    const botmuxDependencyRoot = canonical(join(botmuxInstallRoot, 'node_modules'));
 
     // Pre-create the OWN writable dirs/files the sandboxed CLI creates on
     // demand, so they EXIST at spawn and survive the existence-filter below
@@ -14477,6 +14481,7 @@ async function spawnCli(
       })),
       execPaths: keepExisting([...execDirs, ...execCarve]),
       readonlyRoots: keepExisting([
+        botmuxDependencyRoot,
         ...(cfg.skillReadonlyRoots ?? []),
         ...piInitialPromptReadonlyRoots,
         // Adapter-declared read-only host paths (e.g. traex/coco first-run

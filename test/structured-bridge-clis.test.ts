@@ -3,7 +3,7 @@
  * Keeps the single-source helpers honest without pulling the worker.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, realpathSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -120,7 +120,7 @@ describe('resolveFileBridgePath (oh-my-pi)', () => {
     const legacyPath = join(legacyDir, 'legacy.jsonl');
     writeFileSync(path, '');
     writeFileSync(legacyPath, 'legacy history must not be attached');
-    expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sid-omp' })).toBe(path);
+    expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sid-omp' })).toBe(realpathSync(path));
     expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sid-omp' })).not.toBe(legacyPath);
     expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sibling' })).toBeUndefined();
   });
