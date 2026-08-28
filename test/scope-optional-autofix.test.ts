@@ -70,7 +70,10 @@ describe('checkRequiredScopes — opt-in optional-scope auto-top-up', () => {
 });
 
 describe('tryAutoFixScopes — silent / disableQrLogin plumbing', () => {
-  const region = fnRegion('async function tryAutoFixScopes(', 4200);
+  // ⚠️ 固定字符数窗口：函数体一变长，末尾的断言（DM 抬头文案）就会滑出窗口而
+  // 失败——**不是**行为回归。加了「权限数据范围」那几行日志后实测需要 4448 字符，
+  // 这里留到 5200 给后续小改动一点余量。真正变动这段逻辑时看的是断言本身。
+  const region = fnRegion('async function tryAutoFixScopes(', 5200);
 
   it('accepts the disableQrLogin + silent opts', () => {
     expect(region).toContain('opts?: { disableQrLogin?: boolean; silent?: boolean }');
