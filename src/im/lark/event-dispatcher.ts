@@ -303,8 +303,15 @@ async function tryAutoFixScopes(
             : '所有必需权限已在应用清单中';
       // 一项都没申请上时，这次自愈**没有**修好任何东西，日志级别也不该是「succeeded」。
       const autoFixEffective = result.scopeCount > 0 || (!result.scopeWarning && result.skippedScopeCount === 0);
+      // 数据范围只在**真做了事**或**真出错**时才进日志：常态是「没有待配的」，
+      // 那句话对读日志的人零信息量，还会淹没上面真正的 scope 结论。
+      const privilegeRangeDetail = result.privilegeRangeCount > 0
+        ? `, ${result.privilegeRangeCount} 项权限数据范围已设为「与应用的可用范围一致」`
+        : result.privilegeRangeWarning
+          ? `, 权限数据范围未能自动配置（${result.privilegeRangeWarning}）`
+          : '';
       const summary =
-        `[${larkAppId}] auto-fix ${autoFixEffective ? 'succeeded' : 'could NOT apply the missing scopes'}: ${scopeDetail}, ` +
+        `[${larkAppId}] auto-fix ${autoFixEffective ? 'succeeded' : 'could NOT apply the missing scopes'}: ${scopeDetail}${privilegeRangeDetail}, ` +
         `version ${result.versionId ?? 'n/a'} published, ` +
         `${result.subscribedEventCount} events subscribed`;
       if (autoFixEffective) logger.info(summary);
