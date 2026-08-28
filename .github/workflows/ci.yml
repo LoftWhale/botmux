@@ -128,3 +128,76 @@ jobs:
         # instead of booting a credentialed bot.
         run: node scripts/smoke-bun-binary.mjs dist-bin/botmux-linux-x64
 
+  # The musl (Alpine) binary, gated on PRs — not only at release time.
+  #
+  # WHY THIS JOB EXISTS SEPARATELY FROM `bun-binary`: the musl binary is a shipped
+  # artifact with a DIFFERENT native. `pty.node` is embedded at compile time and
+  # node-pty ships no linux prebuild, so it is compiled against whatever libc the
+  # builder runs on (measured: glibc host → `NEEDED libc.so.6`; node:22-alpine →
+  # `NEEDED libc.musl-x86_64.so.1`). A glibc native inside a musl binary builds
+  # cleanly and fails only when the native is dlopen'd, on the user's machine.
+  #
+  # This job previously lived ONLY in release.yml, which runs on tag push. That
+  # meant a PR could change the build script, the embed plugin, or node-pty's
+  # version and the musl leg was first exercised during a release — after npm had
+  # published. This mirrors the release leg so the PR gate is not weaker.
+  #
+  # Only linux-x64-musl is built: GitHub offers no Alpine runner, so musl requires
+  # a container, and arm64 would need the (slower, separately-queued) arm64 runner.
+  # The release workflow still builds BOTH musl arches; this is the PR canary.
+  bun-binary-musl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # node:22-alpine supplies musl + a Node for the scripts. setup-bun does not run
+    # in a musl container, so bun comes from npm below.
+    container: node:22-alpine
+
+    steps:
+      # git is absent from the base image and checkout needs it for a real clone;
+      # python3/make/g++ are node-gyp's toolchain, required because node-pty has no
+      # linux prebuild and must compile here.
+      - name: Install toolchain (musl needs node-gyp deps for node-pty)
+        run: apk add --no-cache git python3 make g++ libstdc++ bash tar
+
+      - uses: actions/checkout@v6
+
+      - name: Install bun
+        run: npm i -g bun@1.4.0 --loglevel=error
+
+      # Compiles node-pty against MUSL — the entire point of this job.
+      - run: bun install --frozen-lockfile
+
+      - name: Verify the native is musl-linked
+        # Fail closed rather than compiling a musl binary around a glibc native.
+        # That mistake survives the build and surfaces only when the native is
+        # loaded, so assert the linkage here where it is cheap and unambiguous.
+        run: |
+          f=node_modules/node-pty/build/Release/pty.node
+          test -f "$f" || { echo "node-pty native missing at $f"; exit 1; }
+          apk add --no-cache binutils >/dev/null
+          if ! readelf -d "$f" | grep -q 'libc\.musl'; then
+            echo "REFUSING: $f is not musl-linked:"; readelf -d "$f" | grep NEEDED; exit 1
+          fi
+          echo "ok: $(readelf -d "$f" | grep NEEDED | tr -s ' ')"
+
+      - name: Stamp a synthetic version (mirrors the release job)
+        # Same reason and same ORDER as the glibc job above: the compiled binary has
+        # no package.json on disk, so the version is baked at compile time, and the
+        # repo's `0.0.0` placeholder is deliberately treated as "nothing baked" —
+        # compiling from it yields `--version: unknown`, which the smoke gate fails.
+        run: npm version "0.0.0-ci.${{ github.run_number }}" --no-git-tag-version --allow-same-version
+
+      - run: bun run build
+
+      - name: Compile the musl binary
+        run: bun scripts/build-bun-binary.mjs --target bun-linux-x64-musl --out dist-bin/botmux-linux-x64-musl
+
+      - name: Smoke-test the musl binary
+        # Same shared script as the glibc leg, so this gate can never be the weaker
+        # one. This is also where an unloadable native is caught: `dist/cli.js`
+        # statically imports node-pty (via the backends), and node-pty dlopens the
+        # native at MODULE scope — verified by mutation, corrupting the embedded
+        # pty.node makes check 1 die with `ERR_DLOPEN_FAILED`. So running the binary
+        # at all proves the musl native loads; no separate PTY step is needed.
+        run: node scripts/smoke-bun-binary.mjs dist-bin/botmux-linux-x64-musl
+
