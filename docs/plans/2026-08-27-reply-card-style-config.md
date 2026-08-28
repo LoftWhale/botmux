@@ -107,7 +107,9 @@
 
 **skill 注入**：`replyStyle.recipes === false` 时，`botmux-send` 内置指南去掉配方表和选型信号，其它发送契约不变。`layout === false` 时指南不提 `--layout`。
 
-**CLI**：`--layout` 只在 `layout !== false` 时生效；关掉则 stderr 一行提示已忽略，消息仍按普通回复卡发出，不 fail。
+**CLI**：`--layout` 只在 `layout !== false` 时生效；关掉则 stderr 一行提示已忽略，消息仍按普通回复卡发出，不 fail。非法名称（`diff` / `compare` / 缺值 / 重复）同样 fail-soft：stderr 提示后当普通回复卡发出。
+
+**CLI vs relay：** CLI 层 fail-soft 面向用户输入，保证合法调用「发送不失败」。sandbox relay 的 host 校验面向伪造/篡改的 outbox——沙箱内 CLI 只会转发五个 canonical 名，host 再见到非法 `--layout` 只可能是绕过 child 的请求，硬拒绝（与 `--response-kind` 同门）。两层不矛盾，后人不要当成规格冲突。
 
 ## 切分
 
