@@ -27,7 +27,7 @@
 | `replyStyle.recipes` | bool | `true` | 是否把五类写作配方注入 `botmux-send` 指南。`false` → 指南回到纯自由 Markdown |
 | `replyStyle.layout` | bool | `true`（layout 能力落地后） | 是否允许 `--layout`。`false` → flag 被忽略，回退普通回复卡 |
 | `replyStyle.theme` | `'default' \| 'minimal' \| 'vivid'` | `'default'` | 预设主题，只改变壳的「重」，不改变五档语义 |
-| `replyStyle.recipePrompt` | string | 缺省 | 覆写/追加该 bot 的配方引导文案；缺省用内置五类配方 |
+| `replyStyle.recipePrompt` | string | 缺省 | 非空则替换内置配方区；缺省用内置五类配方 |
 | `replyStyle.layoutColors` | 对象 | 主题缺省 | 每档卡头颜色，键为五档名，值必须是飞书 `header.template` 官方枚举 |
 | `replyStyle.layoutTags` | 对象 | 主题缺省 | 每档标签文案。缺省：仅 `risk`/`blocked` 为「需要你」。空字符串 = 该档不显示标签 |
 
