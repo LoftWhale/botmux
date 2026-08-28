@@ -3284,6 +3284,13 @@ interface SessionData {
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
   replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string }>;
+  /** Frozen per-turn reply contexts（见 Session.turnReplyContexts in types.ts）。
+   *  `botmux send` 只读其中的 `inThread`：判断本轮 quote 目标当初是否从**顶层**
+   *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
+  turnReplyContexts?: Record<string, {
+    target?: { mode?: string; chatId?: string; rootMessageId?: string };
+    inThread?: boolean;
+  }>;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   codexAppGenerationCommits?: unknown;
   queued?: boolean;
@@ -7018,6 +7025,7 @@ import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
+  shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
   mentionBackAmbiguity,
   mentionBackAmbiguityError,
@@ -8534,7 +8542,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!statSync(p).isFile()) { console.error(`不是普通文件: ${p}`); process.exit(1); }
   }
 
-  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
@@ -8790,6 +8798,36 @@ async function cmdSend(rest: string[]): Promise<void> {
         ?? frozenTurnDispatch?.quoteTargetId
         ?? s.quoteTargetId,
   });
+  // 「顶层 @ 之后那条消息才被开成话题」的发送侧半边。飞书的 reply 接口让回复继承
+  // 被引用消息**此刻**的话题归属（`reply_in_thread:false` 只是不新开话题，逃不出
+  // 已有话题），所以引用一条事后被开成话题的顶层消息，会把回复带进用户根本没在
+  // 其中 @ 过 bot 的话题里 —— dispatcher 侧的 fold 只管住了卡片，正文由这里决定。
+  //
+  // 只在「该轮确证从顶层进来（inThread === false）且本次真要 quote」时才探测一次
+  // 飞书；话题内轮次、`--top-level`、`--no-quote`、`--quote`、thread-scope 全部在
+  // 上面或 `shouldDropAfterTheFactTopicQuote` 里短路，普通热路径不多付这次调用。
+  // 探测失败一律保持 quote（既有默认行为），绝不因为不确定就改变所有正常回复的落点。
+  const quotedTurnInThread = quoteTargetId
+    ? (s.turnReplyContexts?.[currentTurnId ?? '']?.inThread
+      ?? s.turnReplyContexts?.[quoteTargetId]?.inThread)
+    : undefined;
+  let effectiveQuoteTargetId = quoteTargetId;
+  if (quoteTargetId && !explicitQuote && quotedTurnInThread === false) {
+    const probedThreadId = await getMessageThreadId(appId, quoteTargetId).catch(() => undefined);
+    if (shouldDropAfterTheFactTopicQuote({
+      quoteTargetId,
+      quotedTurnInThread,
+      currentThreadId: probedThreadId,
+      explicitQuote,
+    })) {
+      logger.info(
+        `[send] quote target ${quoteTargetId.substring(0, 12)} was answered flat at top level but now `
+        + `belongs to topic ${String(probedThreadId).substring(0, 12)}; posting flat instead of quoting `
+        + 'so the reply does not land in an after-the-fact topic',
+      );
+      effectiveQuoteTargetId = undefined;
+    }
+  }
   let primaryQuotedId: string | null = null;
   let vcMeetingListenerReplyReplay = false;
   const dispatchPrimary = async (
@@ -8802,7 +8840,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     revalidateVcMeetingManagedSend();
     const proposedOutput = {
       targetChatId,
-      ...(quoteTargetId ? { quoteTargetId } : {}),
+      ...(effectiveQuoteTargetId ? { quoteTargetId: effectiveQuoteTargetId } : {}),
       msgType,
       content,
     };
