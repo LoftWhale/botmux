@@ -51,7 +51,7 @@ describe('botmux send: 事后开的话题不再被 quote 带进去（接线）',
     // 且它落在判据的 if 块里。
     const idx = lines.findIndex(l => l.includes('shouldDropAfterTheFactTopicQuote({'));
     expect(idx).toBeGreaterThan(-1);
-    const block = lines.slice(idx, idx + 14).filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    const block = lines.slice(idx, idx + 20).filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
     expect(block).toMatch(/effectiveQuoteTargetId = undefined;/);
   });
 
@@ -65,5 +65,16 @@ describe('botmux send: 事后开的话题不再被 quote 带进去（接线）',
 
   it('探测走 catch 兜底 ⇒ 飞书报错不阻断发送(失败方向=保持既有 quote)', () => {
     expect(cliSource).toMatch(/const probedThreadId = await getMessageThreadId\([^)]*\)\.catch/);
+  });
+
+  it('收敛时的说明走 console.error 而非 logger(短命 CLI 进程的 logger 进不了 daemon 日志)', () => {
+    // live 实测:用 logger.info 写这条时,daemon out.log 里一条都查不到 ⇒ 排查价值为零。
+    // CLI 侧既有惯例是 console.error(stderr 会被 worker 收进会话日志)。
+    const lines = cliSource.split('\n');
+    const idx = lines.findIndex(l => l.includes('shouldDropAfterTheFactTopicQuote({'));
+    expect(idx).toBeGreaterThan(-1);
+    const block = lines.slice(idx, idx + 16).filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    expect(block).toMatch(/console\.error\(/);
+    expect(block).not.toMatch(/logger\.(info|debug|warn)\(/);
   });
 });

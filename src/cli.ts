@@ -8820,10 +8820,13 @@ async function cmdSend(rest: string[]): Promise<void> {
       currentThreadId: probedThreadId,
       explicitQuote,
     })) {
-      logger.info(
-        `[send] quote target ${quoteTargetId.substring(0, 12)} was answered flat at top level but now `
-        + `belongs to topic ${String(probedThreadId).substring(0, 12)}; posting flat instead of quoting `
-        + 'so the reply does not land in an after-the-fact topic',
+      // `botmux send` 是短命 CLI 进程，它的 logger 不汇进 daemon 的 out.log ——
+      // 实测用 logger.info 写这条时，daemon 日志里一条都查不到，排查价值为零。
+      // CLI 侧的既有惯例是 console.error（stderr 会被 worker 收进会话日志）。
+      console.error(
+        `[send] 引用目标 ${quoteTargetId.substring(0, 12)} 当初是顶层平铺答复的，`
+        + `但它现在已属于话题 ${String(probedThreadId).substring(0, 12)}；`
+        + '本条改为平铺发送，避免回复落进事后创建的话题',
       );
       effectiveQuoteTargetId = undefined;
     }
