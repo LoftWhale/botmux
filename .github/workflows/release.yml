@@ -508,21 +508,30 @@ jobs:
             echo 'CHANGELOG_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release (desktop assets attached asynchronously)
-        # npm-first: the Release is created right after npm publish, WITHOUT the
-        # macOS assets — those are uploaded later by `attach-desktop-assets` once
-        # signing/notarization finishes. So the Release exists with npm already
-        # live but no .dmg/.zip yet. Normally the desktop bundle lands within the
-        # same run (a few minutes) once macOS signing completes — but signing is
-        # behind a human approval gate that can wait up to 30 days, or be
-        # rejected / fail / be cancelled; in those cases the Release stays
-        # npm-only until the manual recovery re-run (see attach-desktop-assets).
-        # softprops keeps the release editable so the later --clobber upload just
-        # adds the files.
+      - name: Create GitHub Release as a DRAFT (published once binaries are attached)
+        # WHY A DRAFT (this was a real user-facing 404): `releases/latest/download/…`
+        # starts resolving to a release the moment it is PUBLISHED, but the binaries
+        # are uploaded by the separate `attach-bun-binaries` job which cannot run
+        # until the release exists. On v3.18.0 that gap was 72 seconds (published
+        # 09:11:58, assets attached 09:13:10) and a user running install.sh inside it
+        # got:
+        #   curl: (56) The requested URL returned error: 404
+        #   botmux install: download failed: …/releases/latest/download/botmux-darwin-arm64
+        #
+        # A draft is invisible to `latest` and to anonymous downloads, so the window
+        # closes: `publish-github-release` below flips it public only after the
+        # binaries are in place. Verified against the real API: uploading to a draft
+        # BY TAG NAME works, publishing preserves the assets, and the asset is then
+        # anonymously downloadable (HTTP 200).
+        #
+        # Desktop (.dmg/.zip) is deliberately NOT part of this gate — signing sits
+        # behind a human approval that can wait up to 30 days, so it still attaches
+        # asynchronously to the already-published release, exactly as before.
         uses: softprops/action-gh-release@v3
         with:
           body: ${{ steps.changelog.outputs.body }}
           prerelease: ${{ steps.dist_tag.outputs.prerelease == 'true' }}
+          draft: true
 
       - name: Comment "Released in" on included PRs
         # squash 兼容的「已发布」标记:GitHub 原生侧栏 released 徽标只认 PR 分支的原始
@@ -972,6 +981,76 @@ jobs:
         run: |
           ls -la dist-bin
           gh release upload "$RELEASE_TAG" dist-bin/botmux-* --clobber --repo "$GITHUB_REPOSITORY"
+
+  publish-github-release:
+    # Flip the draft release public — the LAST step of the release, on purpose.
+    #
+    # WHY THIS JOB EXISTS: `releases/latest/download/…` resolves as soon as a release
+    # is published, but the binaries are attached by `attach-bun-binaries`, which
+    # cannot run before the release exists. Publishing immediately therefore opened a
+    # window where install.sh 404s — 72 seconds on v3.18.0, and a real user hit it.
+    # Creating the release as a draft and publishing HERE means `latest` never points
+    # at a release without binaries.
+    #
+    # WHY IT IS NOT PART OF `attach-bun-binaries`: keeping "upload" and "publish"
+    # separate means a partial upload cannot publish. If attach fails, this job is
+    # skipped and the release stays a DRAFT — invisible to `latest`, so users keep
+    # getting the previous version instead of a 404. That is the fail-closed
+    # direction: npm is already live either way.
+    #
+    # RECOVERY FROM A STUCK DRAFT (verified, because the obvious assumption is wrong):
+    # `workflow_dispatch` does NOT re-run this job — it carries
+    # `github.event_name == 'push'`, and the dispatch path only reaches
+    # `refresh-desktop-assets`. Re-running the failed RUN works only while the
+    # compiled-binary artifacts still exist (`retention-days: 7`). So:
+    #   • within 7 days → re-run the failed jobs of that run; or
+    #   • any time      → attach the assets and publish by hand:
+    #       gh release upload vX.Y.Z <binaries+sha256> --clobber
+    #       gh release edit   vX.Y.Z --draft=false
+    # A draft blocks only the curl/install.sh path; npm already serves the same
+    # binaries inside the platform subpackages, so this is never a total outage.
+    #
+    # `--draft=false` is idempotent: publishing an already-public release is a no-op.
+    if: github.event_name == 'push' && needs.attach-bun-binaries.result == 'success'
+    needs: [attach-bun-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify every install.sh asset is present BEFORE publishing
+        # The gate this whole change exists for. install.sh derives asset names from
+        # `uname -s`/`uname -m` (+ a `-musl` suffix when the libc is musl), so a
+        # missing or misnamed asset is a 404 for exactly the platforms it covers —
+        # and nothing else in the pipeline checks the NAMES at all. Refusing to
+        # publish leaves the release a draft, which is strictly better than a public
+        # release that 404s.
+        run: |
+          missing=""
+          for a in botmux-linux-x64 botmux-linux-arm64 botmux-linux-x64-musl \
+                   botmux-linux-arm64-musl botmux-darwin-x64 botmux-darwin-arm64; do
+            for f in "$a" "$a.sha256"; do
+              gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --json assets --jq '[.assets[].name]|index("'"$f"'")' | grep -q '^[0-9]' \
+                || missing="$missing $f"
+            done
+          done
+          if [ -n "$missing" ]; then
+            echo "REFUSING to publish: missing release assets:$missing"
+            echo "The release stays a DRAFT, so releases/latest/download keeps serving the"
+            echo "previous version instead of 404ing. Fix the assets, then re-run."
+            exit 1
+          fi
+          echo "ok: all 12 install.sh assets present"
+
+      - name: Publish the release
+        run: |
+          gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,assets \
+            --jq '"published: isDraft=\(.isDraft) prerelease=\(.isPrerelease) assets=\(.assets|length)"'
 
   attach-desktop-assets:
     # npm-first tail: once the parallel `desktop` job has signed+notarized the
