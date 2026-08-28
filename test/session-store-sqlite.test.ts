@@ -53,8 +53,6 @@ import {
   readSessionRowCopiesAcrossStores,
   listSessionsStrict,
   SessionStoreSqliteUnavailableError,
-  SessionStoreNotImportedError,
-  SessionStoreUnavailableError,
 } from '../src/services/session-store.js';
 import {
   readPersistedSessionRows,
@@ -193,16 +191,18 @@ describe('first-start JSON import', () => {
     expect(listSessionsStrict().map(s => s.sessionId).sort()).toEqual(['s1', 's2']);
   });
 
-  it('a non-owning process (worker under an old daemon) never bootstraps the .db', () => {
+  it('a non-owning process (worker under an old daemon) reads the JSON and never bootstraps the .db', () => {
     seedJson('sessions-appA.json', { s1: row('s1') });
 
-    // worker（owner:false）在旧 daemon 还没导入时启动：不许建库，也不许把
-    // 「还没迁移」当成「没有会话」——写门必须挡住，而不是从空投影继续。
+    // worker（owner:false）在旧 daemon 还没导入时启动：照常读得到会话（那台
+    // daemon 还在写这份 JSON），但不许建库——建了就等于在它背后把两种表示
+    // 分叉，还会把它的一次性导入门关掉。
     init('appA', { owner: false });
-    expect(getSession('s1')).toBeUndefined();
+    expect(getSession('s1')?.title).toBe('s1');
+    expect(listSessionsStrict()).toHaveLength(1);
     expect(existsSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'))).toBe(false);
-    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
-    expect(() => listSessionsStrict()).toThrow(/尚未迁移/);
+    // 只读：不得把 scope 修复或 legacy 迁移写回 JSON（那是拥有者 daemon 的活）。
+    expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.title).toBe('s1');
 
     // daemon（owner）随后启动才导入
     init('appA');
@@ -238,11 +238,10 @@ describe('the frozen import source is not a store', () => {
     expect(countActiveSessionsOnDisk(tempDir)).toBe(1);
   });
 
-  it('a peer bot that has not imported yet is invisible to cross-bot discovery', () => {
-    // 设计上接受的代价：跨 bot 发现只看 .db。某个 peer 的 daemon 还没在
-    // SQLite 版本上重启过时，它对「跨 bot 继承 workingDir / 活跃数统计 /
-    // adopt 去重」都不可见——而不是被当成一份可信但陈旧的拷贝。调用方自己的
-    // store 走的是 fail-closed 那条路（见下面的 assertStoreImported 用例）。
+  it('an un-imported peer store still composes with imported ones', () => {
+    // 混合升级窗口：appOld 的 daemon 还在跑迁移前的版本（只有 JSON），appNew
+    // 已经切到 SQLite。跨 bot 发现（继承 workingDir、活跃数统计、adopt 去重）
+    // 必须同时看见两者——把没重启过的 peer 读成「不存在」会让继承和去重失效。
     seedJson('sessions-appOld.json', { o1: row('o1', { larkAppId: 'appOld' }) });
     init('appNew');
     const n1 = createSession('oc_chat', 'om_shared_root', 'new bot session');
@@ -251,14 +250,15 @@ describe('the frozen import source is not a store', () => {
     mutatePersistedSessionRow(tempDir, 'appNew', n1.sessionId, (r) => { r.rootMessageId = 'om_o1'; });
 
     const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
-    expect(snapshot.has('o1')).toBe(false);
+    expect(snapshot.get('o1')?.larkAppId).toBe('appOld');
     expect(snapshot.get(n1.sessionId)?.larkAppId).toBe('appNew');
 
     init('appThird');
-    expect(findActiveSessionsByRoot('om_o1').map(s => s.sessionId)).toEqual([n1.sessionId]);
-    expect(countActiveSessionsOnDisk(tempDir)).toBe(1);
+    expect(findActiveSessionsByRoot('om_o1').map(s => s.sessionId).sort())
+      .toEqual(['o1', n1.sessionId].sort());
+    expect(countActiveSessionsOnDisk(tempDir)).toBe(2);
     const ids = collectBotmuxSessionIdentities(tempDir);
-    expect(ids.has('o1')).toBe(false);
+    expect(ids.has('o1')).toBe(true);
     expect(ids.has(n1.sessionId)).toBe(true);
   });
 
@@ -462,53 +462,16 @@ describe('SQLite capability gate', () => {
     )).toThrow(SessionStoreSqliteUnavailableError);
   });
 
-  it('does not mistake a brand-new bot for an un-imported one', () => {
-    // The legacy→per-bot migration never deletes `sessions.json`, so it is
-    // present on every upgraded install and NO daemon will ever import it
-    // (production daemons always carry an appId). Treating it as pending would
-    // fire on every freshly added bot — which has nothing to import — and tell
-    // its operator to restart an already-current daemon.
-    seedJson('sessions.json', { old: row('old') });
-    seedPersistedSessionRows(tempDir, 'appA', { a1: row('a1', { larkAppId: 'appA' }) });
-
-    expect(loadAllSessionsSnapshot({ dataDir: tempDir, fallbackAppId: 'appNew' }).size).toBe(1);
-    expect(mutateSessionRowOffline(
-      { sessionId: 'nope', larkAppId: 'appNew' },
-      () => true,
-      { dataDir: tempDir },
-    )).toBeUndefined();
-  });
-
-  it('explains an empty identity scan caused by an un-imported store', () => {
-    // 「行不存在」和「那个 bot 的库还没导入」是同一个空扫描，但动作完全不同。
-    // 调用方会把 0 命中变成「未找到当前进程所属 session」，把人引去查进程标记。
+  it('an un-imported peer store still resolves for the identity scan', () => {
+    // 身份扫描是 fail-closed 的「恰好一次」判定。窗口期把某个 store 读成
+    // 「不存在」，会让本来能唯一命中的行变成 0 命中，命令报「未找到当前进程
+    // 所属 session」，把人引去查进程标记。
     seedJson('sessions-appOld.json', { o1: row('o1', { larkAppId: 'appOld' }) });
     seedPersistedSessionRows(tempDir, 'appA', { a1: row('a1', { larkAppId: 'appA' }) });
 
     expect(readSessionRowCopiesAcrossStores('a1', tempDir)).toHaveLength(1);
-    expect(() => readSessionRowCopiesAcrossStores('missing', tempDir))
-      .toThrow(SessionStoreNotImportedError);
-  });
-
-  it('an un-imported store is a migration error, never an engine capability error', () => {
-    // 引擎在不在 与 这个 store 迁没迁 是两件事，报错必须分型：前者要人升级
-    // 运行时，后者只要重启 daemon。混成一个会把「重启就好」误报成「装不上」。
-    seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
-
-    expect(() => loadAllSessionsSnapshot({ dataDir: tempDir, fallbackAppId: 'appA' }))
-      .toThrow(SessionStoreNotImportedError);
-    expect(() => mutateSessionRowOffline(
-      { sessionId: 's1', larkAppId: 'appA' },
-      (current) => { current.status = 'closed'; return true; },
-      { dataDir: tempDir },
-    )).toThrow(/尚未迁移/);
-    // 没有 .db 也没有 JSON 的数据目录只是「还没有会话」，静默返回空。
-    const emptyDir = mkdtempSync(join(tmpdir(), 'session-store-empty-'));
-    try {
-      expect(loadAllSessionsSnapshot({ dataDir: emptyDir, fallbackAppId: 'appA' }).size).toBe(0);
-    } finally {
-      rmSync(emptyDir, { recursive: true, force: true });
-    }
+    expect(readSessionRowCopiesAcrossStores('o1', tempDir)).toHaveLength(1);
+    expect(readSessionRowCopiesAcrossStores('missing', tempDir)).toHaveLength(0);
   });
 
   it('a corrupt .db is a skippable store, not a missing-engine error', () => {

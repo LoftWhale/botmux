@@ -272,12 +272,19 @@ Node 免 flag 线仍是 v22.13.0 / v23.4.0，但仓库 `engines` 跟 master 的
 原则 1 在本步兑现。`session-store.ts` 从 2154 行降到约 1800 行，且删掉的全部是机器
 而不是注释：
 
-- **JSON 引擎净删除**：`save()` 整份序列化 + byte-identical 跳写、`load()` 的
-  JSON/legacy 迁移分支、`readExistingSessionsFromDisk` / `readSessionsProjectionStrict`、
-  Remote lineage CAS + readback 的 JSON 实现（约 80 行）、`mutateSessionRowOffline`
-  的 JSON 分支、以及 `StoreFileRef.kind` 撑起来的整套 db-else-json 分流。
-  `resolveStoreFile` / `listStoreRefs` / `readStoreEntries` / `readStoreRowByKey` /
-  `readStoreActiveRows` / `countActiveSessionsOnDisk` / `getSessionFresh` 一律 db-only。
+- **daemon 侧 JSON 引擎净删除**：`save()` 整份序列化 + tmp+rename + byte-identical
+  跳写、`load()` 的 JSON 写回与 legacy→per-bot 迁移写、`readExistingSessionsFromDisk` /
+  `readSessionsProjectionStrict`、Remote lineage CAS + readback 的 JSON 实现（约 80 行）、
+  `repairMissingChatScopes` 与它每次 load 里那次「修完再写回」的事务、
+  `persistRow` 的 `save()` 兜底。拥有者 daemon 从此只写 SQLite。
+
+- **跨进程那一层的 db-else-json 保留**（读 + 离线写）。原计划第 5 条写的是
+  「收敛为 db-only」，**这条被推翻了**：db-only 会在「npm 已升级、daemon 还没重启」
+  的窗口里把 CLI 快照读、点读、身份扫描、worker 读、离线写**五条全部打断**——
+  实测与 master 的 A/B 见下。而这个窗口不是少数落后用户的边角：自动更新默认关闭、
+  `botmux upgrade` 明说让用户自己 `botmux restart`，所以它**没有上界**，且每个老用户
+  升级时都会经历一次。窗口内 agent 连 `botmux send` 都发不出去，等于回不了话。
+  原计划把「灰度稳定」当成可以假设的前提，这个前提不成立。
 - **`withFileLockSync` 只剩导入一处**（编排全部消失）。**没有全删**：导入经固定的
   `<db>.tmp` 暂存，同一 bot 的两个 owner 进程可能短暂并存（重启撞上尚未回收的前任），
   两边都会通过 `existsSync(db)`、写同一个 tmp、发布出损坏库。改 per-process tmp 名会换来
@@ -295,12 +302,11 @@ Node 免 flag 线仍是 v22.13.0 / v23.4.0，但仓库 `engines` 跟 master 的
   掉前一条——陈旧的 closed 幽灵行覆盖活行，而且导入只跑一次、JSON 随后冻结，
   不可逆。按文件原 key 导入，错键行保持惰性（身份扫描本来就跳过 key 与
   `sessionId` 不符的行）。这一条是复核时用两个 checkout 跑同一份输入实测出来的。
-- **未导入的 store 一律 fail-closed**，不再静默空投影。新增 `SessionStoreNotImportedError`：
-  「有 `sessions*.json` 但没有 `.db`」意味着拥有该 bot 的 daemon 还在跑迁移前的版本，
-  `loadAllSessionsSnapshot`（仅针对调用方自己的 store）、`mutateSessionRowOffline`、
-  以及 `owner: false` 的 `load()` 都报出可行动的错误。这是删掉 db-else-json 之后
-  「灰度窗口」的诚实形态：把静默降级换成一句「重启 daemon 完成一次性导入」。
-  peer bot 的未导入 store 保持不可见（本来就不是调用方的事）。
+- **升级窗口内行为与 master 逐字一致**（实测 A/B：CLI 快照读 / 点读 / 身份扫描 /
+  worker `getSession` / `getSessionFresh` / 离线写六项全部相同）。`owner: false` 的
+  `load()` 读那份 JSON 但**只读**——scope 修复与 legacy 迁移都是拥有者 daemon 的活，
+  它在导入时做一次。离线写仍落到同一份 JSON（那台 daemon 还在读它），并且**绝不建 .db**：
+  空库会关掉它的一次性导入门。
 - **两条建库地雷已封**（删 JSON 分支时才暴露出来，master 上靠 db-else-json 的
   `existsSync` 前置侥幸不可达）：SQLite 的读写 open **会创建文件**，而一个空库会让
   daemon 的 `existsSync(db)` 导入门判假、静默丢掉整份迁移前的行。现在
@@ -310,8 +316,9 @@ Node 免 flag 线仍是 v22.13.0 / v23.4.0，但仓库 `engines` 跟 master 的
   就已失效（它约束的是文件锁），现在连 JSON 路径也没有了，从签名删除；
   fleet shutdown 的 deadline 预检（`remaining <= 0` 直接拒绝）保留，仍在干活。
   等待上限统一由 `busy_timeout`（3s）决定。
-- **沙盒收面**：`fs-policy` 的两处 readOnly 授权不再包含冻结的
-  `sessions-<appId>.json`，只授权 `session-stores/<appId>` 目录；兄弟 bot 仍 deny-by-default。
+- **沙盒**：两处 readOnly 授权改为「store 目录 + 冻结 JSON」并存（目录 bind 的理由见
+  #852：单文件 bind 会钉死 WAL sidecar 的 inode）；兄弟 bot 仍 deny-by-default，
+  且回归里把这条安全断言加强到 sibling 目录本身与共享父目录。
 - **冻结 JSON 的处置（第二 PR 待决项 6）决定：原地保留，不删不改名。** 它已不被任何
   运行时路径读取，代码成本为零；而它是回退到迁移前版本时唯一还能读的副本，改名反而会让
   回退后的旧 daemon 从空库起步、再写出一份新的 JSON。几百 KB 换一条不可逆边界的兜底，
@@ -344,26 +351,16 @@ endsWith('.json')` 动态筛名，整份读改写——按名字 grep 命不中�
 
 **已知边界（本步接受并明写）**：
 
-- 从**迁移前**版本直接升到 db-only 版本、且旧 daemon 仍在跑时，该 bot 的 store 没有
-  `.db`：worker（`owner: false`）与 CLI 离线写都会 fail-closed 报错，直到 daemon 重启完成
-  导入。自动更新默认关闭、`botmux upgrade` 也只提示用户自己 `botmux restart`，所以这个
-  窗口没有上界——**本步的前提就是灰度窗口已关闭**（fleet 里每个 bot 都至少在 #852 的
-  版本上重启过一次）。
-- 跨 bot 发现（`findActiveSessionsByRoot` / `findActiveChatScopeSessionsByChat` /
-  `countActiveSessionsOnDisk` / `collectBotmuxSessionIdentities`）只看 `.db`：未导入的
-  peer 不可见，不报错。
-- 离线写不再顺手收敛整个 store（行级写只碰一行）：错键的脏行不再被删除，
-  保持惰性存在。
-- **沙盒内的未导入检测失效**：`fs-policy` 撤掉了 `sessions-<appId>.json` 授权，
-  bwrap 内的 `existsSync` 看不到那个文件，所以窗口期沙盒里的 `botmux send`
-  仍然是「找不到 session」而不是「请重启 daemon」。保留那条授权能让检测在沙盒里
-  生效，但那等于为一个本步假设已关闭的窗口永久留一个沙盒授权；这里选了减负。
-- **legacy `sessions.json` 里没有 `larkAppId` 的行（多 bot 拆分之前的遗留）不再可见。**
-  实测对照确认：master 上 `loadAllSessionsSnapshot` 经 db-else-json 还能读到它们，
-  db-only 下读不到。这类行本来就不归任何 per-bot store 所有——#852 的导入按
-  `larkAppId === currentAppId` 过滤，从来不收它们；生产 daemon 一律带 appId 启动，
-  扁平 legacy 库只在单 bot 开发/测试下才会建。所以它们此前也只是 CLI 还能列出、
-  还能离线关闭的惰性墓碑，没有 daemon 能恢复或投递。
+- **本步不再依赖任何灰度假设**：跨进程 db-else-json 保留后，升级窗口内的行为与
+  master 一致，什么时候合都安全。代价是 `StoreFileRef.kind` 与三个读函数、
+  `getSessionFresh`、`mutateSessionRowOffline` 的 JSON 分支继续留在库里，
+  约 60 行——它们的清除条件仍是「窗口真的关闭」，但那已经不是本步的前提。
+- 离线写在 SQLite 路径上不再顺手收敛整个 store（行级写只碰一行）：错键的脏行
+  不再被删除，保持惰性存在（读侧本来就按 `sessionId` 过滤）。JSON 路径保持原样。
+- 沙盒**仍然**授权 `sessions-<appId>.json`（一度想撤掉，作为「减面」的一部分）。
+  撤掉会让升级窗口内沙盒里的 `botmux send` 连 stat 都做不到那份 JSON，直接报
+  「找不到 session」——而沙盒是 agent 的主路径，那等于把上面刚修好的窗口兼容
+  在最常用的那条路上又废掉。它的清除条件与 db-else-json 同一条：窗口真的关闭。
 
 ### Step 4 — 按痛点上事务（N 个独立小 PR，ROI gate）
 

@@ -70,7 +70,6 @@ import {
   listSessions,
   listSessionsStrict,
   SessionStoreUnavailableError,
-  SessionStoreNotImportedError,
   beginMojoCloseJournal,
   markMojoClosePrepared,
   finishMojoCloseAbort,
@@ -1348,17 +1347,17 @@ describe('loadAllSessionsSnapshot()', () => {
     expect(existsSync(sessionStorePath(tempDir))).toBe(false);
   });
 
-  it("refuses the caller's own store while its pre-SQLite JSON is still un-imported", () => {
-    // Upgrade window: npm already replaced dist, the owning daemon still runs a
-    // pre-SQLite build, so no .db exists. Reporting "no sessions" here would
-    // look to the agent like its own session vanished.
+  it('still reads a store whose owning daemon has not imported it yet', () => {
+    // Upgrade window: npm already replaced dist and repointed the launcher, but
+    // the daemon that owns these rows still runs the pre-SQLite build and keeps
+    // writing the JSON. Every live session's `botmux send` resolves itself
+    // through here — going db-only would leave the agent unable to reply until
+    // someone restarts the daemon, which nothing forces them to do.
     seedFile('sessions-appB.json', { b1: row('b1') });
-    expect(() => loadAllSessionsSnapshot({ dataDir: tempDir, fallbackAppId: 'appB' }))
-      .toThrow(SessionStoreNotImportedError);
-    // A peer bot in the same state is simply invisible — never the caller's business.
     seedStore('appA', { a1: row('a1') });
-    expect([...loadAllSessionsSnapshot({ dataDir: tempDir, fallbackAppId: 'appA' }).keys()])
-      .toEqual(['a1']);
+    const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
+    expect([...snapshot.keys()].sort()).toEqual(['a1', 'b1']);
+    expect(snapshot.get('b1')?.larkAppId).toBe('appB');
   });
 });
 
@@ -1512,14 +1511,19 @@ describe('mutateSessionRowOffline()', () => {
     expect(existsSync(sessionStorePath(tempDir, 'appA'))).toBe(false);
   });
 
-  it('refuses instead of silently no-opping while the store is still un-imported', () => {
-    // Offline close/abandon during the upgrade window: a silent no-op would
-    // report success while the row stays active.
+  it('writes the JSON store while its owning daemon has not imported it yet', () => {
+    // Upgrade window: the pre-SQLite daemon still owns these rows and reads the
+    // JSON, so an offline close has to land there. Creating a .db here would
+    // fork the two representations behind that daemon's back — and the empty
+    // store would also disable its one-shot import gate.
     seedFile('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
-    expect(() => mutateSessionRowOffline(
+    const published = mutateSessionRowOffline(
       { sessionId: 's1', larkAppId: 'appA' },
       current => { current.status = 'closed'; return true; },
       { dataDir: tempDir },
-    )).toThrow(SessionStoreNotImportedError);
+    );
+    expect(published?.status).toBe('closed');
+    expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('closed');
+    expect(existsSync(sessionStorePath(tempDir, 'appA'))).toBe(false);
   });
 });

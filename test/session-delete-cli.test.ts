@@ -11,8 +11,10 @@ import { createServer, type IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -23,6 +25,7 @@ import { spawnTsScript } from './helpers/ts-runner.js';
 import {
   readPersistedSessionRows,
   seedPersistedSessionRows,
+  sessionStorePath,
 } from './helpers/session-store-disk.js';
 import {
   managedOriginCapabilityPath,
@@ -455,19 +458,17 @@ describe('botmux delete — daemon-first close', () => {
     }
   });
 
-  it('refuses to act on a store whose pre-SQLite JSON has not been imported yet', async () => {
-    // The CLI used to read `sessions-<appId>.json` as a live store. Now it is a
-    // one-shot import source only, so this same fixture must fail LOUDLY: a
-    // silent "没有活跃会话。" would tell the operator their live session is
-    // already gone while the owning (pre-SQLite) daemon still runs it.
+  it('closes a session whose owning daemon has not imported the store yet', async () => {
+    // 升级窗口：npm 换了 dist、重指了 launcher，而拥有这些行的 daemon 还在跑
+    // 迁移前的版本、仍然读写 JSON。离线关闭必须照常落到那份 JSON 上——读不到
+    // 会让 CLI 报「没有活跃会话」，等于告诉用户会话没了；而在这里建 .db 会在
+    // 那台 daemon 背后把两种表示分叉，还会关掉它的一次性导入门。
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-unimported-'));
     tempDirs.push(dataDir);
     const session = makeSession('sess-delete-unimported');
     mkdirSync(dataDir, { recursive: true });
-    writeFileSync(
-      join(dataDir, `sessions-${APP_ID}.json`),
-      JSON.stringify({ [session.sessionId]: session }),
-    );
+    const jsonFp = join(dataDir, `sessions-${APP_ID}.json`);
+    writeFileSync(jsonFp, JSON.stringify({ [session.sessionId]: session }));
 
     const result = await runDelete(dataDir, [session.sessionId], {
       BOTMUX_SESSION_ID: undefined,
@@ -476,8 +477,9 @@ describe('botmux delete — daemon-first close', () => {
       BOTMUX_DAEMON_IPC_PORT: undefined,
     });
 
-    expect(result.status).not.toBe(0);
+    expect(result.status).toBe(0);
     expect(result.stdout).not.toContain('没有活跃会话');
-    expect(`${result.stdout}\n${result.stderr}`).toContain('会话库尚未迁移到 SQLite');
+    expect(JSON.parse(readFileSync(jsonFp, 'utf-8'))[session.sessionId].status).toBe('closed');
+    expect(existsSync(sessionStorePath(dataDir, APP_ID))).toBe(false);
   });
 });

@@ -1,4 +1,4 @@
-import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
@@ -55,11 +55,20 @@ function stripLegacyPendingCardFields(session: Record<string, unknown>): void {
 // `Session` type stays the schema authority; the generated columns below only
 // serve hot lookups.
 //
-// SQLite is the ONLY engine. The pre-SQLite `sessions*.json` files are a
-// one-shot IMPORT SOURCE (below) and nothing else: after the import they are
-// frozen in place, never read on any live path and never written again. They
-// are deliberately not deleted — they are the only artifact a downgrade to a
-// pre-SQLite botmux can still read, and they cost a few hundred KB.
+// SQLite is the only engine the OWNING DAEMON ever writes. It imports its
+// pre-SQLite `sessions*.json` once at first load and never writes JSON again.
+//
+// The cross-process surface (worker reads, CLI reads, CLI offline writes) still
+// resolves each store as "use the .db when it exists, else the .json". That is
+// not leftover indecision — it is the upgrade window. `npm i -g` replaces dist
+// and repoints ~/.botmux/bin/botmux immediately, while the daemon that owns the
+// rows keeps running the OLD code (auto-update is off by default and `botmux
+// upgrade` tells the operator to restart by hand), so a store can legitimately
+// have no `.db` for hours or weeks. Dropping the JSON read seam would leave
+// every live session's `botmux send` unable to find itself until that restart.
+//
+// The frozen JSON is deliberately never deleted: it is also the only artifact a
+// downgrade to a pre-SQLite botmux can read, and it costs a few hundred KB.
 
 type SqliteStatementLike = StatementLike;
 type SqliteDatabaseLike = DatabaseSyncLike;
@@ -97,55 +106,6 @@ export class SessionStoreSqliteUnavailableError extends Error {
   override readonly name = 'SessionStoreSqliteUnavailableError';
 }
 
-/** A store whose pre-SQLite `sessions*.json` still exists while its `.db` does
- *  not: the daemon that owns it has not restarted on a SQLite build yet, so
- *  the one-shot import has not run. Only that daemon may import (the
- *  `owner: false` contract), so cross-process callers refuse loudly instead of
- *  reporting an empty store — an offline close that silently no-ops, or a
- *  `botmux send` that cannot find its own session, is the worse outcome. */
-export class SessionStoreNotImportedError extends Error {
-  override readonly name = 'SessionStoreNotImportedError';
-}
-
-/** A per-bot store that still has its own un-imported `sessions-<appId>.json`.
- *
- *  Deliberately narrow. It does NOT consult the legacy `sessions.json`, for two
- *  reasons: that file is never deleted by the legacy→per-bot migration, so it
- *  survives on every upgraded install forever; and no daemon will ever import
- *  it (production daemons always start with an appId, so nothing owns the flat
- *  store). Treating it as "pending" would fire on every freshly added bot —
- *  which has nothing to import at all — and tell its operator to restart a
- *  daemon that is already current. A store with no own JSON is simply new. */
-function unimportedStoreJsonPath(appId: string, dataDir: string): string | undefined {
-  if (existsSync(storeDbPath(appId, dataDir))) return undefined;
-  const ownJsonFp = join(dataDir, storeJsonFileName(appId));
-  return existsSync(ownJsonFp) ? ownJsonFp : undefined;
-}
-
-function assertStoreImported(appId: string | undefined, dataDir: string): void {
-  if (!appId) return;
-  const pendingJsonFp = unimportedStoreJsonPath(appId, dataDir);
-  if (!pendingJsonFp) return;
-  throw new SessionStoreNotImportedError(
-    `会话库尚未迁移到 SQLite：${pendingJsonFp} 存在但 ${storeDbPath(appId, dataDir)} 不存在。`
-    + `拥有该 bot 的 daemon 仍在跑迁移前的版本——请重启 daemon（botmux restart）让它完成一次性导入。`,
-  );
-}
-
-/** Every per-bot store whose own JSON is still waiting to be imported. Used to
- *  explain an empty cross-store scan instead of reporting "row not found". */
-function listUnimportedStoreJsonPaths(dataDir: string): string[] {
-  let names: string[];
-  try { names = readdirSync(dataDir); } catch { return []; }
-  const pending: string[] = [];
-  for (const name of names) {
-    if (!name.startsWith('sessions-') || !name.endsWith('.json')) continue;
-    const appId = name.slice('sessions-'.length, -'.json'.length);
-    const jsonFp = unimportedStoreJsonPath(appId, dataDir);
-    if (jsonFp) pending.push(jsonFp);
-  }
-  return pending;
-}
 
 function sqliteUnavailableMessage(context: string): string {
   return `${context}需要 SQLite 引擎（Node 的 node:sqlite 或 Bun 的 bun:sqlite），但当前运行时不可用。Node 请升级到 ${SQLITE_NODE_VERSION_HINT}；编译版请使用支持 bun:sqlite 的 Bun。当前 runtime: ${process.version}。`;
@@ -247,12 +207,12 @@ export function __testOnly_setBeforeRowPersist(hook: ((sessionId: string) => voi
   testOnlyBeforeRowPersist = hook;
 }
 
-// ─── Store resolution ────────────────────────────────────────────────────────
+// ─── Store resolution (db-else-json, cross-process only) ─────────────────────
 
 type StoreFileRef = {
   /** undefined = the legacy no-appId store. */
   appId?: string;
-  /** Absolute path of that store's `sessions.db`. */
+  kind: 'sqlite' | 'json';
   path: string;
 };
 
@@ -275,24 +235,37 @@ function storeDbPath(appId: string | undefined, dataDir: string): string {
   return appId ? join(sessionStoreSqliteDir(appId, dataDir), 'sessions.db') : join(dataDir, 'sessions.db');
 }
 
-/** Import source only — never read on a live path (see `importJsonStoreToSqlite`). */
+/** The pre-SQLite file for a store: the daemon's one-shot import source, and
+ *  the cross-process read seam until that daemon restarts. */
 function storeJsonFileName(appId: string | undefined): string {
   return appId ? `sessions-${appId}.json` : 'sessions.json';
 }
 
+/** Per-store rule for every cross-process reader and CLI offline writer:
+ *  use the .db when it exists, else the .json (see the upgrade-window note at
+ *  the top of the engine section). */
 function resolveStoreFile(appId: string | undefined, dataDir: string): StoreFileRef {
-  return { appId, path: storeDbPath(appId, dataDir) };
+  const dbPath = storeDbPath(appId, dataDir);
+  if (existsSync(dbPath)) return { appId, kind: 'sqlite', path: dbPath };
+  return { appId, kind: 'json', path: join(dataDir, storeJsonFileName(appId)) };
 }
 
-/** One ref per store that exists on disk: the flat legacy `sessions.db` plus
- *  every `session-stores/<appId>/sessions.db`. `strict` propagates an
- *  unlistable `session-stores/` dir (fail-closed callers must not mistake an
- *  unreadable store set for an empty one); otherwise it degrades to whatever
- *  could be enumerated. */
+/** One ref per store identity across the whole data dir, .db winning: flat
+ *  legacy files + per-bot JSON files + per-bot SQLite store directories.
+ *  `strict` propagates an unlistable `session-stores/` dir (fail-closed
+ *  callers must not mistake an unreadable store set for an empty one);
+ *  otherwise it degrades to the JSON view. */
 function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreFileRef[] {
   const names = readdirSync(dataDir);
-  const refs: StoreFileRef[] = [];
-  if (names.includes('sessions.db')) refs.push({ path: join(dataDir, 'sessions.db') });
+  const dbPaths = new Map<string, string>();
+  const jsonPaths = new Map<string, string>();
+  for (const name of names) {
+    if (name === 'sessions.db') dbPaths.set('', join(dataDir, name));
+    else if (name === 'sessions.json') jsonPaths.set('', join(dataDir, name));
+    else if (name.startsWith('sessions-') && name.endsWith('.json')) {
+      jsonPaths.set(name.slice('sessions-'.length, -'.json'.length), join(dataDir, name));
+    }
+  }
   if (names.includes(PER_BOT_STORE_DIRNAME)) {
     let appIds: string[] = [];
     try {
@@ -302,8 +275,17 @@ function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreF
     }
     for (const appId of appIds) {
       const dbPath = storeDbPath(appId, dataDir);
-      if (existsSync(dbPath)) refs.push({ appId, path: dbPath });
+      if (existsSync(dbPath)) dbPaths.set(appId, dbPath);
     }
+  }
+  const refs: StoreFileRef[] = [];
+  for (const key of new Set([...dbPaths.keys(), ...jsonPaths.keys()])) {
+    const dbPath = dbPaths.get(key);
+    refs.push({
+      appId: key === '' ? undefined : key,
+      kind: dbPath ? 'sqlite' : 'json',
+      path: dbPath ?? jsonPaths.get(key)!,
+    });
   }
   return refs;
 }
@@ -311,6 +293,11 @@ function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreF
 /** All [key, value] entries of one store. Throws on an unreadable store;
  *  callers decide skip-vs-propagate (capability errors always propagate). */
 function readStoreEntries(ref: StoreFileRef): [string, Session][] {
+  if (ref.kind === 'json') {
+    const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
+    if (!parsed || typeof parsed !== 'object') return [];
+    return Object.entries(parsed as Record<string, Session>);
+  }
   const db = openDbForRead(ref.path);
   try {
     const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
@@ -326,6 +313,11 @@ function readStoreEntries(ref: StoreFileRef): [string, Session][] {
 
 /** Point-read one key from one store. Throws on an unreadable store. */
 function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | undefined {
+  if (ref.kind === 'json') {
+    const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+    return (parsed as Record<string, Session>)[sessionId];
+  }
   // The daemon's hot freshness reads hit its own store — reuse the attached
   // connection instead of opening one per call.
   if (ownStore && loaded && ref.appId === currentAppId && ref.path === getDbPath()) {
@@ -346,6 +338,11 @@ function readStoreActiveRows(
   ref: StoreFileRef,
   hint?: { rootMessageId?: string; chatScopeChatId?: string },
 ): Session[] {
+  if (ref.kind === 'json') {
+    const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
+    if (!parsed || typeof parsed !== 'object') return [];
+    return Object.values(parsed as Record<string, Session>).filter(s => s?.status === 'active');
+  }
   const db = openDbForRead(ref.path);
   try {
     let sql = "SELECT row FROM sessions WHERE status = 'active'";
@@ -440,7 +437,6 @@ export function __testOnly_setAfterRemoteBatchRename(hook: (() => void) | undefi
 export function init(appId?: string, opts: { owner?: boolean } = {}): void {
   currentAppId = appId;
   sqliteBootstrapAllowed = opts.owner !== false;
-  warnedUnimportedOwnStore = false;
   loaded = false;
   sessions = new Map();
   loadFailure = undefined;
@@ -577,6 +573,32 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
   }
 }
 
+/** Read this store's pre-SQLite JSON into the in-memory projection WITHOUT
+ *  writing anything back. Only for a non-owning process during the upgrade
+ *  window (see `load()`); the owning daemon imports instead. */
+function loadFromFrozenJson(): void {
+  const jsonFp = getImportJsonPath();
+  const legacyFp = join(config.session.dataDir, 'sessions.json');
+  const sourceFp = existsSync(jsonFp) ? jsonFp
+    : currentAppId && existsSync(legacyFp) ? legacyFp
+      : undefined;
+  sessions = new Map();
+  if (!sourceFp) return;
+  try {
+    const data = parseSessionsProjectionStrict(readFileSync(sourceFp, 'utf-8'), sourceFp);
+    for (const [key, value] of Object.entries(data)) {
+      if (sourceFp === legacyFp && value?.larkAppId !== currentAppId) continue;
+      repairMissingChatScope(value);
+      sessions.set(key, value);
+    }
+    logger.info(`Loaded ${sessions.size} sessions from ${sourceFp} (store not imported yet)`);
+  } catch (err) {
+    logger.error(`Failed to load sessions: ${err}`);
+    loadFailure = err instanceof Error ? err : new Error(String(err));
+    sessions = new Map();
+  }
+}
+
 // Sessions persisted before 2026-04-29 lack `cliId`; consumers must fall back to 'unknown' at the render boundary.
 function load(): void {
   if (loaded) return;
@@ -585,20 +607,13 @@ function load(): void {
 
   if (!existsSync(dbFp)) {
     if (!sqliteBootstrapAllowed) {
-      // `owner: false` (a worker) and no store yet. Only reachable when the
-      // daemon that spawned this process still runs a pre-SQLite build: it
-      // keeps writing its JSON file, and creating the .db behind its back
-      // would fork the two representations. Record the failure instead of
-      // starting from an empty projection, so every write gate
-      // (loadForWrite / listSessionsStrict) fails closed until the daemon
-      // restarts on this build and imports.
-      const err = new SessionStoreNotImportedError(
-        `会话库尚未迁移到 SQLite：${dbFp} 不存在，而本进程（owner: false）不得建库。`
-        + `请重启拥有该 bot 的 daemon 完成一次性导入。`,
-      );
-      logger.error(`Failed to load sessions: ${err.message}`);
-      loadFailure = err;
-      sessions = new Map();
+      // `owner: false` (a worker) and no store yet: the daemon that spawned it
+      // still runs the pre-SQLite build and keeps writing its JSON, so this
+      // process reads THAT — creating a .db behind that daemon's back would
+      // fork the two representations. Read-only: the repairs and the
+      // legacy→per-bot migration are the owning daemon's job, and it does them
+      // once, as the import.
+      loadFromFrozenJson();
       loaded = true;
       return;
     }
@@ -974,34 +989,31 @@ export function getOwnedSession(sessionId: string): Session | undefined {
   return sessions.get(sessionId);
 }
 
-let warnedUnimportedOwnStore = false;
-
-/** Cross-process fresh read: a point SELECT observes the last committed write
- *  (WAL orders the daemon against offline CLI writers). */
+/** Cross-process fresh read. SQLite: a point SELECT observes the last committed
+ *  write (WAL orders the daemon against offline CLI writers). JSON (a store the
+ *  owning daemon has not imported yet): ordered after writers by the shared file
+ *  lock, as before. */
 export function getSessionFresh(sessionId: string): Session | undefined {
+  ensureDir();
   const dbFp = getDbPath();
-  if (!existsSync(dbFp)) {
-    // Callers here (worker `authorizeManagedSend`) treat undefined as "no such
-    // row" and degrade quietly — a codex-app turn ends up refused as
-    // `origin_mismatch` with nothing in the log pointing at the real cause.
-    // Throwing is not an option (the worker's IPC handler has no catch), so at
-    // least say it once.
-    if (currentAppId && !warnedUnimportedOwnStore
-        && unimportedStoreJsonPath(currentAppId, config.session.dataDir)) {
-      warnedUnimportedOwnStore = true;
-      logger.warn(
-        `会话库尚未迁移到 SQLite：${dbFp} 不存在，本进程的所有会话读取都会落空。`
-        + `请重启拥有该 bot 的 daemon 完成一次性导入。`,
-      );
+  if (existsSync(dbFp)) {
+    try {
+      return readStoreRowByKey({ appId: currentAppId, kind: 'sqlite', path: dbFp }, sessionId);
+    } catch (err) {
+      if (err instanceof SessionStoreSqliteUnavailableError) throw err;
+      return undefined;
     }
-    return undefined;
   }
-  try {
-    return readStoreRowByKey({ appId: currentAppId, path: dbFp }, sessionId);
-  } catch (err) {
-    if (err instanceof SessionStoreSqliteUnavailableError) throw err;
-    return undefined;
-  }
+  const fp = getImportJsonPath();
+  return withFileLockSync(fp, () => {
+    if (!existsSync(fp)) return undefined;
+    try {
+      const data = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, Session>;
+      return data[sessionId];
+    } catch {
+      return undefined;
+    }
+  });
 }
 
 /**
@@ -1619,12 +1631,17 @@ export function countActiveSessionsOnDisk(dataDir: string = config.session.dataD
   let n = 0;
   for (const ref of refs) {
     try {
-      const db = openDbForRead(ref.path);
-      try {
-        const hit = db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE status = 'active'").get() as { n: number };
-        n += hit.n;
-      } finally {
-        db.close();
+      if (ref.kind === 'sqlite') {
+        const db = openDbForRead(ref.path);
+        try {
+          const hit = db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE status = 'active'").get() as { n: number };
+          n += hit.n;
+        } finally {
+          db.close();
+        }
+      } else {
+        const data: Record<string, Session> = JSON.parse(readFileSync(ref.path, 'utf-8'));
+        for (const s of Object.values(data)) if (s?.status === 'active') n++;
       }
     } catch (err) {
       if (err instanceof SessionStoreSqliteUnavailableError) throw err;
@@ -1699,10 +1716,6 @@ export function loadAllSessionsSnapshot(options: {
   fallbackAppId?: string;
 } = {}): Map<string, Session> {
   const dataDir = options.dataDir ?? config.session.dataDir;
-  // Only the caller's own store is asserted: a peer bot that has not migrated
-  // yet is invisible (it was never this caller's business), but the store the
-  // caller belongs to reading as empty would look like "your session is gone".
-  if (options.fallbackAppId) assertStoreImported(options.fallbackAppId, dataDir);
   const out = new Map<string, Session>();
   const readInto = (ref: StoreFileRef): void => {
     let entries: [string, Session][];
@@ -1795,19 +1808,6 @@ export function readSessionRowCopiesAcrossStores(
     if (session.sessionId !== sessionId) continue;
     matches.push(session);
   }
-  if (matches.length === 0) {
-    // "Row not found" and "that bot's store was never imported" are the same
-    // empty scan but completely different actions. Callers turn a zero match
-    // into 「未找到当前进程所属 session」, which sends the operator hunting for a
-    // lost process marker instead of restarting one daemon.
-    const pending = listUnimportedStoreJsonPaths(dataDir);
-    if (pending.length > 0) {
-      throw new SessionStoreNotImportedError(
-        `会话库尚未迁移到 SQLite：${pending.join('、')} 仍未导入，扫描结果不可信。`
-        + `请重启对应 bot 的 daemon（botmux restart）完成一次性导入。`,
-      );
-    }
-  }
   return matches;
 }
 
@@ -1836,34 +1836,59 @@ export function mutateSessionRowOffline(
   options: { dataDir?: string; abortIf?: () => boolean } = {},
 ): Session | undefined {
   const dataDir = options.dataDir ?? config.session.dataDir;
-  assertStoreImported(target.larkAppId, dataDir);
   const ref = resolveStoreFile(target.larkAppId, dataDir);
-  // `openDbForOwnStore` is a read-write open: it would CREATE the store and
-  // poison the owning daemon's import gate. A store that does not exist simply
-  // holds no row.
-  if (!existsSync(ref.path)) return undefined;
 
-  const db = openDbForOwnStore(ref.path);
-  let inTxn = false;
-  try {
-    db.exec('BEGIN IMMEDIATE');
-    inTxn = true;
-    if (options.abortIf?.()) return undefined;
-    const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
-      .get(target.sessionId) as { row: string } | undefined;
-    if (!hit) return undefined;
-    const current = JSON.parse(hit.row) as Session;
-    if (!mutate(current)) return current;
-    if (options.abortIf?.()) return undefined;
-    db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
-      .run(sessionStatusText(current), JSON.stringify(current), target.sessionId);
-    db.exec('COMMIT');
-    inTxn = false;
-    return current;
-  } finally {
-    if (inTxn) { try { db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
-    db.close();
+  if (ref.kind === 'sqlite') {
+    const db = openDbForOwnStore(ref.path);
+    let inTxn = false;
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      inTxn = true;
+      if (options.abortIf?.()) return undefined;
+      const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
+        .get(target.sessionId) as { row: string } | undefined;
+      if (!hit) return undefined;
+      const current = JSON.parse(hit.row) as Session;
+      if (!mutate(current)) return current;
+      if (options.abortIf?.()) return undefined;
+      db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
+        .run(sessionStatusText(current), JSON.stringify(current), target.sessionId);
+      db.exec('COMMIT');
+      inTxn = false;
+      return current;
+    } finally {
+      if (inTxn) { try { db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
+      db.close();
+    }
   }
+
+  // Upgrade window: this store's owning daemon still runs the pre-SQLite build
+  // and keeps writing the JSON, so an offline mutation has to land there too —
+  // creating a .db here would fork the two representations behind that daemon's
+  // back. Same file lock the old build takes.
+  const fp = ref.path;
+  return withFileLockSync(fp, () => {
+    if (options.abortIf?.()) return undefined;
+    let data: Record<string, Session> = {};
+    if (existsSync(fp)) {
+      try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
+    }
+    const current = data[target.sessionId];
+    if (!current || !mutate(current)) return current;
+    data[target.sessionId] = current;
+    for (const [key, val] of Object.entries(data)) {
+      if (val && typeof val === 'object' && 'sessionId' in val && (val as Session).sessionId !== key) {
+        delete data[key];
+        continue;
+      }
+      if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
+    }
+    if (options.abortIf?.()) return undefined;
+    const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
+    renameSync(tmpFp, fp);
+    return current;
+  });
 }
 
 function findActiveSessionsMatching(
