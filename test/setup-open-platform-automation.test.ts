@@ -539,7 +539,7 @@ describe('privilege 数据范围 —— 自动填「与应用的可用范围一�
       // 非必填 → console 自己的 gate 也不强制，不碰。
       { ...VC_PRIVILEGE, resource: 'meeting.participant', isRequired: false },
       // 已经收敛到具体范围 → 可能是人手精心配的，覆盖它比不配更糟。
-      { ...VC_PRIVILEGE, resource: 'vc.record', content: '{"mode":"part","filters":[]}' },
+      { ...VC_PRIVILEGE, resource: 'vc.record', content: '{"mode":"part","filters":[{"field":"owner_scope","value":"[]","operator":"in"}]}' },
       // 必填但不可自动填 → 留给人手配。
       DLP_PRIVILEGE,
     ]));
@@ -584,12 +584,30 @@ describe('privilege 数据范围 —— 自动填「与应用的可用范围一�
     expect(narrowed('')).toBe(false);                                  // 未配置
     expect(narrowed('{"mode":"all"}')).toBe(false);                    // 模板默认「全部」
     expect(narrowed('{"mode":""}')).toBe(false);                       // 空 mode 同样不算收敛
-    expect(narrowed('{"mode":"part","filters":[]}')).toBe(true);       // 人手配的具体范围
+    expect(narrowed('{"resource":"x"}')).toBe(false);                  // mode 整个缺失
+    expect(narrowed('{"mode":"null"}')).toBe(false);                   // console 的「无」
+    expect(narrowed('{"mode":"part","filters":[{"field":"owner_scope","value":"[]","operator":"in"}]}')).toBe(true);
     // 我们自己写过的也算收敛 —— 重复跑权限自愈不该反复重写同一条。
     expect(narrowed(buildPrivilegeAppAvailabilityContent(
       extractOpenPlatformPrivileges(payloadOf([VC_PRIVILEGE])).privileges[0]))).toBe(true);
     // content 存在但读不懂 → 保守视为已配置：覆盖一个读不懂的值风险更大。
     expect(narrowed('{oops')).toBe(true);
+  });
+
+  /**
+   * 与 console 自己的「是否配置好」谓词 `XC()` 对齐：它要求
+   * `mode === 'all' || (Array.isArray(filters) && filters.length > 0)`。
+   * 也就是说 `mode:'part'` 但 filters 为空，在 console 眼里**不算配置好**（UI 上显示
+   * 「暂未配置筛选条件」）。这是又一个「看着配过、其实是空的」中间态——放过它就是
+   * 重犯 `mode:"all"` 那个空转 bug 的同类错误。
+   */
+  it('mode:part 但 filters 为空同样视为未收敛（对齐 console 的 XC()）', () => {
+    const state = extractOpenPlatformPrivileges(payloadOf([{
+      ...VC_PRIVILEGE,
+      content: '{"biz_id":"vc","mode":"part","resource":"meeting.meetingid","filters":[],"expression":""}',
+    }]));
+    expect(isPrivilegeRangeNarrowed(state.privileges[0])).toBe(false);
+    expect(selectPrivilegesNeedingAppAvailability(state).map(p => p.resource)).toEqual(['meeting.meetingid']);
   });
 
   it('写入 payload 只带本次要填的条目，并保留原始字段', () => {

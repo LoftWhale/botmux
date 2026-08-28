@@ -605,19 +605,26 @@ export function buildPrivilegeAppAvailabilityContent(privilege: OpenPlatformPriv
  *
  * 所以判据是「**已收敛到 all 以外**」：
  *   • `mode:'all'`（全部）→ 需要我们收窄，视为未配置
- *   • `mode:'part'` / 其它 → 人为或我们之前配过的具体范围，绝不覆盖
- *   • 空 / 解析不了 → 未配置
+ *   • `mode:'part'` 但 `filters` 为空 → console 自己的 `XC()` 也不认这算配置好
+ *     （它要求 `mode==='all' || filters.length>0`），是个「看着配过、其实空」的
+ *     中间态，同样视为未配置
+ *   • `mode:'part'` 且有 filters / 其它 → 人为或我们之前配过的具体范围，绝不覆盖
+ *   • 空 / `mode` 缺失 / `mode:'null'`（console 的「无」）→ 未配置
  */
 export function isPrivilegeRangeNarrowed(privilege: OpenPlatformPrivilege): boolean {
   if (!privilege.content) return false;
+  let parsed: Record<string, unknown>;
   try {
-    const parsed = asRecord(JSON.parse(privilege.content));
-    return parsed.mode !== undefined && parsed.mode !== '' && parsed.mode !== 'all';
+    parsed = asRecord(JSON.parse(privilege.content));
   } catch {
     // content 存在但不是合法 JSON:不敢当成"配过了",也不敢覆盖——保守视为已配置,
     // 交给人处理(覆盖一个读不懂的值风险更大)。
     return true;
   }
+  const mode = parsed.mode;
+  if (typeof mode !== 'string' || mode === '' || mode === 'all' || mode === 'null') return false;
+  // 与 console 的 XC() 对齐：非 all 的 mode 必须真的带上筛选条件才算配置好。
+  return Array.isArray(parsed.filters) && parsed.filters.length > 0;
 }
 
 /**
