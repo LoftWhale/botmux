@@ -2453,12 +2453,22 @@ function sleepSyncMs(ms: number): void {
  * double-run alongside the supervisor. This detects that stale God and stops it
  * (delegated to the self-contained `reapLegacyPm2`), so the operator never has
  * to `pm2 kill` by hand. Fail-safe + no-op on fresh installs / when pm2 is
- * absent (always the case for the compiled single binary). The `_op` parameter
- * is retained for call-site compatibility but no longer changes behavior — the
- * reaper is a single idempotent operation.
+ * absent. The `_op` parameter is retained for call-site compatibility but no
+ * longer changes behavior — the reaper is a single idempotent operation.
+ *
+ * A reap that finds a God but cannot confirm it is down is reported on STDERR,
+ * not just through `logger`: CLI mode runs with `logger.setSilent(true)`, so the
+ * reaper's own notes are invisible without DEBUG. That silence is how a
+ * double-run started unnoticed — both fleets live, two processes consuming the
+ * same Feishu events and the same session sqlite. The operator needs to see it.
  */
 function cleanupLegacyPm2(_op?: 'stop' | 'restart'): boolean {
   const r = reapLegacyPm2(CONFIG_DIR, PKG_ROOT, (m) => logger.info(`[legacy-pm2] ${m}`));
+  if (r.unresolved) {
+    console.warn(`⚠️  检测到迁移前的 pm2 守护进程,但未能确认其已停止:${r.note}`);
+    console.warn('   旧 fleet 可能仍在消费同一批飞书事件(消息重复、会话存储争用)。');
+    console.warn('   请手动确认:ps -ef | grep index-daemon   然后停掉旧进程后重试。');
+  }
   return r.found;
 }
 
