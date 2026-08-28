@@ -19870,7 +19870,7 @@ async function handleThreadReplyAdmitted(
       // guard (the builder's own note only covers ds.pendingSender's top-level
       // tag, and is absent entirely when pendingSender is undefined).
       const followUpSenderBlock = renderBufferedSenderBlock(
-        followUpSender, getBot(larkAppId).config.cliId, localeForBot(larkAppId),
+        followUpSender, getBot(larkAppId).config.cliId, localeForBot(larkAppId), larkAppId,
       );
       if (followUpSenderBlock) {
         enriched = `${followUpSenderBlock}\n${enriched}`;
