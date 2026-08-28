@@ -596,19 +596,45 @@ export function buildPrivilegeAppAvailabilityContent(privilege: OpenPlatformPriv
 }
 
 /**
- * 挑出「必须配、但还没配」且能安全自动填的数据范围条目。
+ * 这条数据范围是否已经被**收敛过**（即不需要我们再动它）。
+ *
+ * ⚠️ 不能简单判 `content` 非空。实测「一键创建智能体」模板建出来的应用，出生就
+ * 带着 `{"mode":"all"}`（console 上显示为选中「全部」）——正是审批规则里要额外
+ * 说明理由、视情况加签至 CEO-2 的那一档。按「有 content 就算配过」会把这个默认
+ * 值当成用户的选择而跳过，于是新建 bot 永远带着「全部」提审，改动完全空转。
+ *
+ * 所以判据是「**已收敛到 all 以外**」：
+ *   • `mode:'all'`（全部）→ 需要我们收窄，视为未配置
+ *   • `mode:'part'` / 其它 → 人为或我们之前配过的具体范围，绝不覆盖
+ *   • 空 / 解析不了 → 未配置
+ */
+export function isPrivilegeRangeNarrowed(privilege: OpenPlatformPrivilege): boolean {
+  if (!privilege.content) return false;
+  try {
+    const parsed = asRecord(JSON.parse(privilege.content));
+    return parsed.mode !== undefined && parsed.mode !== '' && parsed.mode !== 'all';
+  } catch {
+    // content 存在但不是合法 JSON:不敢当成"配过了",也不敢覆盖——保守视为已配置,
+    // 交给人处理(覆盖一个读不懂的值风险更大)。
+    return true;
+  }
+}
+
+/**
+ * 挑出「必须配、但还没收敛」且能安全自动填的数据范围条目。
  *
  * 只取 `isRequired`：console 自己的 gate（`jC()`）也只强制这一档，实测线上租户
  * 84 条 privilege 条目里 required 的只有 2 条（会议号查询会议信息 / 创建更新
- * 任务时可指定的人员范围）。已经有 `content` 的一律不碰——那可能是人手精心配
- * 过的范围，覆盖它比不配更糟。
+ * 任务时可指定的人员范围）。已经收敛到具体范围的一律不碰——那可能是人手精心配
+ * 过的，覆盖它比不配更糟；但模板默认的 `mode:'all'` **要**收窄（见
+ * {@link isPrivilegeRangeNarrowed}）。
  */
 export function selectPrivilegesNeedingAppAvailability(
   state: OpenPlatformPrivilegeState,
 ): OpenPlatformPrivilege[] {
   return state.privileges.filter(privilege =>
     privilege.isRequired
-    && !privilege.content
+    && !isPrivilegeRangeNarrowed(privilege)
     && canFillPrivilegeWithAppAvailability(privilege));
 }
 
@@ -631,6 +657,28 @@ export function buildPrivilegeUpdatePayload(appId: string, privileges: OpenPlatf
       content: buildPrivilegeAppAvailabilityContent(privilege),
     })),
   };
+}
+
+/**
+ * 读 `privilege/all` → 把「必须配但还没收敛」的数据范围写成「与应用的可用范围
+ * 一致」。返回实际写了几条（0 = 没有待收窄的）。
+ *
+ * 抽成共享函数是因为**两条路径都必须做**，且各自发的是不同的版本：
+ *   • {@link createOpenPlatformAppWithClient} —— 模板建完立刻发第一版
+ *   • {@link automateOpenPlatformSetup} —— 权限自愈 / 补配时发下一版
+ * 只做前者，存量 bot 永远不收窄；只做后者，新建 bot 的第一版仍带「全部」提审。
+ *
+ * 调用方决定失败怎么处理（两处都是非致命，但一处 warn 一处进 result.warning）。
+ */
+async function narrowRequiredPrivilegeRanges(
+  api: { postJson(path: string, body?: unknown): Promise<unknown> },
+  appId: string,
+): Promise<number> {
+  const state = extractOpenPlatformPrivileges(await api.postJson(`/developers/v1/privilege/all/${appId}`, {}));
+  const needFill = selectPrivilegesNeedingAppAvailability(state);
+  if (needFill.length === 0) return 0;
+  await api.postJson(`/developers/v1/privilege/update/${appId}`, buildPrivilegeUpdatePayload(appId, needFill));
+  return needFill.length;
 }
 
 export function buildScopeUpdatePayload(appId: string, mapped: Pick<MappedScopeIds, 'tenantScopeIds' | 'userScopeIds'>) {
@@ -1344,17 +1392,7 @@ export async function automateOpenPlatformSetup(
   let privilegeRangeCount = 0;
   let privilegeRangeWarning: string | undefined;
   try {
-    const privilegeState = extractOpenPlatformPrivileges(
-      await postJson(`/developers/v1/privilege/all/${options.appId}`, {}),
-    );
-    const needFill = selectPrivilegesNeedingAppAvailability(privilegeState);
-    if (needFill.length > 0) {
-      await postJson(
-        `/developers/v1/privilege/update/${options.appId}`,
-        buildPrivilegeUpdatePayload(options.appId, needFill),
-      );
-      privilegeRangeCount = needFill.length;
-    }
+    privilegeRangeCount = await narrowRequiredPrivilegeRanges({ postJson }, options.appId);
   } catch (err: any) {
     privilegeRangeWarning = safeErrorMessage(err);
   }
@@ -1948,6 +1986,19 @@ export async function createOpenPlatformAppWithClient(
       client.postJson(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true }));
     await retryIdempotentOnTransientNetworkError(() =>
       client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 })); // WebSocket
+
+    // 模板建出来的应用，「权限可访问的数据范围」出生就是 `mode:'all'`（console 上
+    // 显示「全部」）——而这里紧接着就要发**第一个版本**。不先收窄，这一版就带着
+    // 「全部」进审批：正是租户规则里要补充理由、视情况加签至 CEO-2 的那一档。
+    // 后续 automateOpenPlatformSetup 也会做同一件事，但它发的是**下一个**版本，
+    // 救不回这一版，所以两处都必须做。
+    //
+    // 非致命：数据范围只影响审批快慢，不影响应用能不能收发消息。这里正处在
+    // 「应用已建成、还没发版」的窗口里，为它把整条创建链路判死（用户被丢进手动读
+    // Secret 的恢复路径）代价明显更大。
+    await narrowRequiredPrivilegeRanges(client, appId).catch((err: unknown) => {
+      console.warn(`权限数据范围自动收窄失败（不影响建 bot，可到开放平台手动选「与应用的可用范围一致」）: ${safeErrorMessage(err)}`);
+    });
 
     // 复刻 console launcher「一键创建智能体」的最后一步:立刻用极简版本发布一次,
     // 让应用**上架启用**(tenantAppStatus 0→2)。这样返回的就是一个「已启用、可

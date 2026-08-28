@@ -29,6 +29,7 @@ import {
   extractOpenPlatformScopeEntries,
   filterScopeManifest,
   getCookieHeader,
+  isPrivilegeRangeNarrowed,
   mapFeishuQrPollingStatus,
   mapManifestScopesToOpenPlatformIds,
   readDefaultScopeManifest,
@@ -532,18 +533,63 @@ describe('privilege 数据范围 —— 自动填「与应用的可用范围一�
     ]);
   });
 
-  it('只挑「isRequired 且当前为空」的，已配过的一律不覆盖', () => {
+  it('只挑「isRequired 且还没收敛」的，已收敛到具体范围的一律不覆盖', () => {
     const state = extractOpenPlatformPrivileges(payloadOf([
       VC_PRIVILEGE,
       // 非必填 → console 自己的 gate 也不强制，不碰。
       { ...VC_PRIVILEGE, resource: 'meeting.participant', isRequired: false },
-      // 已经有 content → 可能是人手精心配的范围，覆盖它比不配更糟。
+      // 已经收敛到具体范围 → 可能是人手精心配的，覆盖它比不配更糟。
       { ...VC_PRIVILEGE, resource: 'vc.record', content: '{"mode":"part","filters":[]}' },
       // 必填但不可自动填 → 留给人手配。
       DLP_PRIVILEGE,
     ]));
     expect(selectPrivilegesNeedingAppAvailability(state).map(p => p.resource))
       .toEqual(['meeting.meetingid']);
+  });
+
+  /**
+   * 🔴 生产回归（live 实测发现）：「一键创建智能体」模板建出来的应用，这两条数据
+   * 范围**出生就带 `{"mode":"all"}`**（console 上显示选中「全部」）——正是审批规则里
+   * 要补充理由、视情况加签至 CEO-2 的那一档。
+   *
+   * 第一版守卫写的是「有 content 就算配过、不覆盖」（本意是别覆盖人手配的范围），
+   * 而模板塞的默认值刚好满足「有 content」⟹ 被当成用户的选择跳过，
+   * `privilegeRangeCount` 恒为 0，整个改动空转。下面两个 fixture 是**线上抓下来的
+   * 原文**，不是构造的。
+   */
+  const TEMPLATE_DEFAULT_ALL_VC = {
+    ...VC_PRIVILEGE,
+    privilegeStatus: 2,
+    // 线上原文。`\n` 必须是 JSON 里的转义序列（`\\n` 在 JS 源码里），不是真换行——
+    // 真换行会让这串不是合法 JSON，从而走进「读不懂 → 保守视为已配置」的分支，
+    // 把这个测试变成假绿。
+    content: '{"biz_id":"vc","resource":"meeting.meetingid","mode":"all","description":"视频会议 - 会议号查询会议信息\\n\\t全部\\n"}',
+  };
+
+  it('模板默认的 mode:"all" 视为待收窄（不是"已配置"）', () => {
+    const state = extractOpenPlatformPrivileges(payloadOf([TEMPLATE_DEFAULT_ALL_VC]));
+    expect(isPrivilegeRangeNarrowed(state.privileges[0])).toBe(false);
+    // 这一条是整个改动的成败所在：漏了它，新建 bot 永远带「全部」提审。
+    expect(selectPrivilegesNeedingAppAvailability(state).map(p => p.resource))
+      .toEqual(['meeting.meetingid']);
+    // 收窄后的目标形态：按条件筛选 + 与应用的可用范围一致。
+    const rewritten = JSON.parse(buildPrivilegeAppAvailabilityContent(state.privileges[0]));
+    expect(rewritten.mode).toBe('part');
+    expect(JSON.parse(rewritten.filters[0].value)[0].mode).toBe('availability_of_app');
+  });
+
+  it('已收敛的判据是「mode 不是 all」，不是「content 非空」', () => {
+    const narrowed = (content: string) =>
+      isPrivilegeRangeNarrowed(extractOpenPlatformPrivileges(payloadOf([{ ...VC_PRIVILEGE, content }])).privileges[0]);
+    expect(narrowed('')).toBe(false);                                  // 未配置
+    expect(narrowed('{"mode":"all"}')).toBe(false);                    // 模板默认「全部」
+    expect(narrowed('{"mode":""}')).toBe(false);                       // 空 mode 同样不算收敛
+    expect(narrowed('{"mode":"part","filters":[]}')).toBe(true);       // 人手配的具体范围
+    // 我们自己写过的也算收敛 —— 重复跑权限自愈不该反复重写同一条。
+    expect(narrowed(buildPrivilegeAppAvailabilityContent(
+      extractOpenPlatformPrivileges(payloadOf([VC_PRIVILEGE])).privileges[0]))).toBe(true);
+    // content 存在但读不懂 → 保守视为已配置：覆盖一个读不懂的值风险更大。
+    expect(narrowed('{oops')).toBe(true);
   });
 
   it('写入 payload 只带本次要填的条目，并保留原始字段', () => {
@@ -1269,6 +1315,9 @@ describe('createFeishuOpenPlatformApp', () => {
       '/developers/v1/manifest/upsert_by_template',
       '/developers/v1/robot/switch/cli_created',
       '/developers/v1/event/switch/cli_created',
+      // 模板建出来的应用数据范围默认是 mode:'all'(「全部」),必须在**这一版发布之前**
+      // 收窄——这个 mock 的 privilege/all 返回空,所以只有读、没有 privilege/update。
+      '/developers/v1/privilege/all/cli_created',
       '/developers/v1/app_version/create/cli_created',
       '/developers/v1/publish/commit/cli_created/v-enable',
       '/developers/v1/secret/cli_created',
@@ -1322,10 +1371,122 @@ describe('createFeishuOpenPlatformApp', () => {
       '/developers/v1/app/create',
       '/developers/v1/robot/switch/cli_fallback',
       '/developers/v1/event/switch/cli_fallback',
+      // 回退路径（裸自建应用）同样在发版前收窄数据范围。
+      '/developers/v1/privilege/all/cli_fallback',
       '/developers/v1/app_version/create/cli_fallback',
       '/developers/v1/publish/commit/cli_fallback/v-enable',
       '/developers/v1/secret/cli_fallback',
     ]);
+  });
+
+  /**
+   * 🔴 生产回归（live 建 bot 实测发现）：模板建出来的应用，数据范围出生就是
+   * `mode:'all'`（「全部」），而**紧接着就发第一个版本**。只在
+   * `automateOpenPlatformSetup` 里收窄救不回这一版（它发的是下一版），所以创建
+   * 路径必须自己做一次。上面的顺序断言只证明「读了」，这里证明「**真写了**、且
+   * 写在发版之前、内容是与应用的可用范围一致」。
+   */
+  it('模板默认的「全部」在第一个版本发布前就被收窄', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-narrow-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const calls: string[] = [];
+    let written: any;
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      const path = new URL(href).pathname;
+      calls.push(path);
+      if (path === '/developers/v1/app/upload/image') {
+        return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
+      }
+      if (path === '/developers/v1/manifest/upsert_by_template') {
+        return Response.json({ code: 0, data: { clientID: 'cli_narrow' } });
+      }
+      if (path === '/developers/v1/privilege/all/cli_narrow') {
+        // 线上模板建出来的真实形态：isRequired 且 mode:'all'。
+        return Response.json({
+          code: 0,
+          data: {
+            scopeBiz: [{ bizId: 'vc', bizName: '视频会议' }],
+            privileges: [{
+              bizId: 'vc', resource: 'meeting.meetingid', name: '会议号查询会议信息',
+              isRequired: true, privilegeStatus: 2, schemaType: 1, organizationType: 1,
+              content: '{"biz_id":"vc","resource":"meeting.meetingid","mode":"all","description":"视频会议 - 会议号查询会议信息\\n\\t全部\\n"}',
+              schemaContent: {
+                selectionExpressionSchemaContent: {
+                  fields: [{ id: 'owner_scope', name: '会议的归属者', operators: ['in'], data_source: { type: 'select_staff', val: '' } }],
+                  select_mode_options: ['all', 'part', 'null'],
+                },
+              },
+            }],
+          },
+        });
+      }
+      if (path === '/developers/v1/privilege/update/cli_narrow') {
+        written = JSON.parse(String(init?.body));
+        return Response.json({ code: 0 });
+      }
+      if (path === '/developers/v1/app_version/create/cli_narrow') {
+        return Response.json({ code: 0, data: { versionId: 'v-enable' } });
+      }
+      if (path === '/developers/v1/secret/cli_narrow') {
+        return Response.json({ code: 0, data: { secret: 'narrow-secret' } });
+      }
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    const result = await createFeishuOpenPlatformApp({
+      name: 'botmux-narrow', sessionFilePath: sessionFile, disableBytedcliFallback: true, fetchImpl,
+    });
+    expect(result).toMatchObject({ ok: true, appId: 'cli_narrow' });
+
+    // 真的发出了写请求，且内容是「按条件筛选 + 与应用的可用范围一致」
+    expect(written?.clientId).toBe('cli_narrow');
+    const content = JSON.parse(written.privileges[0].content);
+    expect(content.mode).toBe('part');
+    expect(JSON.parse(content.filters[0].value)[0].mode).toBe('availability_of_app');
+
+    // 顺序：收窄必须在**这一版**发布之前，否则第一版仍带「全部」进审批。
+    const narrowAt = calls.indexOf('/developers/v1/privilege/update/cli_narrow');
+    const versionAt = calls.indexOf('/developers/v1/app_version/create/cli_narrow');
+    expect(narrowAt).toBeGreaterThanOrEqual(0);
+    expect(versionAt).toBeGreaterThan(narrowAt);
+  });
+
+  it('数据范围收窄失败不影响建 bot（非致命）', async () => {
+    // 这里正处在「应用已建成、还没发版」的窗口：为一个只影响审批快慢的步骤把整条
+    // 创建链路判死，会把用户丢进手动读 Secret 的恢复路径，代价明显更大。
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-narrowfail-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      const path = new URL(href).pathname;
+      if (path === '/developers/v1/app/upload/image') {
+        return Response.json({ code: 0, data: { url: 'https://cdn.example/botmux.png' } });
+      }
+      if (path === '/developers/v1/manifest/upsert_by_template') {
+        return Response.json({ code: 0, data: { clientID: 'cli_nf' } });
+      }
+      if (path === '/developers/v1/privilege/all/cli_nf') {
+        return Response.json({ code: 1, msg: 'privilege read denied' });
+      }
+      if (path === '/developers/v1/app_version/create/cli_nf') {
+        return Response.json({ code: 0, data: { versionId: 'v-enable' } });
+      }
+      if (path === '/developers/v1/secret/cli_nf') {
+        return Response.json({ code: 0, data: { secret: 'nf-secret' } });
+      }
+      return Response.json({ code: 0 });
+    }) as typeof fetch;
+
+    await expect(createFeishuOpenPlatformApp({
+      name: 'botmux-nf', sessionFilePath: sessionFile, disableBytedcliFallback: true, fetchImpl,
+    })).resolves.toMatchObject({ ok: true, appId: 'cli_nf', appSecret: 'nf-secret' });
   });
 
   function outcomeUnknownFetchImpl(calls: string[], templateResponse: () => Response | Promise<Response>) {
