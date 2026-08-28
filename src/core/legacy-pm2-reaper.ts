@@ -15,12 +15,19 @@
  * processes itself. Either way it is FAIL-SAFE — a fresh install with no legacy
  * God no-ops entirely — but it never reports success it cannot back up: see
  * `unresolved` on the result.
+ *
+ * PROCESS AND SOCKET FACTS COME FROM `/proc` ON LINUX, not from `ps`/`lsof`. We
+ * ship a musl (Alpine) binary where both are BusyBox applets with different
+ * semantics — `ps` rejects `-p`, and `lsof` ignores its path argument entirely —
+ * which silently disabled every guard here. `/proc` is a kernel interface that
+ * behaves identically under glibc and musl. macOS keeps the `ps`/`lsof` paths.
+ * See `cmdlineOf`, `isAlive` and `rpcSocketHeld` for the measurements.
  */
 
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { isStandaloneBinary } from './self-spawn.js';
 
 /** A botmux core process name managed by the old pm2 ecosystem. */
@@ -51,7 +58,27 @@ function resolvePm2Bin(pkgRoot: string): string | null {
   // Probe PATH rather than returning a hopeful 'pm2': knowing now whether the
   // CLI exists lets the caller pick the fallback instead of discovering it
   // through a chain of swallowed ENOENTs.
-  const probe = spawnSync('pm2', ['--version'], { encoding: 'utf-8', timeout: 15_000 });
+  //
+  // PM2_HOME IS MANDATORY HERE, even though this only asks for a version.
+  // `pm2 --version` is NOT read-only: it DAEMONIZES a God (MEASURED — "Spawning
+  // PM2 daemon with pm2_home=… / PM2 Successfully daemonized"). Inheriting the
+  // ambient env would create that God in whatever home the caller happens to
+  // point at: ~/.botmux/pm2 (which this reaper then "finds and kills" — it would
+  // report a legacy fleet on a machine that never had one) or the SHARED ~/.pm2
+  // that the rest of this module takes pains never to touch. Every other pm2
+  // invocation in the repo passes an explicit PM2_HOME; this one must too.
+  // A throwaway dir keeps any God the probe spawns isolated and disposable.
+  const probeHome = join(tmpdir(), `botmux-pm2-probe-${process.pid}`);
+  const probe = spawnSync('pm2', ['--version'], {
+    encoding: 'utf-8', timeout: 15_000,
+    env: { ...process.env, PM2_HOME: probeHome },
+  });
+  // Stop and remove whatever the probe may have started, so it never outlives
+  // this call. Best-effort: a leftover temp dir is harmless either way.
+  if (!probe.error) {
+    spawnSync('pm2', ['kill'], { encoding: 'utf-8', timeout: 15_000, env: { ...process.env, PM2_HOME: probeHome } });
+  }
+  try { rmSync(probeHome, { recursive: true, force: true }); } catch { /* best effort */ }
   if (probe.error || probe.status !== 0) return null;
   return 'pm2';
 }
@@ -109,8 +136,30 @@ function looksLikePm2God(pid: number): boolean {
   return /PM2\b.*God Daemon/i.test(cmdlineOf(pid));
 }
 
-/** `pid`'s command line, or '' when it cannot be read. */
+/**
+ * `pid`'s command line, or '' when it cannot be read.
+ *
+ * LINUX READS `/proc`, NOT `ps`. The daemon runs on Linux and we ship a musl
+ * (Alpine) binary, where `ps` is a BusyBox applet that does not support `-p`:
+ * MEASURED in node:22-alpine, `ps -p <pid> -o command=` exits 1 with no output.
+ * Every caller of this function treats '' as "cannot identify" and fails closed,
+ * so on musl the pid-reuse guards rejected EVERY process — `legacyProcsFromPidsDir`
+ * always came back empty and the whole CLI-less reap silently no-opped. `/proc` is
+ * a kernel interface, identical under glibc and musl (verified in both), and needs
+ * no subprocess at all.
+ *
+ * `/proc/<pid>/cmdline` is NUL-separated; join with spaces so the substring checks
+ * above read like a command line. A ZOMBIE has an EMPTY cmdline (verified) — which
+ * is the correct answer here: we must not signal something we cannot identify.
+ */
 function cmdlineOf(pid: number): string {
+  if (process.platform === 'linux') {
+    try {
+      const raw = readFileSync(`/proc/${pid}/cmdline`, 'utf-8');
+      return raw.replace(/\0+$/, '').split('\0').join(' ').trim();
+    } catch { return ''; }   // no such pid, or unreadable → cannot identify
+  }
+  // macOS/BSD: no /proc. `ps` there is the real thing and supports -p.
   const ps = spawnSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf-8', timeout: 5_000 });
   if (ps.error || ps.status !== 0) return '';
   return (ps.stdout || '').trim();
@@ -142,9 +191,21 @@ function stopProcs(procs: LegacyProc[], log: (m: string) => void): string[] {
  *  daemons stayed "alive" for the full escalation window. It matters in
  *  production too: when the pm2 God dies before its children, they are zombies
  *  until init adopts and reaps them. A zombie holds no ports, no sqlite handle,
- *  and consumes no Feishu events — for our purposes it is down. */
+ *  and consumes no Feishu events — for our purposes it is down.
+ *
+ *  LINUX READS `/proc` for the same reason as `cmdlineOf`: BusyBox `ps` rejects
+ *  `-p`, so on musl this fell through to the `kill(0)` answer and called every
+ *  zombie alive. MEASURED in node:22-alpine on a real zombie (a `sh` parent that
+ *  never wait()s): `kill(pid,0)` → true, `ps -p -o stat=` → exit 1, while
+ *  `/proc/<pid>/stat` → 'Z'. */
 function isAlive(pid: number): boolean {
   try { process.kill(pid, 0); } catch { return false; }
+  if (process.platform === 'linux') {
+    const state = procState(pid);
+    if (state === null) return true;   // unreadable → keep the kill(0) answer
+    if (state === '') return false;    // no longer in /proc → gone
+    return state !== 'Z';              // zombie → effectively down
+  }
   const ps = spawnSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf-8', timeout: 5_000 });
   // If ps cannot tell us, fall back to the kill(0) answer (true) rather than
   // claiming a live process is gone.
@@ -152,6 +213,27 @@ function isAlive(pid: number): boolean {
   const stat = (ps.stdout || '').trim();
   if (!stat) return false;             // no longer in the table → gone
   return !stat.startsWith('Z');        // 'Z'/'Z+' → zombie → effectively down
+}
+
+/**
+ * The process state character from `/proc/<pid>/stat` ('R'/'S'/'Z'/…), '' when the
+ * pid is gone, or null when /proc could not be read at all.
+ *
+ * Parsing note: state is field 3, but field 2 (`comm`) is wrapped in parentheses
+ * and MAY ITSELF CONTAIN spaces and parentheses, so a naive `split(' ')[2]` is
+ * wrong for a process whose name is e.g. `(my app)`. Scan past the LAST ')'.
+ */
+function procState(pid: number): string | null {
+  let raw: string;
+  try { raw = readFileSync(`/proc/${pid}/stat`, 'utf-8'); }
+  catch (err) {
+    // ENOENT means the pid is genuinely gone; anything else (EACCES, /proc not
+    // mounted) is "cannot tell" and must not be read as "gone".
+    return (err as NodeJS.ErrnoException)?.code === 'ENOENT' ? '' : null;
+  }
+  const close = raw.lastIndexOf(')');
+  if (close < 0) return null;                       // unexpected shape → cannot tell
+  return raw.slice(close + 1).trim().split(/\s+/)[0] || null;
 }
 
 /**
@@ -253,26 +335,65 @@ export function liveGodAt(home: string): Pm2God | null {
  *
  * Distinguishes a real God from the orphaned `rpc.sock` that `pm2 kill` leaves
  * behind. `existsSync` cannot: MEASURED on a socket whose listener was SIGKILLed,
- * the file survives and `statSync().isSocket()` is still true.
+ * the file survives and `statSync().isSocket()` is still true (verified under both
+ * glibc and musl).
  *
- * `lsof <path>` answers it — exit 0 with rows when a process holds the socket,
- * exit 1 with no output for an orphan (verified against both shapes, and against
- * the real orphan this reaper left on this box). It is the same tool the reaper
- * already relies on for `ps`, needs no listener-side cooperation, and works in the
- * compiled binary — unlike spawning our own runtime with `-e`, which the
- * standalone build does not support (it re-enters the CLI and hangs: MEASURED
- * ETIMEDOUT).
+ * LINUX READS `/proc/net/unix`, NOT `lsof`. `lsof <path>` looks like the right
+ * tool but is wrong on two counts here:
  *
- * Fails CLOSED on an unusable probe: if `lsof` is missing we keep the old
- * existence-only answer, so a live socket-only God is never missed (the hazard
- * `f2c9f7b5` fixed). The cost is only a stale warning, never a double-run.
+ *  • On Alpine `lsof` EXISTS as a BusyBox applet that IGNORES the path argument
+ *    entirely — it dumps every open file and exits 0. MEASURED in node:22-alpine:
+ *    `lsof -- /tmp/does-not-exist.sock` → exit 0 with a full dump, so the
+ *    `status === 0 && stdout` test was UNCONDITIONALLY true and an orphan read as
+ *    held. That put the stale "legacy pm2 still running" warning right back on
+ *    musl — the very thing this detector exists to prevent.
+ *  • `lsof` is not always installed at all (MEASURED: absent in debian:12-slim),
+ *    which fails closed into the same permanent warning.
+ *
+ * `/proc/net/unix` is the kernel's own list of bound unix sockets: a socket a
+ * process holds appears with its path; an orphaned FILE does not. Verified against
+ * a real SIGKILLed listener (the exact shape `pm2 kill` leaves) under BOTH glibc
+ * and musl. No subprocess, no external tool, ~microseconds instead of ~1.5s.
+ *
+ * Fails CLOSED when `/proc/net/unix` cannot be read: we keep the existence-only
+ * answer, so a live socket-only God is never missed (the hazard `f2c9f7b5` fixed).
+ * The cost is only a stale warning, never a double-run.
  */
 function rpcSocketHeld(sockPath: string): boolean {
   if (!existsSync(sockPath)) return false;
+  if (process.platform === 'linux') {
+    const bound = boundUnixSocketPaths();
+    if (bound === null) return true;              // cannot tell → fail closed
+    return bound.has(sockPath);
+  }
+  // macOS/BSD: no /proc/net/unix. Real lsof there honours the path argument.
   const r = spawnSync('lsof', ['--', sockPath], { encoding: 'utf-8', timeout: 5_000 });
   if (r.error) return true;                       // no lsof → fail closed
   if (r.status === 0 && (r.stdout || '').trim()) return true;
   return false;                                   // exit 1 / empty → orphan
+}
+
+/**
+ * Paths of all bound unix sockets, per `/proc/net/unix`, or null if unreadable.
+ *
+ * Format is a header line plus one row per socket; the PATH is the last field and
+ * is absent for unnamed sockets. A path may contain spaces, so take everything
+ * after the 7th whitespace-separated field rather than the last token. Abstract
+ * sockets start with '@' and are not filesystem paths — they can never match a
+ * `rpc.sock` file, so they are simply kept as-is and never compared equal.
+ */
+function boundUnixSocketPaths(): Set<string> | null {
+  let raw: string;
+  try { raw = readFileSync('/proc/net/unix', 'utf-8'); } catch { return null; }
+  const out = new Set<string>();
+  const lines = raw.split('\n');
+  for (const line of lines) {
+    if (!line || line.startsWith('Num')) continue;   // header
+    // Num RefCount Protocol Flags Type St Inode Path  → 7 fields then the path.
+    const m = /^\s*\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(.+)$/.exec(line);
+    if (m) out.add(m[1].trim());
+  }
+  return out;
 }
 
 /** Parse `pm2 jlist` stdout (may be prefixed by log lines) into the app array. */

@@ -839,6 +839,16 @@ jobs:
               if [ ! -x "$BIN" ]; then echo "musl binary $BIN not built"; exit 1; fi
               node scripts/smoke-bun-binary.mjs "$BIN"
 
+              # The legacy-pm2 reaper's process/socket probes, exercised against
+              # BusyBox. Mirrors the PR gate deliberately: `bun run test` runs on
+              # glibc, where reverting either probe to `ps -p`/`lsof` leaves the
+              # unit suite green while the musl binary we ship stops reaping at all
+              # (and can never clear its own stale warning). Keeping this in BOTH
+              # workflows is the same "no leg gated more weakly" rule as above —
+              # last time the legs diverged, the PR gate was green while the release
+              # failed.
+              node scripts/smoke-musl-reaper-probes.mjs dist/core/legacy-pm2-reaper.js
+
               # Hand dist-bin back to the HOST user before exiting.
               #
               # WHY (this broke v3.18.0-canary.5, after the container work itself had

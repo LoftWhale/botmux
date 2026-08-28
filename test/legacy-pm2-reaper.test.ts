@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync, readFileSync, existsSync, statSync, accessSync, constants as fsConstants } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { join } from 'node:path';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createServer, type Server } from 'node:net';
 import { reapLegacyPm2, liveGodAt } from '../src/core/legacy-pm2-reaper.js';
@@ -25,21 +25,41 @@ let savedHome: string | undefined;
 // dev-dependency pm2 shim lives — so a bare `pm2` ALWAYS resolves under the test
 // runner. That silently hid the production bug this suite now covers: the compiled
 // binary has no bundled pm2 and no pm2 on PATH, and resolvePm2Bin's PATH fallback
-// was never exercisable in a test. Strip node_modules/.bin so "no pm2 CLI" is
-// actually reachable; tests that want a working pm2 plant one under pkgRoot.
+// was never exercisable in a test.
+//
+// FILTER BY CAPABILITY, NOT BY NAME. Stripping segments literally named
+// `node_modules/.bin` only makes pm2 unreachable when that is its ONLY source —
+// true on CI, FALSE on any box with a global pm2. MEASURED on a dev box with pm2
+// installed under a version manager: these tests failed 5/17 there while CI was
+// green and the author saw 17/17 — three honest observations of the same suite.
+// So drop every PATH segment that actually CONTAINS an executable pm2; tests that
+// want a working pm2 plant one under pkgRoot instead.
 let savedPath: string | undefined;
+let savedPm2Home: string | undefined;
+function pathWithoutPm2(rawPath: string): string {
+  return rawPath
+    .split(':')
+    .filter((seg) => {
+      if (!seg) return false;
+      try { accessSync(join(seg, 'pm2'), fsConstants.X_OK); return false; } catch { return true; }
+    })
+    .join(':');
+}
 beforeEach(() => {
   savedHome = process.env.HOME;
   process.env.HOME = tmp();
   savedPath = process.env.PATH;
-  process.env.PATH = (savedPath ?? '')
-    .split(':')
-    .filter((p) => !p.endsWith(`${sep}node_modules${sep}.bin`))
-    .join(':');
+  process.env.PATH = pathWithoutPm2(savedPath ?? '');
+  // A pm2 the probe could reach would daemonize a God in whatever PM2_HOME the
+  // ambient env names — including this box's real ~/.botmux/pm2. Belt and braces
+  // alongside the PATH filter above.
+  savedPm2Home = process.env.PM2_HOME;
+  delete process.env.PM2_HOME;
 });
 afterEach(() => {
   if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
   if (savedPath === undefined) delete process.env.PATH; else process.env.PATH = savedPath;
+  if (savedPm2Home === undefined) delete process.env.PM2_HOME; else process.env.PM2_HOME = savedPm2Home;
   // Kill whole process groups first: a group leader's grandchildren are not in
   // `spawned` and would otherwise survive as orphans.
   for (const pid of groupLeaders.splice(0)) {
@@ -101,6 +121,34 @@ function listenOnUnixSocket(p: string): void {
   const srv = createServer(() => { /* accept and ignore */ });
   srv.listen(p);
   servers.push(srv);
+}
+
+/**
+ * A REAL orphaned socket: a child process binds `home/rpc.sock`, then is SIGKILLed
+ * so the socket FILE survives with no owner. This is exactly what `pm2 kill` leaves
+ * behind, and it is a stronger fixture than a plain regular file — `statSync().
+ * isSocket()` is still true here (MEASURED under both glibc and musl), so a probe
+ * that merely checks "is this a socket file" cannot tell it from a live God.
+ * Returns once the file exists and its creator is gone.
+ */
+function realOrphanGodSocket(home: string): void {
+  mkdirSync(home, { recursive: true });
+  const sock = join(home, 'rpc.sock');
+  const child = spawn(process.execPath, ['-e',
+    `const net=require('net');const s=net.createServer(()=>{});`
+    + `s.listen(${JSON.stringify(sock)},()=>process.stdout.write('READY'));setTimeout(()=>{},60_000);`],
+    { stdio: ['ignore', 'pipe', 'ignore'] });
+  spawned.push(child);
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline && !existsSync(sock)) spinMs(25);
+  child.kill('SIGKILL');
+  // Wait for the owner to actually be gone, else we would be testing a live socket.
+  const gone = Date.now() + 5_000;
+  while (Date.now() < gone) {
+    try { process.kill(child.pid!, 0); } catch { break; }
+    spinMs(25);
+  }
+  spinMs(150);
 }
 
 // ── Fixtures for the CLI-less fallback ──────────────────────────────────────
@@ -235,6 +283,72 @@ describe('reapLegacyPm2', () => {
     expect(r.note).toContain('no live legacy pm2 God');
   });
 
+  // ── The probe must judge OWNERSHIP, not socket-ness ─────────────────────────
+  // The fixture above uses a plain file. This one uses a REAL socket whose listener
+  // was SIGKILLed — production's actual shape. It is the case that broke on musl:
+  // Alpine's `lsof` is a BusyBox applet that IGNORES its path argument and exits 0
+  // with a full dump, so the old `status===0 && stdout` test was unconditionally
+  // true and this orphan read as a live God. Reading /proc/net/unix (the kernel's
+  // own list of BOUND sockets) answers it correctly on both libcs.
+  it('treats a REAL orphaned socket (listener SIGKILLed) as no God', () => {
+    const configDir = tmp();
+    const home = join(configDir, 'pm2');
+    realOrphanGodSocket(home);
+
+    // The file is still a socket — this is what defeats an existence/type check.
+    expect(existsSync(join(home, 'rpc.sock'))).toBe(true);
+    expect(statSync(join(home, 'rpc.sock')).isSocket()).toBe(true);
+
+    expect(liveGodAt(home)).toBeNull();
+    const r = reapLegacyPm2(configDir, tmp(), () => {});
+    expect(r.found).toBe(false);
+    expect(r.unresolved).toBe(false);
+  });
+
+  it('still sees a God whose rpc.sock IS held by a live listener', () => {
+    // The positive half: the probe must not answer "no God" for everything. Without
+    // this, a probe that always said "orphan" would pass the test above and silently
+    // reintroduce the double-run this module exists to prevent.
+    const configDir = tmp();
+    const home = join(configDir, 'pm2');
+    liveGodSocketOnly(home);      // real listener bound to rpc.sock
+
+    const god = liveGodAt(home);
+    expect(god).not.toBeNull();
+    expect(god?.pid).toBe(0);     // socket-only → pid unknown
+  });
+
+  it('does not let the pm2 PATH probe touch the ambient PM2_HOME', () => {
+    // `pm2 --version` is NOT read-only: it DAEMONIZES a God (MEASURED: "Spawning
+    // PM2 daemon with pm2_home=… / Successfully daemonized"). With the ambient env
+    // inherited, the probe created one in the caller's PM2_HOME — including a real
+    // ~/.botmux/pm2, which the reaper then "found and killed", reporting a legacy
+    // fleet on a machine that never had one. Plant a pm2 on PATH that RECORDS the
+    // PM2_HOME it was handed, and require it to be a throwaway.
+    const configDir = tmp();
+    const pkgRoot = tmp();          // no bundled pm2 → the PATH probe runs
+    const binDir = tmp();
+    const seen = join(binDir, 'seen-home.log');
+    writeFileSync(join(binDir, 'pm2'), [
+      '#!/usr/bin/env node',
+      `require('fs').appendFileSync(${JSON.stringify(seen)}, (process.env.PM2_HOME ?? '<unset>')+'\\n');`,
+      `process.exit(0);`,
+    ].join('\n'), { mode: 0o755 });
+    chmodSync(join(binDir, 'pm2'), 0o755);
+    process.env.PATH = `${binDir}:${process.env.PATH ?? ''}`;
+
+    const ambient = join(configDir, 'pm2');   // stands in for ~/.botmux/pm2
+    process.env.PM2_HOME = ambient;
+    reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    const homes = readFileSync(seen, 'utf-8').trim().split('\n').filter(Boolean);
+    expect(homes.length).toBeGreaterThan(0);           // the probe really ran
+    for (const h of homes) {
+      expect(h).not.toBe(ambient);                     // never the caller's home
+      expect(h).not.toBe('<unset>');                   // and never inherited-empty
+    }
+  });
+
   it('clears the God records so the warning cannot come back', () => {
     // Leaving the dead God's records on disk would re-trigger detection on the
     // next command. Reaping must clear the evidence it just invalidated — BOTH
@@ -363,6 +477,31 @@ describe('reapLegacyPm2', () => {
     expect(r.found).toBe(true);
     expect(r.deleted).toEqual([]);
     expect(r.note).toContain('jlist failed');
+  });
+
+  // ── CLI path: row deletion must precede `pm2 kill` ──────────────────────────
+  // The CLI-less path has an explicit ordering test (the God must stop first there,
+  // or it respawns what we reap). The CLI path needs the OPPOSITE order and had no
+  // assertion at all: hoisting `pm2 kill` above the delete loop left the suite
+  // fully green. `pm2 kill` tears the God down, so `pm2 delete <row>` afterwards
+  // has nothing to talk to — the rows survive in the dump and a later pm2 would
+  // resurrect them. Pin the sequence, not just the set of calls.
+  it('deletes botmux rows BEFORE `pm2 kill` (killing first strands the rows)', () => {
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    const logFile = fakePm2(pkgRoot, { jlist: JSON.stringify([{ name: 'botmux' }, { name: 'botmux-0' }]) });
+    liveGodPidfile(join(configDir, 'pm2'));
+
+    const r = reapLegacyPm2(configDir, pkgRoot);
+    expect(r.deleted.sort()).toEqual(['botmux', 'botmux-0']);
+
+    // One line per invocation, in call order.
+    const calls = readFileSync(logFile, 'utf-8').trim().split('\n');
+    const killAt = calls.findIndex((c) => c.trim() === 'kill');
+    const lastDeleteAt = calls.reduce((acc, c, i) => (c.startsWith('delete ') ? i : acc), -1);
+    expect(killAt).toBeGreaterThan(-1);        // the God is killed
+    expect(lastDeleteAt).toBeGreaterThan(-1);  // rows are deleted
+    expect(lastDeleteAt).toBeLessThan(killAt); // ...and every delete lands FIRST
   });
 
   it('never `pm2 kill`s the SHARED ~/.pm2 God — only deletes botmux rows there', () => {
