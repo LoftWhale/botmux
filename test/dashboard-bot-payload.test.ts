@@ -22,7 +22,7 @@ describe('dashboard bot payload helpers', () => {
       'envelopeInjection', 'env', 'grantDefaultDurationMs', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
       'feedback',
       'overloadAlert', 'p2pMode', 'p2pOpen', 'privateCard', 'regularGroupMentionMode',
-      'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
+      'regularGroupReplyMode', 'replyStyle', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
       'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
       'summaryMemory', 'summaryMemoryPath', 'summaryRange', 'senderTag', 'writableTerminalLinkInCard',
       'sessionOwnerReminder',
@@ -40,6 +40,28 @@ describe('dashboard bot payload helpers', () => {
     const feedback = { enabled: true, audience: 'requester' };
     expect(botDefaultsPayload({ larkAppId: 'app' }, { feedback })).toMatchObject({ feedback });
     expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('feedback');
+  });
+
+  it('exposes only the normalized sparse reply style in private Bot Defaults payloads', () => {
+    const replyStyle = {
+      recipes: false,
+      theme: 'vivid',
+      recipePrompt: '  先说风险  ',
+      layoutColors: { result: 'green', blocked: 'laser', unknown: 'blue' },
+      layoutTags: { result: '', risk: '请确认', progress: 42 },
+    };
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { replyStyle })).toMatchObject({
+      replyStyle: {
+        recipes: false,
+        theme: 'vivid',
+        recipePrompt: '先说风险',
+        layoutColors: { result: 'green' },
+        layoutTags: { result: '', risk: '请确认' },
+      },
+    });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { replyStyle: 'secret-looking-invalid' }))
+      .toMatchObject({ replyStyle: null });
+    expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('replyStyle');
   });
 
   it('keeps executable runtime details out of public group roster summaries', () => {
