@@ -37,6 +37,28 @@ case "$arch" in
 esac
 asset="botmux-${os_tag}-${arch_tag}"
 
+# On Linux, pick the musl build when the C library is musl (Alpine and most slim
+# Docker images). A glibc-linked binary does not run there at all — it dies in the
+# loader with a message that names no cause — so guessing wrong is worse than not
+# installing. `uname` cannot tell us this, so probe the loader.
+#
+# Deliberately conservative: only switch to musl when musl is POSITIVELY observed,
+# so a glibc box can never be pushed onto the musl asset by a false positive.
+if [ "$os_tag" = linux ]; then
+  is_musl=0
+  # `ldd --version` prints "musl libc" on Alpine; on glibc it prints "GNU libc"/
+  # "GLIBC". musl's ldd exits non-zero for --version, so ignore the status.
+  if (ldd --version 2>&1 || true) | grep -qi musl; then
+    is_musl=1
+  # Fallbacks for images without ldd: the loader itself, then Alpine's marker.
+  elif ls /lib/ld-musl-* >/dev/null 2>&1 || ls /usr/lib/ld-musl-* >/dev/null 2>&1; then
+    is_musl=1
+  elif [ -f /etc/alpine-release ]; then
+    is_musl=1
+  fi
+  [ "$is_musl" -eq 1 ] && asset="${asset}-musl"
+fi
+
 # ── Resolve the download URLs (binary + checksum) ─────────────────────────────
 if [ "${BOTMUX_VERSION:-latest}" = "latest" ]; then
   base="https://github.com/${REPO}/releases/latest/download"

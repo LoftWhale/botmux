@@ -1,21 +1,21 @@
 {
-  "name": "botmux-linux-arm64",
+  "name": "botmux-linux-x64-musl",
   "version": "0.0.0",
-  "description": "The Linux arm64 binary for botmux",
+  "description": "The Linux x64 (musl / Alpine) binary for botmux",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/deepcoldy/botmux.git",
-    "directory": "packages/binary-linux-arm64"
+    "directory": "packages/binary-linux-x64-musl"
   },
   "os": [
     "linux"
   ],
   "cpu": [
-    "arm64"
+    "x64"
   ],
   "libc": [
-    "glibc"
+    "musl"
   ],
   "files": [
     "botmux"
