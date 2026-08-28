@@ -4452,6 +4452,50 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(ctxFor(genuine)).toMatchObject({ scope: 'chat', anchor: 'chat-e2e', replyRootId: 'om_native_seed' });
   });
 
+  it('抑制显示锚点时仍交出 foldedRootId,且真 producer 据此登记 alias(话题内非@消息能折回本会话)', async () => {
+    const { beginReplyTargetTurn, chatSessionAnsweredRootAtTopLevel: answeredAtTopLevel } = await import('../src/core/reply-target.js');
+    const now = new Date().toISOString();
+    const ds = chatScopeDs('chat-alias');
+    beginReplyTargetTurn(ds, undefined, 'om_top_at', now, { inThread: false });
+
+    setupBotState({ regularGroupReplyMode: 'chat', allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((a: string) => a === 'chat-alias');
+    handlers.chatSessionAnsweredRootAtTopLevel.mockImplementation(
+      (rootId: string) => answeredAtTopLevel(ds.session, rootId),
+    );
+
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA follow up' }),
+      rootId: 'om_top_at',
+      threadId: 'omt_after_fact',
+      messageId: 'msg-alias-case',
+      chatId: 'chat-alias',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    const ctx = (
+      handlers.handleThreadReply.mock.calls.find(c => c[0] === event)
+      ?? handlers.handleNewTopic.mock.calls.find(c => c[0] === event)
+    )?.[1];
+    // 显示锚点被抑制(回复平铺),但路由归属仍交出去
+    expect(ctx.replyRootId).toBeUndefined();
+    expect(ctx.foldedRootId).toBe('om_top_at');
+
+    // 真 producer 拿到 foldedRootId 后必须登记 alias,否则该话题内的非 @ 消息
+    // 查不到本会话会另起 thread 会话
+    beginReplyTargetTurn(ds, ctx.replyRootId, 'msg-alias-case', now, {
+      inThread: true,
+      foldedRootId: ctx.foldedRootId,
+    });
+    expect(ds.session.replyThreadAliases?.['om_top_at']).toBeTruthy();
+    // 抑制显示锚点的语义不变:不设 currentReplyTarget
+    expect(ds.session.currentReplyTarget).toBeUndefined();
+  });
+
   it('new-topic mode keeps @ inside a regular-group topic as an independent thread session', async () => {
     setupBotState({ regularGroupReplyMode: 'new-topic', allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');

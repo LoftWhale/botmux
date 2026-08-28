@@ -263,7 +263,7 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string },
 ): void {
   // #597: the frozen per-turn dispatch context — the authoritative reply target
   // for THIS turn's Codex App dispatch (steer/queued/opening). Independent of the
@@ -340,6 +340,23 @@ export function beginReplyTargetTurn(
     ds.session.replyThreadAliases = aliases;
     ds.session.currentReplyTarget = target;
     return;
+  }
+  // The turn folded into this chat-scope session from a Lark thread whose root
+  // we deliberately did NOT anchor the visible reply to (an after-the-fact
+  // topic — see chatSessionAnsweredRootAtTopLevel). Routing and display are
+  // separate contracts: the reply stays flat, but this session must still be
+  // discoverable by that root, or a later NON-@ message inside that topic
+  // misses `findChatReplyAlias` and forks a brand-new thread-scope session
+  // instead of folding back here (reachable under the never/topic/ambient
+  // mention modes, which answer un-@'d messages).
+  if (opts?.foldedRootId) {
+    const aliases = { ...(ds.replyThreadAliases ?? ds.session.replyThreadAliases ?? {}) };
+    aliases[opts.foldedRootId] = {
+      createdAt: aliases[opts.foldedRootId]?.createdAt ?? nowIso,
+      lastUsedAt: nowIso,
+    };
+    ds.replyThreadAliases = aliases;
+    ds.session.replyThreadAliases = aliases;
   }
   ds.currentReplyTarget = undefined;
   ds.session.currentReplyTarget = undefined;

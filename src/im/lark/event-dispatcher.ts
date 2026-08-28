@@ -2093,6 +2093,12 @@ export interface RoutingContext {
   anchor: string;
   /** Chat-scope shared-topic reply target for this turn, if any. */
   replyRootId?: string;
+  /** Set when the turn folded into the group chat-scope session from a Lark
+   *  thread whose root was deliberately NOT used as `replyRootId` (an
+   *  after-the-fact topic). The reply stays flat, but the session must still be
+   *  registered under this root so a later NON-@ message inside that topic
+   *  folds back here instead of forking a new thread-scope session. */
+  foldedRootId?: string;
   /** Command prompt that should be sent to the CLI instead of raw text. */
   promptOverride?: string;
   /** Durable VC routing succeeded but the bounded pre-turn catch-up did not.
@@ -2583,7 +2589,7 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   chatId: string;
   chatType: 'group' | 'p2p';
   message: any;
-  routing: { scope: 'thread' | 'chat'; anchor: string };
+  routing: { scope: 'thread' | 'chat'; anchor: string; foldedRootId?: string };
   forceTopicApplied?: boolean;
   mentionedThisBot: boolean;
   ownsThreadSession?: boolean;
@@ -2633,13 +2639,19 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   // 已完成），但此时不能再把可见回复钉进这个事后创建的话题 —— 否则用户在顶层
   // @ 得到的回复会跑进一个他并未在其中 @ 过 bot 的话题里。
   //
-  // 「@ 在既有话题里」永不命中：那种 root 不曾被本会话以顶层平铺方式答过。
-  // 因此既有的话题锚定契约（chat/shared fold 用例）保持不变。
+  // 判据要求 `inThread === false`（答那轮的 inbound 不带 thread_id），所以
+  // 「@ 在既有话题里」不会命中：原生话题的开场消息虽然同样记 mode='plain'，但它
+  // 带 thread_id ⇒ inThread=true。既有的话题锚定契约（chat/shared fold 用例）
+  // 因此保持不变。
+  //
+  // 只抑制**显示锚点**，不抑制**路由归属**：仍把 rootId 作为 foldedRootId 交出去
+  // 登记 alias，否则该话题内后续的非 @ 消息会查不到本会话而另起 thread 会话。
   if (answeredRootAtTopLevel?.(rootId)) {
     logger.info(
       `[reply-mode] thread root=${rootId.substring(0, 12)} was answered flat at top level; ` +
       `folding into chat=${chatId.substring(0, 12)} WITHOUT anchoring the reply into the after-the-fact topic`,
     );
+    routing.foldedRootId = rootId;
     return undefined;
   }
   logger.info(`[reply-mode] mentioned thread root=${rootId.substring(0, 12)} folds into chat=${chatId.substring(0, 12)}`);
