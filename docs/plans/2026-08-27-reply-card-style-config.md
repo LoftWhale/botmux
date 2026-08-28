@@ -26,13 +26,13 @@
 | `replyStyle.recipes` | bool | `true` | 是否把五类写作配方注入 `botmux-send` 指南。`false` → 指南回到纯自由 Markdown |
 | `replyStyle.layout` | bool | `true`（layout 能力落地后） | 是否允许 `--layout`。`false` → flag 被忽略，回退普通回复卡 |
 | `replyStyle.theme` | `'default' \| 'minimal' \| 'vivid'` | `'default'` | 预设主题，只改变壳的「重」，不改变五档语义 |
-| `replyStyle.recipePrompt` | string | 缺省 | **本轮不做**：覆写/追加该 bot 的配方引导文案 |
-| `replyStyle.layoutColors` | 对象 | 缺省映射 | **本轮不做**：在飞书 `header.template` 官方枚举内改档位颜色 |
-| `replyStyle.layoutTags` | 对象 | 见下 | **本轮不做**：改标签文案。空字符串 = 该档不显示标签 |
+| `replyStyle.recipePrompt` | string | 缺省 | 覆写/追加该 bot 的配方引导文案；缺省用内置五类配方 |
+| `replyStyle.layoutColors` | 对象 | 主题缺省 | 每档卡头颜色，键为五档名，值必须是飞书 `header.template` 官方枚举 |
+| `replyStyle.layoutTags` | 对象 | 主题缺省 | 每档标签文案。缺省：仅 `risk`/`blocked` 为「需要你」。空字符串 = 该档不显示标签 |
 
-`layoutColors` 只允许飞书卡头 template 枚举：`blue` / `wathet` / `turquoise` / `green` / `yellow` / `orange` / `red` / `carmine` / `violet` / `purple` / `indigo` / `grey`。非法值忽略并打日志，回退主题缺省，不发送失败。
+`layoutColors` 只允许飞书卡头 template 枚举：`blue` / `wathet` / `turquoise` / `green` / `yellow` / `orange` / `red` / `carmine` / `violet` / `purple` / `indigo` / `grey`。未知档名、非法颜色、非字符串标签一律忽略并打日志，该档回退当前主题缺省，整张卡仍发出、不 fail。微调不能突破底线：不能用这个口子加按钮、进度条或任意 JSON。
 
-## 预设主题（第一批就要能跑）
+## 预设主题
 
 五档语义固定，主题只调视觉重量。
 
@@ -55,20 +55,24 @@
   "replyStyle": {
     "recipes": true,
     "layout": true,
-    "theme": "default"
+    "theme": "default",
+    "recipePrompt": "",
+    "layoutColors": { "handoff": "indigo" },
+    "layoutTags": { "risk": "需要你", "blocked": "需要你" }
   }
 }
 ```
 
-缺省整块省略 = 上表缺省。不要做成全局 daemon 配置，避免一改全员 Bot 变脸。
+缺省整块省略 = 上表缺省。不要做成全局 daemon 配置，避免一改全员 Bot 变脸。`layoutColors` / `layoutTags` 只写要覆盖的档，未写的档走当前主题。
 
-**Dashboard**：Bot 设置里、品牌文案附近加一小节「回复风格」。第一批 UI 只需：
+**Dashboard**：Bot 设置里、品牌文案附近加一小节「回复风格」。本轮 UI：
 
 - 配方引导：开 / 关
 - layout 壳：开 / 关
 - 主题：默认 / 极简 / 鲜明（下拉，枚举写死）
-
-第二批再放开「配方文本」多行输入、每档颜色下拉（同样锁官方枚举）。
+- 配方文本：多行输入，空 = 用内置引导
+- 每档卡头颜色：五档各自一个下拉，选项锁官方色板；另加「跟随主题」
+- 每档标签：五档各自一个短文本；空 = 跟随主题（default 下 result/progress/handoff 为空）
 
 **skill 注入**：`replyStyle.recipes === false` 时，`botmux-send` 内置指南去掉配方表和选型信号，其它发送契约不变。`layout === false` 时指南不提 `--layout`。
 
@@ -80,16 +84,16 @@
 
 1. 五档 layout 薄壳：卡头按上表 + 规定标签 + 正文仍走现有 Markdown（不加原生分栏、不加进度条、不加按钮）
 2. `replyStyle.recipes` / `replyStyle.layout` / `replyStyle.theme`；枚举锁死，非法值忽略并回退缺省，发送不失败
-3. bots.json 解析 + Dashboard 三个控件
-4. `recipes === false` 时指南去掉配方表和选型信号；`layout === false` 时指南不提 `--layout`，CLI 忽略 flag
-5. 回读：换主题后 `quoted` / `history` 仍能还原正文和表格；测例必须用 **live 归一化形态**，不认 builder 原始 JSON
+3. `replyStyle.recipePrompt`：覆写/追加配方引导；空或省略 = 内置文本
+4. `replyStyle.layoutColors` / `replyStyle.layoutTags`：官方色板内每档微调；非法值按档回退主题缺省
+5. bots.json 解析 + Dashboard：三个开关/主题下拉、配方多行文本框、每档颜色下拉、每档标签输入
+6. `recipes === false` 时指南去掉配方表和选型信号（自定义 `recipePrompt` 也不注入）；`layout === false` 时指南不提 `--layout`，CLI 忽略 flag，颜色/标签配置不生效
+7. 回读：换主题或微调颜色/标签后 `quoted` / `history` 仍能还原正文和表格；测例必须用 **live 归一化形态**，不认 builder 原始 JSON
 
 ### 本轮之后
 
-1. `recipePrompt` 覆写/追加写作引导
-2. `layoutColors` / `layoutTags` 枚举内微调
-3. Diff 分栏（见 layer2 backlog）
-4. 私聊按人覆盖（若要做）；群聊永远不按读者分皮肤
+1. Diff 分栏（见 layer2 backlog）
+2. 私聊按人覆盖（若要做）；群聊永远不按读者分皮肤
 
 ## 明确不做（本轮）
 
