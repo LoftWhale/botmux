@@ -1023,7 +1023,7 @@ describe('buildReplyCardFooter', () => {
     expect(footer?.element).toMatchObject({
       tag: 'markdown',
       element_id: 'botmux_reply_footer',
-      text_size: 'notation_small_v2',
+      text_size: 'notation',
       content: footer?.content,
     });
   });
@@ -1213,7 +1213,7 @@ describe('buildMarkdownCard footer brand', () => {
   it('empty brand + no recipient → no footer at all (no orphan hr)', () => {
     const els = JSON.parse(buildMarkdownCard('hi', undefined, '')).body.elements;
     expect(els.some((e: any) => e.tag === 'hr')).toBe(false);
-    expect(els.some((e: any) => e.text_size === 'notation_small_v2')).toBe(false);
+    expect(els.some((e: any) => e.element_id === 'botmux_reply_footer')).toBe(false);
     expect(JSON.stringify(els)).not.toContain('botmux');
     expect(els.some((e: any) => e.tag === 'markdown' && /hi/.test(e.content))).toBe(true);
   });
@@ -1400,7 +1400,7 @@ describe('buildContextualReplyCard footer brand', () => {
       title: 'T', assistantText: 'a', assistantLabel: 'Claude', recipientOpenId: 'ou_x', brand: 'Acme',
     })).body.elements;
     const last = els[els.length - 1];
-    expect(last.text_size).toBe('notation_small_v2');
+    expect(last.text_size).toBe('notation');
     expect(last.content).toContain('Acme');
     expect(last.content).not.toContain('botmux');
   });
@@ -1409,7 +1409,7 @@ describe('buildContextualReplyCard footer brand', () => {
     const els = JSON.parse(buildContextualReplyCard({
       title: 'T', assistantText: 'a', assistantLabel: 'Claude', brand: '',
     })).body.elements;
-    expect(els.some((e: any) => e.text_size === 'notation_small_v2')).toBe(false);
+    expect(els.some((e: any) => e.element_id === 'botmux_reply_footer')).toBe(false);
     expect(JSON.stringify(els)).not.toContain('botmux');
   });
 });

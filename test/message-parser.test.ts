@@ -810,7 +810,11 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
 // ─── Structural footer strip (brand-agnostic, for per-bot custom brands) ──
 
 describe('Interactive card parsing: footer stripped structurally (custom brand)', () => {
-  it('drops a schema 2.0 footer element without text_size when it carries the exact split-font marker', () => {
+  it.each([
+    { name: 'without text_size', textSize: undefined },
+    { name: 'with Card 2.0 notation', textSize: 'notation' },
+    { name: 'with legacy notation_small_v2', textSize: 'notation_small_v2' },
+  ])('drops a schema 2.0 footer $name when it carries the exact split-font marker', ({ textSize }) => {
     const card = {
       schema: '2.0',
       body: { elements: [
@@ -819,6 +823,7 @@ describe('Interactive card parsing: footer stripped structurally (custom brand)'
         {
           element_id: 'botmux_reply_footer',
           tag: 'markdown',
+          ...(textSize === undefined ? {} : { text_size: textSize }),
           content: '[botmux](https://github.com/deepcoldy/botmux)'
             + "<font color='grey'> </font>"
             + '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)'
@@ -837,6 +842,7 @@ describe('Interactive card parsing: footer stripped structurally (custom brand)'
       footer: {
         element_id: 'botmux_reply_footer',
         tag: 'markdown',
+        text_size: 'notation',
         content: '[footer spec](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
       },
       expected: 'footer spec',
@@ -1003,7 +1009,7 @@ describe('botmux internal callback buttons (🔊 语音总结 …) dropped from 
         { tag: 'hr' },
         { tag: 'column_set', flex_mode: 'none', columns: [
           { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
-            elements: [{ tag: 'markdown', text_size: 'notation_small_v2', content: ' ' }] },
+            elements: [{ tag: 'markdown', text_size: 'notation', content: ' ' }] },
           { tag: 'column', width: 'auto', vertical_align: 'center', elements: [{
             tag: 'button',
             text: { tag: 'plain_text', content: '🔊 语音总结' },

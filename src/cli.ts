@@ -9151,7 +9151,7 @@ async function cmdSend(rest: string[]): Promise<void> {
                 tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
                 elements: [footer?.element ?? {
                   tag: 'markdown',
-                  text_size: 'notation_small_v2',
+                  text_size: 'notation',
                   content: ' ',
                 }],
               },
