@@ -2,6 +2,7 @@
  * Session cost calculator — computes token usage from JSONL logs.
  */
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, type Stats } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { logger } from '../utils/logger.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -396,6 +397,106 @@ function foldCocoLine(agg: TokenUsageAggregate, entry: any): void {
   agg.turns++;
 }
 
+/** Pi transcripts carry per-turn usage but no context window of their own;
+ *  the window comes from ~/.pi/agent/models.json. Cache by mtime so the fold
+ *  never re-reads a stable file (models.json is edited rarely). */
+const PI_MODELS_JSON_PATH = join(homedir(), '.pi', 'agent', 'models.json');
+
+interface PiModelsCacheEntry {
+  mtimeMs: number;
+  size: number;
+  contextByModelId: Map<string, number>;
+  contextByProviderModel: Map<string, number>;
+}
+
+let piModelsCache: (PiModelsCacheEntry & { ambiguousBareIds?: Set<string> }) | null = null;
+
+interface PiModelsWindows {
+  byBareId: Map<string, number>;
+  byProviderModel: Map<string, number>;
+  ambiguousBareIds: Set<string>;
+}
+
+function readPiModelsContextWindows(): PiModelsWindows | null {
+  try {
+    const st = statSync(PI_MODELS_JSON_PATH);
+    if (piModelsCache && piModelsCache.mtimeMs === st.mtimeMs && piModelsCache.size === st.size) {
+      return { byBareId: piModelsCache.contextByModelId, byProviderModel: piModelsCache.contextByProviderModel, ambiguousBareIds: piModelsCache.ambiguousBareIds ?? new Set() };
+    }
+    const parsed = JSON.parse(readFileSync(PI_MODELS_JSON_PATH, 'utf-8')) as any;
+    const contextByModelId = new Map<string, number>();
+    const contextByProviderModel = new Map<string, number>();
+    const ambiguousBareIds = new Set<string>();
+    const providers = parsed?.providers;
+    if (providers && typeof providers === 'object') {
+      for (const [providerName, provider] of Object.entries<any>(providers)) {
+        if (!provider || typeof provider !== 'object') continue;
+        const models = provider.models;
+        if (!Array.isArray(models)) continue;
+        for (const model of models) {
+          if (model && typeof model.id === 'string' && typeof model.contextWindow === 'number' && model.contextWindow > 0) {
+            const existing = contextByModelId.get(model.id);
+            if (existing !== undefined && existing !== model.contextWindow) {
+              // Same bare id with a different window under another provider: bare-id
+              // lookup would silently pick one, so mark it ambiguous and only allow
+              // provider-qualified resolution.
+              ambiguousBareIds.add(model.id);
+            } else {
+              contextByModelId.set(model.id, model.contextWindow);
+            }
+            contextByProviderModel.set(`${providerName}/${model.id}`, model.contextWindow);
+          }
+        }
+      }
+    }
+    for (const id of ambiguousBareIds) contextByModelId.delete(id);
+    piModelsCache = { mtimeMs: st.mtimeMs, size: st.size, contextByModelId, contextByProviderModel, ambiguousBareIds };
+    return { byBareId: contextByModelId, byProviderModel: contextByProviderModel, ambiguousBareIds };
+  } catch {
+    // models.json missing or unparseable: fall back to used-tokens-only context
+    // (no window, no percentage), same as Claude Code sessions.
+    return null;
+  }
+}
+
+/** Resolve a model's context window, tolerating pi's bare model ids as well as
+ *  the "provider/model" and "model:variant" shapes used in configs. */
+function piModelContextWindow(modelId: string, provider?: string): number | undefined {
+  const windows = readPiModelsContextWindows();
+  if (!windows) return undefined;
+  // Prefer the exact provider+model identity recorded in the transcript.
+  if (provider) {
+    const qualified = windows.byProviderModel.get(`${provider}/${modelId}`);
+    if (qualified !== undefined) return qualified;
+  }
+  if (windows.byBareId.has(modelId)) return windows.byBareId.get(modelId);
+  const bare = modelId.includes('/') ? modelId.slice(modelId.lastIndexOf('/') + 1) : modelId;
+  if (provider) {
+    const qualifiedBare = windows.byProviderModel.get(`${provider}/${bare}`);
+    if (qualifiedBare !== undefined) return qualifiedBare;
+  }
+  if (windows.byBareId.has(bare)) return windows.byBareId.get(bare);
+  const withoutVariant = bare.includes(':') ? bare.slice(0, bare.indexOf(':')) : bare;
+  if (withoutVariant !== bare) {
+    if (provider) {
+      const qualifiedNoVariant = windows.byProviderModel.get(`${provider}/${withoutVariant}`);
+      if (qualifiedNoVariant !== undefined) return qualifiedNoVariant;
+    }
+    if (windows.byBareId.has(withoutVariant)) return windows.byBareId.get(withoutVariant);
+  }
+  return undefined;
+}
+
+/** pi's usage is per-turn prompt-side totals; the latest measurement is the
+ *  context gauge. The window (and therefore the percentage) comes from
+ *  ~/.pi/agent/models.json when the model id can be resolved. */
+function buildPiContextUsage(usedTokens: number, modelId: string, provider?: string): SessionContextUsage {
+  const windowTokens = piModelContextWindow(modelId, provider);
+  if (!windowTokens) return { usedTokens };
+  const percentUsed = Math.round(Math.max(0, Math.min(1, usedTokens / windowTokens)) * 100);
+  return { usedTokens, windowTokens, percentUsed };
+}
+
 /** Grok Build persists ACP updates. `turn_completed.usage` is an exact
  *  per-turn provider total (input includes cached input); companion
  *  signals.json supplies the live context gauge and user-facing model id. */
@@ -452,6 +553,18 @@ function foldPiLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry
   agg.outputTokens += num(u.output);
   agg.cacheReadTokens += num(u.cacheRead);
   agg.cacheCreateTokens += num(u.cacheWrite);
+  // Pi 0.84+ native context accounting prefers usage.totalTokens; fall back to
+  // the four-part sum (input + output + cacheRead + cacheWrite). input alone
+  // excludes the current turn's output, which undercounts the real context.
+  const totalTokens = num(u.totalTokens);
+  const contextTokens = totalTokens > 0
+    ? totalTokens
+    : num(u.input) + num(u.output) + num(u.cacheRead) + num(u.cacheWrite);
+  // Synthetic/empty assistant records (e.g. around compaction) must not erase
+  // the last native context measurement.
+  if (contextTokens > 0) {
+    agg.latestContextUsage = buildPiContextUsage(contextTokens, typeof msg.model === 'string' ? msg.model : '', typeof msg.provider === 'string' ? msg.provider : '');
+  }
   if (!agg.model && typeof msg.model === 'string') agg.model = msg.model;
   agg.turns++;
 }
@@ -605,6 +718,7 @@ const warnedOversizedUsageFiles = new Set<string>();
 export function __resetSessionUsageCachesForTest(): void {
   usageFileCache.clear();
   warnedOversizedUsageFiles.clear();
+  piModelsCache = null;
   __resetTranscriptResolverCacheForTest();
 }
 

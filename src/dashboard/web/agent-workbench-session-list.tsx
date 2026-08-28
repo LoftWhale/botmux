@@ -1,3 +1,4 @@
+import type React from 'react';
 import {
   useEffect,
   useMemo,
@@ -34,13 +35,6 @@ import { t } from './ui.js';
 
 /** 行操作按钮用短文字，不用图标——图标要靠猜，两个字直接说清楚做什么。 */
 
-/** 会话类型徽标文案。键与 workbenchSessionKind 的返回值一一对应。 */
-const KIND_COPY: Record<WorkbenchSessionKind, { label: string; title: string }> = {
-  thread: { label: '话题', title: '话题会话' },
-  group: { label: '群', title: '群会话' },
-  p2p: { label: '单聊', title: '单聊会话' },
-};
-
 /** 与服务端 locateLimiter 对齐的按钮侧冷却；成功态只是短暂的视觉确认。 */
 const LOCATE_COOLDOWN_MS = 30_000;
 const LOCATE_SUCCESS_MS = 2_000;
@@ -56,6 +50,13 @@ function locateErrorText(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error ?? '');
   return message.trim() || '未知错误';
 }
+
+/** 会话类型徽标文案。键与 workbenchSessionKind 的返回值一一对应。 */
+const KIND_COPY: Record<WorkbenchSessionKind, { label: string; title: string }> = {
+  thread: { label: '话题', title: '话题会话' },
+  group: { label: '群', title: '群会话' },
+  p2p: { label: '单聊', title: '单聊会话' },
+};
 
 /** 行前的状态记号。分组名本身由 model 给（动态维度下就是机器人名/会话名），
  *  这里只留图标，避免同一份文案在两处各写一遍、日子久了对不上。 */
@@ -114,7 +115,7 @@ function FeishuChatAnchor(props: {
   ariaLabel: string;
   onActivate?: () => void;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <a
       className={props.className}
@@ -142,13 +143,17 @@ export interface WorkbenchSessionListProps {
   online?: boolean;
   onSelect(sessionId: string): void;
   onToggleCollapsed?(): void;
-  /** Row-level shortcuts: jump straight to a surface instead of selecting the
-   *  session and then hunting for the layout control. */
-  onOpenSurface?(sessionId: string, surface: 'terminal' | 'terminal-control' | 'chat'): void;
-  /** P1-4：显式传 false 时不渲染行内「接管」捷径（只留只读「终端」）——没有
-   *  canControl 能力的身份（平台 teammate/guest、触屏 H5）接管必 403。不传按
-   *  旧行为渲染（dock 等不带能力投影的精简形态）。 */
-  canControlTerminal?: boolean;
+  /** Row-level shortcut: jump straight to the session's terminal instead of
+   *  selecting the session and then hunting for the layout control. 行内只有
+   *  这一个终端入口（只读打开 / 再点关闭）——接管统一走终端面板标题栏的
+   *  「接管输入」，行内不再提供接管捷径。 */
+  onOpenTerminal?(sessionId: string): void;
+  /** 恒可写身份（平台所有者）：「终端」按钮点开就是可输入的终端，说明文案不能
+   *  再写「只读」（P1-4：宁可不提只读，也不留一句与实际能力相反的话）。 */
+  fixedTerminal?: boolean;
+  /** 这个会话的终端面板有写请求在途：行内「终端」此刻禁用，连点不会在 POST
+   *  回执前把面板关掉、留下一条没人管的写租约。 */
+  terminalBusySessionId?: string | null;
   /** 话题会话专用：让 bot 在原话题里 @ 会话拥有者，用户点通知即可跳回话题。
    *  不传则不渲染定位按钮（dock 等精简形态就是这么用的）。 */
   onLocate?(sessionId: string): Promise<void>;
@@ -214,7 +219,7 @@ function useTouchRowMetrics(): boolean {
   return touch;
 }
 
-export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Element {
+export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JSX.Element {
   const touchRows = useTouchRowMetrics();
   const [query, setQuery] = useState('');
   const [scrollTop, setScrollTop] = useState(0);
@@ -261,8 +266,8 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
     [groups],
   );
 
-  // 定位只在选中会话变化时发生一次，避免每次重渲染都把 scrollTop 拽回选中行、和用户滚动打架。
-  // 初始选中不定位（列表保持置顶的「待你处理」可见），只有用户切换选中才滚动定位。
+  // 列表滚动只在选中会话变化时发生一次，避免每次重渲染都把 scrollTop 拽回选中行、和用户滚动打架。
+  // 初始选中不滚动（列表保持置顶的「待你处理」可见），只有用户切换选中才滚动定位。
   useEffect(() => {
     if (!props.selectedSessionId) {
       lastScrolledSelectionRef.current = null;
@@ -281,9 +286,6 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
 
   // 冷却和成功态都是时间推导出来的，需要一个心跳把它们重绘掉。心跳只在真的有
   // 冷却时存在：过期条目在这里被剪掉，Map 空了 effect 自然清掉定时器。
-  // 用裸的 setInterval 而不是 window.setInterval：这个 effect 在首次成功定位后
-  // 才挂载，走 window 会让整个列表在没有 window 的环境（组件测试跑在 node 上）
-  // 一点定位就崩。同目录的 panes 一直是这么写的，计时本来也不需要 DOM。
   useEffect(() => {
     if (locateAt.size === 0) return undefined;
     const timer = setInterval(() => {
@@ -300,7 +302,6 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
   const onLocate = props.onLocate;
   const startLocate = (sessionId: string) => {
     if (!onLocate) return;
-    // 乐观进入冷却：请求还在飞的时候按钮就不可点，失败再放开。
     setLocateAt(previous => new Map(previous).set(sessionId, Date.now()));
     setLocateError(previous => {
       if (!previous.has(sessionId)) return previous;
@@ -310,8 +311,6 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
     });
     void onLocate(sessionId).then(
       () => {
-        // 成功后把时间戳推到「此刻」：成功态从这里开始算 2s，冷却也从服务端
-        // 真正受理的时刻开始算 30s，不会比服务端的限流窗口短。
         setLocateAt(previous => new Map(previous).set(sessionId, Date.now()));
       },
       (error: unknown) => {
@@ -319,8 +318,6 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
         const retryAfterMs = locateRetryAfterMs(error);
         setLocateAt(previous => {
           const next = new Map(previous);
-          // 429 说明服务端还在限流窗口里，按它给的剩余时间继续禁用；
-          // 其它错误立刻恢复可点，让用户能重试。
           if (retryAfterMs === null) next.delete(sessionId);
           else next.set(sessionId, Date.now() - (LOCATE_COOLDOWN_MS - retryAfterMs));
           return next;
@@ -502,7 +499,7 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
             const reason = attentionSummary(session) ?? (unread ? UNREAD_REASON : null);
             const selected = session.sessionId === props.selectedSessionId;
             const statusText = item.group === 'needs-you' ? '待你处理' : item.group === 'active' ? session.status : '最近';
-            const openSurface = props.onOpenSurface;
+            const openTerminal = props.onOpenTerminal;
             const chatHref = session.feishuChatLink
               || (session.chatId ? buildChatAppLink(session.chatId) : null);
             const kind = workbenchSessionKind(session);
@@ -549,7 +546,7 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
                       >{copy}</FeishuChatAnchor>
                     );
                   })()}
-                  {openSurface ? (
+                  {openTerminal ? (
                     <span className="wb-session-row-actions">
                       {/* A real anchor, not a scripted open: handing the AppLink
                           to the browser lets the Feishu client claim it and place
@@ -567,8 +564,8 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
                           onActivate={() => props.onSeen?.(session.sessionId)}
                         >聊天</FeishuChatAnchor>
                       ) : null}
-                      {/* 定位只对话题会话有意义：群/单聊会话没有可回跳的话题锚点。
-                          聊天按钮照旧开群，定位是它旁边的另一条路。 */}
+                      {/* 原「定位」语义不变：让 bot 在原话题里 @ owner，用户通过
+                          消息通知回到话题；写能力与 30 秒冷却也继续沿用。 */}
                       {kind === 'thread' && onLocate ? (() => {
                         const at = locateAt.get(session.sessionId) ?? 0;
                         const elapsed = Date.now() - at;
@@ -595,28 +592,43 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): JSX.Elem
                           >{located ? '已发送' : '定位'}</button>
                         );
                       })() : null}
-                      {([
-                        ['terminal', '打开只读终端', '终端'] as const,
-                        // 接管捷径只对有 canControl 能力的身份渲染（P1-4）；
-                        // undefined（dock/旧调用方）保持旧行为。
-                        ...(props.canControlTerminal !== false
-                          ? [['terminal-control', '打开终端并接管输入', '接管'] as const]
-                          : []),
-                      ]).map(([surface, label, text]) => (
-                        <button
-                          key={surface}
-                          type="button"
-                          className={`wb-session-row-action is-${surface}`}
-                          title={label}
-                          aria-label={`${label} — ${title}`}
-                          onClick={event => {
-                            // The row itself selects; without this the click would
-                            // also bubble and fire a redundant selection.
-                            event.stopPropagation();
-                            openSurface(session.sessionId, surface);
-                          }}
-                        >{text}</button>
-                      ))}
+                      {/* 「跳转」是新增的只读入口，仅在服务端已经拿到原生 `omt_`
+                          话题 id 时渲染；不能把 `om_` 路由锚点伪造成原话题链接。 */}
+                      {kind === 'thread' && session.feishuThreadLink ? (
+                        <FeishuChatAnchor
+                          className="wb-session-row-action is-jump"
+                          href={session.feishuThreadLink}
+                          title="跳转到原话题"
+                          ariaLabel={`跳转到原话题 — ${title}`}
+                          onActivate={() => props.onSeen?.(session.sessionId)}
+                        >跳转</FeishuChatAnchor>
+                      ) : null}
+                      {/* 行内只剩「终端」这一个终端入口（产品决策：接管统一走终端
+                          面板标题栏的「接管输入」，那条链路是唯一知道自己真实模式
+                          的地方；行内再摆一个接管捷径只是同一件事的第二条路）。 */}
+                      {(() => {
+                        // 恒可写身份点开就能输入，这里再写「只读」等于说反话；
+                        // 普通身份的「终端」确实是只读打开（面板会把攥着的租约
+                        // 还回去），照旧说清楚。
+                        const label = props.fixedTerminal
+                          ? '打开终端（当前身份可直接输入）'
+                          : '打开只读终端';
+                        return (
+                          <button
+                            type="button"
+                            className="wb-session-row-action is-terminal"
+                            title={label}
+                            aria-label={`${label} — ${title}`}
+                            disabled={props.terminalBusySessionId === session.sessionId}
+                            onClick={event => {
+                              // The row itself selects; without this the click would
+                              // also bubble and fire a redundant selection.
+                              event.stopPropagation();
+                              openTerminal(session.sessionId);
+                            }}
+                          >终端</button>
+                        );
+                      })()}
                     </span>
                   ) : null}
                 </div>

@@ -1,4 +1,4 @@
-import type { CodexAppTurnInput } from '../../types.js';
+import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -29,6 +29,13 @@ export interface PtyHandle {
    *  can read `~/.claude/sessions/<pid>.json` to follow Claude's authoritative
    *  current session id (which can rotate on resume / mid-session). */
   cliPid?: number;
+  /**
+   * An explicitly selected remote Codex App Server thread. When set, Codex
+   * history-submit verification accepts only this session id instead of
+   * checking rollout ownership through the local `codex --remote` client's
+   * PID—the rollout belongs to the external App Server, not the viewer.
+   */
+  expectedCodexSessionId?: string;
   /** Working directory the CLI was spawned in; cross-checked against the pid file's
    *  cwd field to reject pid reuse / unrelated processes. */
   cliCwd?: string;
@@ -57,6 +64,7 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  trustedCaller?: TrustedCaller;
   /** codex-app only: this turn is authorized to steer into an active turn. */
   codexAppSteerable?: true;
 }
@@ -93,6 +101,17 @@ export interface McpGatewayInstallSpec {
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
+
+  /** Controls whether BotMux uses its routing/session XML envelope or the
+   *  non-command service-user envelope. The latter preserves the original
+   *  message body but adds a fixed safe prefix so OMP never interprets an
+   *  external `/`, `!`, `$ `, `.`, or `c` message as local TUI control input. */
+  readonly inputEnvelope?: 'standard' | 'service-user';
+
+  /** Whether the process-wide CLI_EXTRA_ARGS escape hatch may append argv.
+   *  Defaults to true. Managed service entrypoints should set false so their
+   *  fixed auth/session contract cannot be altered by ambient daemon config. */
+  readonly allowExtraArgs?: boolean;
 
   /** Declarative config target for the process-scoped Botmux MCP Gateway. */
   readonly mcpGateway?: McpGatewayInstallSpec;
@@ -136,11 +155,13 @@ export interface CliAdapter {
      *  adapters without a runner turn timeout ignore the field. */
     turnTimeoutMs?: number;
     /** Optional per-turn reasoning effort (codex `model_reasoning_effort`,
-     *  grok `--reasoning-effort`). Only adapters with an explicit reasoning
-     *  control honor it; others ignore. */
+     *  traex `model_reasoning_effort`, grok `--reasoning-effort`). Only adapters
+     *  with an explicit reasoning control honor it; others ignore. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Codex App only: restricted local browser extension bridge. */
+    codexBrowser?: import('../../core/codex-browser-config.js').CodexBrowserConfig;
     /** Codex-family only: when true (default from the global `bypassCodexHookTrust`
      *  toggle, still ANDed with `!disableCliBypass` by the worker), pass
      *  `--dangerously-bypass-hook-trust` so a headless plain-TUI launch does not
@@ -349,6 +370,29 @@ export interface CliAdapter {
    *  contain old busy text; existing adapters remain opt-out by default. */
   readonly idleToBusyPattern?: RegExp;
 
+  /** Opt-in PRE-idle busy latch for static busy screens that emit no further
+   *  PTY bytes after the initial render (e.g. a capacity-queue notice drawn
+   *  alongside a readyPattern status bar). Unlike busyPattern — a viewport
+   *  probe that only runs on backends whose screen cache is authoritative for
+   *  mutation — this consumes raw PTY evidence inside IdleDetector, so it also
+   *  holds on backends where screen capture must not mutate state (ZMX):
+   *  while latched, screen-derived idle is suppressed until a PTY chunk with
+   *  explicit composer evidence (staticBusyClearPattern) redraws AFTER the
+   *  last queue marker. The latch is set from the rolling outputTail (queue
+   *  markers can be split across chunks); clear is decided by the LAST
+   *  static/clear evidence position within the current chunk. reset() rebases
+   *  it. External structured completion (fireIdle) bypasses the latch — it is
+   *  authoritative independently of the screen observer. */
+  readonly staticBusyPattern?: RegExp;
+
+  /** Opt-in CLEAR pattern for the pre-idle static-busy latch. Matches the
+   *  real composer prompt (e.g. line-start ›/❯) so the latch can clear when
+   *  the queue screen redraws into the composer. Must NOT match the status
+   *  bar (e.g. `\d+% left`) — the queue screen itself carries a status bar,
+   *  so the broad readyPattern can never clear the latch. Only tested against
+   *  the CURRENT chunk (fresh composer evidence), not the rolling tail. */
+  readonly staticBusyClearPattern?: RegExp;
+
   /** Ready marker regex — matches when the CLI's input prompt is rendered and
    *  functional.  When set, the idle detector suppresses quiescence-based idle
    *  until this pattern appears in the PTY output.  Checked every cycle (reset
@@ -405,6 +449,21 @@ export interface CliAdapter {
    *  capability; `queued` and `final_output` are not completion receipts. */
   readonly reliableTurnTerminal?: boolean;
 
+  /** The adapter PUBLISHES a structured `limited` screen_update from a machine
+   *  rate-limit signal in its transcript (not from scraping screen text). When
+   *  true, `isStructuredRateLimitAuthoritative` treats it as the sole rate-limit
+   *  authority and suppresses the screen-scan `rate` heuristic — otherwise the
+   *  model's own output or a dev editing rate-limit code puts "429" / "exceeded
+   *  retry limit" on screen and the scraper false-positives (it cannot tell a
+   *  printed "429" from a request that actually returned 429). The Claude family
+   *  is authoritative via `claudeDataDir` regardless of this flag; Codex sets it
+   *  because the worker's `maybeEmitCodexStructuredRateLimit` reads the rollout's
+   *  `codex_rate_limited` terminal and emits `limited`. Do NOT set it for a
+   *  codexBridgeQueue CLI that has no such emit (grok / traex / pi / hermes /
+   *  mtr / cursor) — suppressing their screen scan would silently drop the real
+   *  429 backoff + Dashboard「需要你」signal. */
+  readonly emitsStructuredRateLimit?: boolean;
+
   /** True when this adapter supports running under per-bot read isolation (its
    *  data root is redirectable into BOT_HOME — CLAUDE_CONFIG_DIR / CODEX_HOME —
    *  and it runs correctly under the worker's whole-process Seatbelt wrapper,
@@ -448,6 +507,20 @@ export interface CliAdapter {
    *  presented as-is; the setup prompt always appends an "Other / custom"
    *  free-text option, so this list is curation, not a hard whitelist. */
   readonly modelChoices?: readonly string[];
+
+  /** Optional live model discovery: enumerate the models this CLI can actually
+   *  use right now (e.g. `traex debug models` prints its full catalogue as
+   *  JSON). The dashboard model picker invokes it on demand for the SELECTED
+   *  CLI only — never in a scan over all adapters — and merges the result with
+   *  `modelChoices`. Contract:
+   *  - MUST be fail-soft: return null on any error, timeout, or unparseable
+   *    output, never throw (the caller falls back to `modelChoices`);
+   *  - MUST be self-contained: one short-lived subprocess (or pure file read)
+   *    with a tight timeout (≤10s) and a capped output buffer — catalogue
+   *    JSON can be hundreds of KB;
+   *  - absent = the CLI cannot enumerate its models; the picker shows
+   *    `modelChoices` only. */
+  readonly detectModels?: () => Promise<readonly string[] | null>;
 
   /** Claude-family CLIs only (claude-code, seed). The data root holding
    *  `projects/<hash>/<id>.jsonl`, `sessions/<pid>.json`, `tasks/`,
@@ -501,7 +574,16 @@ export interface CliAdapter {
    *  (→ readOnly rule). `~`-expanded + existence-filtered by the worker, so
    *  listing a path absent on this host is a no-op. Missing/empty → nothing extra
    *  exposed. Return ONLY paths safe to reveal read-only (never credentials). */
-  sandboxReadonlyPaths?(): readonly string[];
+  sandboxReadonlyPaths?(env?: NodeJS.ProcessEnv): readonly string[];
+
+  /** Credential files a trusted service CLI must read inside the sandbox.
+   *  This is deliberately separate from ordinary readonlyRoots so adapters
+   *  cannot expose secrets accidentally. The worker validates exact regular
+   *  files and fs-policy emits them mandatory read-only, except that a
+   *  no-transport turn suppresses entries inside Feishu authority roots. Use
+   *  only when the CLI's model-facing tool surface has no general file/shell
+   *  escape, and return exact files rather than parent directories. */
+  sandboxSecretReadonlyPaths?(env?: NodeJS.ProcessEnv): readonly string[];
 
   /** Extra env merged into the spawned child's environment. Used by Claude-family
    *  forks to point the CLI at its data root (e.g. Seed's `CLAUDE_CONFIG_DIR`).
@@ -571,4 +653,4 @@ export interface CliAdapter {
   buildSessionRenameCommand?(title: string): string;
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'mojo';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo';

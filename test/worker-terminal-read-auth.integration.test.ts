@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { createHmac } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { deriveTerminalWriteToken } from '../src/core/terminal-write-auth.js';
 import {
@@ -91,39 +92,6 @@ function waitForReady(child: ChildProcess, logs: string[]): Promise<Extract<Work
   });
 }
 
-function installSlowDashboardSecretReadHook(root: string, delayMs: number): string {
-  const hookPath = join(root, 'slow-dashboard-secret-read.cjs');
-  writeFileSync(hookPath, `
-const fs = require('node:fs');
-const { syncBuiltinESMExports } = require('node:module');
-const dashboardSecretFds = new Set();
-const originalOpenSync = fs.openSync;
-const originalReadFileSync = fs.readFileSync;
-const originalCloseSync = fs.closeSync;
-
-fs.openSync = function openSync(path, ...args) {
-  const fd = originalOpenSync.call(this, path, ...args);
-  if (typeof path === 'string' && /[\\/]\.dashboard-secret$/.test(path)) {
-    dashboardSecretFds.add(fd);
-  }
-  return fd;
-};
-fs.readFileSync = function readFileSync(path, ...args) {
-  if (typeof path === 'number' && dashboardSecretFds.has(path)) {
-    const deadline = Date.now() + ${delayMs};
-    while (Date.now() < deadline) {}
-  }
-  return originalReadFileSync.call(this, path, ...args);
-};
-fs.closeSync = function closeSync(fd) {
-  dashboardSecretFds.delete(fd);
-  return originalCloseSync.call(this, fd);
-};
-syncBuiltinESMExports();
-`, { mode: 0o600 });
-  return hookPath;
-}
-
 function rawWsHandshake(port: number, path: string, headers: Record<string, string> = {}): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     const extra = Object.entries(headers).map(([name, value]) => `${name}: ${value}\r\n`).join('');
@@ -186,7 +154,7 @@ setInterval(() => {}, 1_000);
 
     const logs: string[] = [];
     const sessionId = 'terminal-auth-session';
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -241,6 +209,23 @@ setInterval(() => {}, 1_000);
     expect(viewHtml).toContain('var hasToken=false');
     // The browser must carry the view capability into its WS connection too.
     expect(viewHtml).toContain("base+'/'+location.search");
+    // 无平台提示头时按本地只读渲染（readonly 横幅，不是 SSO 登录引导）。
+    expect(viewHtml).toContain('var platformReadonly=false');
+
+    // #933 回归修复：中央前门剥掉平台注入的 Cookie/Role 后，用展示层提示头把「平台
+    // 认证过的只读访客」带过来 → 页面渲染 SSO 登录引导（platformReadonly=true），
+    // 而读/写授权判定不受它影响（仍是只读：hasToken=false）。
+    const platformHintView = await fetch(`${base}/?viewToken=${encodeURIComponent(ready.viewToken!)}`, {
+      headers: { 'x-botmux-platform-readonly': '1' },
+    });
+    expect(platformHintView.status).toBe(200);
+    const platformHintHtml = await platformHintView.text();
+    expect(platformHintHtml).toContain('var hasToken=false');
+    expect(platformHintHtml).toContain('var platformReadonly=true');
+    // 提示头绝不能把写权限带出来：伪造它 + 错误 token 仍被整体拒绝。
+    expect((await fetch(`${base}/?token=wrong-token`, {
+      headers: { 'x-botmux-platform-readonly': '1' },
+    })).status).toBe(403);
 
     // Every historically issued stable view token fails closed on this worker.
     expect((await fetch(`${base}/?viewToken=${encodeURIComponent(retiredStableViewToken(secret, sessionId))}`)).status).toBe(403);
@@ -427,7 +412,7 @@ setInterval(() => {}, 1_000);
 
     const logs: string[] = [];
     const sessionId = 'view-central-session';
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -550,7 +535,7 @@ setInterval(() => {}, 1_000);
     };
     const spawnWorker = async (): Promise<{ child: ChildProcess; ready: Extract<WorkerToDaemon, { type: 'ready' }> }> => {
       const logs: string[] = [];
-      const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      const child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -633,8 +618,12 @@ setInterval(() => {}, 1_000);
   // 过期的窥屏通道，中央前门再怎么撤销也够不着它。
   //
   // 这条缝的宽度就等于那次同步文件读：本地 SSD 上 ~0.1ms，$HOME 挂在慢盘/NFS 上就是
-  // 几十上百毫秒（backlog P1-10 记的正是这种 HOME）。测试在子进程内只对
-  // `.dashboard-secret` 读注入等价延迟，保持凭证本身符合宿主安全原语的大小限制。
+  // 几十上百毫秒（backlog P1-10 记的正是这种 HOME）。以前靠把 secret 文件用 32MB 空白
+  // 撑大来复现慢 HOME 的时序，但 #920 给宿主凭证读取加了严格 0600 + 256 字节上限，撑大的
+  // 文件会被直接判「大小异常」拒读——于是改用 worker 侧的测试专用 env
+  // （BOTMUX_TEST_TERMINAL_SECRET_READ_DELAY_MS）在握手路径的那次 secret 读后加一段有界
+  // 忙等：secret 值一个字节没变、凭证文件仍是合法的小文件，只是把这条本来就存在的缝
+  // 稳定拉宽到可观测（生产不设该 env，行为不变）。
   it('P1-3: a view capability that dies inside the WS handshake is refused at the connection re-check', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-ws-handshake-race-'));
     tempDirs.add(root);
@@ -643,8 +632,15 @@ setInterval(() => {}, 1_000);
     const secret = 'integration-ws-handshake-race-secret';
     const botmuxDir = join(root, '.botmux');
     mkdirSync(botmuxDir, { recursive: true });
-    writeFileSync(join(botmuxDir, '.dashboard-secret'), secret, { mode: 0o600 });
-    const slowDashboardSecretReadHook = installSlowDashboardSecretReadHook(root, 40);
+    // 合法的小凭证文件（0600），满足 #920 的严格宿主凭证读取；握手读窗口由下面的
+    // 测试专用 env 拉宽，而不是靠撑大文件。
+    writeFileSync(
+      join(botmuxDir, '.dashboard-secret'),
+      secret,
+      { mode: 0o600 },
+    );
+    // 握手路径每次读 secret 后忙等这么久，复现慢 HOME 的读窗口（> P1-3 需要的 20ms 下限）。
+    const handshakeReadDelayMs = 40;
 
     // 让 scrollback 非空。socket 一旦被登记，worker 会立刻把这段历史种子推过去，于是
     // 「有没有被登记」在客户端侧是直接可观测的事实，不用去断言 worker 的内部集合。
@@ -660,18 +656,16 @@ setInterval(() => {}, 1_000);
 
     const logs: string[] = [];
     const sessionId = 'ws-handshake-race-session';
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
-        NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require=${slowDashboardSecretReadHook}`]
-          .filter(Boolean)
-          .join(' '),
         HOME: root,
         SESSION_DATA_DIR: dataDir,
         BOTMUX_SESSION_ID: sessionId,
         LARK_APP_ID: 'app_ws_race',
         LARK_APP_SECRET: 'secret',
+        BOTMUX_TEST_TERMINAL_SECRET_READ_DELAY_MS: String(handshakeReadDelayMs),
       },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });

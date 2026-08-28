@@ -1,3 +1,4 @@
+import type React from 'react';
 import { useEffect, useState } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useDashboardStore } from './react-hooks.js';
@@ -5,7 +6,7 @@ import { ui } from './ui.js';
 import { parseWorkbenchHash, type WorkbenchSessionRow } from './agent-workbench-model.js';
 import { AgentWorkbenchView } from './agent-workbench-view.js';
 
-function AgentWorkbenchRoutePage(): JSX.Element {
+function AgentWorkbenchRoutePage(): React.JSX.Element {
   const snapshot = useDashboardStore();
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -18,8 +19,8 @@ function AgentWorkbenchRoutePage(): JSX.Element {
       sessions={[...snapshot.sessions.values()] as WorkbenchSessionRow[]}
       online={snapshot.online}
       authenticated={ui.workbenchAuthed}
-      // P1-4：操作入口（定位/接管/交互）各看服务端投影的对应布尔，不再由
-      // workbenchAuthed 一个布尔包办。
+      // P1-4：写操作入口（定位/接管/交互）各看服务端投影的对应布尔，不再由
+      // workbenchAuthed 一个布尔包办；跳转是行数据提供的只读 AppLink。
       capabilities={ui.workbenchCapabilities}
       // 「常驻链接」是管理面能力，只认本机完整管理身份（loadAuthState 从
       // /api/settings 的 authed 写入；H5/平台身份在那里就被置 false）。

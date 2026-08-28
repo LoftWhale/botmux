@@ -3,6 +3,7 @@ import { createHmac } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import { once } from 'node:events';
+import { tsRunnerPrefix, tsEvalArgs } from './helpers/ts-runner.js';
 import {
   chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
   symlinkSync, writeFileSync, existsSync, statSync,
@@ -263,10 +264,15 @@ describe('token persistence (survives restart, rotates only on `botmux dashboard
       while (!existsSync(goPath)) await new Promise(resolve => setTimeout(resolve, 5));
       process.stdout.write(loadOrCreatePersistedToken(tokenPath));
     `;
+    // The extra argv after the source can't go through the spawnTsEval wrapper,
+    // so build the runtime-aware prefix by hand. Node still needs `--import tsx`
+    // because the snippet imports a repo .ts module; Bun runs TS natively.
+    const { command, prefixArgs } = tsRunnerPrefix();
+    const evalArgs = tsEvalArgs(childSource).args;
     const children = Array.from({ length: 12 }, (_, index) => {
       const readyPath = join(dir, `token-ready-${index}`);
-      const child = spawn(process.execPath, [
-        '--import', 'tsx', '--input-type=module', '-e', childSource,
+      const child = spawn(command, [
+        ...prefixArgs, ...evalArgs,
         tokenPath, readyPath, goPath,
       ], { stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
@@ -471,10 +477,12 @@ describe('token persistence under a symlinked HOME on a shared drive (Linux FD-p
       while (!existsSync(goPath)) await new Promise(resolve => setTimeout(resolve, 5));
       process.stdout.write(loadOrCreatePersistedToken(tokenPath));
     `;
+    const { command, prefixArgs } = tsRunnerPrefix();
+    const evalArgs = tsEvalArgs(childSource).args;
     const children = Array.from({ length: 12 }, (_, index) => {
       const readyPath = join(base, `ready-${index}`);
-      const child = spawn(process.execPath, [
-        '--import', 'tsx', '--input-type=module', '-e', childSource,
+      const child = spawn(command, [
+        ...prefixArgs, ...evalArgs,
         tokenPath, readyPath, goPath,
       ], { stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
@@ -578,6 +586,7 @@ describe('dashboard secret persistence', () => {
     if (process.platform === 'win32') return;
     mkdirSync(join(dir, 'nested'));
     writeFileSync(secretPath, 'x'.repeat(43), { mode: 0o644 });
+    chmodSync(secretPath, 0o644);
     expect(() => loadDashboardSecret(secretPath)).toThrow(/0600/);
   });
 
@@ -606,10 +615,12 @@ describe('dashboard secret persistence', () => {
       while (!existsSync(goPath)) await new Promise(resolve => setTimeout(resolve, 5));
       process.stdout.write(loadOrCreateDashboardSecret(secretPath));
     `;
+    const { command, prefixArgs } = tsRunnerPrefix();
+    const evalArgs = tsEvalArgs(childSource).args;
     const children = Array.from({ length: 8 }, (_, index) => {
       const readyPath = join(dir, `ready-${index}`);
-      const child = spawn(process.execPath, [
-        '--import', 'tsx', '--input-type=module', '-e', childSource,
+      const child = spawn(command, [
+        ...prefixArgs, ...evalArgs,
         secretPath, readyPath, goPath,
       ], { stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
@@ -1061,6 +1072,7 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
   it('management/config reads stay behind the token even in publicReadOnly', () => {
     for (const pathname of [
       '/api/connectors',
+      '/api/autostart',
       '/api/connectors/stats',
       '/api/webhook-secrets',
       '/api/trigger-logs',

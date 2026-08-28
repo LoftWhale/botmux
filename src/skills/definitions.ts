@@ -270,7 +270,7 @@ JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`r
 
 const SEND_SKILL = `---
 name: botmux-send
-description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
+description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 按 messageId 原地更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
 ---
 
 # botmux-send — 向飞书话题发送消息
@@ -427,6 +427,28 @@ botmux send --card-file /tmp/card.json --no-mention
 botmux send --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"**Done**"}]}}' --mention-back
 \`\`\`
 
+#### 发出后原地更新：\`botmux card patch\`
+
+自定义卡片发出后可以**原地改内容**——不发新消息、不换群/话题，用户看到的还是那张卡。适合进度卡片（开始时发「进行中」，每到节点刷新，结束改「完成」，不刷屏）和状态卡片（构建/审批结果过期后原地更正）。只想再发一条消息就用 \`send\`；daemon 自己维护的流式卡片/会话管理卡不要 patch；消息已撤回只能重新 send。
+
+流程是 \`send\` 拿 \`messageId\` → \`card patch\` 按它更新：
+
+\`\`\`bash
+MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+botmux card patch --message-id "$MID" --card-file /tmp/progress-50.json
+botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 100%"}]}}'
+\`\`\`
+
+| 参数 | 说明 |
+|---|---|
+| \`--message-id <om_xxx>\` | 必填。目标卡片的 messageId，取自 \`botmux send\` 成功输出的 \`.messageId\` |
+| \`--card-file <path>\` / \`--card-json <json>\` | 新卡片 JSON，二选一 |
+| \`--session-id <id>\` | 手动指定 session（通常自动推断，不需要传） |
+
+安全边界与上面的 \`send --card-file/--card-json\` **完全相同**：只允许纯展示元素 + open_url 按钮，任何回调控件都会被拒绝。Bot 身份从会话上下文解析，不提供 \`--bot\` 类显式指定；飞书本身也禁止跨应用 patch 别人的卡片。
+
+成功 stdout 一行 JSON \`{"success":true,"messageId":"om_xxx","sessionId":"..."}\`。参数错误（缺 \`--message-id\`、卡片输入未二选一、messageId 非 \`om_\` 开头、含回调控件、JSON 非法）exit 2；\`--card-file\` 不存在、消息已撤回、飞书 API 报错 exit 1，stderr 透出原因。
+
 ### @mention 其他机器人协作
 
 \`\`\`bash
@@ -528,12 +550,16 @@ botmux send --top-level --chat-id oc_xxxxxxxxxxxx "📦 自动推送内容..."
 
 const BOTS_SKILL = `---
 name: botmux-bots
-description: 列出当前飞书群里可协作的机器人（协作花名册：含能力标签、是否有团队角色、以及你能否可靠 @ 到它）。在需要点名其他机器人协作、或交棒给队友前查看时使用。
+description: 列出可协作的机器人（协作花名册）。默认列**当前飞书群内**的 bot（含能力标签、是否有团队角色、能否可靠 @ 到它）；加 --scope team 则跨机列**同团队、已 opt-in** 的 agent 供按专长发现，并可用 create-group --team 拉进新群、或 bots invite 补进已有团队群。在需要点名协作、交棒队友、或跨机找/拉别人的 agent 前使用。
 ---
 
-# botmux-bots — 群内协作花名册
+# botmux-bots — 协作花名册（群内 + 团队维度）
 
-## 用法
+两种 scope，用途不同：
+- **chat（默认）**：\`botmux bots list\` —— 列**当前群里**的 bot，判断能不能 @、派活。
+- **team**：\`botmux bots list --scope team\` —— 跨机列**同团队、已 opt-in** 的 agent（在别人机器上、还没进你的群），用于按专长发现后拉群协作。
+
+## 用法（chat scope，默认）
 
 \`\`\`bash
 botmux bots list
@@ -577,13 +603,44 @@ botmux bots list
 }
 \`\`\`
 
-## 关键规则
+## 关键规则（chat scope）
 
 1. **只 @ \`mentionable=true\` 的机器人**。\`mentionable=false\` 表示"知道它在群里，但当前点不准"（飞书 open_id 按 app 隔离）——这种先让它 / 用户在群里 \`/introduce\` 一次，再点名。
 2. 按 \`capability\` 挑合适的队友，而不是乱点。
 3. **\`unknown\` ≠ 不可用、更 ≠ 离线**：只是这条命令当前没有足够证据。别把 \`unknown\` 当成"它挂了"而放弃派活；语义拿不准就查 \`collaborationHelp\`。
 4. \`authorization.operate\` 默认按 \`false\`/\`unknown\` 处理：能对话不等于能让它跑 \`/repo\`、\`/restart\` 等管理动作，那类要单独授权。
 5. 配合 botmux send：\`botmux send --mention "ou_yyy:后端Bot" "请帮忙处理"\`
+
+## 团队维度：跨机发现 + 拉群（--scope team）
+
+用途：找到**同团队、还没进你群、在别人机器上**的 agent，按专长挑出来，拉进一个聚焦新群一起干活。
+
+\`\`\`bash
+# 1) 发现：列同团队已 opt-in 的 agent（本机在多团队时用 --team 指定）
+botmux bots list --scope team [--team <teamId>]
+
+# 2a) 建新群：把发现到的 agent（按 appId）+ 各自 owner 拉进一个平台代建的**新群**
+botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群名"]
+
+# 2b) 往已有群补人：把 agent + 各自 owner 加进一个**你已在场的**群（恒带 owner）
+botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
+\`\`\`
+
+team scope 输出的 \`agents[]\` 每项：\`appId\`（拉群/补人就用它）、\`name\`、\`specialties\`（专长标签数组，发现依据）、\`mentionable\`、\`online\`、\`owner\`、\`machineId/machineName\`。
+
+**必须知道的语义**：
+- **opt-in 闸**：发现列表**只含已加入团队的 agent**——即它的 owner 在平台「管理机器人」里把它显式加进了团队（\`team.bots\`）。没加进来的 agent 你看不到、也拉不动。查不到某个 agent？多半是对方 owner 还没 opt-in，不是命令坏了。
+- **specialties / mentionable / online 是 agent 自报**：仅供你挑选参考，**不是可信凭据**，别拿它当权限判断。
+- **CLI 不做任何授权判断**：团队成员校验、opt-in 闸全在平台。你只管发现 + 拉群/补人，平台会拒绝越权的调用。
+- **只认 appId、不需要 @**：正因为别人 bot 进你群前你根本 @不到它，team 拉群/补人全走 appId + machine-auth，天然绕开"看不见就点不着"。结果里 \`invalidBotIds\` / \`invalidOwnerUnionIds\` 是平台过滤掉的（未 opt-in / 拉不动），如实展示即可。
+- \`bots invite\` 的目标群要满足：**平台机器人（BotmuxPlatform）已在群里**（否则平台加不进人 → 403 \`platform_bot_not_in_chat\`，先把它拉进群）+ **你本人已在该群**（→ 403 \`requester_not_in_chat\`，只能往你自己在场的群补人）+ **非机器人大厅**（→ 403 \`chat_is_hall\`）。补人恒把 agent + 各自 owner 一起拉进。
+- 平台端点没上线时命令会明确提示「平台尚未部署…端点」——那是平台侧还没部署，不是你调错。
+
+**三条拉人路径 —— 别混**：
+- \`create-group --team\`：跨机、把**同团队但不在任何共同群**的 agent + owner **新建**成一个聚焦群。"首次把没见过面的 agent 聚到一起"。
+- \`bots invite --chat\`：把同团队 agent + 各自 owner 加进一个**你已在场、且平台机器人也在**的群（跨机、machine-auth、只认 appId）。"群已经在了，往里补同团队的人（含其 owner）"。
+- \`/invite\`（飞书群内 slash）：把 bot 加进**当前已存在的**群，走飞书原生加成员，**限同租户**、只拉 bot 不带 owner。"群在了，把某个同租户 bot 也拉进来"。
+- 一句话：跨 team 从零聚人 → \`create-group --team\`；往你已在场的群补同团队的人 → \`bots invite\`；当前群补同租户 bot → \`/invite\`。
 
 ## 要把任务交棒给别的机器人？
 
@@ -592,7 +649,7 @@ botmux bots list
 
 const HANDOFF_SKILL = `---
 name: botmux-handoff
-description: 把当前任务交棒给团队里另一个机器人时使用（多机器人协作接力）。当你做完自己负责的部分、需要另一个机器人接手下一步，或用户说"交给X""让X接着做""@某bot继续""下一步谁谁来"时触发。先用 botmux-bots 查花名册挑对象，再用结构化交接发给对方。
+description: 把当前任务交棒给团队里另一个机器人时使用（多机器人协作接力）。当你做完自己负责的部分、需要另一个机器人接手下一步，或用户说"交给X""让X接着做""@某bot继续""下一步谁谁来"时触发。单个目标 bot 或单个专项的接力默认保留在当前话题，不新建子项目话题；先用 botmux-bots 查花名册挑对象，再用结构化交接发给对方。
 ---
 
 # botmux-handoff — 机器人接力交棒
@@ -605,6 +662,13 @@ description: 把当前任务交棒给团队里另一个机器人时使用（多�
    - 按 \`capability\` 挑**合适**的接手机器人；
    - 确认它 \`mentionable: true\`（若为 false，先让它/用户 \`/introduce\` 一次再点名）。
 2. 用 \`botmux send --mention\` 发一条**结构化交接**给它。
+
+## 话题规则
+
+- **单 bot 接力留在当前话题**：直接运行 \`botmux send --mention\`，不加 \`--top-level\`；BotMux 会把消息发回当前轮次所在话题。
+- 不要为单个接手者运行不带 \`--into\` 的 \`botmux dispatch\`：它会额外发一条顶层子项目消息、新建话题。
+- 如果必须使用稳定 App ID 和接单确认，使用 \`botmux dispatch --into <当前话题根消息id> --bot-app <larkAppId> ...\`，明确追加到当前话题。
+- 只有任务确实拆成多个独立子项目、需要并行跟踪和主 bot 汇总时，才使用 \`botmux-orchestrate\` 新开话题。
 
 ## 交接必须包含 5 要素
 
@@ -1199,7 +1263,7 @@ $${GOAL_ENV.INPUTS_PATH}
 
 const ORCHESTRATE_SKILL = `---
 name: botmux-orchestrate
-description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 分工」+「持续的 goal 群/多话题协调与进度板」+「主 bot 汇总验收」时触发，例如多组 coder/reviewer 并行推进。若只是一个有界 DAG、跑完即散、产出单一交付物，应使用 botmux-workflow；单步任务直接处理。显式提到 botmux orchestrate / goal supervise / dispatch 派活时也使用。
+description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 分工」+「持续的 goal 群/多话题协调与进度板」+「主 bot 汇总验收」时触发，例如多组 coder/reviewer 并行推进。若只是一个有界 DAG、跑完即散、产出单一交付物，应使用 botmux-workflow；只把下一步或单个专项交给一个 bot 时，必须使用 botmux-handoff 留在当前话题，不得新建子项目话题。显式提到 botmux orchestrate / goal supervise / dispatch 派活时也使用。
 ---
 
 # botmux-orchestrate — 多 bot 多话题编排
@@ -1209,7 +1273,7 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 ## 适用 & 不适用
 - 适用：一个长期项目同时满足三个结构化判据：① **多个 bot 分工**处理基本独立的子项目；② 需要持续存在的 **goal 群/多话题协调**和共享进度板；③ 主 bot 要持续收件并做最终**验收**。
 - 不适用：一个**有界 DAG、跑完即散、只有一个交付物**的多步目标——使用 **botmux-workflow**。
-- 不适用：单步请求 / 普通改代码（直接做），或只需把下一步交给一个 bot（用 botmux-handoff）。
+- 不适用：单步请求 / 普通改代码（直接做），或只需把下一步、单个专项交给一个 bot（用 botmux-handoff，留在当前话题）。
 
 ## 物理事实（先记牢）
 - **你和子 bot 之间没有直连**，只能靠飞书消息触发；**没有请求-响应关联**——子 bot 干完用 \`botmux report\` 把回报发回**你这条主编排话题**（不是在它自己的子话题里 @ 你——那条子话题没有你的会话，@ 会另起一个无上下文的新会话）。对你就是「话题里来了条新消息」，你被唤起（带完整上下文）后去读任务板拿结构化状态。
@@ -1537,11 +1601,32 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-send', content: SEND_SKILL },
   { name: 'botmux-bots', content: BOTS_SKILL },
   { name: 'botmux-handoff', content: HANDOFF_SKILL },
+  { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
+];
+
+/** The v3 Workflow skill family, gated by the machine-wide workflow kill-switch
+ *  (`workflow.enabled` / `BOTMUX_WORKFLOW_ENABLED`, see
+ *  global-config.ts `isWorkflowFeatureEnabled`). Kept OUT of {@link BUILTIN_SKILLS}
+ *  — which is installed/advertised unconditionally — so that when the feature is
+ *  disabled these skills are neither written to a CLI's skills dir nor listed in
+ *  the prompt catalog (mirrors how the whiteboard skill is conditional).
+ *
+ *  `botmux-orchestrate` is deliberately NOT here: it is a separate multi-bot
+ *  long-running-orchestration capability, not a v3 workflow, and stays available
+ *  regardless of the workflow switch.
+ *
+ *  Order matches their historical position in the catalog (right after
+ *  `botmux-handoff`) so the ENABLED path renders byte-for-byte as before. */
+export const WORKFLOW_FEATURE_SKILLS: SkillDef[] = [
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
   { name: 'botmux-workflow', content: WORKFLOW_V3_SKILL },
   { name: 'botmux-goal-ask', content: GOAL_ASK_SKILL },
-  { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
 ];
+
+/** Names in {@link WORKFLOW_FEATURE_SKILLS}, for install cleanup + catalog
+ *  filtering when the workflow feature is off. */
+export const WORKFLOW_FEATURE_SKILL_NAMES: string[] =
+  WORKFLOW_FEATURE_SKILLS.map((s) => s.name);
 
 /** Skills that earlier botmux versions installed but no longer ship. The
  *  installer cleans these up so renamed skills don't linger as duplicates
@@ -1555,4 +1640,8 @@ export const RETIRED_SKILL_NAMES: string[] = [
   // (Groups & Bots → bot card). The CLI subcommand was removed too, so the
   // skill has nothing to drive — prune it from every CLI's skills dir on upgrade.
   'botmux-worker-budget',
+  // Folded into botmux-send as the "发出后原地更新" section (the `botmux card
+  // patch` subcommand stays). Only pre-release builds of this branch ever wrote
+  // it, but those installs must not linger as a duplicate skill.
+  'botmux-card-patch',
 ];

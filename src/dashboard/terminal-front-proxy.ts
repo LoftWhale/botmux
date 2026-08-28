@@ -7,6 +7,7 @@ import {
 import type { Duplex } from 'node:stream';
 import { requestLiteralLoopback } from '../core/loopback-target.js';
 import { TERMINAL_VIEW_FORWARD_HEADER } from '../core/terminal-control-grant.js';
+import { TERMINAL_PLATFORM_READONLY_HINT_HEADER } from '../core/terminal-write-auth.js';
 import type {
   TerminalControlManager,
   TerminalDashboardActor,
@@ -200,7 +201,25 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
         viewForwardProof = options.viewCapabilityForwardProof?.(viewToken);
       }
     }
-    const proxyGrant = actor && !hasExplicitQueryCapability
+    // P1-6: an explicit `?token=`/`?viewToken=` query capability is normally the
+    // SOLE authorization basis — no proxy grant is injected next to it, so a wrong
+    // token can't borrow the opener's owner ambient. But a `?viewToken=` READ link
+    // is the one the Feishu card hands the owner, and stripping the owner's proxy
+    // grant there regressed the pre-3.16 behavior "owner logs in → can operate":
+    // the viewToken forced read-only and the owner's platform identity was dropped
+    // (#933). Carve out exactly that case — a verified platform OWNER opening a
+    // viewToken-only link (never `?token=`, which keeps its independent-capability
+    // path) still gets the signed WRITE grant. This does NOT reopen P1-6: the grant
+    // is minted here from `actor` — whose owner role is itself gated on the
+    // platform-injected dashboard-token cookie matching this machine's live secret
+    // (resolveDashboardIdentity), a value a viewToken holder does not possess — and
+    // travels as an HMAC-signed `X-Botmux-Terminal-Control` header, never as a
+    // passed-through client cookie/role. A guest/teammate viewToken opener has no
+    // owner actor, so this branch does not fire and they stay read-only.
+    const ownerWithViewToken = actor?.terminalCapability === 'owner'
+      && url.searchParams.has('viewToken')
+      && !url.searchParams.has('token');
+    const proxyGrant = actor && (!hasExplicitQueryCapability || ownerWithViewToken)
       ? options.control.grantForProxy(actor, parsed.sessionId)
       : undefined;
     if (actor && proxyGrant?.scope === 'read') readAuthSessionId = actor.authSessionId;
@@ -213,6 +232,16 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
     // Set AFTER the header build, which drops every client-supplied `x-botmux-*`
     // on this path: a browser can never smuggle its own forward proof through.
     if (viewForwardProof) headers[TERMINAL_VIEW_FORWARD_HEADER] = viewForwardProof;
+    // #933 回归修复：`terminalCapability === 'readonly'` 只可能来自平台注入身份
+    // （teammate/guest —— legacy/H5 都是 'controlled'，平台 owner 是 'owner'）。上面
+    // 两条路都已把平台注入的 Cookie / X-Botmux-Role 剥掉（P1-6 strip 或换内部 grant），
+    // worker 便判不出「平台认证过的只读访客」→ platformReadonly 恒 false → 只读终端页
+    // 上的「owner 登录后可操作 →」SSO 引导消失，冷打开卡片链接的人困在无登录入口的
+    // 只读页里。补一个仅展示用的提示头（授权判定完全不读它，见常量注释）；同样设在
+    // terminalForwardHeaders 之后，客户端自带的同名头已被整片丢弃、无法夹带。
+    if (actor?.terminalCapability === 'readonly') {
+      headers[TERMINAL_PLATFORM_READONLY_HINT_HEADER] = '1';
+    }
     return { ...parsed, port, revoked: false, actor, proxyGrant, readAuthSessionId, headers };
   };
 
@@ -315,24 +344,27 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
         return;
       }
 
-      let leaseMarker: string | undefined;
-      if (prepared.actor && prepared.proxyGrant?.scope === 'write' && prepared.proxyGrant.leaseMarker) {
+      let acquisition: string | undefined;
+      if (prepared.actor && prepared.proxyGrant?.scope === 'write' && prepared.proxyGrant.acquisition) {
         const registered = options.control.registerWritableSocket(
           prepared.actor,
           prepared.sessionId,
           clientSocket,
-          prepared.proxyGrant.leaseMarker,
+          prepared.proxyGrant.acquisition,
         );
-        leaseMarker = registered.leaseMarker;
+        acquisition = registered.acquisition;
         if (!registered.registered) {
           // The worker may have accepted a grant that was valid when the dial
           // began but was released/expired/replaced during its async handshake.
           // Never relay that 101: revoke the matching old lease (if any) and
           // make the browser reconnect through the now-read-only path.
+          // `disconnect` is acquisition-scoped, so if the reason we could not
+          // register is that a NEWER acquisition took the lease over, this call
+          // is a no-op instead of collateral damage.
           options.control.disconnect(
             prepared.actor,
             prepared.sessionId,
-            prepared.proxyGrant.leaseMarker,
+            prepared.proxyGrant.acquisition,
           );
           upstreamSocket.destroy();
           socketError(clientSocket, 409, 'terminal control expired');
@@ -347,7 +379,7 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       // owner's fixed write grant, which has no lease behind it) is indexed
       // here — otherwise the liveness re-check above would only have moved the
       // leak one tick later instead of closing it.
-      const deregisterBridgeSocket = authSessionId !== undefined && !leaseMarker
+      const deregisterBridgeSocket = authSessionId !== undefined && !acquisition
         ? options.control.registerReadSocket(authSessionId, clientSocket)
         : undefined;
 
@@ -364,8 +396,8 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
         if (disconnected) return;
         disconnected = true;
         deregisterBridgeSocket?.();
-        if (prepared.actor && leaseMarker) {
-          options.control.disconnect(prepared.actor, prepared.sessionId, leaseMarker);
+        if (prepared.actor && acquisition) {
+          options.control.disconnect(prepared.actor, prepared.sessionId, acquisition);
         }
       };
 

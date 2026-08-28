@@ -7,7 +7,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdirSync, rmSync, appendFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { codexHome } from '../src/services/codex-paths.js';
 
 // ---------------------------------------------------------------------------
@@ -44,12 +44,14 @@ import { createMirAdapter } from '../src/adapters/cli/mir.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
-import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
+import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
+import { assertEbsdPerBotEnv, createEbsdAdapter, ebsdBotmuxSessionDir } from '../src/adapters/cli/ebsd.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createDshAdapter } from '../src/adapters/cli/dsh.js';
+import { createDshTuiAdapter } from '../src/adapters/cli/dsh-tui.js';
 import { buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import { ALL_CLI_IDS as REGISTRY_ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import { isRemoteCliId } from '../src/core/remote-cli-ids.js';
@@ -111,7 +113,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi', 'grok', 'kiro-cli', 'reasonix'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'ebsd', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -552,6 +554,68 @@ describe('codex-app buildArgs', () => {
     expect(args).toContain('--thread-id');
     expect(args).toContain('thread-123');
   });
+
+  it('canonicalizes a symlinked codex so --codex-bin matches the sandbox-authorized path', () => {
+    // Regression, same class as the dsh case below: `codex` on PATH is commonly a
+    // symlink CHAIN — measured on the dev box, ~/.local/bin/codex →
+    // …/standalone/current/bin/codex → …/releases/<version>/bin/codex, where the
+    // middle `current` hop re-points on every upgrade. The file sandbox authorizes
+    // only dirname(realpath(bin)) (worker.ts `execDirs`), while
+    // codex-app-runner.ts spawns --codex-bin verbatim → `execvp … No such file or
+    // directory` inside the sandbox and an app-server crash-loop.
+    //
+    // Verified against a real bwrap sandbox: raw path → execvp ENOENT, canonical
+    // path → exit 0. All three call sites must agree, since they share one cache.
+    const root = mkdtempSync(join(tmpdir(), 'codex-symlink-'));
+    try {
+      const realDir = join(root, 'releases', '1.2.3', 'bin');
+      mkdirSync(realDir, { recursive: true });
+      const realBin = join(realDir, 'codex');
+      writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
+      // Two hops, mirroring the real install: link/codex → current/codex → realBin.
+      const midDir = join(root, 'current', 'bin');
+      mkdirSync(midDir, { recursive: true });
+      const midBin = join(midDir, 'codex');
+      symlinkSync(realBin, midBin);
+      const linkDir = join(root, 'local', 'bin');
+      mkdirSync(linkDir, { recursive: true });
+      const linkBin = join(linkDir, 'codex');
+      symlinkSync(midBin, linkBin);
+
+      const symlinkAdapter = createCodexAppAdapter(linkBin);
+      const canonicalReal = realpathSync(realBin);
+      expect(linkBin).not.toBe(canonicalReal); // the hazard exists in this fixture
+
+      const args = symlinkAdapter.buildArgs({ sessionId: 's', resume: false });
+      const binIdx = args.indexOf('--codex-bin');
+      expect(binIdx).toBeGreaterThanOrEqual(0);
+      expect(args[binIdx + 1]).toBe(canonicalReal);
+      // Must equal the argv exactly — the sandbox authorizes from THIS list while
+      // the runner spawns the argv; any divergence is the bug.
+      expect(symlinkAdapter.sandboxExtraExecPaths?.()).toEqual([canonicalReal]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('passes the opt-in browser bridge only to the Codex App runner', () => {
+    const disabled = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
+    expect(disabled).not.toContain('--browser-family');
+
+    const enabled = adapter.buildArgs({
+      sessionId: 'sess-app',
+      resume: false,
+      codexBrowser: {
+        enabled: true,
+        family: 'edge',
+        pluginRoot: '/opt/codex/chrome-plugin',
+      },
+    });
+    expect(enabled).toEqual(expect.arrayContaining([
+      '--browser-family', 'edge',
+      '--browser-plugin-root', '/opt/codex/chrome-plugin',
+    ]));
+  });
 });
 
 describe('mira buildArgs', () => {
@@ -644,6 +708,36 @@ describe('dsh buildArgs (runner model)', () => {
     expect(adapter.modelChoices).toEqual(['deepseek-v4-flash', 'deepseek-v4-pro']);
   });
 
+  it('canonicalizes a symlinked bin so --dsh-bin matches the sandbox-authorized path', () => {
+    // Regression: a symlink-installed dsh-jsonrpc-agent (e.g. ~/.local/bin →
+    // SDK package dir) plus a symlinked HOME made the runner spawn the raw
+    // symlink path, which the file sandbox never exposes (it authorizes only
+    // dirname(realpath(bin))) → `spawn ... ENOENT` crash-loop under sandbox=true.
+    // Both --dsh-bin and sandboxExtraExecPaths() must resolve to the real target.
+    const root = mkdtempSync(join(tmpdir(), 'dsh-symlink-'));
+    try {
+      const realDir = join(root, 'opt', 'runtime');
+      mkdirSync(realDir, { recursive: true });
+      const realBin = join(realDir, 'dsh-jsonrpc-agent-pkg-linux-x64');
+      writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
+      const linkDir = join(root, 'local', 'bin');
+      mkdirSync(linkDir, { recursive: true });
+      const linkBin = join(linkDir, 'dsh-jsonrpc-agent');
+      symlinkSync(realBin, linkBin);
+
+      const symlinkAdapter = createDshAdapter(linkBin);
+      const canonicalReal = realpathSync(realBin);
+
+      const args = symlinkAdapter.buildArgs({ sessionId: 's', resume: false });
+      const binIdx = args.indexOf('--dsh-bin');
+      expect(binIdx).toBeGreaterThanOrEqual(0);
+      expect(args[binIdx + 1]).toBe(canonicalReal);
+      expect(symlinkAdapter.sandboxExtraExecPaths?.()).toEqual([canonicalReal]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('writeInput frames content with the dsh marker', async () => {
     const written: string[] = [];
     const pty = {
@@ -656,6 +750,65 @@ describe('dsh buildArgs (runner model)', () => {
     const decoded = JSON.parse(Buffer.from(line.slice('::botmux-dsh:'.length).trim(), 'base64').toString('utf8'));
     expect(decoded.content).toBe('hello dsh');
     expect(decoded.replyTurnId).toBe('turn-1');
+  });
+});
+
+describe('dsh-tui buildArgs (PTY TUI model)', () => {
+  const adapter = createDshTuiAdapter('/opt/dsh-tui/bin/dsh-tui');
+
+  it('spawns the dsh-tui binary directly (no runner)', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-tui', resume: false, workingDir: '/repo/root' });
+    expect(adapter.resolvedBin).toBe('/opt/dsh-tui/bin/dsh-tui');
+    // No runner script — the TUI is spawned directly with no args on fresh boot.
+    expect(args.some(a => /runner\.js$/.test(a))).toBe(false);
+  });
+
+  it('passes --resume for session resume', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'abc-123' });
+    expect(args).toContain('--resume');
+    expect(args).toContain('abc-123');
+  });
+
+  it('passes bare --resume (no session id) to read resume.txt', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: true });
+    expect(args).toEqual(['--resume']);
+  });
+
+  it('omits --resume on fresh spawn', () => {
+    expect(adapter.buildArgs({ sessionId: 's', resume: false })).toEqual([]);
+  });
+
+  it('has no portable copy-paste resume command (session id not tracked)', () => {
+    expect(adapter.buildResumeCommand?.({ sessionId: 's', cliSessionId: 'abc' })).toBeNull();
+  });
+
+  it('readyPattern matches the TUI prompt char', () => {
+    expect(adapter.readyPattern?.test('❯ ')).toBe(true);
+  });
+
+  it('defers the first prompt until the TUI composer is ready', () => {
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+  });
+
+  it('does not type ahead', () => {
+    expect(adapter.supportsTypeAhead).not.toBe(true);
+  });
+
+  it('exposes ~/.dsh and ~/.dsh-tui as auth paths', () => {
+    expect(adapter.authPaths).toContain('~/.dsh');
+    expect(adapter.authPaths).toContain('~/.dsh-tui');
+  });
+
+  it('writeInput types text and presses Enter', async () => {
+    const sent: string[] = [];
+    const keys: string[][] = [];
+    const pty = {
+      sendText: (t: string) => { sent.push(t); return true; },
+      sendSpecialKeys: (...k: string[]) => { keys.push(k); return true; },
+    } as unknown as PtyHandle;
+    await adapter.writeInput!(pty, 'hello tui');
+    expect(sent).toEqual(['hello tui']);
+    expect(keys).toEqual([['Enter']]);
   });
 });
 
@@ -699,6 +852,54 @@ describe('mir buildArgs (runner model)', () => {
   it('omits --mircli-bin when no cliPathOverride is configured', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false });
     expect(args).not.toContain('--mircli-bin');
+  });
+
+  it('canonicalizes a symlinked mircli so --mircli-bin matches the sandbox-authorized path', () => {
+    // Same defect class as codex-app above and dsh below: mir-runner.ts spawns
+    // `this.mircliBin || MIRCLI_BIN || 'mircli'` verbatim, while the file sandbox
+    // authorizes only dirname(realpath(bin)) (worker.ts `execDirs`) → a raw
+    // symlink path ENOENTs inside the sandbox.
+    //
+    // mir's gap used to be the WIDEST of the three: before this it declared no
+    // sandboxExtraExecPaths at all, so the second-stage binary was never exposed.
+    const root = mkdtempSync(join(tmpdir(), 'mircli-symlink-'));
+    try {
+      const realDir = join(root, 'releases', '2.0.0', 'bin');
+      mkdirSync(realDir, { recursive: true });
+      const realBin = join(realDir, 'mircli');
+      writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
+      // Two hops, matching how versioned CLIs are usually installed.
+      const midDir = join(root, 'current', 'bin');
+      mkdirSync(midDir, { recursive: true });
+      const midBin = join(midDir, 'mircli');
+      symlinkSync(realBin, midBin);
+      const linkDir = join(root, 'local', 'bin');
+      mkdirSync(linkDir, { recursive: true });
+      const linkBin = join(linkDir, 'mircli');
+      symlinkSync(midBin, linkBin);
+
+      const symlinkAdapter = createMirAdapter(linkBin);
+      const canonicalReal = realpathSync(realBin);
+      expect(linkBin).not.toBe(canonicalReal); // the hazard exists in this fixture
+
+      const args = symlinkAdapter.buildArgs({ sessionId: 's', resume: false });
+      const idx = args.indexOf('--mircli-bin');
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(args[idx + 1]).toBe(canonicalReal);
+      // The sandbox authorizes from this list while the runner spawns the argv —
+      // any divergence between the two IS the bug.
+      expect(symlinkAdapter.sandboxExtraExecPaths?.()).toEqual([canonicalReal]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('declares no sandbox exec path when there is no cliPathOverride', () => {
+    // Without an override the runner resolves `mircli` from PATH *inside* the
+    // sandbox, which the adapter cannot know here — so it declares nothing rather
+    // than guessing. Documents the remaining gap (tracked as a follow-up): that
+    // PATH entry may not be bind-mounted, and would still ENOENT.
+    expect(adapter.sandboxExtraExecPaths?.()).toEqual([]);
   });
 
   it('has no portable copy-paste resume command (mircli owns the session store)', () => {
@@ -771,11 +972,17 @@ describe('cursor buildArgs', () => {
   const adapter = createCursorAdapter('/usr/bin/cursor-agent');
 
   it('fresh session passes trust/force/model flags without resume flags', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, model: 'gpt-5' });
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      initialPrompt: 'first Lark turn',
+      model: 'gpt-5',
+    });
     expect(args).toContain('--trust');
     expect(args).toContain('--force');
     expect(args).toContain('--model');
     expect(args).toContain('gpt-5');
+    expect(args.at(-1)).toBe('first Lark turn');
     expect(args).not.toContain('--resume');
     expect(args).not.toContain('--continue');
   });
@@ -786,11 +993,13 @@ describe('cursor buildArgs', () => {
       sessionId: 'sess-cursor',
       resume: true,
       resumeSessionId: chatId,
+      initialPrompt: 'resume turn',
     });
     expect(args).toContain('--trust');
     expect(args).toContain('--resume');
     const idx = args.indexOf('--resume');
     expect(args[idx + 1]).toBe(chatId);
+    expect(args.at(-1)).toBe('resume turn');
     expect(args).not.toContain('--continue');
   });
 
@@ -814,6 +1023,27 @@ describe('cursor buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-cursor', resume: false, disableCliBypass: true });
     expect(args).toContain('--trust');
     expect(args).not.toContain('--force');
+  });
+
+  it('delivers the opening prompt through argv and enables post-ready type-ahead', () => {
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+    expect(adapter.supportsTypeAhead).toBe(true);
+  });
+
+  it('readyPattern matches BOTH the empty-session and post-turn composer placeholders', () => {
+    // Cursor Agent 2026.08.11 renders `sessionEmpty ? "Plan, search, build
+    // anything" : "Add a follow-up"` and never reverts. The worker resets the
+    // IdleDetector (clearing readySeen) before every write, and quiescence-idle
+    // is suppressed until readyPattern is seen again — so if the pattern only
+    // matched the empty-session placeholder, turn 2+ would never re-seed ready
+    // and the CLI would be stuck reporting "working" forever. Both must match.
+    expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
+    expect(adapter.readyPattern?.test('  → Add a follow-up')).toBe(true);
+    // Guard against over-broad matching: the arrow-prefixed composer glyph is
+    // required, so unrelated screen text with the phrase must not false-match.
+    expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
   });
 });
 
@@ -985,24 +1215,90 @@ describe('pi buildArgs', () => {
 
 describe('oh-my-pi buildArgs', () => {
   const adapter = createOhMyPiAdapter('/usr/bin/omp');
+  let home: string;
 
-  it('launches omp TUI with tools, approval-mode, and no-title', () => {
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-omp-adapter-'));
+    vi.stubEnv('HOME', home);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('launches an isolated omp TUI with runtime-default tools, approval-mode, and no-title', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false, initialPrompt: 'hello omp' });
     expect(adapter.resolvedBin).toBe('/usr/bin/omp');
-    expect(args).toContain('--tools');
-    expect(args).toContain('read,bash,edit,write,browser,web_search,ast_grep,ast_edit,lsp,debug,find,eval,search,task,ask');
+    expect(args).not.toContain('--tools');
+    expect(args.join(' ')).not.toMatch(/browser|ast_grep/);
     expect(args).toContain('--approval-mode');
     expect(args[args.indexOf('--approval-mode') + 1]).toBe('yolo');
     expect(args).toContain('--no-title');
+    expect(args[args.indexOf('--session-dir') + 1]).toBe(ompSessionDir('sess-omp'));
+    expect(args).not.toContain('--resume');
+    expect(args).not.toContain('--continue');
     expect(args).not.toContain('hello omp');
     expect(adapter.passesInitialPromptViaArgs).toBe(false);
     expect(adapter.altScreen).toBe(true);
+    expect(adapter.authPaths).toEqual(['~/.omp/agent']);
+    expect(adapter.supportsTypeAhead).toBe(true);
+    expect(adapter.busyPattern?.test('Working...')).toBe(true);
+    expect(adapter.busyPattern?.test('Working…')).toBe(true);
+    expect(adapter.mergeQueuedInput).not.toBe(true);
+    expect(adapter.reliableTurnTerminal).not.toBe(true);
   });
 
   it('does not include --session-id (oh-my-pi has none)', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false });
     expect(args).not.toContain('--session-id');
-    expect(args).not.toContain('sess-omp');
+  });
+
+  it('rejects path-like session ids instead of escaping the managed OMP root', () => {
+    expect(() => ompSessionDir('../sibling')).toThrow('Invalid Botmux session id for OMP');
+    expect(() => ompSessionDir('nested/session')).toThrow('Invalid Botmux session id for OMP');
+  });
+
+  it('uses the canonical home path when HOME is a symlink', () => {
+    const realHome = join(home, "real'home");
+    const linkedHome = join(home, 'linked-home');
+    mkdirSync(realHome);
+    symlinkSync(realHome, linkedHome, 'dir');
+    vi.stubEnv('HOME', linkedHome);
+
+    const expected = join(realpathSync(realHome), '.omp', 'agent', 'sessions', 'botmux', 'sess-linked');
+    expect(ompSessionDir('sess-linked')).toBe(expected);
+    const args = adapter.buildArgs({ sessionId: 'sess-linked', resume: false });
+    expect(args[args.indexOf('--session-dir') + 1]).toBe(expected);
+  });
+
+  it('resumes the newest top-level JSONL exactly and ignores nested transcripts', () => {
+    const sessionDir = ompSessionDir('sess-omp');
+    const nestedDir = join(sessionDir, 'nested');
+    mkdirSync(nestedDir, { recursive: true });
+    const older = join(sessionDir, 'older.jsonl');
+    const newest = join(sessionDir, 'newest.jsonl');
+    const nested = join(nestedDir, 'not-a-candidate.jsonl');
+    writeFileSync(older, '{}\n');
+    writeFileSync(newest, '{}\n');
+    writeFileSync(nested, '{}\n');
+    utimesSync(older, new Date(1_000), new Date(1_000));
+    utimesSync(newest, new Date(2_000), new Date(2_000));
+    utimesSync(nested, new Date(3_000), new Date(3_000));
+
+    const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: true });
+    expect(args[args.indexOf('--resume') + 1]).toBe(newest);
+    expect(args[args.indexOf('--session-dir') + 1]).toBe(sessionDir);
+    expect(args).not.toContain('--continue');
+    expect(adapter.checkResumeTargetExists?.({ sessionId: 'sess-omp' })).toBe(true);
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-omp' }))
+      .toBe(`omp --resume '${newest}' --session-dir '${sessionDir}'`);
+  });
+
+  it('fails the resume probe closed when the isolated directory has no transcript', () => {
+    mkdirSync(ompSessionDir('sess-omp'), { recursive: true });
+    expect(adapter.checkResumeTargetExists?.({ sessionId: 'sess-omp' })).toBe(false);
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-omp' })).toBeNull();
   });
 
   it('omits --approval-mode yolo when disableCliBypass is true', () => {
@@ -1215,6 +1511,102 @@ describe('oh-my-pi buildArgs', () => {
 
   it('has no modelChoices (setup skips model prompt)', () => {
     expect(adapter.modelChoices).toBeUndefined();
+  });
+});
+
+describe('ebsd buildArgs', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-ebsd-adapter-'));
+    vi.stubEnv('HOME', home);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('launches the hidden service-mode TUI without OMP yolo or model flags', () => {
+    const adapter = createEbsdAdapter('/usr/bin/ebsd');
+    const args = adapter.buildArgs({
+      sessionId: 'sid-ebsd',
+      resume: false,
+      model: 'must-not-forward',
+      disableCliBypass: false,
+    });
+    expect(args).toEqual([
+      'botmux', '--session-id', 'sid-ebsd', '--auth-mode', 'service',
+    ]);
+    expect(adapter.inputEnvelope).toBe('service-user');
+    expect(adapter.allowExtraArgs).toBe(false);
+    expect(adapter.supportsTypeAhead).toBe(false);
+    expect(adapter.reliableTurnTerminal).toBe(true);
+    expect(adapter.skillsDir).toBeUndefined();
+    expect(adapter.spawnEnv).toMatchObject({ EBSD_NO_UPDATE_CHECK: '1' });
+    expect(adapter.authPaths).toEqual(['~/.ebsd']);
+    const serviceEnv = {
+      EBSD_BOTMUX_DIAG_TOKEN_FILE: '/run/secrets/diag',
+      EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE: '/run/secrets/ak',
+      EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE: '/run/secrets/sk',
+      EBSD_BOTMUX_REPOSITORY_ROOT: '/srv/repos',
+    };
+    expect(adapter.sandboxReadonlyPaths?.(serviceEnv)).toEqual(['/srv/repos']);
+    expect(adapter.sandboxSecretReadonlyPaths?.(serviceEnv)).toEqual([
+      '/run/secrets/diag',
+      '/run/secrets/ak',
+      '/run/secrets/sk',
+    ]);
+  });
+
+  it('resumes only an exact transcript and rejects escaping ids', () => {
+    const adapter = createEbsdAdapter('/usr/bin/ebsd');
+    const dir = ebsdBotmuxSessionDir('sid-ebsd');
+    mkdirSync(dir, { recursive: true });
+    const transcript = join(dir, 'session.jsonl');
+    writeFileSync(transcript, '{}\n');
+    expect(adapter.checkResumeTargetExists?.({ sessionId: 'sid-ebsd' })).toBe(true);
+    expect(adapter.buildArgs({ sessionId: 'sid-ebsd', resume: true })).toEqual([
+      'botmux', '--session-id', 'sid-ebsd', '--auth-mode', 'service', '--resume',
+    ]);
+    expect(() => adapter.buildArgs({ sessionId: '../sibling', resume: false })).toThrow(
+      'Invalid BotMux session id for ebsd',
+    );
+    expect(() => adapter.buildArgs({ sessionId: 'x'.repeat(256), resume: false })).toThrow(
+      'Invalid BotMux session id for ebsd',
+    );
+  });
+
+  it('rejects per-bot HOME overrides that would split worker and child session roots', () => {
+    expect(() => assertEbsdPerBotEnv({ HOME: '/tmp/other-home' })).toThrow(
+      'ebsd does not allow a per-bot HOME override',
+    );
+    expect(() => assertEbsdPerBotEnv({ HTTPS_PROXY: 'http://proxy.invalid' })).not.toThrow();
+  });
+
+  it('does not retry or cancel an unconfirmed Enter', async () => {
+    const adapter = createEbsdAdapter('/usr/bin/ebsd');
+    const sendSpecialKeys = vi.fn(() => false);
+    const pty: PtyHandle = {
+      write: vi.fn(() => true),
+      sendText: vi.fn(() => true),
+      sendSpecialKeys,
+    };
+
+    const result = await adapter.writeInput?.(pty, 'diagnose');
+
+    expect(result).toMatchObject({ submitted: false });
+    expect(sendSpecialKeys.mock.calls).toEqual([['Enter']]);
+  });
+
+  it('does not promote a rejected direct PTY write to success', async () => {
+    const adapter = createEbsdAdapter('/usr/bin/ebsd');
+    const write = vi.fn(() => false);
+
+    const result = await adapter.writeInput?.({ write }, 'diagnose');
+
+    expect(result).toMatchObject({ submitted: false });
+    expect(write).not.toHaveReturnedWith(true);
   });
 });
 
@@ -1486,6 +1878,85 @@ describe('busyPattern', () => {
     expect(busy!.test('Working through the implementation')).toBe(false);
     expect(busy!.test('press esc to interrupt')).toBe(false);
   });
+
+  it('traex matches spinner-anchored working labels and standalone queue strings but not prose or idle composer', () => {
+    // Regression: a static capacity-queue screen matches readyPattern's
+    // `\d+% left` status-bar arm and survives the 2s quiescence window,
+    // flipping the card/Dashboard to Idle while the session is still waiting
+    // for capacity. The busyPattern must cover both the queue screen and the
+    // normal working indicator so the worker's deferPromptReadyWhileBusy
+    // backstop (and its idle probe) holds the session busy until a real
+    // terminal state.
+    //
+    // Every anchor below is extracted verbatim from the traex binary's
+    // compiled-in TUI string tables (verified across all 9 local releases,
+    // 0.201.1-alpha.5 … 0.201.2-alpha.2, both `traex` and
+    // `traex-code-mode-host`):
+    //   spinner frames:  "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    //   working labels:  "Working…", "Thinking…", "Pondering…",
+    //                    "Working it out…" (full rotation in traex.ts)
+    //   queue strings:   "Queued for capacity",
+    //                    "Too many requests right now. You're in the queue."
+    //   idle composer:   "Ask TraeCode CLI to do anything" + "100% context left"
+    // TraeX forked from Codex and DELETED the "esc to interrupt" footer hint
+    // (0 hits across all releases + the 94MB TUI logs), so the Codex
+    // pattern's second anchor is invalid here.
+    const busy = createTraexAdapter('/bin/traex').busyPattern;
+    expect(busy).toBeDefined();
+    // Spinner-anchored working labels: "<braille frame> <label>".
+    expect(busy!.test('⠋ Working…')).toBe(true);
+    expect(busy!.test('⠹ Thinking…')).toBe(true);
+    expect(busy!.test('⠸ Pondering…')).toBe(true);
+    expect(busy!.test('⠼ Working it out…')).toBe(true);
+    // Spinner-prefixed queue state: the queue screen can render a frozen
+    // braille frame in front of the label, and the label is part of the
+    // compiled-in spinner string table.
+    expect(busy!.test('⠋ Queued for capacity')).toBe(true);
+    // Standalone capacity-queue strings — the queue screen may render
+    // statically (no animating spinner), so no frame anchor is required.
+    // Line-anchored: bare line, indented line, and `at position N` suffix
+    // all match.
+    expect(busy!.test('Queued for capacity')).toBe(true);
+    expect(busy!.test('  Queued for capacity')).toBe(true);
+    expect(busy!.test('Queued for capacity at position 3.')).toBe(true);
+    expect(busy!.test("Too many requests right now. You're in the queue.")).toBe(true);
+    expect(busy!.test("Too many requests right now. You're in the queue at position 3.")).toBe(true);
+    // Mid-sentence prose quotes must NOT match — the line anchor is the
+    // discriminator for the standalone arms (the braille frame for the
+    // spinner arms).
+    expect(busy!.test('The status line says Queued for capacity right now')).toBe(false);
+    expect(busy!.test("It printed Too many requests right now. You're in the queue. and stopped")).toBe(false);
+    // Idle composer must NOT match.
+    expect(busy!.test('› Ask TraeCode CLI to do anything                        100% context left')).toBe(false);
+    // Prose must NOT match — the braille frame anchor is the discriminator.
+    expect(busy!.test('Working… on the fix')).toBe(false);
+    expect(busy!.test('Working through the implementation')).toBe(false);
+    expect(busy!.test('press esc to interrupt')).toBe(false);
+  });
+
+  it('traex staticBusyPattern latches only on line-anchored queue evidence', () => {
+    // The pre-idle static latch (ZMX gap) consumes queue evidence straight
+    // from the PTY byte stream — see TRAEX_STATIC_BUSY_PATTERN in traex.ts.
+    // It must match every queue-screen shape (bare / indented / spinner-
+    // prefixed / at-position suffix / ANSI-stripped by IdleDetector) and
+    // must NOT match prose quotes or the idle composer.
+    const staticBusy = createTraexAdapter('/bin/traex').staticBusyPattern;
+    expect(staticBusy).toBeDefined();
+    expect(staticBusy!.test('Queued for capacity')).toBe(true);
+    expect(staticBusy!.test('  Queued for capacity')).toBe(true);
+    expect(staticBusy!.test('Queued for capacity at position 3.')).toBe(true);
+    expect(staticBusy!.test('⠋ Queued for capacity')).toBe(true);
+    expect(staticBusy!.test("Too many requests right now. You're in the queue.")).toBe(true);
+    expect(staticBusy!.test("Too many requests right now. You're in the queue at position 3.")).toBe(true);
+    // Mid-sentence prose quotes must NOT latch.
+    expect(staticBusy!.test('The status line says Queued for capacity right now')).toBe(false);
+    expect(staticBusy!.test("It printed Too many requests right now. You're in the queue. and stopped")).toBe(false);
+    // Idle composer must NOT latch.
+    expect(staticBusy!.test('› Ask TraeCode CLI to do anything                        100% context left')).toBe(false);
+    // Working labels without the queue string must NOT latch — the latch is
+    // queue-only; ordinary working turns are covered by the spinner guard.
+    expect(staticBusy!.test('⠋ Working…')).toBe(false);
+  });
 });
 
 describe('idleToBusyPattern', () => {
@@ -1506,6 +1977,26 @@ describe('idleToBusyPattern', () => {
     expect(adapter.idleToBusyPattern!.source).toBe(adapter.busyPattern!.source);
     expect(adapter.idleToBusyPattern!.test('● Working... (esc to interrupt)')).toBe(true);
     expect(adapter.idleToBusyPattern!.test('Working through the implementation')).toBe(false);
+  });
+
+  it('traex opts into idle→busy recovery with the same strict active marker as busyPattern', () => {
+    // The capacity-queue screen can render AFTER a false idle was already
+    // published (readyPattern's `\d+% left` arm matched the status bar and
+    // quiescence fired). idleToBusyPattern must flip the session back to
+    // working when the queue marker or a working spinner label appears in
+    // the PTY stream. Strings are the same binary-extracted anchors as the
+    // busyPattern test above.
+    const adapter = createTraexAdapter('/bin/traex');
+    expect(adapter.idleToBusyPattern).toBeDefined();
+    expect(adapter.idleToBusyPattern!.source).toBe(adapter.busyPattern!.source);
+    // Spinner-anchored working labels.
+    expect(adapter.idleToBusyPattern!.test('⠋ Working…')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test('⠙ Pondering…')).toBe(true);
+    // Standalone queue strings.
+    expect(adapter.idleToBusyPattern!.test('Queued for capacity')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test("Too many requests right now. You're in the queue.")).toBe(true);
+    // Prose without the braille frame anchor must NOT flip idle→busy.
+    expect(adapter.idleToBusyPattern!.test('Working… on the fix')).toBe(false);
   });
 
   it.each([
@@ -1641,6 +2132,22 @@ describe('readyPattern', () => {
 });
 
 describe('traex automation trust flags', () => {
+  it('injects structured reasoning effort as a TraeX launch config', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-effort',
+      resume: false,
+      reasoningEffort: 'medium',
+    });
+    const i = args.indexOf('model_reasoning_effort="medium"');
+    expect(i).toBeGreaterThan(0);
+    expect(args[i - 1]).toBe('-c');
+  });
+
+  it('omits the reasoning effort launch config when none is configured', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-effort', resume: false });
+    expect(args.join(' ')).not.toContain('model_reasoning_effort');
+  });
+
   it('bypasses both permission and hook-review gates for automation when the hook-trust toggle is on', () => {
     const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-goal', resume: false, bypassHookTrust: true });
     expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
@@ -1910,10 +2417,10 @@ describe('buildResumeCommand', () => {
       .toBe('pi --session-id bm-pi');
   });
 
-  it('oh-my-pi emits `omp --continue` (best-effort, ignores sessionId)', () => {
+  it('oh-my-pi returns null when its isolated exact transcript is absent', () => {
     const a = createOhMyPiAdapter('/bin/omp');
-    expect(a.buildResumeCommand?.({ sessionId: 'bm-omp', cliSessionId: 'ignored' }))
-      .toBe('omp --continue');
+    expect(a.buildResumeCommand?.({ sessionId: randomUUID(), cliSessionId: 'ignored' }))
+      .toBeNull();
   });
 
   it('copilot emits `copilot --resume <cliSessionId>` when known, null otherwise', () => {
@@ -2161,7 +2668,7 @@ describe('grok buildArgs', () => {
     expect(events).toEqual(['text:line1\nline2', 'keys:Enter']);
   });
 
-  it('writeInput retries only Enter (does not re-paste full text)', async () => {
+  it('writeInput does not send a second Enter when history is delayed', async () => {
     process.env.BOTMUX_TIME_SCALE = '0.01';
     const cwd = '/tmp/proj';
     const historyDir = join(GROK_TEST_HOME, 'sessions', encodeURIComponent(cwd));
@@ -2170,28 +2677,31 @@ describe('grok buildArgs', () => {
     const grokMintedSid = '019f55e6-10a3-7f31-bc07-2fb370ae8239';
 
     const events: string[] = [];
-    let enterCount = 0;
     const pty = {
       write() {},
       cliCwd: cwd,
       sendText(text: string) { events.push(`text:${text}`); },
       sendSpecialKeys(...keys: string[]) {
         events.push(`keys:${keys.join(',')}`);
-        enterCount++;
-        // First Enter is swallowed (slow history); second lands the submit.
-        if (enterCount >= 2) {
-          appendFileSync(historyPath, JSON.stringify({
-            timestamp: '2026-07-12T10:00:00Z', session_id: grokMintedSid, prompt: 'once only', is_bash: false,
-          }) + '\n');
-        }
       },
     } satisfies PtyHandle;
 
-    const result = await adapter.writeInput(pty, 'once only');
-    expect(result).toEqual({ submitted: true, cliSessionId: grokMintedSid });
-    // Text pasted exactly once; Enter retried.
+    // First Enter already accepted; history shows up after the old 800ms
+    // retry window (8ms scaled) but inside the 4s poll budget (40ms scaled).
+    const late = setTimeout(() => {
+      appendFileSync(historyPath, JSON.stringify({
+        timestamp: '2026-07-12T10:00:00Z', session_id: grokMintedSid, prompt: 'once only', is_bash: false,
+      }) + '\n');
+    }, 20);
+
+    try {
+      const result = await adapter.writeInput(pty, 'once only');
+      expect(result).toEqual({ submitted: true, cliSessionId: grokMintedSid });
+    } finally {
+      clearTimeout(late);
+    }
     expect(events.filter((e) => e.startsWith('text:'))).toEqual(['text:once only']);
-    expect(events.filter((e) => e === 'keys:Enter').length).toBeGreaterThanOrEqual(2);
+    expect(events.filter((e) => e === 'keys:Enter')).toEqual(['keys:Enter']);
   });
 
   it('writeInput treats sendText/sendSpecialKeys false as definite failure (adopt pipe path)', async () => {
@@ -2230,15 +2740,17 @@ describe('grok buildArgs', () => {
     mkdirSync(historyDir, { recursive: true });
     const historyPath = join(historyDir, 'prompt_history.jsonl');
 
+    const events: string[] = [];
     const pty = {
       write() {},
       cliCwd: cwd,
-      sendText() {},
-      sendSpecialKeys() {},
+      sendText() { events.push('text'); },
+      sendSpecialKeys(...keys: string[]) { events.push(`keys:${keys.join(',')}`); },
     } satisfies PtyHandle;
 
     const result = await adapter.writeInput(pty, 'never lands');
     expect(result).toMatchObject({ submitted: false });
+    expect(events.filter((e) => e === 'keys:Enter')).toEqual(['keys:Enter']);
     const recheck = (result as { recheck?: () => unknown }).recheck!;
     expect(recheck()).toBe(false);
     // Late append (slow submit) — the deferred recheck must pick it up.

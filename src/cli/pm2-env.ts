@@ -1,6 +1,8 @@
 import {
   scrubClaudeSessionMarkerEnv,
+  scrubInvokerTerminalEnv,
   scrubSessionCliHomeEnv,
+  scrubSessionTurnMarkerEnv,
   scrubWorkflowWorkerEnv,
   stripDashboardH5Env,
 } from '../utils/child-env.js';
@@ -45,6 +47,20 @@ export function scrubPm2CallerEnv(env: NodeJS.ProcessEnv): void {
   // legitimate consumer and loads the family itself (index-dashboard.ts), so
   // nothing needs it here.
   stripDashboardH5Env(env);
+  // Invoker-terminal fingerprints (NO_COLOR=1 / CODEX_CI=1 / PAGER=cat from
+  // an agent's non-interactive shell) ride the same persistence vector; baked
+  // in they turn every session PTY on the machine colorless. Same class, same
+  // boundary — see INVOKER_TERMINAL_ENV_KEYS.
+  scrubInvokerTerminalEnv(env);
+  // Turn-scoped session identity and capabilities of the invoking bot session
+  // must not become fleet-wide daemon env — the daemon stays session-agnostic
+  // (see SESSION_TURN_MARKER_ENV_KEYS for the per-key rationale).
+  scrubSessionTurnMarkerEnv(env);
+  // Re-pin TERM to the constant every botmux PTY already forces. Deleting it
+  // outright would make pm2 CLIENT output (e.g. `botmux status` on a real
+  // TTY) fail supports-color detection and render colorless; pinning keeps
+  // the baked value deterministic and invoker-independent instead of absent.
+  env.TERM = 'xterm-256color';
 }
 
 /** Build the env for a pm2 invocation with an isolated PM2_HOME. */

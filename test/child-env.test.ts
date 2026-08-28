@@ -6,12 +6,16 @@ import {
   CLAUDE_SESSION_MARKER_ENV_KEYS,
   DASHBOARD_H5_ENV_KEYS,
   DASHBOARD_H5_ENV_PREFIX,
+  INVOKER_TERMINAL_ENV_KEYS,
   redactChildEnv,
   REDACTED_CHILD_ENV_KEYS,
   scrubClaudeSessionMarkerEnv,
+  scrubInvokerTerminalEnv,
   scrubSessionCliHomeEnv,
+  scrubSessionTurnMarkerEnv,
   scrubWorkflowWorkerEnv,
   SESSION_CLI_HOME_ENV_KEYS,
+  SESSION_TURN_MARKER_ENV_KEYS,
   stripDashboardH5Env,
   WORKFLOW_WORKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
@@ -345,21 +349,172 @@ describe('scrubWorkflowWorkerEnv()', () => {
   });
 });
 
+describe('scrubInvokerTerminalEnv()', () => {
+  it('removes every invoker-terminal fingerprint in place, leaving machine env alone', () => {
+    const env: NodeJS.ProcessEnv = {
+      ...Object.fromEntries(INVOKER_TERMINAL_ENV_KEYS.map((key) => [key, 'fingerprint'])),
+      PATH: '/usr/bin',
+      LANG: 'en_US.UTF-8',
+      SSH_AUTH_SOCK: '/tmp/agent.sock',
+      HTTPS_PROXY: 'http://proxy:8080',
+    };
+
+    scrubInvokerTerminalEnv(env);
+
+    for (const key of INVOKER_TERMINAL_ENV_KEYS) {
+      expect(key in env, key).toBe(false);
+    }
+    // Machine/user env that legitimately flows into the fleet must survive.
+    expect(env.PATH).toBe('/usr/bin');
+    expect(env.LANG).toBe('en_US.UTF-8');
+    expect(env.SSH_AUTH_SOCK).toBe('/tmp/agent.sock');
+    expect(env.HTTPS_PROXY).toBe('http://proxy:8080');
+  });
+
+  it('pins the observed agent-shell fingerprints that turned the fleet colorless', () => {
+    // The 2026-08 incident baked exactly these from a Codex tool shell into
+    // every daemon: NO_COLOR killed all session TUI colors, CODEX_CI marked
+    // every child as CI, PAGER=cat + TERMINFO pointed at a terminal app's
+    // private dir. Keep them pinned so a list refactor cannot drop them.
+    for (const key of ['NO_COLOR', 'FORCE_COLOR', 'CODEX_CI', 'CI', 'TERM', 'TERMINFO', 'PAGER', 'GIT_PAGER', 'GH_PAGER']) {
+      expect(INVOKER_TERMINAL_ENV_KEYS).toContain(key);
+    }
+    // TERMINFO_DIRS is machine-level terminfo search-path config on
+    // NixOS/custom-ncurses hosts, not an invoker fingerprint — never scrub it.
+    expect(INVOKER_TERMINAL_ENV_KEYS).not.toContain('TERMINFO_DIRS');
+  });
+});
+
+describe('scrubSessionTurnMarkerEnv()', () => {
+  it('removes turn-scoped session identity, leaving documented ambient config alone', () => {
+    const env: NodeJS.ProcessEnv = {
+      ...Object.fromEntries(SESSION_TURN_MARKER_ENV_KEYS.map((key) => [key, 'stale-turn'])),
+      // Documented ambient daemon config channels must NOT be swept by this
+      // scrub (they are handled by resolveDaemonEnv / registry precedence).
+      BOTS_CONFIG: '/alt/bots.json',
+      BOTMUX_PUBLIC_URL: 'https://botmux.example',
+      KEEP: 'v',
+    };
+
+    scrubSessionTurnMarkerEnv(env);
+
+    for (const key of SESSION_TURN_MARKER_ENV_KEYS) {
+      expect(key in env, key).toBe(false);
+    }
+    expect(env.BOTS_CONFIG).toBe('/alt/bots.json');
+    expect(env.BOTMUX_PUBLIC_URL).toBe('https://botmux.example');
+    expect(env.KEEP).toBe('v');
+  });
+
+  it('covers both owner channels so a stale owner can never be baked fleet-wide', () => {
+    expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_OWNER_OPEN_ID');
+    expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('__OWNER_OPEN_ID');
+    expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_SESSION_ID');
+  });
+
+  it('covers session-only capabilities AND routing keys the pane transport never carries', () => {
+    // The list is hand-maintained on the "session-scoped by construction"
+    // criterion, NOT derived from BOTMUX_INJECTED_ENV_KEYS — that list is the
+    // pane TRANSPORT whitelist and mixes in ambient config. Both directions
+    // must hold: capabilities that ARE transported, and routing keys that are
+    // NOT (BOTMUX_SESSION_SCOPE / BOTMUX_SEND_RELAY reach children outside
+    // the pane injection list).
+    for (const key of [
+      'BOTMUX_MCP_GATEWAY_SOCKET',
+      'BOTMUX_MCP_GATEWAY_REQUIRED',
+      'BOTMUX_DAEMON_IPC_PORT',
+      'BOTMUX_READ_ISOLATION',
+      'BOTMUX_READ_ISOLATED',
+      'BOTMUX_API_ONLY',
+      'IS_SANDBOX',
+      'BOTMUX_ORIGIN_CHANNEL_ID',
+      'BOTMUX_LARK_APP_ID',
+      'BOTMUX_SESSION_SCOPE',
+      'BOTMUX_SEND_RELAY',
+    ]) {
+      expect(SESSION_TURN_MARKER_ENV_KEYS, key).toContain(key);
+    }
+  });
+
+  it('legitimate ambient/daemon config survives the FULL pm2/daemon-boot scrub stack', () => {
+    // The regression this pins: CLAUDE_CODE_RESUME_TOKEN_THRESHOLD's only
+    // legitimate channel is daemon ambient env (worker.ts reads process.env,
+    // per-bot env rejects the key) — index-daemon loads ~/.botmux/.env via
+    // dotenv and THEN runs these scrubs, so including it in any scrub family
+    // silently kills the user's setting. Same for the HERMES install-location
+    // roots (nothing in botmux sets them; ambient-only, like GROK_HOME) and
+    // the documented ambient/ecosystem config keys.
+    const env: NodeJS.ProcessEnv = {
+      CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: '150000',
+      HERMES_HOME: '/opt/hermes',
+      HERMES_BOTMUX_SOURCE_HOME: '/opt/hermes-src',
+      HERMES_BOTMUX_PROFILES_ROOT: '/opt/hermes-profiles',
+      BOTS_CONFIG: '/alt/bots.json',
+      SESSION_DATA_DIR: '/data/botmux',
+      BOTMUX_LARK_LIST_BOTS_API_ENABLED: 'true',
+      BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS: '3000',
+      GROK_HOME: '/opt/grok',
+    };
+
+    // The full boundary stack, in the index-daemon boot order.
+    scrubSessionTurnMarkerEnv(env);
+    scrubSessionCliHomeEnv(env);
+    scrubClaudeSessionMarkerEnv(env);
+    scrubWorkflowWorkerEnv(env);
+    scrubInvokerTerminalEnv(env);
+
+    expect(env.CLAUDE_CODE_RESUME_TOKEN_THRESHOLD).toBe('150000');
+    expect(env.HERMES_HOME).toBe('/opt/hermes');
+    expect(env.HERMES_BOTMUX_SOURCE_HOME).toBe('/opt/hermes-src');
+    expect(env.HERMES_BOTMUX_PROFILES_ROOT).toBe('/opt/hermes-profiles');
+    expect(env.BOTS_CONFIG).toBe('/alt/bots.json');
+    expect(env.SESSION_DATA_DIR).toBe('/data/botmux');
+    expect(env.BOTMUX_LARK_LIST_BOTS_API_ENABLED).toBe('true');
+    expect(env.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS).toBe('3000');
+    expect(env.GROK_HOME).toBe('/opt/grok');
+  });
+
+  it('true session-only values are deleted by the same stack', () => {
+    const env: NodeJS.ProcessEnv = {
+      BOTMUX_SESSION_ID: 's-1',
+      BOTMUX_SESSION_SCOPE: 'thread',
+      BOTMUX_SEND_RELAY: '/tmp/relay',
+      BOTMUX_MCP_GATEWAY_SOCKET: '/tmp/mcp.sock',
+      BOTMUX_DAEMON_IPC_PORT: '7951',
+      BOTMUX_OWNER_OPEN_ID: 'ou_x',
+      IS_SANDBOX: '1',
+      CLAUDE_CONFIG_DIR: '/leak/claude',
+      CLAUDECODE: '1',
+      NO_COLOR: '1',
+    };
+
+    scrubSessionTurnMarkerEnv(env);
+    scrubSessionCliHomeEnv(env);
+    scrubClaudeSessionMarkerEnv(env);
+    scrubWorkflowWorkerEnv(env);
+    scrubInvokerTerminalEnv(env);
+
+    for (const key of Object.keys(env)) {
+      expect.fail(`expected every key deleted, found ${key}`);
+    }
+  });
+});
+
 describe('session CLI home scrub call sites', () => {
   // The scrub only works if every process boundary actually invokes it. These
   // source-level pins keep a refactor from silently dropping a boundary:
-  // pm2Env (bakes the caller env into pm2 apps + dump.pm2), daemon boot
-  // (resurrected from a stale dump, workers fork from it), worker boot
-  // (worker-side dynamic resolvers + childEnv seeding).
+  // the fleet supervisor boot (index-supervisor.ts — it spawns every daemon
+  // child from process.env, replacing the old pm2Env boundary), daemon boot
+  // (workers fork from it), worker boot (worker-side dynamic resolvers +
+  // childEnv seeding).
   const read = (rel: string) =>
     readFileSync(new URL(`../src/${rel}`, import.meta.url), 'utf-8');
 
-  it('the pm2 caller env scrubs session CLI homes', () => {
-    // cli.ts pm2Env() delegates to cli/pm2-env.ts; that is where the scrub set
-    // lives (and where pm2CallerEnv() above proves it behaviorally).
-    const src = read('cli/pm2-env.ts');
-    const fn = src.slice(src.indexOf('export function scrubPm2CallerEnv('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubSessionCliHomeEnv(');
+  it('index-supervisor.ts scrubs process.env before spawning any daemon (replaces pm2Env boundary)', () => {
+    // The supervisor forks each daemon inheriting its (scrubbed) process.env via
+    // resolveFleetDaemonEnv, so scrubbing at supervisor boot is the boundary that
+    // pm2Env used to be — a leaked marker here would ride into every daemon.
+    expect(read('index-supervisor.ts')).toContain('scrubSessionCliHomeEnv(process.env)');
   });
 
   it('index-daemon.ts scrubs process.env at boot', () => {
@@ -371,12 +526,9 @@ describe('session CLI home scrub call sites', () => {
   });
 
   it('all three boundaries also scrub Claude session markers', () => {
-    // Same rationale, same boundaries: a marker that survives pm2's persisted
-    // env or a stale dump.pm2 reaches the daemon → the tmux server it forks →
-    // every pane on the machine.
-    const pm2 = read('cli/pm2-env.ts');
-    const fn = pm2.slice(pm2.indexOf('export function scrubPm2CallerEnv('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubClaudeSessionMarkerEnv(');
+    // Same rationale, same boundaries: a marker that survives into the supervisor
+    // reaches the daemon → the tmux server it forks → every pane on the machine.
+    expect(read('index-supervisor.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
     expect(read('index-daemon.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
     expect(read('worker.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
   });
@@ -389,10 +541,8 @@ describe('session CLI home scrub call sites', () => {
     expect(worker).toContain('applySessionOwnerEnv(mergedEnv, cfg.ownerOpenId)');
   });
 
-  it('pm2, daemon, and dashboard boot scrub workflow identity without scrubbing real worker boot', () => {
-    const pm2 = read('cli/pm2-env.ts');
-    const fn = pm2.slice(pm2.indexOf('export function scrubPm2CallerEnv('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubWorkflowWorkerEnv(');
+  it('supervisor, daemon, and dashboard boot scrub workflow identity without scrubbing real worker boot', () => {
+    expect(read('index-supervisor.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
     expect(read('index-daemon.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
     const dashboard = read('dashboard.ts');
     const scrubAt = dashboard.indexOf('scrubWorkflowWorkerEnv(process.env)');
@@ -417,6 +567,32 @@ describe('session CLI home scrub call sites', () => {
     // drops ZELLIJ*), unlike the tmux viewer whose tmuxEnv folds in
     // REDACTED_CHILD_ENV_KEYS.
     expect(worker).toContain('zellijEnv(redactChildEnv(process.env))');
+  });
+
+  it('pm2 boundaries and daemon boot scrub invoker-terminal fingerprints and turn markers', () => {
+    // Same persistence vector as the scrubs above, fourth and fifth key
+    // families: agent-shell fingerprints (NO_COLOR/CODEX_CI/PAGER — colorless
+    // fleet TUIs) and turn-scoped session identity. The plugin pm2 client
+    // boundary (core/plugins/pm2.ts, which shares the God's PM2_HOME and routes
+    // through scrubPm2CallerEnv) must bake clean env; daemon boot additionally
+    // heals a fleet already poisoned by an earlier restart or a stale dump.pm2.
+    const pm2EnvSrc = read('cli/pm2-env.ts');
+    const fn = pm2EnvSrc.slice(pm2EnvSrc.indexOf('export function scrubPm2CallerEnv('));
+    const fnBody = fn.slice(0, fn.indexOf('\n}'));
+    expect(fnBody).toContain('scrubInvokerTerminalEnv(');
+    expect(fnBody).toContain('scrubSessionTurnMarkerEnv(');
+    // TERM is re-pinned (not left absent) inside the shared scrub so pm2
+    // CLIENT output on a real TTY keeps supports-color detection.
+    expect(fnBody).toContain("env.TERM = 'xterm-256color'");
+    const pluginPm2 = read('core/plugins/pm2.ts');
+    expect(pluginPm2).toContain('scrubPm2CallerEnv(');
+    expect(read('index-daemon.ts')).toContain('scrubInvokerTerminalEnv(process.env)');
+    expect(read('index-daemon.ts')).toContain('scrubSessionTurnMarkerEnv(process.env)');
+    // Daemon boot must re-pin too: the boot scrub runs AFTER pm2Env() baked
+    // its snapshot, so without this the daemon (and every forked worker) runs
+    // TERM-less — the zmx backend's sessions inherit that env verbatim (no
+    // node-pty `name` to force TERM) and their CLIs render colorless.
+    expect(read('index-daemon.ts')).toContain("process.env.TERM = 'xterm-256color'");
   });
 
   it('worker-pool strips the PM2 sentinel when forking a worker (source pin)', () => {
@@ -448,7 +624,10 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
 });
 
 /**
- * pm2 invocation boundary (cli.ts pm2Env → cli/pm2-env.ts).
+ * pm2 invocation boundary — the plugin pm2 client (core/plugins/pm2.ts →
+ * cli/pm2-env.ts). (Core fleet supervision no longer uses pm2 after the
+ * pm2→supervisor migration; plugin services remain pm2-managed and share the
+ * God's PM2_HOME.)
  *
  * pm2 copies the CALLER's environment into every managed app and into
  * dump.pm2, which `pm2 resurrect` replays after a reboot — so whatever survives
@@ -501,13 +680,5 @@ describe('pm2CallerEnv()', () => {
     const base: NodeJS.ProcessEnv = { BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'h5-secret' };
     pm2CallerEnv(base, '/tmp/pm2-home');
     expect(base.BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET).toBe('h5-secret');
-  });
-
-  it('is the env cli.ts pm2Env() actually hands to pm2 (source pin)', () => {
-    // The behavior above only matters if the real pm2 invocations use it: a
-    // hand-rolled `{ ...process.env }` in cli.ts would reopen the hole.
-    const src = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf-8');
-    const fn = src.slice(src.indexOf('function pm2Env('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('pm2CallerEnv(process.env, home)');
   });
 });

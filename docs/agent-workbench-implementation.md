@@ -17,7 +17,7 @@ Agent Workbench v1 是 Dashboard 内的单会话操作工作区，已经提供�
 
 最重要的产品边界：
 
-- Chat 始终由飞书客户端承载：入口是行内真实 AppLink 锚点（target=_blank rel=noopener），H5 里没有自绘聊天面板，也不调用 toggleChat/enterChat JSAPI。
+- Chat 始终由飞书客户端承载：「聊天」保持真实 AppLink 锚点（target=_blank rel=noopener），H5 里没有自绘聊天面板，也不调用 toggleChat/enterChat JSAPI；非话题不重复显示「跳转」。
 - Terminal 默认只读，写控制由服务端短租约决定，浏览器拿不到 write grant。
 - Web 默认是带可见标签的 Preview；交互必须显式解锁，15 分钟无操作后回锁。
 - Preview 蒙层只防误触，不是应用级强只读。真正的隔离靠 origin：应用被钉在 opaque origin 的 sandbox 里，够不到 Dashboard 的 DOM、cookie 与管理接口。
@@ -43,7 +43,7 @@ https://<dashboard-host>/auth/feishu?returnTo=/#/agent-workbench/<encoded-sessio
 Full Workbench 的基本流程：
 
 1. 在会话列表搜索并选择会话；支持六个分组维度（状态/机器人/会话位置/类型/CLI/活跃时间）、组折叠与未读标记。
-2. 行内操作：「聊天」是真实锚点，交给飞书客户端原生打开；「定位」（仅话题会话）让 bot 在话题里 @ 你，按钮与服务端限流对齐、30 秒冷却；「终端」以只读打开工作区终端；「接管」打开终端并自动请求写权限。
+2. 行内操作：「聊天」是真实锚点，交给飞书客户端原生打开；「定位」（仅话题会话）让 bot 在话题里 @ 你，按钮与服务端限流对齐、30 秒冷却；「跳转」仅对已有原生 `omt_` 的话题显示；「终端」以只读打开工作区终端（已接管时再点降回只读、真的还回租约，只读时再点关闭）。行内不提供接管捷径——接管统一走终端面板标题栏的「接管输入」。
 3. 工作区一次只有一个终端面板：释放、到期或断连回到只读，「关闭终端」后列表重新铺满。触屏与未登录浏览器走只读 viewToken 通道，不提供接管。
 4. Agent 在自己的 Botmux 会话内注册 Web 开发服务器后，窄屏详情才出现「网页」页；网页预览默认「预览」蒙层，「开启交互」显式解锁，15 分钟无操作回锁。桌面工作区只承载终端，网页预览经会话坞的「网页链接」或直接访问 /preview/<encoded-session-id>/ 打开，该 URL 是 Dashboard 同源的 guard shell，它维持蒙层与解锁，并把应用本身框进 opaque-origin sandbox。
 
@@ -143,9 +143,9 @@ Dashboard 进程读 `~/.botmux/.env` 时只按**白名单**取键（H5 族 + 上
 
 常见失败为 400 invalid_session_id、401 authentication_required、404 unknown_session、409 session_not_active / terminal_external_only / terminal_unavailable、503 daemon_offline。
 
-另有两个配套接口：GET /api/sessions/:id/view-link 为触屏或未登录浏览器换取只读 viewToken 终端链接（iOS WebView 的 WebSocket 升级不带 Cookie，同源地址必然握手失败）；POST /api/sessions/:id/locate 让 bot 在话题内 @ 用户定位会话，服务端限流，UI 侧 30 秒冷却。
+另有两个配套接口：GET /api/sessions/:id/view-link 为触屏或未登录浏览器换取只读 viewToken 终端链接（iOS WebView 的 WebSocket 升级不带 Cookie，同源地址必然握手失败）；POST /api/sessions/:id/locate 让 bot 在话题内 @ 用户定位会话，服务端限流，Workbench UI 侧 30 秒冷却。「跳转」是独立的只读 AppLink，不调用该接口。
 
-GET /api/workbench/capabilities 向已认证身份投影最小操作能力集 `{ canLocate, canControl, canInteract }`：三布尔由服务端复算真实路由门禁得出（路由级 auth 决策 + terminalCapability/previewCapability 角色检查），前端只据此渲染定位、终端接管与 Preview 解锁入口——workbenchAuthed 只证明可进工作台，不再被当作操作权限。legacy owner 三项全 true；H5 与平台 owner 为 `{false, true, true}`（capability 表没有 /locate）；平台 teammate/guest 与匿名全 false。该路径不在 publicReadOnly 白名单，匿名恒 401，前端把任何非 200 或缺字段严格回落为全 false。canControl 只描述无显式 token 时的默认能力：显式 write token 走终端前置代理的独立授权，不经过也不受本投影影响。
+GET /api/workbench/capabilities 向已认证身份投影最小操作能力集 `{ canLocate, canControl, canInteract }`：三布尔由服务端复算真实路由门禁得出（路由级 auth 决策 + terminalCapability/previewCapability 角色检查），前端据此渲染定位、终端接管与 Preview 解锁入口。「跳转」不依赖 canLocate，仅在话题行拥有经校验的原生 `omt_` AppLink 时显示；非话题行只保留 chat/open anchor。workbenchAuthed 只证明可进工作台，不再被当作写操作权限。legacy owner 三项全 true；H5 与平台 owner 为 `{false, true, true}`（capability 表没有 /locate）；平台 teammate/guest 与匿名全 false。该路径不在 publicReadOnly 白名单，匿名恒 401，前端把任何非 200 或缺字段严格回落为全 false。canControl 只描述无显式 token 时的默认能力：显式 write token 走终端前置代理的独立授权，不经过也不受本投影影响。
 
 central proxy 只在 loopback hop 注入签名 read/write grant。租约释放、到期、写 WebSocket 断开、H5 logout/expiry 或 legacy Dashboard token rotation 都会删除租约并关闭登记的写 socket；后续连接回到只读。H5 用户不能通过 legacy write-link 绕过接管。
 
@@ -192,9 +192,9 @@ Preview guard 的覆盖层只防误触，不是应用级强只读：解锁后应
 
 ### 5.3 Chat 边界
 
-Chat 不在 Workbench 页面内渲染，也不再脚本化调用 toggleChat/enterChat JSAPI。所有 surface 的聊天入口都是真实锚点（`target="_blank" rel="noopener"`）：href 优先取会话自带的 feishuChatLink，否则由 chatId 构造标准 `/client/chat/open?openChatId=…` AppLink。真实用户点击是飞书客户端唯一按标准聊天面板处理的派发；脚本化打开（window.open、合成 click、enterChat）会被客户端降级到窄容器——这正是当初「聊天开成窄窗」的问题根源。没有 chatId 的会话不渲染聊天入口（会话坞显示「无聊天」），不会拼接损坏链接。
+Chat 不在 Workbench 页面内渲染。所有「聊天」入口都是真实锚点（`target="_blank" rel="noopener"`）：href 优先取会话自带的 feishuChatLink，否则由 chatId 构造标准 `/client/chat/open?openChatId=…` AppLink；这条路径不调用任何 JSAPI。没有 chatId 的会话不渲染聊天入口，非话题不再重复渲染相同链接的「跳转」。
 
-chat/open 链接不携带 sidebar/width 参数：那是 web_app 容器契约，chat/open 带上会让客户端放弃就地放置而整页跳转。会话坞的「打开完整工作台」走 /client/web_app/open，mode=appCenter；侧边栏 AppLink 使用 mode=sidebar、min_width=350、max_width=520。普通浏览器不主动加载飞书 SDK。openWorkbenchChat（toggleChat → enterChat → AppLink 能力链）与 ensureFeishuJsApi 仍作为带测试的工具函数保留，但当前没有任何 surface 调用；浏览器验收断言 sdkCalls 为空。
+chat/open 链接不携带 sidebar/width 参数：那是 web_app 容器契约。会话坞的「打开完整工作台」走 /client/web_app/open，mode=appCenter；侧边栏 AppLink 使用 mode=sidebar、min_width=350、max_width=520。普通浏览器不主动加载飞书 SDK；Workbench 的「聊天」和原生话题「跳转」均保持零 JSAPI。
 
 ## 6. 集成收口修复
 
@@ -265,12 +265,12 @@ Store 快照或终端代理跑通的证据**——后者见 8.2.1。结果 JSON 
 | h5_failure — provider 失败显示可重试错误 | 通过 |
 | h5_timeout — SDK 有界超时进入可重试错误 | 通过 |
 | h5_without_sdk — 普通浏览器无 SDK 安全降级 | 通过 |
-| workbench_route_switch_and_terminal_control — 行内终端/接管、路由与会话切换、释放与关闭终端；聊天为真实锚点且 sdkCalls 为空 | 通过 |
+| workbench_route_switch_and_terminal_control — 行内「终端」只读打开 + 标题栏「接管输入」、路由与会话切换、降级为只读、释放与关闭终端；聊天为真实锚点且 sdkCalls 为空 | 通过 |
 | workbench_failure — 控制接口 503 daemon_offline 报错并停在只读 | 通过 |
 | unauthorized — 未登录只读、不渲染接管按钮，preview 与 h5-context 均 401 | 通过 |
 | mobile_and_sidebar_layout — 390×844 下钻栈（无页内 tab 栏、无分屏）与 375×800 会话坞（minWidth 350、零 pane） | 通过 |
 | dock_touch_view_token — iPhone 13 真机 profile（hasTouch）下会话坞终端链接带 viewToken；把它拿到完全无 Cookie 的上下文里仍能打开终端，同上下文的裸 /s/&lt;id&gt; 401 | 通过 |
-| wide_touch_targets — 1194×834 触屏（iPad 横屏）下行操作 ≥44px，且触屏不渲染行内「接管」 | 通过 |
+| wide_touch_targets — 1194×834 触屏（iPad 横屏）下行操作 ≥44px，且行内不渲染「接管」（该按钮已整体移除） | 通过 |
 | rail_collapsed_recovery — 预置「已收起」偏好后 1440/900/390 三档视口都能把列表叫回来并选到会话 | 通过 |
 | mobile_preview_interaction — 移动「网页」页蒙层、开启交互/立即锁定与 guard 同步 | 通过 |
 | preview_registration_and_proxy_boundaries — 注册、无效/未注册端口、不可达与代理边界不泄漏内部 target | 通过 |
@@ -401,7 +401,7 @@ Workbench-only 身份按能力根本不请求 `/api/schedules`（`scheduleReques
 
 - 一条 localStorage 记录 `botmux.agent-workbench.appearance.v1` 存三件事——`skin`（4 选 1）、`mode`（system/light/dark）、`termStyle`（reader/classic），永远一起读一起写。
 - 4 套配色：`ink`（墨黑）、`slate-blue`（蓝灰，默认）、`warm-graphite`（石墨）、`light-frost`（冷白）。浅色族只有 light-frost 一套，`mode` 落到 light 时恒用它。
-- 终端双渲染：`reader`（阅读，低饱和 + 行距 1.3，配色跟随当前 skin）与 `classic`（经典，Tokyo Night 原样 + 行距 1.0，默认）。
+- 终端双渲染：`reader`（阅读，低饱和 + 行距 1.15，配色跟随当前 skin）与 `classic`（经典，Tokyo Night 原样 + 行距 1.0，默认）。
 - 旧偏好自动迁移：首版命名 `orca-ink` / `orca` 读到时静默换成 `ink` / `reader`，normalize 是唯一入口（load / save / 跨 tab storage 事件三路一致）。
 - 生效值写到文档根 `data-skin` / `data-theme`，CSS 侧靠属性选择器整体换档；工作台挂载期间接管这两个属性，卸载时把进来之前的值原样还回全站机制。
 - 跨 tab 同步靠 `storage` 事件；跟随系统靠 `matchMedia('(prefers-color-scheme: dark)')` 的 change；系统明暗变化时幂等盖回自己的解析结果，不额外重绘。
@@ -476,3 +476,31 @@ Workbench-only 身份按能力根本不请求 `/api/schedules`（`scheduleReques
 - 契约测试：四套皮肤 15 个色值逐项锁死、圆角三档白名单。
 - 常驻链接：路由级 401/404、处理器级 404、跨站 403、审计失败 503、token 轮换后链接自然更新。
 - 浏览器实测：上述截图均来自隔离实例（合成会话数据，无真实敏感信息），覆盖桌面 / 手机、四主题、双渲染、外观面板、常驻链接面板。
+
+### 11.7 终端控制权：acquisition 端到端收口
+
+写租约挂在（会话 × 登录）上，**不**挂在面板上：同一个登录里第二块面板接管，服务端给的是同一把租约。因此「我这次接管的回执迟到了、面板却已经没了 → 把租约还回去」这条补偿，在服务端看来与正常释放完全同形，实际却会把用户此刻正在打字的那块终端的写权限收走。收口方案是让**客户端在 POST 之前**生成一次性的 acquisition id，端到端贯穿四段：
+
+1. **takeover POST**：`?acq=<id>`，服务端把它绑定到本次接管（形状不合法直接 400，不静默降级——静默降级会发出一把调用方无法补偿的租约）。
+2. **状态回读**：`GET /control` 对持有者返回当前的 `acquisition`，面板据此判断「还是不是我那一次」。
+3. **补偿释放**：`?expect=<id>` 的条件释放（CAS），不匹配返回 `control_lease_superseded` 且租约原封不动。分发收进 `src/dashboard/terminal-control-route.ts`——生产 dashboard 与两个验收脚本调的是同一份，此前脚本读了 `?expect=` 而生产没读，条件释放在真链路上等于不存在。
+4. **WS 注册 / 断开**：前置代理按 acquisition 注册可写 socket，`disconnect` 也只对**当前** acquisition 生效；同登录接管轮换 acquisition 之后，旧面板 socket 断开不再拆掉新面板刚拿到的租约。
+
+关键在于 id 由客户端先生成：服务端生成的标记只随成功响应返回，最需要它的「服务端已受理、响应丢失」分支恰恰拿不到；事后再 GET 一次「当前标记」拿到的可能是别的标签页那一次，用它补偿就是精准误删。
+
+配套的三处收口：
+
+- **关面板 = 放弃这次接管**：接管已回执、但新的 iframe/WS 还没连上就关掉终端时，既没有在途 promise 可补偿、也没有已注册的 socket 会触发 disconnect，租约会一路挂到 TTL。面板卸载时按自己确认过的 acquisition 做一次可重入的条件释放（恒可写身份除外）。
+- **首屏未知不挂 iframe**：首个控制权 GET 还没回来时，同一个登录留下的旧租约会让这块 iframe **真的能打字**。能握租约的通道（authenticated + canControl，含随后才被识别为 fixed 的平台 owner）在 loading 期间不挂 iframe，改显「正在确认终端控制权」；无 canControl / 无凭证的只读通道照旧直挂。
+- **观察读数的盖写基准**改成「已发起的写 epoch」（写失败也推进）。写失败正是最需要 unknown 防线的场景（回执丢了、服务端很可能已受理），用「已结算成功」当基准时，接管之前发出的旧 poll 会在写失败清掉 pending 之后把 unknown 一把抹回只读。
+
+### 11.8 终端写权限信号：带外首帧
+
+「这条 WS 到底能不能写」以前混在 PTY 字节流里（OSC 1989 `write`），而且终端页对**每一帧**都扫一遍——只读终端里跑个 `printf` 打出同样的字节就能把 `wsHasWrite` 翻成 true（反向则是把自己打成只读的 DoS）。现在改成带外控制帧（`src/core/terminal-write-frame.ts`）：
+
+- worker 在注册这条 socket 的同一个同步 tick 里把它作为**第一条消息**发出；
+- 终端页只在「本连接的第一帧」上尝试解码，且要求**整帧精确匹配**，解出即锁存，之后的字节永远只是 PTY 输出；
+- 每次重连先把结论退回未知（并把这个「未知」上抛给嵌入方）；
+- 解码只有一份实现，终端页把它的源码原样内嵌（那段页面代码住在模板字符串里，import 不进来），单测跑的就是页面里真正执行的那一份。
+
+工作台侧同步收紧：`readTerminalFrameWrite` 只认已建立的 WS，不再拿页面那次 HTTP GET 的 `hasToken` 兜底——两次是各自独立的鉴权（iOS WebView 的 WS 升级不带 Cookie），兜底等于在连接还没建立时宣称「可以输入」。短时 viewToken 换链时，链接换代计入 iframe/watcher 的 key（只存计数，token 不进 DOM），旧连接的结论立刻作废回未知。

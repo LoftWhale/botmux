@@ -8,7 +8,7 @@ import { ProxyAgent } from 'proxy-agent';
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
-import { getBot, getAllBots, findOncallChat, getOwnerOpenId, loadBotConfigs, type BotState } from '../../bot-registry.js';
+import { getBot, getAllBots, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
@@ -20,7 +20,7 @@ import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, mentionA
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
-import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMemberChat } from '../../services/platform-team-store.js';
+import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL } from './doc-comment.js';
@@ -35,7 +35,7 @@ import {
   buildEventSubDeepLink,
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
-import { automateOpenPlatformSetup } from '../../setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleInviteCommand } from './invite-command.js';
@@ -261,11 +261,18 @@ async function tryAutoFixScopes(
   try {
     const totalMissing = missingCritical.length + missingOptional.length;
     logger.info(`[${larkAppId}] attempting auto-fix for ${totalMissing} missing scopes via Open Platform...`);
+    // 只申请「实际缺失」的那几项：把默认清单裁成缺失集合再传进去，避免
+    // 「用缺失项当触发器、却拿完整 manifest（300+ 项）当申请集合」——那会让补一个
+    // im:feed_group_v1:read 连带申请日历/文档/表格等一大批 botmux 不校验的权限。
+    // 分桶归属仍以默认 manifest 为准（见 filterScopeManifest）。
+    const wantedScopeNames = [...missingCritical, ...missingOptional].map(s => s.name);
+    const scopeManifest = filterScopeManifest(readDefaultScopeManifest(), wantedScopeNames);
     const result = await automateOpenPlatformSetup({
       appId: bot.config.larkAppId,
       brand,
       maxWaitMs: 60_000,
       disableQrLogin: opts?.disableQrLogin,
+      scopeManifest,
       onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
       onQrCode: (info) => {
         logger.warn(
@@ -277,14 +284,39 @@ async function tryAutoFixScopes(
     });
 
     if (result.ok) {
+      // ⚠️ `scopeCount === 0` 有三种**互相矛盾**的成因，不能共用一句话。自从申请集合
+      // 被裁成「缺失项」后（见上方 filterScopeManifest），它的语义从「整份清单导入了
+      // 多少」变成「**缺失的那几项里成功了多少**」，于是 0 不再等于「本来就齐」，
+      // 反而最可能是「一项都没补上」——照旧说「所有必需权限已在应用清单中」就成了
+      // 恰在全部失败时谎报齐全。三种成因按可诊断性分开：
+      //   ① scopeWarning 有值 → scope/update 被租户整批拒了（开放平台明确报错）
+      //   ② skippedScopeCount > 0 → 这些名字不在该租户的开放平台目录里，不可授予
+      //      （automation 自己 warn 过「not present in the Open Platform catalog」）
+      //   ③ 都没有 → 申请集合本就是空的（缺失项已在清单中），才是真的「已齐全」
+      // 这句同时进 daemon 日志**和**下面的管理员 DM，DM 开头写着「✅ 已自动修复了
+      // 缺失的权限」，一旦这里说反就自相矛盾，管理员会以为不用管。
       const scopeDetail = result.scopeCount > 0
         ? `${result.scopeCount} 项权限已导入${result.skippedScopeCount > 0 ? `（${result.skippedScopeCount} 项跳过）` : ''}`
-        : '所有必需权限已在应用清单中';
-      logger.info(
-        `[${larkAppId}] auto-fix succeeded: ${scopeDetail}, ` +
+        : result.scopeWarning
+          ? `0 项权限已导入——开放平台拒绝了本次权限申请（${result.scopeWarning}），需到「权限管理」手动开通`
+          : result.skippedScopeCount > 0
+            ? `0 项权限已导入——这 ${result.skippedScopeCount} 项不在当前租户的开放平台权限目录中，无法自动申请，需到「权限管理」手动开通`
+            : '所有必需权限已在应用清单中';
+      // 一项都没申请上时，这次自愈**没有**修好任何东西，日志级别也不该是「succeeded」。
+      const autoFixEffective = result.scopeCount > 0 || (!result.scopeWarning && result.skippedScopeCount === 0);
+      // 数据范围只在**真做了事**或**真出错**时才进日志：常态是「没有待配的」，
+      // 那句话对读日志的人零信息量，还会淹没上面真正的 scope 结论。
+      const privilegeRangeDetail = result.privilegeRangeCount > 0
+        ? `, ${result.privilegeRangeCount} 项权限数据范围已设为「与应用的可用范围一致」`
+        : result.privilegeRangeWarning
+          ? `, 权限数据范围未能自动配置（${result.privilegeRangeWarning}）`
+          : '';
+      const summary =
+        `[${larkAppId}] auto-fix ${autoFixEffective ? 'succeeded' : 'could NOT apply the missing scopes'}: ${scopeDetail}${privilegeRangeDetail}, ` +
         `version ${result.versionId ?? 'n/a'} published, ` +
-        `${result.subscribedEventCount} events subscribed`,
-      );
+        `${result.subscribedEventCount} events subscribed`;
+      if (autoFixEffective) logger.info(summary);
+      else logger.warn(summary);
       // opt-in / optional-only path: succeeded silently, no admin DM (a bot that
       // never enabled the feature must not be pinged just because a non-critical
       // scope was topped up in the background). The log line above is the record.
@@ -295,13 +327,18 @@ async function tryAutoFixScopes(
       if (adminOpenId) {
         const fixedList = [...missingCritical, ...missingOptional];
         const missingList = fixedList.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n');
+        // 标题跟着实际结果走：一项都没落地时说「已自动修复」是谎报，管理员会以为
+        // 不用管，而这条路径的下游（缺 critical scope）恰恰是最需要人工介入的。
         await dmAdmin(
           larkAppId,
           adminOpenId,
-          `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n${missingList}\n\n` +
+          (autoFixEffective
+            ? `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n`
+            : `⚠️ botmux 尝试自动为机器人 "${bot.botName ?? larkAppId}" 补齐以下权限，但没能申请成功，需要你手动开通：\n\n`) +
+          `${missingList}\n\n` +
           `${scopeDetail}，新版本已发布。\n` +
           `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。`,
-          `auto-fixed ${fixedList.length} scopes`,
+          autoFixEffective ? `auto-fixed ${fixedList.length} scopes` : `auto-fix could not apply ${fixedList.length} scopes`,
         );
       }
       return true;
@@ -361,11 +398,13 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // self_manage 后下次重启就能自检了。
     if (infoData.code === 99991672) {
       // Chicken-and-egg: app lacks self_manage so we can't even check what scopes
-      // are missing. Try the Open Platform web-session auto-fix to add ALL
-      // required scopes (including self_manage) in one shot.
+      // are missing. Try the Open Platform web-session auto-fix to add every
+      // botmux-required scope (including self_manage) in one shot — passing the
+      // full BOTMUX_REQUIRED_SCOPES so the next restart's self-check finds them
+      // all present, without over-applying the whole 300+ scope manifest.
       if (brand === 'feishu') {
-        const fixed = await tryAutoFixScopes(larkAppId, bot, brand,
-          [{ name: SELF_MANAGE_SCOPE, desc: '应用自查 (免审批)' }], []);
+        const requiredNow = BOTMUX_REQUIRED_SCOPES.map(s => ({ name: s.name, desc: s.desc }));
+        const fixed = await tryAutoFixScopes(larkAppId, bot, brand, requiredNow, []);
         if (fixed) return;
       }
       const selfManageAuthUrl = buildScopeDeepLink(bot.config.larkAppId, SELF_MANAGE_SCOPE, brand);
@@ -456,10 +495,15 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       const globalVcListenerAppId = vcMeetingAgentGlobalListenerBotAppId();
       if (
         isVcMeetingAgentGloballyEnabled()
-        && bot.config.vcMeetingAgent?.enabled === true
+        // VC 现在默认对每个连着飞书的 bot 生效（enabled:false 才是显式退出），所以
+        // 就绪自检也要跟着走 vcMeetingAgentConfigActive，而不是只认显式 enabled:true——
+        // 否则「默认开」的绝大多数 bot 在启动时永远不做权限体检。
+        && !!vcMeetingAgentConfigActive(bot.config)
         && (!globalVcListenerAppId || globalVcListenerAppId === larkAppId)
       ) {
-        const requiredVcScopes = bot.config.vcMeetingAgent.realtimeVoice?.enabled === true
+        // 实时语音也默认开启（未配=开），所以 VC 权限体检默认把实时语音 scope 纳入
+        // 必需项；只有显式 realtimeVoice.enabled=false 才不查它。
+        const requiredVcScopes = bot.config.vcMeetingAgent?.realtimeVoice?.enabled !== false
           ? [...VC_MEETING_FEATURE_SCOPES, ...VC_MEETING_REALTIME_VOICE_SCOPES]
           : VC_MEETING_FEATURE_SCOPES;
         const missingVc = requiredVcScopes.filter(s => !grantedScopes.has(s.name));
@@ -553,6 +597,75 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     await dmAdmin(larkAppId, adminOpenId, dm, `missing scopes: ${missingCritical.map(s => s.name).join(',')}`);
   } catch (err: any) {
     logger.debug(`[${larkAppId}] scope check errored: ${err?.message ?? err}`);
+  }
+}
+
+/**
+ * Startup: ensure this bot is subscribed to the VC meeting events
+ * (`vc.bot.meeting_*` + participant_meeting_joined) so ANY invited bot can
+ * receive meeting invites — the physical prerequisite for bot-agnostic
+ * auto-join. Check-first: a read-only probe over the cached Feishu web session
+ * (no QR at boot); only when events are missing / event mode is wrong do we run
+ * the full open-platform automation (which subscribes them AND publishes a
+ * version). This mirrors checkRequiredScopes ("fix only when something's
+ * missing") so a bot with events already subscribed makes zero mutating calls
+ * and never republishes. Best-effort: never throws into boot; apiOnly and
+ * VC-disabled bots are skipped by the caller / the active-config gate.
+ */
+export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promise<void> {
+  const bot = getBot(larkAppId);
+  const brand = normalizeBrand(bot.config.brand);
+  // Open-platform automation only supports feishu.cn tenants. Skip apiOnly and
+  // VC-inactive bots — vcMeetingAgentConfigActive fail-closes both.
+  if (brand !== 'feishu') return;
+  if (!vcMeetingAgentConfigActive(bot.config)) return;
+  try {
+    const probe = await probeVcMeetingEventSubscription(larkAppId);
+    if (!probe.ok) {
+      // No cached web session / expired / network — degrade gracefully. Do NOT
+      // pop a QR at boot. Surface once to the admin so they can `botmux setup`.
+      logger.info(
+        `[${larkAppId}] VC event subscription check skipped (${probe.reason}): ${probe.message}. ` +
+        `被邀请进会需先订阅 vc.bot.meeting_* 事件；如该 bot 从未订阅，请运行 \`botmux setup\` 刷新开放平台登录态后重启。`,
+      );
+      return;
+    }
+    if (probe.missingVcEvents.length === 0 && probe.eventModeReady) {
+      logger.info(`[${larkAppId}] VC meeting events already subscribed (long-connection mode)`);
+      return;
+    }
+    logger.info(
+      `[${larkAppId}] VC events missing (${probe.missingVcEvents.join('、') || '事件模式非长连接'}); auto-subscribing via Open Platform...`,
+    );
+    const result = await automateOpenPlatformSetup({
+      appId: bot.config.larkAppId,
+      brand,
+      maxWaitMs: 60_000,
+      disableQrLogin: true,
+      onStatus: (msg) => logger.info(`[${larkAppId}] vc-event-autoconfig: ${msg}`),
+      onQrCode: () => {
+        logger.warn(`[${larkAppId}] vc-event-autoconfig: cached Feishu web session expired; run \`botmux setup\` to refresh, then restart.`);
+      },
+    });
+    if (result.ok) {
+      logger.info(`[${larkAppId}] VC events auto-subscribed: ${result.subscribedEventCount} events, version ${result.versionId ?? 'n/a'} published`);
+      return;
+    }
+    // Automation failed (session expired mid-run / api error). Log; DM the admin
+    // once so a bot that genuinely lacks the subscription gets a human nudge.
+    logger.warn(`[${larkAppId}] VC event auto-subscribe failed (${result.reason}): ${result.message}`);
+    const adminOpenId = getAdminOpenId(bot);
+    if (adminOpenId) {
+      await dmAdmin(
+        larkAppId,
+        adminOpenId,
+        `⚠️ botmux 想在启动时自动为机器人 "${bot.botName ?? larkAppId}" 订阅视频会议事件（vc.bot.meeting_*），以便它被拉进会时能自动进会，但自动配置失败：${result.message}\n\n` +
+        `请运行 \`botmux setup\` 刷新飞书开放平台登录态后重启 daemon，botmux 会自动重试。`,
+        'vc event auto-subscribe failed',
+      );
+    }
+  } catch (err: any) {
+    logger.debug(`[${larkAppId}] VC event subscription check errored: ${err?.message ?? err}`);
   }
 }
 
@@ -937,6 +1050,64 @@ export function isVerifiedLocalSiblingBot(
 }
 
 /**
+ * Resolve a foreign bot sender's CURRENT display name from its tenant-stable
+ * `union_id` — rename-proof, unlike the per-app name→open_id cross-ref.
+ *
+ * Why this exists: `lookupForeignBotName` historically read the receiver-local
+ * cross-ref (`bot-openids-<receiverApp>.json`), which only learns a bot's name
+ * when THAT bot is @-mentioned in one of the receiver's own events. When a
+ * renamed bot merely *sends* to us (the `[来自 X 的 @mention]` prefix path), no
+ * mention of X flows through us, so its cross-ref entry stays frozen at the old
+ * name. `union_id` is stamped on every inbound event's `sender.sender_id` and is
+ * stable across renames AND shared tenant-wide, so it maps the sender to the one
+ * locally-configured sibling that learned the same union_id, whose live
+ * `bots-info.json` entry is rewritten by its OWN daemon on every rename
+ * (setBotRenamer → writeBotInfoFile). That is the freshest cross-process name.
+ *
+ * Matches exactly one sibling (same ambiguity guard as isVerifiedLocalSiblingBot).
+ * Returns undefined on empty/unknown union_id, ambiguity, or a missing bots-info
+ * entry, so the caller falls back to the cross-ref / "Bot". Cross-deployment team
+ * peers aren't locally configured, so they return undefined here and rely on the
+ * cross-ref (whose stale aliases the writer now evicts on the next @ by new name).
+ */
+export function resolveSiblingBotNameByUnionId(
+  dataDir: string,
+  larkAppId: string,
+  senderUnionId: string | undefined,
+): string | undefined {
+  const unionId = (senderUnionId ?? '').trim();
+  if (!unionId) return undefined;
+
+  // union_id → the single locally-configured sibling appId that learned it.
+  let siblingAppId: string | undefined;
+  try {
+    for (const cfg of loadBotConfigs()) {
+      const appId = (cfg.larkAppId ?? '').trim();
+      if (!appId || appId === larkAppId) continue;
+      if (getBotUnionId(dataDir, appId) === unionId) {
+        if (siblingAppId) return undefined; // two siblings share a union_id → ambiguous
+        siblingAppId = appId;
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  if (!siblingAppId) return undefined;
+
+  // appId → current botName from the shared, rename-fresh bots-info.json.
+  try {
+    const infoPath = join(dataDir, 'bots-info.json');
+    if (existsSync(infoPath)) {
+      const entries: Array<{ larkAppId?: string; botName?: string | null }> =
+        JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const name = entries.find(e => e.larkAppId === siblingAppId)?.botName;
+      if (typeof name === 'string' && name.trim()) return name.trim();
+    }
+  } catch { /* fall through to caller's cross-ref path */ }
+  return undefined;
+}
+
+/**
  * Should a FOREIGN bot sender be trusted to collaborate (route/spawn a session)
  * WITHOUT `/grant`, because it's a teammate? Two trust sources, both rooted in
  * tenant-stable identity or team-controlled group membership — never a name:
@@ -1003,6 +1174,21 @@ export function updateBotOpenIdCrossRef(
     const openId = mentionOpenId(m);
     if (!name || !openId) continue;
     if (!knownBotNames.has(name.toLowerCase())) continue;
+    // Evict pre-rename aliases before recording the current name. An open_id is
+    // unique to one bot, so any OTHER name key still pointing at this open_id is
+    // a name that bot used before it was renamed. Left in place, the file would
+    // accumulate every historical name and lookupForeignBotName() (which returns
+    // the FIRST name matching an open_id, i.e. the oldest) would keep serving the
+    // stale one. Dropping them keeps the map at exactly the current name per
+    // open_id, and self-heals a table already polluted by past renames the next
+    // time this bot is @-mentioned by its new name. (Object.entries snapshots the
+    // keys, so deleting from `existing` inside the loop is safe.)
+    for (const [existingName, existingOpenId] of Object.entries(existing)) {
+      if (existingOpenId === openId && existingName !== name) {
+        delete existing[existingName];
+        changed = true;
+      }
+    }
     if (existing[name] === openId) continue;
     existing[name] = openId;
     changed = true;
@@ -1206,12 +1392,21 @@ function substituteTargetMatchesMention(target: {
   );
 }
 
+// 替身触发只认「发送者本人当场亲手 @」的消息类型：text（纯文本）/ post（富文本）。
+// 转发一张卡片（interactive）或合并转发（merge_forward）时，飞书会把被转发内容
+// 里原本的接收人 / at-node 继承进这条消息的顶层 mentions —— 那不是发送者真的
+// @ 了替身对象（用户实测：卡片里灰色的「发送给:@某某」被当成了真 @，凭空触发替身
+// 在话题外回复）。这类消息一律不触发替身，避免转发误触发。
+const SUBSTITUTE_TRIGGER_MESSAGE_TYPES = new Set(['text', 'post']);
+
 export function resolveSubstituteTrigger(
   larkAppId: string,
   message: any,
 ): import('../../types.js').SubstituteTrigger | undefined {
   const cfg = getBot(larkAppId).config.substituteMode;
   if (!cfg?.enabled || !cfg.targets?.length) return undefined;
+  const messageType = message?.message_type ?? message?.msg_type;
+  if (!SUBSTITUTE_TRIGGER_MESSAGE_TYPES.has(messageType)) return undefined;
   const mentions = extractMentionIdentities(message);
   for (const mention of mentions) {
     const target = cfg.targets.find(t => substituteTargetMatchesMention(t, mention));
@@ -1521,8 +1716,8 @@ export function canTalk(
  *   锁定为「飞书盖章的 bot 发送方」（daemon 的 teamTrustUnionId），否则恶意成员把
  *   真人 union 报成 bot 就能让真人继承 bot 信任。
  * @param memberUnionId  发送方 union（teamMember 腿）——可为真人 union（未锁 bot）。
- *   仅授 chat 作用域内的 talk、不授 operate，且要求 union 在该团队的成员名单里
- *   （memberUnionIds 来自平台鉴权的团队成员，非机器自报），故喂真人 union 是安全的。
+ *   授 talk、不授 operate，要求 union 与本 bot 同属一个平台团队（memberUnionIds
+ *   来自平台鉴权的团队成员，非机器自报），不限 chat，故喂真人 union 是安全的。
  * @param chatType  当前会话类型。**仅 p2pOpen 腿读它**；省略时该腿不生效（fail-closed），
  *   所以拿不到 chatType 的调用点保持原语义、不会误放行。
  */
@@ -1557,10 +1752,12 @@ export function evaluateTalk(
   if (senderUnionId && (isTeamBot(config.session.dataDir, senderUnionId) || isPlatformTeamBot(config.session.dataDir, senderUnionId))) {
     return { allowed: true, reason: 'teamBot' };
   }
-  // 平台团队成员（人）：发送者 union_id 是本群所属平台团队的成员 → talk 免 grant。
-  // 严格 chat 作用域（isPlatformTeamMemberChat 要求成员与群在同一团队），只放 talk：
-  // canOperate 不引这一腿，/restart 等仍限 allowedUsers。授权用户在团队群里 @ bot 即免卡。
-  if (memberUnionId && isPlatformTeamMemberChat(config.session.dataDir, chatId, memberUnionId)) {
+  // 平台团队成员（人）：发送者 union_id 与本 bot 同属某平台团队 → talk 免 grant，
+  // 不限群（手动建群 / 原生 /invite 拉的群同样生效，不再要求群 ∈ 平台登记的
+  // groupChatIds）。作用域锚在「团队共属」：本 bot ∈ team.bots ∧ 发送者 ∈ 同队
+  // memberUnionIds（isPlatformTeamMember 要求同一 team 同时成立），跨团队不泄漏。
+  // 只放 talk：canOperate 不引这一腿，/restart 等仍限 allowedUsers。
+  if (memberUnionId && isPlatformTeamMember(config.session.dataDir, larkAppId, memberUnionId)) {
     return { allowed: true, reason: 'teamMember' };
   }
   if (hasAllowedChatGroup(larkAppId, chatId)) return { allowed: true, reason: 'allowedChatGroup' };
@@ -1603,7 +1800,7 @@ export function evaluateTalk(
  *     `union_id` 的情况（此时 gate 前那次 `recordTeamBot` 被 `senderUnionId &&` 短路，
  *     evaluateTalk 的 teamBot 腿必然落空）。**这条不能下沉进 evaluateTalk**：那是人/bot
  *     共用的，加进去等于团队群里任何真人都自动过 canTalk，绕开 teamMember 腿的成员校验
- *     （isPlatformTeamMemberChat 要求 union 在该团队成员名单里）。它另外两条 union 锚定
+ *     （isPlatformTeamMember 要求 union 与本 bot 同属一个平台团队）。它另外两条 union 锚定
  *     的腿与 evaluateTalk 的 teamBot 腿重合，留着是为了让「bot 团队信任」只有一处定义。
  *
  *  2. `p2pOpen`（−）：不传 chatType → 该腿 fail-closed 不生效。飞书里 bot 之间不存在
@@ -3219,7 +3416,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }
 
       const senderOpenId = sender?.sender_id?.open_id as string | undefined;
-      // 人的 union_id：平台团队成员 talk-免grant 腿（isPlatformTeamMemberChat）要用。
+      // 人的 union_id：平台团队成员 talk-免grant 腿（isPlatformTeamMember）要用。
       const humanSenderUnionId = sender?.sender_id?.union_id as string | undefined;
       // defaultOncall 自动绑定必须在 canTalk 权限判断前完成，否则已开 defaultOncall
       // 的群首次 @bot 时 oncallChats 中还没有该 chat → evaluateTalk 判无权限 → 误弹
