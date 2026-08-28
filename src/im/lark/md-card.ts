@@ -73,7 +73,7 @@ export interface ReplyCardFooter {
   element: {
     tag: 'markdown';
     element_id: typeof REPLY_CARD_FOOTER_ELEMENT_ID;
-    text_size: 'notation_small_v2';
+    text_size: 'notation';
     content: string;
   };
 }
@@ -476,7 +476,7 @@ export function buildReplyCardFooter(opts: {
     element: {
       tag: 'markdown',
       element_id: REPLY_CARD_FOOTER_ELEMENT_ID,
-      text_size: 'notation_small_v2',
+      text_size: 'notation',
       content,
     },
   };

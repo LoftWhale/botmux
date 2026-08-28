@@ -1301,7 +1301,11 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   if (
     el.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
     && tag === 'markdown'
-    && (el.text_size === undefined || el.text_size === 'notation_small_v2')
+    && (
+      el.text_size === undefined
+      || el.text_size === 'notation'
+      || el.text_size === 'notation_small_v2'
+    )
     && typeof elementText === 'string'
     && hasExactMarkerMarkdown(elementText)
   ) {
