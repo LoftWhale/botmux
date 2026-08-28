@@ -26,13 +26,37 @@
  * It deliberately tests the SHIPPED module (dist/core/legacy-pm2-reaper.js) rather
  * than reimplementing the probes, so it cannot drift from the real logic.
  */
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, statSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, statSync, rmSync, accessSync, constants as fsConstants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 const distPath = process.argv[2] ?? 'dist/core/legacy-pm2-reaper.js';
+
+// ENFORCE THE CLI-LESS PATH BEFORE IMPORTING ANYTHING.
+//
+// These checks exercise the fallback the compiled binary uses: no bundled pm2, no
+// pm2 on PATH. If a pm2 IS reachable, `resolvePm2Bin` returns it and the reaper
+// takes the pm2 CLI path instead — a different code path, whose (correct) results
+// look like failures against the expectations below. MEASURED on a dev box with a
+// global pm2: 3 checks "failed" with the reaper behaving perfectly, and `pm2 jlist`
+// even daemonized a real God inside the fixture home.
+//
+// CI is Alpine with no pm2 so it never saw this, but a human running the script
+// locally would — the same "isolation stated but not enforced" trap that made the
+// unit suite fail 5/17 on exactly such a box. So drop every PATH segment that
+// actually contains an executable pm2 (filter by capability, not by directory
+// name), and clear PM2_HOME so nothing can touch a real pm2 home either.
+process.env.PATH = (process.env.PATH ?? '')
+  .split(':')
+  .filter((seg) => {
+    if (!seg) return false;
+    try { accessSync(join(seg, 'pm2'), fsConstants.X_OK); return false; } catch { return true; }
+  })
+  .join(':');
+delete process.env.PM2_HOME;
+
 const { reapLegacyPm2, liveGodAt } = await import(pathToFileURL(distPath).href);
 
 const spin = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no SAB */ } };
@@ -49,6 +73,9 @@ console.log('environment:');
 console.log(`  libc            : ${existsSync('/lib/ld-musl-x86_64.so.1') || existsSync('/lib/ld-musl-aarch64.so.1') ? 'musl' : 'glibc'}`);
 console.log(`  ps -p supported : ${psWorks ? 'yes' : 'NO (BusyBox)'}`);
 console.log(`  /proc readable  : ${existsSync('/proc/net/unix')}`);
+// Say which path is under test: a reachable pm2 would silently switch the reaper to
+// its CLI branch and make these expectations meaningless.
+console.log(`  pm2 on PATH     : ${spawnSync('pm2', ['--version'], { encoding: 'utf-8' }).error ? 'no (CLI-less path under test)' : 'YES — expectations below assume none'}`);
 if (psWorks) {
   // Not a failure — the script is also runnable on glibc for comparison — but say so
   // loudly, because the whole point is to exercise the BusyBox shapes.
