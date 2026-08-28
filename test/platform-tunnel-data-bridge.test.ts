@@ -23,8 +23,16 @@ import { bridgeDataChannel } from '../src/platform/tunnel-client.js';
  * runner uses, and nothing exercised the bridge end to end.
  *
  * So these tests bridge REAL sockets — a real WebSocketServer, a real TCP server —
- * and assert bytes make the round trip. The runtime-parity test below then proves
- * the mechanism works under the runtime that actually ships.
+ * and assert bytes make the round trip, against the PRODUCTION bridge imported from
+ * `src/` (see the note above `startBridgingWsServer`).
+ *
+ * ⚠️ Scope, stated honestly: every test here runs on whatever runtime vitest uses,
+ * which is Node — and `spawnSyncTsEvalWithRepoImports` children inherit that, so the
+ * out-of-process test is Node too (MEASURED: the child reports `node v22.21.1`).
+ * Nothing in this file executes under Bun. The Bun-specific facts that motivated the
+ * fix (`createWebSocketStream` throws; `pause()`/`bufferedAmount`/`send()` callbacks
+ * are all unusable; FIN-time `terminate()` truncates at volume) were measured by hand
+ * and are guarded here by SOURCE-SHAPE assertions, not by behaviour.
  */
 
 const servers: Array<NetServer | WebSocketServer> = [];
@@ -333,15 +341,21 @@ describe('platform tunnel data bridge — flow control and shutdown', () => {
 });
 
 /**
- * The FIN path can only be *behaviourally* tested under Bun.
+ * The FIN path can only be *behaviourally* observed under Bun, and only at volume.
  *
- * MEASURED: with `terminate()` at FIN, Bun's platform side received 50.2MB of a 64MB
- * response while Node received all 64MB — Node's `ws` flushes its queue regardless,
- * so under the Node-run unit suite that mutation is structurally UNABLE to fail. Both
- * checks below exist because of that: one asserts the shape in source (cheap, runs
- * everywhere), one drives a real Bun child process (proves the actual bytes).
+ * MEASURED, two separate reasons a behavioural assertion cannot guard this in CI:
+ *  • Runtime: with `terminate()` at FIN, Bun's platform side received 50.2MB of a 64MB
+ *    response while Node received all 64MB — Node's `ws` flushes its queue regardless.
+ *    The unit suite runs on Node (and child processes inherit that), so the mutation is
+ *    structurally unable to fail here.
+ *  • Volume: once the reverse gate exists, FIN-time in-flight bytes sit near the
+ *    watermark, so small payloads survive `end → kill` even on Bun (24MB stayed
+ *    complete). Truncation needs ~64MB to reappear (14-17MB lost, 27.6MB against a
+ *    slow platform) — too slow and too memory-hungry for a unit test.
+ * Hence the guard below asserts the SHAPE in source. It is cheap, runs everywhere, and
+ * is the thing that actually fails if someone routes FIN back to the hard kill.
  */
-describe('platform tunnel data bridge — graceful shutdown is Bun-only observable', () => {
+describe('platform tunnel data bridge — graceful shutdown shape', () => {
   it('does not terminate() the tunnel socket on the local FIN path', async () => {
     const src = await import('node:fs/promises').then((fs) =>
       fs.readFile(new URL('../src/platform/tunnel-client.ts', import.meta.url), 'utf8'));
@@ -360,10 +374,26 @@ describe('platform tunnel data bridge — graceful shutdown is Bun-only observab
     expect(code).toMatch(/tcp\.on\(\s*'close'[\s\S]{0,80}?!ending/);
   });
 
-  it('delivers a large response intact under Bun, where terminate() would truncate it', () => {
-    // Runs the REAL production bridge in a child process. Under Bun this is the exact
-    // path that lost 13.8MB per 64MB before the fix; under Node it is a second, redundant
-    // confirmation. Either way the child reports the platform-side byte total.
+  it('delivers a large response intact end to end, in a child process', () => {
+    // Pins the WHOLE-DELIVERY property against the real production bridge, out of
+    // process. Two things this test deliberately does NOT claim:
+    //
+    //  • It does not run under Bun. `spawnSyncTsEvalWithRepoImports` inherits the
+    //    parent runtime, and vitest runs on Node — MEASURED, the child reports
+    //    `node v22.21.1`. (An earlier version of this comment claimed a "real Bun
+    //    child process", which was the same mistake this suite calls out elsewhere:
+    //    naming a runtime a test never reaches.)
+    //  • It is not the regression guard for shutdown truncation. With the reverse
+    //    gate in place, FIN-time in-flight bytes are held near the watermark, so at
+    //    this size `end → kill` does NOT truncate — MEASURED under Bun: 24MB stayed
+    //    complete on both fast and slow platforms. Truncation only reappears at
+    //    larger volumes (64MB lost 14.1/14.6/16.9MB across three runs, and 27.6MB
+    //    against a slow platform, versus 0 for the shipped `finish` path). The
+    //    source-shape guard above is what actually holds that line in CI.
+    //
+    // What it does buy: the production function, driven over real sockets in a fresh
+    // process, delivers every byte — which fails loudly if the bridge drops or
+    // reorders data anywhere along the path.
     const snippet = `
       const net = await import('node:net');
       const { WebSocket, WebSocketServer } = await import('ws');

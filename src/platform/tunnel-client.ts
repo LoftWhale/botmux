@@ -547,9 +547,11 @@ export function bridgeDataChannel(winner: WebSocket, dashboardPort: number): voi
   };
 
   // ── 平台 → 本地 ──
-  // TCP 侧写不动时暂停 WebSocket 读取，drain 后恢复。⚠️ `winner.pause()` 在 Bun 下是
-  // no-op（见上），所以这个方向在编译版里仍**无法**真正止流；保留是因为它在 Node（源码/npm
-  // 形态）下有效，且无害。真正的兜底是下面反向那条不依赖 ws 层信号的闸门。
+  // TCP 侧写不动时暂停 WebSocket 读取，drain 后恢复。
+  // ⚠️ `winner.pause()` 在 Bun 下是 no-op（见函数注释），所以**这个方向在编译版里仍然没有
+  // 闸门**：平台灌得比本地 dashboard 收得快时，帧会堆在进程里。下面反向那条 ping 闸门只管
+  // 「本地 → 平台」，**不解决这一侧**，别把它读成这一侧的兜底。保留 pause/resume 是因为它
+  // 在 Node（源码/npm 形态）下真实有效且在 Bun 下无害。编译态这一侧待 follow-up。
   winner.on('message', (data: RawData) => {
     const buf = toBuffer(data);
     if (!buf.length) return;
