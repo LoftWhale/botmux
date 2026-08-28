@@ -1260,6 +1260,86 @@ function withImgAlt(label: string, alt: string): string {
   return label.endsWith(']') ? `${label.slice(0, -1)}: ${alt}]` : `${label} (${alt})`;
 }
 
+/** Normalize a schema-v2 table label/cell into one safe pipe-table cell.
+ *  Lark table values are usually strings (`lark_md`), but third-party cards
+ *  may wrap text in a plain-text object. Message reads also return CardKit's
+ *  normalized shape (`property.elements[].property.content`) rather than the
+ *  original string sent by botmux. */
+function nestedCardTableText(value: unknown): string | undefined {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const parts = value.map(nestedCardTableText).filter((part): part is string => Boolean(part));
+    return parts.length > 0 ? parts.join('') : undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+
+  const record = value as Record<string, any>;
+  const direct = firstNonEmptyString(
+    record.text?.content,
+    record.content,
+    record.property?.content,
+    typeof record.text === 'string' ? record.text : undefined,
+  );
+  if (direct) return direct;
+
+  // CardKit may expose both a rendered `elements` tree and markdown metadata.
+  // Prefer the rendered tree and only fall back to metadata to avoid repeating
+  // the same visible cell text twice.
+  const childGroups = [
+    record.property?.elements,
+    record.elements,
+    record.property?.markdownElements,
+    record.markdownElements,
+  ];
+  for (const children of childGroups) {
+    if (!Array.isArray(children) || children.length === 0) continue;
+    const nested = nestedCardTableText(children);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+/** Newlines become `<br>` so a single value cannot split the reconstructed
+ *  table into extra rows. */
+function cardTableCellText(value: unknown): string {
+  const text = nestedCardTableText(value);
+  return (text ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/\n/g, '<br>');
+}
+
+/** Reconstruct an original schema-v2 native table as readable pipe Markdown.
+ *  `botmux send` deliberately emits native tables because Lark's markdown
+ *  widget cannot draw a grid; history/quoted/cross-bot reads must still retain
+ *  those facts instead of silently dropping the whole component. */
+function extractTableMarkdown(el: any): string | null {
+  if (!Array.isArray(el?.columns) || el.columns.length === 0) return null;
+  const columns = el.columns.map((column: any, index: number) => ({
+    key: typeof column?.name === 'string' && column.name ? column.name : `c${index}`,
+    label: cardTableCellText(column?.display_name) || `列 ${index + 1}`,
+  }));
+  const lines = [
+    `| ${columns.map((column: any) => column.label).join(' | ')} |`,
+    `| ${columns.map(() => '---').join(' | ')} |`,
+  ];
+  for (const row of Array.isArray(el.rows) ? el.rows : []) {
+    const cells = columns.map((column: any, index: number) => {
+      const value = Array.isArray(row)
+        ? row[index]
+        : row && typeof row === 'object'
+          ? row[column.key]
+          : undefined;
+      return cardTableCellText(value);
+    });
+    lines.push(`| ${cells.join(' | ')} |`);
+  }
+  return lines.join('\n');
+}
+
 type ResourcePusher = (resources: MessageResource[], r: MessageResource) => void;
 
 /** Recursively extract image resources from an original-format card element. */
@@ -1312,6 +1392,11 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   if (tag === 'div' || tag === 'markdown' || tag === 'plain_text') {
     const text = el.text?.content ?? el.content;
     if (text) parts.push(text);
+  }
+
+  if (tag === 'table') {
+    const table = extractTableMarkdown(el);
+    if (table) parts.push(table);
   }
 
   // div.fields[] — v2 cards put most body text in a fields array of lark_md

@@ -671,6 +671,90 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).not.toContain('发送给');
   });
 
+  it('round-trips standalone reply headings without losing section text', () => {
+    const raw = buildMarkdownCard(
+      '# 执行结果\n\n核心链路已验证。\n\n## 下一步\n\n请在飞书确认排版。',
+      'ou_owner',
+    );
+    const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));
+
+    expect(result.content).toContain('执行结果');
+    expect(result.content).toContain('核心链路已验证。');
+    expect(result.content).toContain('下一步');
+    expect(result.content).toContain('请在飞书确认排版。');
+    expect(result.content).not.toContain('botmux');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('round-trips native reply tables as readable pipe Markdown', () => {
+    const raw = buildMarkdownCard([
+      '## 验证结果',
+      '',
+      '| 项目 | 结果 |',
+      '| --- | --- |',
+      '| build | pass |',
+      '| test | 280 passed |',
+    ].join('\n'), 'ou_owner');
+    const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));
+
+    expect(result.content).toContain('| 项目 | 结果 |');
+    expect(result.content).toContain('| --- | --- |');
+    expect(result.content).toContain('| build | pass |');
+    expect(result.content).toContain('| test | 280 passed |');
+    expect(result.content).not.toContain('botmux');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('escapes pipes and folds newlines when flattening third-party table cells', () => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [{
+        tag: 'table',
+        columns: [
+          { name: 'name', display_name: { tag: 'plain_text', content: '名称' } },
+          { name: 'detail', display_name: '详情' },
+        ],
+        rows: [{ name: 'A | B', detail: 'line 1\nline 2' }],
+      }] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+
+    expect(result.content).toContain('| 名称 | 详情 |');
+    expect(result.content).toContain('| A \\| B | line 1<br>line 2 |');
+  });
+
+  it('round-trips CardKit-normalized table cells returned by the live message API', () => {
+    const normalizedCell = (content: string) => ({
+      tag: 'markdown',
+      property: {
+        elements: [{
+          tag: 'plain_text',
+          property: { content, textAlign: 'left' },
+        }],
+        markdownElements: [],
+        originTag: 'lark_md',
+      },
+    });
+    const card = {
+      schema: '2.0',
+      body: { elements: [{
+        tag: 'table',
+        columns: [
+          { name: 'c0', display_name: normalizedCell('检查项') },
+          { name: 'c1', display_name: '预期结果' },
+        ],
+        rows: [{
+          c0: normalizedCell('标题层级'),
+          c1: normalizedCell('H1/H2 明显大于正文'),
+        }],
+      }] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+
+    expect(result.content).toContain('| 检查项 | 预期结果 |');
+    expect(result.content).toContain('| 标题层级 | H1/H2 明显大于正文 |');
+  });
+
   it('round-trips a footer whose custom brand contains an unmatched bracket', () => {
     const raw = buildMarkdownCard('正文内容', 'ou_owner', 'Acme [beta');
     const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));

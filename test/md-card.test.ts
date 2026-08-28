@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import {
   appendReplyCardFooterToV2Card,
   buildCardBodyElements,
+  buildCanonicalFinalReplyCard,
   buildImageCardElements,
   buildMarkdownCard,
   buildContextualReplyCard,
@@ -40,11 +41,78 @@ describe('buildCardBodyElements', () => {
     expect(out[0]).toMatchObject({ tag: 'markdown', content: 'hello world' });
   });
 
-  it('promotes ATX headings to bold (Feishu markdown widget can\'t render #)', () => {
+  it('promotes H1/H2 to standalone heading components', () => {
     const out = buildCardBodyElements('# Title\n\nbody text');
-    const text = mdElements(out)[0].content;
-    expect(text).toContain('**Title**');
-    expect(text).not.toMatch(/^#\s/m);
+    expect(out).toEqual([
+      { tag: 'markdown', text_size: 'heading-2', content: 'Title' },
+      { tag: 'markdown', content: 'body text' },
+    ]);
+
+    expect(buildCardBodyElements('## Section\n\nbody')).toEqual([
+      { tag: 'markdown', text_size: 'heading-2', content: 'Section' },
+      { tag: 'markdown', content: 'body' },
+    ]);
+  });
+
+  it('keeps H3-H6 compact as bold markdown', () => {
+    const out = buildCardBodyElements('### Detail\n\nbody text');
+    expect(out).toEqual([{ tag: 'markdown', content: '**Detail**\n\nbody text' }]);
+  });
+
+  it('keeps setext headings on the compact fallback path', () => {
+    const out = buildCardBodyElements('Legacy title\n===\n\nbody text');
+    expect(out).toEqual([{ tag: 'markdown', content: '**Legacy title**\n\nbody text' }]);
+  });
+
+  it('keeps structured heading, prose, table, and code sections in source order', () => {
+    const input = [
+      '# 执行结果',
+      '',
+      '核心链路已验证。',
+      '',
+      '| 项目 | 结果 |',
+      '| --- | --- |',
+      '| build | pass |',
+      '',
+      '## 验证命令',
+      '',
+      '```bash',
+      'bun run build',
+      '```',
+    ].join('\n');
+    const out = buildCardBodyElements(input);
+
+    expect(out.map(element => element.tag)).toEqual([
+      'markdown', 'markdown', 'table', 'markdown', 'markdown',
+    ]);
+    expect(out[0]).toMatchObject({ text_size: 'heading-2', content: '执行结果' });
+    expect(out[1].content).toBe('核心链路已验证。');
+    expect(out[2].rows).toEqual([{ c0: 'build', c1: 'pass' }]);
+    expect(out[3]).toMatchObject({ text_size: 'heading-2', content: '验证命令' });
+    expect(out[4].content).toContain('```bash\nbun run build\n```');
+  });
+
+  it('bounds promoted headings and preserves overflow headings as bold text', () => {
+    const input = Array.from(
+      { length: 8 },
+      (_, index) => `# Section ${index + 1}\n\nbody ${index + 1}`,
+    ).join('\n\n');
+    const out = buildCardBodyElements(input);
+    const promoted = out.filter(element => element.text_size === 'heading-2');
+    const rendered = mdElements(out).map(element => element.content).join('\n\n');
+
+    expect(promoted).toHaveLength(6);
+    expect(rendered).toContain('**Section 7**');
+    expect(rendered).toContain('**Section 8**');
+    expect(rendered).toContain('body 8');
+  });
+
+  it('does not promote heading-looking lines inside a code fence', () => {
+    const out = buildCardBodyElements('```markdown\n# literal heading\n```');
+    expect(out).toEqual([{
+      tag: 'markdown',
+      content: '```markdown\n# literal heading\n```',
+    }]);
   });
 
   it('Bug A: code fence with no blank line before/after still emits a fenced block', () => {
@@ -663,6 +731,33 @@ describe('normalizeLocalHomeLinks', () => {
 });
 
 describe('buildMarkdownCard', () => {
+  it('uses wide-screen chrome consistently across ordinary reply builders', () => {
+    const cards = [
+      buildMarkdownCard('hello'),
+      buildCanonicalFinalReplyCard({ markdown: 'hello' }),
+      buildContextualReplyCard({
+        title: 'Local turn',
+        assistantText: 'hello',
+        assistantLabel: 'Codex',
+      }),
+    ].map(json => JSON.parse(json));
+
+    for (const card of cards) {
+      expect(card.config).toEqual({ update_multi: true, width_mode: 'fill' });
+    }
+  });
+
+  it('keeps explicit builder and fallback-final body layout identical', () => {
+    const markdown = '# 结果\n\n已完成。\n\n## 验证\n\n- build\n- test';
+    const explicitSendElements = buildImageCardElements(markdown, []);
+    const fallbackElements = JSON.parse(buildCanonicalFinalReplyCard({
+      markdown,
+      brand: '',
+    })).body.elements;
+
+    expect(fallbackElements).toEqual(explicitSendElements);
+  });
+
   it('renders native context in the reply-card footer (token stays off the footer)', () => {
     const json = buildMarkdownCard('hello', 'ou_abc', undefined, 'zh', undefined, 'filesystem', {
       context: { usedTokens: 159_861, windowTokens: 258_400, percentUsed: 62 },
@@ -1239,6 +1334,22 @@ describe('buildImageCardElements', () => {
     expect(out[0]).toMatchObject({ tag: 'markdown', content: 'top' });
     expect(out[1].tag).toBe('column_set');
     expect(out[2]).toMatchObject({ tag: 'markdown', content: 'bottom' });
+  });
+
+  it('shares the six-heading promotion budget across image-row segments', () => {
+    const input = Array.from({ length: 8 }, (_, index) => [
+      `# Section ${index + 1}`,
+      `body ${index + 1}`,
+      index < 7 ? '![](img:0,1)' : '',
+    ].filter(Boolean).join('\n\n')).join('\n\n');
+    const out = buildImageCardElements(input, K.slice(0, 2));
+    const promoted = out.filter(element => element.text_size === 'heading-2');
+    const rendered = mdElements(out).map(element => element.content).join('\n\n');
+
+    expect(out.filter(element => element.tag === 'column_set')).toHaveLength(7);
+    expect(promoted).toHaveLength(6);
+    expect(rendered).toContain('**Section 7**');
+    expect(rendered).toContain('**Section 8**');
   });
 
   it('mixed: grouped row + an unreferenced image appended at the end', () => {
