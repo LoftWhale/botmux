@@ -45,6 +45,18 @@
 
 `vivid` 的额外标签是主题增量；**default 才是定稿观感**。实现时 default 不得给 result/progress/handoff 加标签。
 
+**标签颜色（已拍板）：语义色固定，不随 `layoutColors` 卡头色漂移。** `text_tag.color` 用飞书标签官方枚举（与 `header.template` 不是同一张表；标签有 `neutral`/`lime`，没有 `grey`）。
+
+| 档 | 标签文案（vivid 全开；default 仅 risk/blocked） | `text_tag.color` |
+|---|---|---|
+| result | 完成 | green |
+| progress | 进行中 | blue |
+| risk | 需要你 | red |
+| blocked | 需要你 | red |
+| handoff | 交接 | indigo |
+
+不在标签官方枚举内的色忽略并打日志，该档标签色回退 `neutral`，整张卡仍发出、不 fail。改 `layoutColors` 只动卡头 template，不动上表。
+
 短确认、未传 `--layout`：三种主题都 **不套壳**。没有 `compare`、`diff` 这两个名字。
 
 ## 卡头标题生成
