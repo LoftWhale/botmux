@@ -18,7 +18,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { isStandaloneBinary } from './self-spawn.js';
@@ -154,8 +154,45 @@ function isAlive(pid: number): boolean {
   return !stat.startsWith('Z');        // 'Z'/'Z+' → zombie → effectively down
 }
 
-interface Pm2God {
+/**
+ * Delete a stopped God's leftover records so detection cannot resurrect it.
+ *
+ * Both files this removes are what `liveGodAt` reads, and a successful reap
+ * invalidates both — but nothing else deletes them on the CLI-less path:
+ *
+ *  • `rpc.sock` outlives even a real `pm2 kill` (MEASURED right after this reaper
+ *    first stopped a live fleet), so an existence-only probe reported the dead God
+ *    as live on every later command.
+ *  • `pm2.pid` is removed by `pm2 kill`, but the signal path has no pm2 to do it.
+ *    MEASURED: the file kept naming the God we had just killed, and since it was a
+ *    ZOMBIE at that moment `kill(pid, 0)` still succeeded — so `status` reported a
+ *    live God and re-running `restart` could never clear the warning.
+ *
+ * Either way the operator is told to run a migration that already completed, with
+ * no way to make the message stop. Called only after the God is confirmed down,
+ * and each file is re-checked here so one that is genuinely still in use (a pid
+ * that is live, a socket someone holds) is never removed.
+ */
+function removeStaleGodRecords(home: string, log: (m: string) => void): void {
+  const sock = join(home, 'rpc.sock');
+  if (existsSync(sock) && !rpcSocketHeld(sock)) {
+    try { rmSync(sock, { force: true }); log(`  removed orphaned rpc.sock at ${home}`); }
+    catch { /* best effort: a leftover record only costs a stale warning */ }
+  }
+  const pidFile = join(home, 'pm2.pid');
+  if (!existsSync(pidFile)) return;
+  let pid = 0;
+  try { pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10); } catch { pid = 0; }
+  // A live pid means something owns this file now (a fresh God, or pid reuse) —
+  // leave it alone. Unreadable/garbage counts as stale.
+  if (Number.isSafeInteger(pid) && pid > 1 && isAlive(pid)) return;
+  try { rmSync(pidFile, { force: true }); log(`  removed stale pm2.pid at ${home}`); }
+  catch { /* best effort */ }
+}
+
+export interface Pm2God {
   home: string;
+  /** The God's pid, or 0 when it was found via its RPC socket alone (no pidfile). */
   pid: number;
 }
 
@@ -179,24 +216,63 @@ interface Pm2God {
  * (verified). We return pid 0 for a socket-only God: reaping drives everything
  * through the pm2 CLI (`delete`/`kill`), none of which needs the pid — it is only
  * reported for logging.
+ *
+ * The socket's EXISTENCE is not enough, though: `pm2 kill` removes pm2.pid but
+ * leaves rpc.sock behind — MEASURED right after this reaper first stopped a real
+ * fleet. An existence-only probe then reports the dead God as live on every
+ * subsequent command, so `status` keeps telling the operator to run a migration
+ * that already completed, and re-running it can never clear the warning. So probe
+ * whether a process actually HOLDS the socket.
+ *
+ * The pid check goes through `isAlive`, not a bare `kill(pid, 0)`, for the same
+ * reason: right after a reap the God is a ZOMBIE until its parent reaps it, and
+ * `kill(pid, 0)` succeeds for a zombie — MEASURED, that alone made a
+ * just-killed God read as live and put the stale warning back.
+ *
+ * EXPORTED because `status`/`logs` print an operator-facing "legacy pm2 still
+ * running" warning off the same question. They used to answer it with their own
+ * copy of this logic, which drifted: the warning outlived a successful reap. One
+ * detector means the warning and the reaper cannot disagree.
  */
-function liveGodAt(home: string): Pm2God | null {
+export function liveGodAt(home: string): Pm2God | null {
   const pidFile = join(home, 'pm2.pid');
   if (existsSync(pidFile)) {
     let pid = 0;
     try { pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10); } catch { pid = 0; }
-    if (Number.isSafeInteger(pid) && pid > 1) {
-      try {
-        process.kill(pid, 0);
-        return { home, pid };
-      } catch { /* stale pid file — fall through to the socket probe */ }
-    }
+    if (Number.isSafeInteger(pid) && pid > 1 && isAlive(pid)) return { home, pid };
+    // Stale or zombie pid → fall through to the socket probe.
   }
-  // No usable pid file. A live God still owns its RPC socket; if that exists,
-  // treat the God as present and let the pm2 CLI decide (a truly dead God's
-  // `jlist` fails, which the caller already handles).
-  if (existsSync(join(home, 'rpc.sock'))) return { home, pid: 0 };
+  // No usable pid file. A live God still owns its RPC socket — but only a socket
+  // a process is actually HOLDING proves that. See the note above on orphans.
+  if (rpcSocketHeld(join(home, 'rpc.sock'))) return { home, pid: 0 };
   return null;
+}
+
+/**
+ * Is a live pm2 God actually holding this RPC socket?
+ *
+ * Distinguishes a real God from the orphaned `rpc.sock` that `pm2 kill` leaves
+ * behind. `existsSync` cannot: MEASURED on a socket whose listener was SIGKILLed,
+ * the file survives and `statSync().isSocket()` is still true.
+ *
+ * `lsof <path>` answers it — exit 0 with rows when a process holds the socket,
+ * exit 1 with no output for an orphan (verified against both shapes, and against
+ * the real orphan this reaper left on this box). It is the same tool the reaper
+ * already relies on for `ps`, needs no listener-side cooperation, and works in the
+ * compiled binary — unlike spawning our own runtime with `-e`, which the
+ * standalone build does not support (it re-enters the CLI and hangs: MEASURED
+ * ETIMEDOUT).
+ *
+ * Fails CLOSED on an unusable probe: if `lsof` is missing we keep the old
+ * existence-only answer, so a live socket-only God is never missed (the hazard
+ * `f2c9f7b5` fixed). The cost is only a stale warning, never a double-run.
+ */
+function rpcSocketHeld(sockPath: string): boolean {
+  if (!existsSync(sockPath)) return false;
+  const r = spawnSync('lsof', ['--', sockPath], { encoding: 'utf-8', timeout: 5_000 });
+  if (r.error) return true;                       // no lsof → fail closed
+  if (r.status === 0 && (r.stdout || '').trim()) return true;
+  return false;                                   // exit 1 / empty → orphan
 }
 
 /** Parse `pm2 jlist` stdout (may be prefixed by log lines) into the app array. */
@@ -292,6 +368,7 @@ export function reapLegacyPm2(configDir: string, pkgRoot: string, log: (m: strin
       // was SIGTERMed, came back, and the reaper still reported it deleted.
       if (god.pid > 0 && isAlive(god.pid) && looksLikePm2God(god.pid)) {
         result.killed = stopProcs([{ name: 'pm2 God', pid: god.pid }], log).length > 0;
+        if (result.killed) removeStaleGodRecords(home, log);
         if (!result.killed) {
           // A God we could not stop will undo everything below. Don't touch the
           // daemons: leaving the old fleet whole and reporting it is safer than a
@@ -357,7 +434,10 @@ export function reapLegacyPm2(configDir: string, pkgRoot: string, log: (m: strin
     // shared default God — deleting the botmux rows is enough there.
     if (exclusive) {
       const kill = spawnSync(pm2, ['kill'], { env, encoding: 'utf-8', timeout: 15_000 });
-      if (!kill.error && kill.status === 0) { result.killed = true; log(`  pm2 kill (God at ${home})`); }
+      if (!kill.error && kill.status === 0) {
+        result.killed = true; log(`  pm2 kill (God at ${home})`);
+        removeStaleGodRecords(home, log);
+      }
       else { result.unresolved = true; log(`  pm2 kill failed at ${home}: ${kill.error?.message ?? `exit ${kill.status}`}`); }
     } else {
       log(`  left shared pm2 God at ${home} running (only botmux rows removed)`);

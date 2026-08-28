@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync, readFileSync,
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { reapLegacyPm2 } from '../src/core/legacy-pm2-reaper.js';
+import { createServer, type Server } from 'node:net';
+import { reapLegacyPm2, liveGodAt } from '../src/core/legacy-pm2-reaper.js';
 
 const dirs: string[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'legacy-pm2-')); dirs.push(d); return d; }
@@ -45,6 +46,7 @@ afterEach(() => {
     try { process.kill(-pid, 'SIGKILL'); } catch { /* group already gone */ }
   }
   for (const p of spawned.splice(0)) { try { p.kill('SIGKILL'); } catch { /* already gone */ } }
+  for (const s of servers.splice(0)) { try { s.close(); } catch { /* already closed */ } }
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
@@ -74,14 +76,31 @@ function liveGodPidfile(home: string): void {
   writeFileSync(join(home, 'pm2.pid'), String(process.pid));
 }
 
-/** A live God that has NO pm2.pid — only its RPC socket. This is the shape
- *  MEASURED on the dev box: a God supervising 50 botmux daemons for ~15 hours
- *  with no pidfile in its PM2_HOME. A plain file stands in for the socket; the
- *  reaper only tests existence, and creating a real unix socket would need a
- *  listener. */
+/** A live God that has NO pm2.pid — only its RPC socket, WITH a real listener.
+ *  This is the shape MEASURED on the dev box: a God supervising 50 botmux daemons
+ *  for ~15 hours with no pidfile in its PM2_HOME. The listener matters: detection
+ *  now probes the socket rather than trusting its mere existence. */
 function liveGodSocketOnly(home: string): void {
   mkdirSync(home, { recursive: true });
-  writeFileSync(join(home, 'rpc.sock'), '');
+  listenOnUnixSocket(join(home, 'rpc.sock'));
+}
+
+/** An ORPHANED rpc.sock: the file is there but nothing listens.
+ *
+ *  `pm2 kill` removes pm2.pid but leaves this socket behind — MEASURED after a
+ *  successful reap on this box. An existence-only probe then reports the dead God
+ *  as live forever, so `status` keeps telling the operator to run a migration that
+ *  already completed. */
+function orphanGodSocket(home: string): void {
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, 'rpc.sock'), ''); // plain file: connect() must fail
+}
+
+/** Bind a real unix socket server at `p` and keep it for teardown. */
+function listenOnUnixSocket(p: string): void {
+  const srv = createServer(() => { /* accept and ignore */ });
+  srv.listen(p);
+  servers.push(srv);
 }
 
 // ── Fixtures for the CLI-less fallback ──────────────────────────────────────
@@ -90,6 +109,8 @@ const spawned: ChildProcess[] = [];
  *  group so a fixture that forks grandchildren cannot leave orphans behind —
  *  an unbounded respawning fixture once exhausted this machine's processes. */
 const groupLeaders: number[] = [];
+/** Unix-socket servers standing in for a live God's RPC channel. */
+const servers: Server[] = [];
 
 /** Spawn `n` throwaway processes whose cmdline looks like a pm2-era botmux
  *  daemon (`.../dist/index-daemon.js`), so the reaper's cmdline check accepts
@@ -197,7 +218,79 @@ describe('reapLegacyPm2', () => {
   // real God was found running 50 botmux daemons with no such file — so the
   // reaper silently no-opped and a `botmux restart` would have left both fleets
   // live, two processes answering the same Feishu events.
-  it('detects a live God that has NO pm2.pid (socket-only), and reaps it', () => {
+  it('treats an ORPHANED rpc.sock as no God (nothing listens on it)', () => {
+    // MEASURED after this fix reaped the real fleet: `pm2 kill` removed pm2.pid but
+    // left rpc.sock behind with no listener. An existence-only probe then reported
+    // the dead God as live on EVERY subsequent command, so `status` kept telling
+    // the operator to run a migration that had already completed — and running it
+    // again could never clear the warning.
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    orphanGodSocket(join(configDir, 'pm2'));
+
+    const r = reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    expect(r.found).toBe(false);
+    expect(r.unresolved).toBe(false);
+    expect(r.note).toContain('no live legacy pm2 God');
+  });
+
+  it('clears the God records so the warning cannot come back', () => {
+    // Leaving the dead God's records on disk would re-trigger detection on the
+    // next command. Reaping must clear the evidence it just invalidated — BOTH
+    // files, since detection accepts either one:
+    //
+    //  • rpc.sock, which outlives even a real `pm2 kill`.
+    //  • pm2.pid, which the CLI-less path has no pm2 to remove. MEASURED: it kept
+    //    naming the God we had just killed, and a zombie answers kill(pid,0), so
+    //    the second call still reported found — the warning came right back.
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    const home = join(configDir, 'pm2');
+    mkdirSync(join(home, 'pids'), { recursive: true });
+    const god = spawnTagged(1, 'PM2 v6.0.14: God Daemon (/fake)')[0];
+    writeFileSync(join(home, 'pm2.pid'), String(god));
+    orphanGodSocket(home);                 // socket that will outlive the God
+    const daemon = spawnSleepers(1)[0];
+    writePm2AppPid(home, 'botmux-0', daemon);
+
+    const r = reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    expect(r.killed).toBe(true);
+    expect(existsSync(join(home, 'rpc.sock'))).toBe(false); // cleaned up
+    expect(existsSync(join(home, 'pm2.pid'))).toBe(false);  // ...and this one too
+    // And a follow-up call must now find nothing at all — no `found`, and
+    // crucially no `unresolved`, which is what drives the operator warning.
+    const again = reapLegacyPm2(configDir, pkgRoot, () => {});
+    expect(again.found).toBe(false);
+    expect(again.unresolved).toBe(false);
+    expect(again.note).toContain('no live legacy pm2 God');
+  });
+
+  it('does NOT delete a pm2.pid that still names a LIVE process', () => {
+    // The cleanup above must not degenerate into "delete pm2.pid after any kill".
+    // If the number in the file is live — a God that has started since, or a
+    // recycled pid — removing the record would blind the next detection to a real
+    // God, which is the double-run this whole module exists to prevent.
+    //
+    // Reachable on the pm2-CLI path: real `pm2 kill` removes pm2.pid itself, so
+    // cleanup only ever sees a leftover, and here the leftover names this very
+    // (live) test process. The socket, having no listener, must still go.
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    const home = join(configDir, 'pm2');
+    fakePm2(pkgRoot, { jlist: JSON.stringify([{ name: 'botmux-0' }]) });
+    liveGodPidfile(home);      // pm2.pid → our own pid, which stays alive
+    orphanGodSocket(home);     // ...but nothing holds the socket
+
+    const r = reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    expect(r.killed).toBe(true);
+    expect(existsSync(join(home, 'rpc.sock'))).toBe(false); // orphan → removed
+    expect(existsSync(join(home, 'pm2.pid'))).toBe(true);   // live pid → kept
+  });
+
+  it('still detects a socket-only God when something IS listening', () => {
     const configDir = tmp();
     const pkgRoot = tmp();
     const jlist = JSON.stringify([{ name: 'botmux-claude' }, { name: 'unrelated' }]);
@@ -492,6 +585,29 @@ describe('reapLegacyPm2', () => {
     // Whatever child the pidfile now names must be down and stay down.
     const lastChild = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
     expect(alive(lastChild)).toBe(false);
+  });
+
+  // ── liveGodAt, the detector `status`/`logs` share ───────────────────────────
+  // The warning those commands print goes through this exact function. It is
+  // tested directly because the reap path CANNOT expose the bug below: reaping
+  // deletes the pidfile, so the zombie is never read back. Reverting this to a
+  // bare `kill(pid, 0)` left the whole reap suite green — measured — while
+  // `botmux status` would still have reported a God that no longer exists.
+  it('does not call a ZOMBIE pid a live God (kill(pid,0) lies about zombies)', () => {
+    const home = tmp();
+    // A killed child stays a zombie until the runtime reaps it, and for that whole
+    // window `kill(pid, 0)` succeeds — verified with a probe: stat 'Z', kill0 true.
+    // That is precisely the state a God is in right after a successful reap.
+    const god = spawnTagged(1, 'PM2 v6.0.14: God Daemon (/fake)')[0];
+    writeFileSync(join(home, 'pm2.pid'), String(god));
+    expect(liveGodAt(home)).not.toBeNull();   // alive → detected
+
+    process.kill(god, 'SIGKILL');
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && alive(god)) spinMs(50);
+    expect(alive(god)).toBe(false);           // now a zombie (or fully gone)
+
+    expect(liveGodAt(home)).toBeNull();       // ...and must NOT be called a God
   });
 
   it('ignores a shared ~/.pm2 God that has NO botmux rows (belongs to the user)', () => {
