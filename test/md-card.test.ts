@@ -21,7 +21,9 @@ import {
   brandFooterSegment,
   cardUsageFooterSegment,
   cardUsageRuntimeSegment,
+  createReplyCard,
   DEFAULT_BRAND_LABEL,
+  extractFirstReplyCardHeading,
   hasMarkdown,
   normalizeLocalHomeLinks,
 } from '../src/im/lark/md-card.js';
@@ -29,6 +31,64 @@ import {
 function mdElements(out: any[]): Array<{ tag: 'markdown'; content: string }> {
   return out.filter(e => e.tag === 'markdown');
 }
+
+describe('reply-card layout envelope and title extraction', () => {
+  it('keeps the ordinary v2 envelope identical when no header is requested', () => {
+    expect(createReplyCard([{ tag: 'markdown', content: '正文' }])).toEqual({
+      schema: '2.0',
+      config: { update_multi: true, width_mode: 'fill' },
+      body: {
+        direction: 'vertical',
+        elements: [{ tag: 'markdown', content: '正文' }],
+      },
+    });
+  });
+
+  it('puts an optional Card 2.0 header on the same canonical envelope', () => {
+    const header = {
+      template: 'indigo' as const,
+      title: { tag: 'plain_text' as const, content: '交接 · 下一位接手发布' },
+    };
+    expect(createReplyCard([], header)).toMatchObject({
+      schema: '2.0',
+      config: { update_multi: true, width_mode: 'fill' },
+      header,
+      body: { direction: 'vertical', elements: [] },
+    });
+  });
+
+  it('consumes only the first top-level ATX H1/H2 and preserves the rest', () => {
+    const input = [
+      '> # 引用标题',
+      '',
+      '```md',
+      '# 代码里的标题',
+      '```',
+      '',
+      '### 细节',
+      '',
+      '## **发布** [说明](https://example.com) `v2`',
+      '',
+      '正文',
+      '',
+      '# 第二个标题',
+    ].join('\n');
+    const extracted = extractFirstReplyCardHeading(input);
+
+    expect(extracted.heading).toBe('发布 说明 v2');
+    expect(extracted.markdown).not.toContain('## **发布**');
+    expect(extracted.markdown).toContain('> # 引用标题');
+    expect(extracted.markdown).toContain('# 代码里的标题');
+    expect(extracted.markdown).toContain('### 细节');
+    expect(extracted.markdown).toContain('# 第二个标题');
+  });
+
+  it('does not consume H3, setext, or an empty ATX heading', () => {
+    for (const input of ['### 细节\n\n正文', '旧标题\n===\n\n正文', '#\n\n正文']) {
+      expect(extractFirstReplyCardHeading(input)).toEqual({ markdown: input });
+    }
+  });
+});
 
 describe('buildCardBodyElements', () => {
   it('returns [] for empty input', () => {

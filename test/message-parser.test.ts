@@ -755,6 +755,60 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).toContain('| 标题层级 | H1/H2 明显大于正文 |');
   });
 
+  it('round-trips a live-normalized layout header, tag, body, and native table together', () => {
+    const normalizedMarkdown = (...contents: string[]) => ({
+      tag: 'markdown',
+      property: {
+        elements: contents.map((content, index) => ({
+          tag: index === 0 ? 'plain_text' : 'code_span',
+          property: { content, textAlign: 'left' },
+        })),
+        markdownElements: [],
+        originTag: 'lark_md',
+      },
+    });
+    // Fixture mirrors `botmux quoted --raw` after CardKit normalisation; it is
+    // intentionally not the JSON emitted by the reply-card builder.
+    const card = {
+      schema: '2.0',
+      config: { enable_forward_interaction: false, streaming_mode: false, width_mode: 'fill' },
+      header: {
+        template: 'orange',
+        text_tag_list: [{
+          color: 'red',
+          tag: 'text_tag',
+          text: { content: '需要你', tag: 'plain_text' },
+        }],
+        title: { content: '需要确认 · 回复卡样式是否收口', tag: 'plain_text' },
+      },
+      body: { direction: 'vertical', elements: [
+        { tag: 'markdown', content: '请确认下面三项。' },
+        {
+          tag: 'table',
+          columns: [
+            { name: 'c0', display_name: normalizedMarkdown('检查项') },
+            { name: 'c1', display_name: normalizedMarkdown('实现配置') },
+          ],
+          rows: [{
+            c0: normalizedMarkdown('卡片宽度'),
+            c1: normalizedMarkdown('Card 2.0 ', 'width_mode: fill'),
+          }, {
+            c0: normalizedMarkdown('标题层级'),
+            c1: normalizedMarkdown('H1/H2 ', 'heading-2'),
+          }],
+        },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+
+    expect(result.content).toContain('[卡片: 需要确认 · 回复卡样式是否收口]');
+    expect(result.content).toContain('[标签: 需要你]');
+    expect(result.content).toContain('请确认下面三项。');
+    expect(result.content).toContain('| 检查项 | 实现配置 |');
+    expect(result.content).toContain('| 卡片宽度 | Card 2.0 width_mode: fill |');
+    expect(result.content).toContain('| 标题层级 | H1/H2 heading-2 |');
+  });
+
   it('round-trips a footer whose custom brand contains an unmatched bracket', () => {
     const raw = buildMarkdownCard('正文内容', 'ou_owner', 'Acme [beta');
     const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));
@@ -1231,6 +1285,23 @@ describe('mergeCardText', () => {
   it('falls back to the non-empty side when the other is empty/fallback', () => {
     expect(mergeCardText('', '[卡片: x]\n正文')).toBe('[卡片: x]\n正文');
     expect(mergeCardText('[卡片: y]\n正文', '请升级至最新版本客户端，以查看内容')).toContain('正文');
+  });
+
+  it('preserves header metadata present only in A without duplicating B metadata', () => {
+    const textA = '[卡片: 需要确认]\n[标签: 需要你]\n正文';
+    expect(mergeCardText(textA, '[卡片: 需要确认]\n正文')).toBe(
+      '[卡片: 需要确认]\n[标签: 需要你]\n正文',
+    );
+    expect(mergeCardText(textA, '[卡片: 需要确认]\n[标签: 需要你]\n正文'))
+      .toBe('[卡片: 需要确认]\n[标签: 需要你]\n正文');
+  });
+
+  it('unions distinct header tags by value instead of dropping a second tag by kind', () => {
+    const textA = '[卡片: 进度]\n[标签: 进行中]\n[标签: 需要你]\n正文';
+    const textB = '[卡片: 进度]\n[标签: 进行中]\n正文';
+    expect(mergeCardText(textA, textB)).toBe(
+      '[卡片: 进度]\n[标签: 需要你]\n[标签: 进行中]\n正文',
+    );
   });
 });
 

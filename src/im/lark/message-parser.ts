@@ -889,8 +889,11 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
     // 卡片的 outgoing 消息）让 elements 内容自己说话，避免在正文前堆一行
     // 多余的 `[卡片]`。整张卡片真的没内容时下方 `parts.join('\n') || '[卡片]'`
     // 会兜底返回占位。
-    const title = card.title ?? card.header?.title?.content;
+    const title = nestedCardText(card.title) ?? nestedCardText(card.header?.title);
     if (title) parts.push(`[卡片: ${title}]`);
+    for (const tagText of extractCardHeaderTagTexts(card.header)) {
+      parts.push(`[标签: ${tagText}]`);
+    }
 
     // v2 cards nest elements under `body`; fall back to legacy top-level.
     const rootElements = Array.isArray(card.body?.elements)
@@ -1098,6 +1101,34 @@ export function mergeCardText(textA: string, textB: string): string {
   const baseLines = b.split('\n').filter(l => !isPureCardUpgradeFallback(l));
   const bAll = baseLines.map(normalizeForDedup).join('');
 
+  // CardKit can expose header metadata in only one of the two message-detail
+  // representations. B remains authoritative for the single card title, while
+  // tags are an exact-value union: if B renders one tag and A renders a second,
+  // neither fact may disappear merely because both share the same metadata kind.
+  const metadataKind = (line: string): 'card' | 'tag' | undefined => {
+    if (/^\[卡片(?::[^\]]+)?\]$/.test(line.trim())) return 'card';
+    if (/^\[标签:[^\]]+\]$/.test(line.trim())) return 'tag';
+    return undefined;
+  };
+  const bHasCardMetadata = baseLines.some(line => metadataKind(line) === 'card');
+  const bTagMetadata = new Set(
+    baseLines
+      .filter(line => metadataKind(line) === 'tag')
+      .map(normalizeForDedup)
+      .filter(Boolean),
+  );
+  const seenMetadata = new Set<string>();
+  const missingMetadata = a.split('\n').filter(line => {
+    const kind = metadataKind(line);
+    if (!kind) return false;
+    const key = normalizeForDedup(line);
+    if (kind === 'card' && bHasCardMetadata) return false;
+    if (kind === 'tag' && bTagMetadata.has(key)) return false;
+    if (!key || seenMetadata.has(key)) return false;
+    seenMetadata.add(key);
+    return true;
+  });
+
   const filled = baseLines.map(line => {
     const sm = stripInlineMarkup(line).trimEnd();
     // empty-value field label, e.g. "值班人:" — but not bracketed section
@@ -1111,6 +1142,16 @@ export function mergeCardText(textA: string, textB: string): string {
     if (normalizeForDedup(value) && bAll.includes(normalizeForDedup(value))) return line;
     return `${line.replace(/\s*$/, '')} ${value}`;
   });
+  const missingCards = missingMetadata.filter(line => metadataKind(line) === 'card');
+  const missingTags = missingMetadata.filter(line => metadataKind(line) === 'tag');
+  if (missingCards.length > 0) filled.unshift(...missingCards);
+  if (missingTags.length > 0) {
+    let lastCardIndex = -1;
+    for (let index = 0; index < filled.length; index++) {
+      if (metadataKind(filled[index]) === 'card') lastCardIndex = index;
+    }
+    filled.splice(lastCardIndex + 1, 0, ...missingTags);
+  }
 
   // One honest marker if A carried sub-cards Lark only renders client-side.
   if (aHoleCount > 0) filled.push(CARD_EMBEDDED_PLACEHOLDER);
@@ -1260,17 +1301,16 @@ function withImgAlt(label: string, alt: string): string {
   return label.endsWith(']') ? `${label.slice(0, -1)}: ${alt}]` : `${label} (${alt})`;
 }
 
-/** Normalize a schema-v2 table label/cell into one safe pipe-table cell.
- *  Lark table values are usually strings (`lark_md`), but third-party cards
- *  may wrap text in a plain-text object. Message reads also return CardKit's
- *  normalized shape (`property.elements[].property.content`) rather than the
- *  original string sent by botmux. */
-function nestedCardTableText(value: unknown): string | undefined {
+/** Read visible text from a CardKit value. Lark message reads often replace
+ *  the builder JSON with a rendered tree (`property.elements[].property.content`).
+ *  Header titles/tags and native table labels/cells all use this same normalizer
+ *  so quoted/history does not depend on the original send shape. */
+function nestedCardText(value: unknown): string | undefined {
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
     return String(value);
   }
   if (Array.isArray(value)) {
-    const parts = value.map(nestedCardTableText).filter((part): part is string => Boolean(part));
+    const parts = value.map(nestedCardText).filter((part): part is string => Boolean(part));
     return parts.length > 0 ? parts.join('') : undefined;
   }
   if (!value || typeof value !== 'object') return undefined;
@@ -1295,16 +1335,37 @@ function nestedCardTableText(value: unknown): string | undefined {
   ];
   for (const children of childGroups) {
     if (!Array.isArray(children) || children.length === 0) continue;
-    const nested = nestedCardTableText(children);
+    const nested = nestedCardText(children);
     if (nested) return nested;
   }
   return undefined;
 }
 
+function extractCardHeaderTagTexts(header: unknown): string[] {
+  if (!header || typeof header !== 'object') return [];
+  const record = header as Record<string, any>;
+  const groups: unknown[] = [record.text_tag_list];
+  if (record.i18n_text_tag_list && typeof record.i18n_text_tag_list === 'object') {
+    groups.push(...Object.values(record.i18n_text_tag_list));
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const group of groups) {
+    if (!Array.isArray(group)) continue;
+    for (const tag of group) {
+      const text = nestedCardText(tag?.text ?? tag)?.trim();
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      result.push(text);
+    }
+  }
+  return result;
+}
+
 /** Newlines become `<br>` so a single value cannot split the reconstructed
  *  table into extra rows. */
 function cardTableCellText(value: unknown): string {
-  const text = nestedCardTableText(value);
+  const text = nestedCardText(value);
   return (text ?? '')
     .replace(/\r\n?/g, '\n')
     .replace(/\\/g, '\\\\')

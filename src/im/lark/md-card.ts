@@ -32,6 +32,7 @@ import {
 } from './reply-card-footer-signature.js';
 import { buildFeedbackElement } from './skill-feedback-card.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
+import type { ReplyCardHeader } from './reply-card-style.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
@@ -50,6 +51,26 @@ export const REPLY_CARD_CONFIG = {
   update_multi: true,
   width_mode: 'fill',
 } as const;
+
+export interface ReplyCardV2 {
+  schema: '2.0';
+  config: { update_multi: true; width_mode: 'fill' };
+  header?: ReplyCardHeader;
+  body: { direction: 'vertical'; elements: any[] };
+}
+
+/** Single envelope shared by direct sends and fallback reply-card builders. */
+export function createReplyCard(
+  elements: any[],
+  header?: ReplyCardHeader,
+): ReplyCardV2 {
+  return {
+    schema: '2.0',
+    config: { ...REPLY_CARD_CONFIG },
+    ...(header ? { header } : {}),
+    body: { direction: 'vertical', elements },
+  };
+}
 
 export type LocalHomeLinkMode = 'filesystem' | 'lexical' | 'disabled';
 
@@ -651,6 +672,58 @@ export function prepareCardMarkdown(
   return normalizeLocalHomeLinks(input, homedir(), cwd, existsSync, localHomeLinkMode);
 }
 
+export interface ExtractedReplyCardHeading {
+  /** Markdown body with the selected heading source line removed. */
+  markdown: string;
+  /** Plain visible text for `header.title`; absent when no eligible heading exists. */
+  heading?: string;
+}
+
+function inlineTokenPlainText(token: Token | undefined): string {
+  if (!token) return '';
+  if (!Array.isArray(token.children)) return token.content.trim();
+  return token.children
+    .map(child => {
+      if (child.type === 'text' || child.type === 'code_inline') return child.content;
+      if (child.type === 'softbreak' || child.type === 'hardbreak') return ' ';
+      if (child.type === 'image') return child.content;
+      return '';
+    })
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Consume the first heading that the ordinary body renderer would promote:
+ * a top-level ATX H1/H2 outside code fences. The exact source line is removed
+ * so the Card 2.0 header and body do not repeat it. No other markdown changes.
+ */
+export function extractFirstReplyCardHeading(input: string): ExtractedReplyCardHeading {
+  if (!input) return { markdown: input };
+  const parseInput = unescapeFenceLines(input);
+  const tokens = md.parse(parseInput, {});
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (
+      token.level !== 0
+      || token.type !== 'heading_open'
+      || !/^h[12]$/.test(token.tag)
+      || !/^#{1,2}$/.test(token.markup)
+      || !token.map
+    ) {
+      continue;
+    }
+    const heading = inlineTokenPlainText(tokens[index + 1]);
+    if (!heading) continue;
+    const lines = input.split('\n');
+    const [start, end] = token.map as [number, number];
+    lines.splice(start, Math.max(1, end - start));
+    return { markdown: lines.join('\n'), heading };
+  }
+  return { markdown: input };
+}
+
 /**
  * Split markdown into card v2 body elements:
  *   1. Pipe tables → native `table` widget (Feishu's markdown widget can't
@@ -992,11 +1065,7 @@ export function buildMarkdownCard(
     elements.push({ tag: 'hr' });
     elements.push(footer.element);
   }
-  return JSON.stringify({
-    schema: '2.0',
-    config: { ...REPLY_CARD_CONFIG },
-    body: { direction: 'vertical', elements },
-  });
+  return JSON.stringify(createReplyCard(elements));
 }
 
 /** Build the canonical final-answer card. Streaming/progress/session cards
@@ -1022,7 +1091,7 @@ export function buildCanonicalFinalReplyCard(opts: {
     locale: opts.locale,
   });
   if (footer) elements.push({ tag: 'hr' }, footer.element);
-  return JSON.stringify({ schema: '2.0', config: { ...REPLY_CARD_CONFIG }, body: { direction: 'vertical', elements } });
+  return JSON.stringify(createReplyCard(elements));
 }
 
 /** Prefix every line with `> ` so Feishu's markdown widget renders it as a
@@ -1114,9 +1183,5 @@ export function buildContextualReplyCard(opts: {
     elements.push(footer.element);
   }
 
-  return JSON.stringify({
-    schema: '2.0',
-    config: { ...REPLY_CARD_CONFIG },
-    body: { direction: 'vertical', elements },
-  });
+  return JSON.stringify(createReplyCard(elements));
 }

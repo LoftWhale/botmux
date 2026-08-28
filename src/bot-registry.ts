@@ -34,6 +34,10 @@ import {
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
+import {
+  normalizeReplyStyleConfig,
+  type ReplyStyleConfig,
+} from './im/lark/reply-card-style.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import {
   normalizeSessionOwnerReminderConfig,
@@ -1738,6 +1742,16 @@ export interface BotConfig {
    */
   brandLabel?: string;
   /**
+   * Sparse per-bot reply-writing/card-style overrides. Missing fields inherit
+   * the built-in recipe and theme defaults; malformed hand-edited fields are
+   * dropped independently by {@link normalizeReplyStyleConfig}.
+   *
+   * Workers freeze the normalized sparse object into BOTMUX_REPLY_STYLE when a
+   * session starts so the guide an Agent reads and the card renderer it invokes
+   * cannot drift halfway through a long-lived pane.
+   */
+  replyStyle?: ReplyStyleConfig;
+  /**
    * Where to show native Context / Token usage for this bot's Session cards:
    *   • `'streaming'` (default / unset) → in the live streaming card body
    *   • `'footer'`                      → in the ordinary reply-card footer
@@ -1997,6 +2011,7 @@ export function __testOnly_resetBotRegistry(): void {
   brandLabelCache = null;
   cachedLarkUploadHttpInstance = undefined;
   usageDisplayCache = null;
+  replyStyleCache = null;
 }
 
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
@@ -2378,6 +2393,7 @@ export function isChatOncallBoundForAnyBot(chatId: string): boolean {
 // the configured value (undefined when the bot has no brandLabel key).
 let brandLabelCache: { mtimeMs: number; map: Map<string, string | undefined> } | null = null;
 let usageDisplayCache: { mtimeMs: number; map: Map<string, UsageDisplayMode> } | null = null;
+let replyStyleCache: { mtimeMs: number; map: Map<string, ReplyStyleConfig | undefined> } | null = null;
 
 /** Normalize a raw bots.json entry's usage-display intent to the enum, applying
  *  backward compat: an explicit `usageDisplay` wins; otherwise a legacy
@@ -2478,6 +2494,52 @@ export function resolveUsageDisplay(larkAppId: string): UsageDisplayMode {
     return usageDisplayCache.map.get(larkAppId) ?? DEFAULT_USAGE_DISPLAY;
   } catch {
     return DEFAULT_USAGE_DISPLAY;
+  }
+}
+
+/**
+ * Resolve the normalized sparse reply-style snapshot for a bot.
+ *
+ * Unlike hot display-only settings, a running CLI pane must keep the same
+ * replyStyle it learned through the botmux-send guide when it later invokes
+ * `botmux send`. Therefore the spawn-time env snapshot intentionally wins for
+ * the current app; daemon callers without that snapshot use the loaded registry,
+ * and one-shot host CLIs fall back to an mtime-cached bots.json read.
+ */
+export function resolveReplyStyleConfig(larkAppId: string): ReplyStyleConfig | undefined {
+  if (process.env.BOTMUX_SESSION_ID
+    && process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && 'BOTMUX_REPLY_STYLE' in process.env) {
+    try {
+      const parsed = JSON.parse(process.env.BOTMUX_REPLY_STYLE || '{}');
+      return normalizeReplyStyleConfig(parsed).config;
+    } catch {
+      return undefined;
+    }
+  }
+
+  const inMem = bots.get(larkAppId);
+  if (inMem) return inMem.config.replyStyle;
+
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (!path) return undefined;
+  try {
+    const stat = statSync(path);
+    if (!replyStyleCache || replyStyleCache.mtimeMs !== stat.mtimeMs) {
+      const raw = JSON.parse(readFileSync(path, 'utf-8'));
+      const map = new Map<string, ReplyStyleConfig | undefined>();
+      if (Array.isArray(raw)) {
+        for (const entry of raw) {
+          if (entry && typeof entry.larkAppId === 'string') {
+            map.set(entry.larkAppId, normalizeReplyStyleConfig(entry.replyStyle).config);
+          }
+        }
+      }
+      replyStyleCache = { mtimeMs: stat.mtimeMs, map };
+    }
+    return replyStyleCache.map.get(larkAppId);
+  } catch {
+    return undefined;
   }
 }
 
@@ -3043,6 +3105,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const sanitizedEnv = sanitizePerBotEnv(entry.env);
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
 
+    const normalizedReplyStyle = normalizeReplyStyleConfig(entry.replyStyle);
+    for (const warning of normalizedReplyStyle.warnings) {
+      logger.warn(`[bot-registry:${entry.larkAppId}] ${warning}`);
+    }
+
     const skills = readBotSkillPolicy(entry.skills);
     // Presence is semantic for plugins: [] is an exact "none" override, while
     // an absent field inherits the machine defaults.
@@ -3200,6 +3267,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
+      replyStyle: normalizedReplyStyle.config,
       // Persist only a non-default usage-display mode; 'streaming' (default) and
       // an absent key both mean streaming. Legacy showUsageInCardFooter:false is
       // still honored on read (see normalizeUsageDisplay) but never re-emitted.
