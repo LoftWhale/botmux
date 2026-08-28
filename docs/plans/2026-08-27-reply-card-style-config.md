@@ -9,7 +9,7 @@
 - 标签：只有 `risk`、`blocked` 带「需要你」；其它档不带标签
 - **不设** `compare` 档：对比用自由 Markdown；要人做选择走 `risk` + `botmux ask`
 - **Diff 分栏不进本轮**（仍记在 `docs/plans/2026-08-27-reply-card-layer2-backlog.md`，另开）
-- **卡头标题（A 形态，最终）**：`{前缀}`；正文有首个 ATX H1/H2 则 `{前缀} · {标题文本}`，并取走该行不再当正文 heading 渲染。无 `--layout-title`，不从正文猜档。前缀：result=结果、progress=进度、risk=需要确认、blocked=受阻、handoff=交接
+- **卡头标题**：`{前缀}`；正文有首个 ATX H1/H2 则 `{前缀} · {标题文本}`，并取走该行不再当正文 heading 渲染。无 `--layout-title`，不从正文猜档。前缀：result=结果、progress=进度、risk=需要确认、blocked=受阻、handoff=交接
 
 配置落在 **bot 维度**。飞书一条卡片只有一份渲染，群里不能按读者换皮肤。私聊按人配不进本轮。
 
@@ -47,9 +47,9 @@
 
 短确认、未传 `--layout`：三种主题都 **不套壳**。没有 `compare`、`diff` 这两个名字。
 
-## 卡头标题生成（A 形态，最终）
+## 卡头标题生成
 
-B 形态（卡头只用前缀、正文 H1 原样保留）**作废**。档位只来自显式 `--layout`。`header.title` 按下面确定规则生成，不要新增 CLI flag。
+档位只来自显式 `--layout`。`header.title` 按下面确定规则生成，不要新增 CLI flag。
 
 | `--layout` | 固定前缀 |
 |---|---|
@@ -93,7 +93,7 @@ B 形态（卡头只用前缀、正文 H1 原样保留）**作废**。档位只�
 - 每档卡头颜色：五档各自一个下拉，选项锁官方色板；另加「跟随主题」
 - 每档标签：五档各自一个短文本；空 = 跟随主题（default 下 result/progress/handoff 为空）
 
-**skill 注入**：`replyStyle.recipes === false` 时，`botmux-send` 内置指南去掉配方表和选型信号，其它发送契约不变。`layout === false` 时指南不提 `--layout`。不要再写「顶部别写同义标题」——防重复规则已覆盖。
+**skill 注入**：`replyStyle.recipes === false` 时，`botmux-send` 内置指南去掉配方表和选型信号，其它发送契约不变。`layout === false` 时指南不提 `--layout`。
 
 **CLI**：`--layout` 只在 `layout !== false` 时生效；关掉则 stderr 一行提示已忽略，消息仍按普通回复卡发出，不 fail。
 
@@ -107,7 +107,7 @@ B 形态（卡头只用前缀、正文 H1 原样保留）**作废**。档位只�
 4. `replyStyle.layoutColors` / `replyStyle.layoutTags`：官方色板内每档微调；非法值按档回退主题缺省
 5. bots.json 解析 + Dashboard：三个开关/主题下拉、配方多行文本框、每档颜色下拉、每档标签输入
 6. `recipes === false` 时指南去掉配方表和选型信号（自定义 `recipePrompt` 也不注入）；`layout === false` 时指南不提 `--layout`，CLI 忽略 flag，颜色/标签配置不生效
-7. 回读：换主题或微调后 `quoted` / `history` 仍能还原正文、表格、以及被取进 `header.title` / `text_tag_list` 的标题与标签；测例必须用 **live 归一化形态**。取走正文标题行的前提是 header 回读不丢
+7. 回读：换主题或微调颜色/标签后 `quoted` / `history` 仍能还原正文、表格、以及被取进 `header.title` / `text_tag_list` 的标题与标签；测例必须用 **live 归一化形态**，不认 builder 原始 JSON
 
 ### 本轮之后
 
@@ -119,6 +119,5 @@ B 形态（卡头只用前缀、正文 H1 原样保留）**作废**。档位只�
 - `compare` 档、`diff` 档、进度条、假按钮、插件模板
 - 读者侧主题切换、一条消息两套渲染
 - 从标题或正文关键词自动选档、自动上色
-- 卡头只用固定前缀却保留正文同义 H1 的 B 形态（已作废）
 - 任意卡片 JSON 当主题
 - 用 grey 做 handoff 卡头
