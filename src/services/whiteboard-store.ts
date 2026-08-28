@@ -437,8 +437,9 @@ const UNBIND_IPC_TIMEOUT_MS = 5_000;
 
 /** `cleared` — this call removed the binding. `already_changed` — the row no
  *  longer pointed at this board (someone rebound it first); nothing to do.
- *  `unresolved` — the owning daemon is reachable-but-unusable, so the row was
- *  deliberately left alone rather than written behind a live cache. */
+ *  `unresolved` — the row was deliberately left alone: the owning daemon was
+ *  visible but unusable (writing behind its live cache is not allowed), or the
+ *  row was gone by the time the write ran. */
 type UnbindOutcome = 'cleared' | 'already_changed' | 'unresolved';
 
 /**
@@ -528,11 +529,12 @@ async function clearSessionWhiteboardRefs(
 }
 
 /**
- * `unresolvedSessions` counts rows whose binding could NOT be cleared because
- * their owning daemon was visible but unusable. Those rows are not corrupt:
- * the binding points at a board that no longer exists, and the daemon's
- * `ensureSessionWhiteboard` replaces it on the session's next turn. The count
- * is reported so a caller can say so instead of showing a bare `0`.
+ * `unresolvedSessions` counts rows this call could NOT clear — the owning
+ * daemon was visible but its IPC was unusable, or the row vanished between the
+ * snapshot and the write. Those rows are not corrupt: the binding points at a
+ * board that no longer exists, and the daemon's `ensureSessionWhiteboard`
+ * replaces it on the session's next turn. The count exists so a caller can say
+ * that instead of reporting a bare `clearedSessions: 0`.
  */
 export async function deleteWhiteboard(
   id: string,

@@ -91,7 +91,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 - **occupancy 存在旁路文件里。** `utils/daemon-discovery.ts` 的 `findOnlineDaemon` 读 `dashboard-daemons/*.json` 心跳（90s 过期），写入目标却是会话行。SQLite 锁只串行化写者，不能判断「另一进程是否仍持有将要 `persistRow` 的内存缓存」。在租约写入 SQLite 之前，必须保留 `abortIf` 双次探测。
 - **两套 apply。** daemon 使用 `updateSession` / `persistRow`；其它进程使用 `services/session-offline-write.ts` 的 `mutateSessionRowWhenUnowned`（心跳探测 + `mutateSessionRowOffline`）。后者是第二套权威，不是「临时 host 执行同一套命令」。#1051 已把它收敛成一份实现，删除时只有一个入口。
 - **没有 per-session turn。** 进程内仍依赖多处独立的 fence。
-- **跨进程仍可能读 JSON**（#1051 保留）：当 CLI 已升级、daemon 仍在写 JSON 时，快照、点读、身份扫描、worker、`owner: false` 走 db-else-json。这是迁移兼容，不是终态。升级后自动重启 fleet 落地后，该窗口缩短为一次重启；届时从发布产物中删除 JSON 读写分支。磁盘上的冻结 JSON 文件可以保留。
+- **跨进程仍可能读 JSON**（#1051 保留）：当 CLI 已升级、daemon 仍在写 JSON 时，快照、点读、身份扫描、worker、`owner: false` 走 db-else-json。这是迁移兼容，不是终态。删除这些分支的条件见 Stage 0（fleet 自动重启落地，或 2026-11-26 的兜底复核点）。磁盘上的冻结 JSON 文件可以保留。
 
 #831 / `SessionRuntime` **不合入**。失败原因是只把约 32% 的写点迁入新层、旧 API 完整保留、约 17k 行适配层按设计要整段删除，并在 build 上挂审计脚本。这不能证明会话桥不该用 virtual actor。写点地图和 receipts/lane 只作线索，立项前在现行代码上复核。
 
@@ -128,7 +128,7 @@ Mailbox 在本仓库里要解决的问题：飞书、dashboard、CLI、worker �
 - 线上不再有仍在写 JSON 的 daemon 之后，删除导入实现及其文件锁；新 bot 直接创建空库。
 - 磁盘上的冻结 JSON 文件可以保留，供回退旧版本读取。
 
-在 fleet 自动重启落地之前，#1051 保留 db-else-json：升级窗口内 `botmux send` 必须仍能读到会话。这不是终态要求。
+删除条件满足之前，#1051 保留 db-else-json：升级窗口内 `botmux send` 必须仍能读到会话。这不是终态要求。
 
 ### Stage 1 — Occupancy 写入 SQLite
 
@@ -207,10 +207,10 @@ daemon 进程内部可以先于 Stage 2 排队；**对外保证**要等所有外
 ## 5. 建议顺序
 
 ```
-现在          #1051 合入        升级后自动重启 fleet     occupancy      单一 apply       turn
- |               |                    |                    |              |              |
- |-- Stage 0 ----+-- Stage 0 收尾 -----|                    |              |              |
- |  (本 PR)      |  删除 JSON 读路径   |------ Stage 1 ------+-- Stage 2 ---+-- Stage 3 ---|
+现在          #1051 合入        删除条件满足          occupancy      单一 apply       turn
+ |               |          (fleet 落地 / 复核点)         |              |              |
+ |-- Stage 0 ----+-- Stage 0 收尾 -----|                  |              |              |
+ |  (本 PR)      |  删除 JSON 读路径   |----- Stage 1 -----+-- Stage 2 ---+-- Stage 3 ---|
 ```
 
 - **#1051**：删除 daemon JSON 写路径；含白板解绑的 compare-and-set、离线写打开前拒绝缺文件、离线写与 daemon 发现各收敛成一份实现。
