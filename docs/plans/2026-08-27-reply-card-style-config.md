@@ -9,6 +9,7 @@
 - 标签：只有 `risk`、`blocked` 带「需要你」；其它档不带标签
 - **不设** `compare` 档：对比用自由 Markdown；要人做选择走 `risk` + `botmux ask`
 - **Diff 分栏不进本轮**（仍记在 `docs/plans/2026-08-27-reply-card-layer2-backlog.md`，另开）
+- **卡头标题**：`{前缀}`；正文有首个 ATX H1/H2 则 `{前缀} · {标题文本}`，并取走该行不再当正文 heading 渲染。无 `--layout-title`，不从正文猜档。前缀：result=结果、progress=进度、risk=需要确认、blocked=受阻、handoff=交接
 
 配置落在 **bot 维度**。飞书一条卡片只有一份渲染，群里不能按读者换皮肤。私聊按人配不进本轮。
 
@@ -45,6 +46,24 @@
 `vivid` 的额外标签是主题增量；**default 才是定稿观感**。实现时 default 不得给 result/progress/handoff 加标签。
 
 短确认、未传 `--layout`：三种主题都 **不套壳**。没有 `compare`、`diff` 这两个名字。
+
+## 卡头标题生成
+
+档位只来自显式 `--layout`。`header.title` 按下面确定规则生成，不要新增 CLI flag。
+
+| `--layout` | 固定前缀 |
+|---|---|
+| `result` | 结果 |
+| `progress` | 进度 |
+| `risk` | 需要确认 |
+| `blocked` | 受阻 |
+| `handoff` | 交接 |
+
+1. 扫描正文第一个 ATX H1 或 H2（与会提升成 `heading-2` 的同一批）。H3+、Setext、代码围栏里的 `#` 都不算。
+2. 没有这样的标题 → `header.title.content` = 前缀。
+3. 有标题 → 默认 `{前缀} · {该标题文本}`，**并从正文去掉这一行**，不再渲染成 heading-2。
+4. **防重复**：去掉空白后，标题文本等于前缀，或只是前缀的重复表述（如 `# 结果`、`# 需要确认`、`# 结果 · 结果`）→ 卡头只显示前缀，不出现「结果 · 结果」。该行仍从正文取走，避免正文再出一遍同样的 heading。
+5. **回读对等**：标题进 `header.title`（以及 risk/blocked 的 `header.text_tag_list`）后，quoted/history 必须能从 header 读回。测例用 **live 归一化形态**（飞书可能把 title 收成 `{ tag, content }`），不能只测 builder 输出。取走正文行的前提是 header 回读不丢，否则就是本轮表格教训重演。
 
 ## 落点
 
@@ -88,7 +107,7 @@
 4. `replyStyle.layoutColors` / `replyStyle.layoutTags`：官方色板内每档微调；非法值按档回退主题缺省
 5. bots.json 解析 + Dashboard：三个开关/主题下拉、配方多行文本框、每档颜色下拉、每档标签输入
 6. `recipes === false` 时指南去掉配方表和选型信号（自定义 `recipePrompt` 也不注入）；`layout === false` 时指南不提 `--layout`，CLI 忽略 flag，颜色/标签配置不生效
-7. 回读：换主题或微调颜色/标签后 `quoted` / `history` 仍能还原正文和表格；测例必须用 **live 归一化形态**，不认 builder 原始 JSON
+7. 回读：换主题或微调颜色/标签后 `quoted` / `history` 仍能还原正文、表格、以及被取进 `header.title` / `text_tag_list` 的标题与标签；测例必须用 **live 归一化形态**，不认 builder 原始 JSON
 
 ### 本轮之后
 
