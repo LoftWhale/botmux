@@ -3,7 +3,7 @@
 // 下发 open-stream，本端拨一条数据连接回去、裸桥接到本地 dashboard 端口。
 import net from 'node:net';
 import { hostname, networkInterfaces } from 'node:os';
-import { WebSocket, createWebSocketStream } from 'ws';
+import { WebSocket, type RawData } from 'ws';
 import { setPlatformTeams, clearPlatformBinding, type PlatformBinding, type PlatformTeam } from './binding.js';
 
 /** 本机一个 botmux bot 的概要（上报给平台，供团队页「人→机器→bot」展示 + 拉群）。 */
@@ -66,6 +66,12 @@ const DATA_DIAL_PARALLEL = 3;
 const DATA_DIAL_MAX_WAVES = 2;
 const DATA_DIAL_WAVE_BACKOFF_MS = 150;
 const DATA_DIAL_OVERALL_DEADLINE_MS = 8_000;
+
+// 桥接的 WebSocket 侧背压水位：本地 dashboard 读得比平台链路发得快时（下载、长日志），
+// ws 已缓冲超过这个字节数就暂停 TCP 读取，等排空再继续。`pipe()` 原来替我们管背压，
+// 手写事件桥接（见 bridge()：Bun 不支持 createWebSocketStream）就必须自己管，否则
+// 大响应会在内存里堆帧。
+const WS_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
 
 // 控制连接并行拨号（happy-eyeballs）：一轮并行拨几条、谁先握手成功用谁，兜住入口 VIP 对新建连接
 // ~35% 的黑洞。单条超时给足 TLS 握手时间（好连接 ~40ms，黑洞则等满超时判负）。
@@ -376,21 +382,64 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
       }
       inflight.clear();
       // 数据流必须关 permessage-deflate（连接创建时已设），否则大文件帧经网关压缩协商错位 → RSV1 断流。
-      const dup = createWebSocketStream(winner);
+      //
+      // 手动事件桥接，不用 `ws` 的 createWebSocketStream()：那个 API 在 **Bun 里
+      // 直接抛 `Error("Not supported yet in Bun")`**（实测 bun 1.3.2 抛、node
+      // v22.21.1 正常）。而编译版单文件二进制跑的就是 Bun —— 于是控制通道连上了
+      // （`new WebSocket` 在 Bun 下正常，日志照打「隧道已连接平台」、平台侧显示机器
+      // 在线），但每次真要转发请求都崩在这一行，数据通道永远建不起来：平台侧
+      // Dashboard 整站打不开，而本地直连不经隧道故一切正常。这个「dev 模式能开、
+      // 二进制不能开」的分裂就是它。
       const tcp = net.connect(opts.getDashboardPort(), '127.0.0.1');
       // 交互式终端关 Nagle：终端输出常被拆成「回显字符 + 光标/颜色控制序列」这类分帧小包，
       // Nagle 会把紧随其后的小包扣到对端 delayed-ACK(~40ms)才发出。网页终端经平台隧道中转时
       // 这条桥接 socket 串在链路中间，用户就感到每隔一下卡 ~40ms；本机直连不经隧道故不卡。
       tcp.setNoDelay(true);
+      let killed = false;
       const kill = () => {
-        try { dup.destroy(); } catch { /* ignore */ }
+        if (killed) return;      // 双向都会触发 close/error，去重避免重复 destroy
+        killed = true;
+        try { winner.terminate(); } catch { /* ignore */ }
         try { tcp.destroy(); } catch { /* ignore */ }
       };
-      dup.on('error', kill);
-      tcp.on('error', kill);
+
+      // ── 平台 → 本地 ──
+      // 背压：`pipe()` 原本替我们做这件事，手写就得自己来。TCP 侧写不动时暂停
+      // WebSocket 读取，drain 后恢复；否则大响应（下载、长日志）会在内存里堆帧。
+      winner.on('message', (data: RawData) => {
+        const buf = toBuffer(data);
+        if (!buf.length) return;
+        if (!tcp.write(buf)) {
+          try { winner.pause(); } catch { /* ignore */ }
+        }
+      });
+      tcp.on('drain', () => { try { winner.resume(); } catch { /* ignore */ } });
+
+      // ── 本地 → 平台 ──
+      // 反向背压用 bufferedAmount：ws 没有 write() 的返回值可依赖。
+      tcp.on('data', (chunk: Buffer) => {
+        if (winner.readyState !== winner.OPEN) return;
+        // binary:true 是显式声明，不是必需的保险：实测 ws 对 Buffer 入参本就发二进制帧
+        // （不加也是 isBinary=true、字节逐字不变）。写出来是为了让「这是裸字节桥、
+        // 不许按文本处理」这件事在代码里可见，避免日后有人换成 string 载荷。
+        winner.send(chunk, { binary: true });
+        if (winner.bufferedAmount > WS_BACKPRESSURE_BYTES) {
+          tcp.pause();
+          const resumeWhenDrained = (): void => {
+            if (killed) return;
+            if (winner.bufferedAmount > WS_BACKPRESSURE_BYTES) { setTimeout(resumeWhenDrained, 20); return; }
+            tcp.resume();
+          };
+          setTimeout(resumeWhenDrained, 20);
+        }
+      });
+
+      winner.on('close', kill);
+      winner.on('error', kill);
       tcp.on('close', kill);
-      dup.pipe(tcp);
-      tcp.pipe(dup);
+      tcp.on('error', kill);
+      // 本地 dashboard 读完即关：半关会让隧道另一头一直等，所以直接收尾。
+      tcp.on('end', kill);
     };
 
     // 每波并行拨 DATA_DIAL_PARALLEL 条，谁先 open 谁胜出；一波全黑洞/失败才进下一波（有界）。
@@ -474,6 +523,19 @@ function safeSend(sock: WebSocket, obj: unknown): void {
   } catch {
     /* ignore */
   }
+}
+
+/**
+ * 把 `ws` 的 message 负载归一成一个 Buffer。
+ *
+ * `RawData` 可能是 Buffer、Buffer[]（分片未合并）或 ArrayBuffer，取决于 ws 的
+ * 配置与运行时；桥接要往 TCP 写的是连续字节，所以三种都得收敛。原先
+ * `createWebSocketStream()` 内部替我们做了这件事。
+ */
+function toBuffer(data: RawData): Buffer {
+  if (Buffer.isBuffer(data)) return data;
+  if (Array.isArray(data)) return Buffer.concat(data);
+  return Buffer.from(data as ArrayBuffer);
 }
 
 function wsBase(platformUrl: string): string {
