@@ -131,4 +131,39 @@ describe('buildBridgeInputContent', () => {
     // baseline: confirms the test for buildBridgeInputContent is meaningful
     expect(out).toContain('botmux_reminder');
   });
+
+  // ── no-transport follow-up reminder (质量①, 3rd injection site): an HTTP
+  //    virtual session (http_async_*/http_wait_*) — the follow-up path #71's
+  //    turnIdempotencyKey opens — must NOT get the send/@/silence reminder, which
+  //    carries the BOTMUX_NOTHING_TO_SEND sentence that conflicts with the
+  //    per-turn <botmux_http_response_mode>. The chatId test alone proves
+  //    no-transport (no bot lookup needed), so this works without a registry mock.
+  it('swaps the follow-up reminder to the no-transport variant for an HTTP virtual session', () => {
+    const out = buildFollowUpContent('hi', 'sid-http', {
+      isAdoptMode: false,
+      cliId: 'codex',
+      chatId: 'http_async_abc123',
+    });
+    // Reminder block is still present…
+    expect(out).toContain('<botmux_reminder>');
+    // …but carries NO sentinel semantics (the conflict we removed) and no
+    // "reply via botmux send" directive. It only *prohibits* send (为程序任务防止
+    // 误发飞书), which is a negative instruction — assert the sentinel + the
+    // positive "respond via send" phrasing are gone, not the bare token.
+    expect(out).not.toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(out).not.toContain('回应一次'); // zh "respond at least once via send"
+    expect(out).toContain('不要调用 botmux send'); // explicit prohibition retained
+    // It points the model at the per-turn http_response_mode block instead.
+    expect(out).toContain('botmux_http_response_mode');
+  });
+
+  it('keeps the standard reminder (with sentinel) for a real Feishu follow-up', () => {
+    const out = buildFollowUpContent('hi', 'sid-real', {
+      isAdoptMode: false,
+      cliId: 'codex',
+      chatId: 'oc_realchat',
+    });
+    expect(out).toContain('<botmux_reminder>');
+    expect(out).toContain('BOTMUX_NOTHING_TO_SEND');
+  });
 });

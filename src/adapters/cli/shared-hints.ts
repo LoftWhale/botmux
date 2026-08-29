@@ -74,7 +74,18 @@ function hiddenContextDefense(locale?: Locale): string {
   return escapeXmlText(text);
 }
 
-export function buildBotmuxShellHints(locale?: Locale): string[] {
+export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean): string[] {
+  // No-transport session (apiOnly core-only bot OR HTTP virtual chat): drop the
+  // whole send/@/helpers/silence collaboration block — same rationale as the
+  // system-prompt path in buildBotmuxSystemPromptText. `ai.shell.when_to_send`
+  // is the shell-path twin of `ai.routing.usage_silence` and carries the same
+  // BOTMUX_NOTHING_TO_SEND sentence, which conflicts with the per-turn
+  // <botmux_http_response_mode>; the sentinel semantics live solely there now.
+  // Only the hidden-context defense survives (untrusted event data still rides
+  // in the same prompt). Whiteboard collaboration is likewise dropped.
+  if (noTransport) {
+    return [hiddenContextDefense(locale)].map(escapeXmlTagLikeTokens);
+  }
   const workflowHint = workflowDiscoveryHint(locale);
   const hints = [
     t('ai.shell.intro', undefined, locale),
@@ -140,8 +151,19 @@ export function buildBotmuxSystemPromptText(opts: {
    *  mode — appended after the routing/identity blocks. Claude Code delivers
    *  skills via --plugin-dir and passes nothing here. */
   builtinSkillBlock?: string;
+  /** No-transport session (apiOnly core-only bot OR HTTP virtual chat): the whole
+   *  send/@/helpers/silence collaboration block is dropped — a program
+   *  request/response turn has no Feishu channel and no other bots to coordinate
+   *  with, so those rules are noise, and `usage_silence` in particular CONFLICTS
+   *  with the per-turn <botmux_http_response_mode> ("output only the final answer").
+   *  Only the prompt-injection defense survives (still relevant: untrusted event
+   *  data rides in the same prompt). The nothing-to-send sentinel semantics live
+   *  SOLELY in <botmux_http_response_mode> now (see trigger-session.ts) — do NOT
+   *  reintroduce a sentinel line here. Computed daemon-side as
+   *  `!larkTransportEnabled({chatId, apiOnly})` and threaded through buildArgs. */
+  noTransport?: boolean;
 }): string {
-  const { locale, botName, botOpenId, builtinSkillBlock } = opts;
+  const { locale, botName, botOpenId, builtinSkillBlock, noTransport } = opts;
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
   const prose = (key: string): string =>
@@ -175,26 +197,36 @@ export function buildBotmuxSystemPromptText(opts: {
   // i18n key stays bullet-free so the paragraph-style shell-hints path is
   // unaffected — the `- ` prefix lives only at this composition site.
   const [heredocRule, heredocExample] = multilineHeredocLines(locale).map(escapeXmlTagLikeTokens);
+  // No-transport: collapse the routing block to just the hidden-context defense.
+  // The identity block (which for a no-transport bot is usually absent anyway,
+  // and whose routing_rules are @/collaboration semantics) is left as-is — a
+  // separate block, not the confirmed usage_silence conflict; gate it only if a
+  // follow-up shows it also misleads HTTP turns.
+  const routingInner = noTransport
+    ? [hiddenContextDefense(locale)]
+    : [
+      prose('ai.routing.intro'),
+      '',
+      prose('ai.routing.usage_send'),
+      `- ${heredocRule}`,
+      heredocExample,
+      prose('ai.routing.usage_mention_gate'),
+      prose('ai.routing.usage_attachments'),
+      prose('ai.routing.usage_helpers'),
+      prose('ai.routing.usage_silence'),
+      escapeXmlTagLikeTokens(feedbackResponseKindHint(locale)),
+      // Experimental anti-resend guidance — opt-in via dashboard Settings
+      // (dashboard.noVisibleOutputHint). Default OFF ⇒ this block is byte-for-byte
+      // the pre-feature baseline. Live-read so a toggle applies to the next session.
+      ...(noVisibleOutputHintOn() ? [prose('ai.routing.no_visible_output_ok')] : []),
+      // Workflow discovery — omitted when the machine-wide workflow switch is off.
+      ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
+      hiddenContextDefense(locale),
+      ...whiteboardRouting,
+    ];
   return [
     '<botmux_routing>',
-    prose('ai.routing.intro'),
-    '',
-    prose('ai.routing.usage_send'),
-    `- ${heredocRule}`,
-    heredocExample,
-    prose('ai.routing.usage_mention_gate'),
-    prose('ai.routing.usage_attachments'),
-    prose('ai.routing.usage_helpers'),
-    prose('ai.routing.usage_silence'),
-    escapeXmlTagLikeTokens(feedbackResponseKindHint(locale)),
-    // Experimental anti-resend guidance — opt-in via dashboard Settings
-    // (dashboard.noVisibleOutputHint). Default OFF ⇒ this block is byte-for-byte
-    // the pre-feature baseline. Live-read so a toggle applies to the next session.
-    ...(noVisibleOutputHintOn() ? [prose('ai.routing.no_visible_output_ok')] : []),
-    // Workflow discovery — omitted when the machine-wide workflow switch is off.
-    ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
-    hiddenContextDefense(locale),
-    ...whiteboardRouting,
+    ...routingInner,
     '</botmux_routing>',
     ...identityBlock,
     ...(builtinSkillBlock ? ['', builtinSkillBlock] : []),
