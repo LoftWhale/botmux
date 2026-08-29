@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join, delimiter } from 'node:path';
 import { execFileSync, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import type {
   SessionBackend,
   SessionDestroyResult,
@@ -150,18 +150,6 @@ export interface RiffBackendConfig {
    * after the mandatory botmux install commands.
    */
   setupCommands?: string[];
-  /**
-   * Opt-in to riff's follow-up/create idempotency key (X-Idempotency-Key).
-   * Default OFF — until the riff server side is deployed, sending the header is a
-   * no-op at best; keeping it off makes the client behave exactly as if the
-   * feature did not exist (no header, no auto-resend on a reconcile-miss). When
-   * ON: each user message gets one UUID reused across that message's attempts,
-   * both task-execute and task-follow-up carry it, and a follow-up that times out
-   * AND reconciles to no child is safely auto-resent once under the same key
-   * (the server dedups → never a duplicate task). Also togglable via the
-   * BOTMUX_RIFF_IDEMPOTENCY env var (config wins when set).
-   */
-  idempotencyKey?: boolean;
   /**
    * Extra HTTP headers added to EVERY riff outbound request (task-execute,
    * task-follow-up, task-stream, the reconcile tasks query, task-cancel,
@@ -796,7 +784,10 @@ interface RiffTaskResponse {
  *  NOTE the primary-key field is `id` (the DB `taskId` is serialized out as
  *  `id`) — never read `.taskId` here. `followUpParentTaskId` is absent on the
  *  root task. `interaction.status` is a retired V1 field (not written by new
- *  tasks) — status comes from the top-level `status` only. */
+ *  tasks) — status comes from the top-level `status` only.
+ *  Fields verified against riff's TASK_THREAD_SUMMARY_PROJECTION: the summary
+ *  view really does project `followUpParentTaskId`/`followUpRootTaskId`, so the
+ *  reconcile below can match on them. */
 interface RiffThreadNode {
   id: string;
   threadId?: string;
@@ -805,10 +796,9 @@ interface RiffThreadNode {
   useRunner?: boolean;
   followUpParentTaskId?: string;
   followUpRootTaskId?: string;
-  /** The X-Idempotency-Key that created this task (riff writes it as
-   *  clientRequestId). The EXACT reconcile anchor: one key ↔ one task, immune to
-   *  riff redirecting the follow-up parent to the thread's latest node. */
-  clientRequestId?: string;
+  /** ISO timestamp of task creation. In riff's summary projection; used as the
+   *  reconcile floor so a task stranded by an earlier turn is never adopted. */
+  createdAt?: string;
 }
 
 /** Terminal riff task statuses (riff openApiDocs task contract). Once a task
@@ -1082,12 +1072,6 @@ export class RiffBackend implements SessionBackend {
     }
 
     const { text, attachments } = this.extractAttachments(data);
-    // One idempotency key per user message (null when the feature is off). Reused
-    // across this message's attempts (initial send + a post-timeout resend) so the
-    // server dedups rather than building a duplicate; the next message gets a new
-    // one. Generated here at the write boundary — NOT inside createTask/followUp —
-    // so a resend keeps the same key.
-    const idempotencyKey = this.newIdempotencyKey();
 
     this.writeChain = this.writeChain
       .then(async () => {
@@ -1099,9 +1083,9 @@ export class RiffBackend implements SessionBackend {
         // per turn would cold-boot a new sandbox (minutes) and drop context.
         this.taskDone = false;
         if (!this.currentTaskId) {
-          await this.createTask(text, attachments, idempotencyKey);
+          await this.createTask(text, attachments);
         } else {
-          await this.followUp(text, attachments, idempotencyKey);
+          await this.followUp(text, attachments);
         }
       })
       .catch((err) => {
@@ -1564,7 +1548,7 @@ export class RiffBackend implements SessionBackend {
     return parts[parts.length - 1] ?? p;
   }
 
-  private async createTask(prompt: string, attachments: RiffAttachment[], idempotencyKey: string | null): Promise<void> {
+  private async createTask(prompt: string, attachments: RiffAttachment[]): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-execute`;
 
     // riff task-execute body: origin at top level, prompt inside config.userPrompt
@@ -1615,7 +1599,7 @@ export class RiffBackend implements SessionBackend {
     if (this.config.templateId) payload.templateId = this.config.templateId;
 
     try {
-      const taskId = await this.uploadAndCreate(url, payload, attachments, this.createTimeoutMs, idempotencyKey);
+      const taskId = await this.uploadAndCreate(url, payload, attachments, this.createTimeoutMs);
       if (!(await this.adoptLateTask(taskId))) return;
       this.markActivity();
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
@@ -1632,24 +1616,6 @@ export class RiffBackend implements SessionBackend {
     this.lastTaskActivityMs = Date.now();
   }
 
-  /** Whether the X-Idempotency-Key feature is enabled. Default OFF; config wins,
-   *  else the BOTMUX_RIFF_IDEMPOTENCY env var (1/true/on). Gates BOTH sending the
-   *  header AND the auto-resend on a reconcile-miss — when off, behavior is
-   *  identical to the feature not existing. */
-  private idempotencyEnabled(): boolean {
-    if (typeof this.config.idempotencyKey === 'boolean') return this.config.idempotencyKey;
-    const env = process.env.BOTMUX_RIFF_IDEMPOTENCY?.trim().toLowerCase();
-    return env === '1' || env === 'true' || env === 'on';
-  }
-
-  /** A fresh idempotency key for one user-intent, or null when the feature is
-   *  off. The SAME key is reused across that message's attempts (initial send +
-   *  a post-timeout resend) so the server returns the first task rather than
-   *  building a duplicate; a new user message gets a new key. */
-  private newIdempotencyKey(): string | null {
-    return this.idempotencyEnabled() ? randomUUID() : null;
-  }
-
   /** Pick the follow-up fetch budget. Cold (larger budget) when the riff sandbox
    *  has likely gone cold and this follow-up must synchronously wake it:
    *    • this process has seen NO task activity yet — the daemon-restart resume
@@ -1663,7 +1629,7 @@ export class RiffBackend implements SessionBackend {
     return cold ? this.followUpColdTimeoutMs : this.followUpHotTimeoutMs;
   }
 
-  private async followUp(prompt: string, attachments: RiffAttachment[], idempotencyKey: string | null): Promise<void> {
+  private async followUp(prompt: string, attachments: RiffAttachment[]): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-follow-up`;
 
     // Capture the parent BEFORE the request: reconcile-on-timeout below needs the
@@ -1677,19 +1643,18 @@ export class RiffBackend implements SessionBackend {
       prompt: this.injectSystemPrompt(prompt),
     };
 
-    // One send attempt: POST → adopt → stream. Throws on fetch/HTTP failure
-    // (incl. TimeoutError). Reused verbatim by the post-timeout resend so the
-    // success path (and its markActivity/stream wiring) is single-sourced.
-    const sendOnce = async (): Promise<void> => {
-      const taskId = await this.uploadAndCreate(url, payload, attachments, this.followUpTimeoutMs(), idempotencyKey);
+    // Send-time floor for reconcile-on-timeout: only a task created at/after this
+    // instant can be THIS follow-up's child (see reconcileAfterFollowUpTimeout).
+    // Read before the request so a slow pre-flight cannot push it past the child's
+    // own createdAt.
+    const sentAtMs = Date.now();
+
+    try {
+      const taskId = await this.uploadAndCreate(url, payload, attachments, this.followUpTimeoutMs());
       if (!(await this.adoptLateTask(taskId))) return;
       this.markActivity();
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
       this.streamTask(taskId);
-    };
-
-    try {
-      await sendOnce();
     } catch (err) {
       // A client-side fetch timeout does NOT mean the server did nothing. riff
       // task-follow-up is "accept → return taskId", but returns only AFTER a
@@ -1702,40 +1667,14 @@ export class RiffBackend implements SessionBackend {
       // child already exists, adopt it (no lost context, no duplicate); only a true
       // broken lineage resets to a fresh task.
       if (this.isTimeoutError(err) && parentTaskId) {
-        if (await this.reconcileAfterFollowUpTimeout(parentTaskId, idempotencyKey)) return;
-        // Reconcile found no child: the server had not created one when we looked.
-        if (idempotencyKey) {
-          // Idempotency key present (feature ON) → safe to resend the SAME key:
-          // the server returns the first task if it did end up creating one
-          // (dedup, never a duplicate). Covers the race where the child was
-          // created just after our reconcile probe. Only ONE resend — if it also
-          // times out, fall through to keeping the lineage.
-          try {
-            this.emitLine(`[riff] follow-up 超时且未查到子任务，携带幂等键重发一次`, 'warn');
-            await sendOnce();
-            return;
-          } catch (retryErr) {
-            if (this.isTimeoutError(retryErr)) {
-              // A last reconcile: the resend itself may have created/hit the child
-              // before timing out.
-              if (await this.reconcileAfterFollowUpTimeout(parentTaskId, idempotencyKey)) return;
-            }
-            // else: a non-timeout error on resend → fall through to broken-lineage.
-            if (this.isTimeoutError(retryErr)) {
-              this.emitError(`riff follow-up 超时，重发仍未送达（血缘保留，请重发本条消息）: ${retryErr}`);
-              return;
-            }
-            this.currentTaskId = null;
-            this.taskIdCb?.(null);
-            this.emitError(`riff follow-up 失败: ${retryErr}（下一条消息将新建任务）`);
-            return;
-          }
-        }
-        // Feature OFF: do not auto-resend (without the key a resend could build a
-        // duplicate via riff's parent→latest-node redirect). Keep the lineage —
-        // the parent is still valid, the next message retries follow-up against it
-        // rather than cold-booting a fresh task. THIS turn's prompt is dropped;
-        // surface that so the user can resend. No lineage/context loss.
+        if (await this.reconcileAfterFollowUpTimeout(parentTaskId, sentAtMs)) return;
+        // Reconcile found no child. Deliberately NO auto-resend: riff has no
+        // request-dedup (no X-Idempotency-Key / clientRequestId server-side), and
+        // its follow-up redirects the parent to the thread's latest node — so a
+        // blind resend can genuinely build a SECOND task for one user message.
+        // Keep the lineage instead: the parent is still valid, so the next message
+        // continues the conversation rather than cold-booting a fresh sandbox.
+        // THIS turn's prompt is dropped; say so plainly so the user can resend.
         this.emitError(`riff follow-up 超时，本次未送达（血缘保留，请重发本条消息）: ${err}`);
         return;
       }
@@ -1774,15 +1713,25 @@ export class RiffBackend implements SessionBackend {
    * resumed / terminal result fetched). False means "no child yet" → caller keeps
    * the lineage without adopting.
    *
-   * MATCHING ANCHOR — crid first, parent second:
-   *   1. clientRequestId === the X-Idempotency-Key WE sent — the exact, unique
-   *      anchor: one key ↔ one task, and immune to riff redirecting the follow-up
-   *      parent to the thread's latest node (which breaks a parent-id match).
-   *   2. Fallback (idempotency OFF, or a node predating the crid projection):
-   *      followUpParentTaskId === parentTaskId. Looser, but the only signal when
-   *      no crid is available.
+   * MATCHING ANCHOR — `followUpParentTaskId` PLUS a send-time floor:
+   *   riff has no per-request id we could echo back (no clientRequestId in the
+   *   task document, no X-Idempotency-Key handling), so the parent link is the
+   *   only server-side signal tying a task to this follow-up.
+   *   It is not unique on its own: riff redirects a follow-up's parent to the
+   *   thread's LATEST node (api/lambda/task-follow-up.ts — "普通追问必须从 thread
+   *   最新节点发起"), so several siblings can share one parent — including a task
+   *   stranded by an EARLIER timed-out turn. Adopting that one would replay a
+   *   previous turn's output and silently drop this turn's prompt.
+   *   Hence `sentAtMs`: only a child created at/after the moment we issued THIS
+   *   follow-up can be its child. `createdAt` is in riff's
+   *   TASK_THREAD_SUMMARY_PROJECTION, so the summary view really carries it.
+   *   A node with an absent/unparsable createdAt is NOT adopted — fail closed,
+   *   because a wrong adopt is worse than a missed one (the caller keeps the
+   *   lineage and the user just resends).
+   *   Ties are broken by the OLDEST qualifying child: the first task created
+   *   after we sent is the one our request produced.
    */
-  private async reconcileAfterFollowUpTimeout(parentTaskId: string, idempotencyKey: string | null): Promise<boolean> {
+  private async reconcileAfterFollowUpTimeout(parentTaskId: string, sentAtMs: number): Promise<boolean> {
     for (let attempt = 1; attempt <= this.reconcileMaxAttempts; attempt++) {
       if (this.killed || this.closing || this.shutdownDetaching) return false;
       let nodes: RiffThreadNode[];
@@ -1793,13 +1742,9 @@ export class RiffBackend implements SessionBackend {
         nodes = [];
       }
       // Diagnostic: what did the thread query return, and what are we matching on?
-      // ids/keys only — surfaces missing (timing/scope) vs present-but-unmatched.
-      logger.info(`[riff] reconcile attempt ${attempt}: match by ${idempotencyKey ? `crid=${idempotencyKey.slice(0, 8)}` : `parent=${parentTaskId.slice(0, 8)}`}, thread has ${nodes.length} node(s): ${nodes.map(n => `${n.id?.slice(0, 8)}(par=${n.followUpParentTaskId?.slice(0, 8) ?? 'none'},crid=${n.clientRequestId?.slice(0, 8) ?? 'none'},${n.status})`).join(' ')}`);
-      // Prefer the crid anchor (redirect-proof); fall back to the parent match.
-      const child = (idempotencyKey
-        ? nodes.find((n) => !!n.id && n.clientRequestId === idempotencyKey)
-        : undefined)
-        ?? nodes.find((n) => !!n.id && n.followUpParentTaskId === parentTaskId);
+      // ids/times only — surfaces missing (timing/scope) vs present-but-unmatched.
+      logger.info(`[riff] reconcile attempt ${attempt}: match by parent=${parentTaskId.slice(0, 8)} createdAt>=${new Date(sentAtMs).toISOString()}, thread has ${nodes.length} node(s): ${nodes.map(n => `${n.id?.slice(0, 8)}(par=${n.followUpParentTaskId?.slice(0, 8) ?? 'none'},created=${n.createdAt ?? 'none'},${n.status})`).join(' ')}`);
+      const child = this.pickReconciledChild(nodes, parentTaskId, sentAtMs);
       if (child) {
         const childId = child.id;
         // Re-check we can still adopt (a concurrent close/kill may have landed).
@@ -1821,6 +1766,30 @@ export class RiffBackend implements SessionBackend {
       }
     }
     return false;
+  }
+
+  /** The thread node this follow-up created, or undefined. Requires BOTH the
+   *  parent link AND creation at/after `sentAtMs` (see the anchor notes on
+   *  reconcileAfterFollowUpTimeout — the parent alone can match a task stranded
+   *  by an earlier timed-out turn). Unparsable/absent createdAt → not a
+   *  candidate. Oldest qualifying node wins. */
+  private pickReconciledChild(
+    nodes: RiffThreadNode[],
+    parentTaskId: string,
+    sentAtMs: number,
+  ): RiffThreadNode | undefined {
+    let best: RiffThreadNode | undefined;
+    let bestMs = Number.POSITIVE_INFINITY;
+    for (const n of nodes) {
+      if (!n.id || n.followUpParentTaskId !== parentTaskId) continue;
+      const createdMs = n.createdAt ? Date.parse(n.createdAt) : NaN;
+      if (!Number.isFinite(createdMs) || createdMs < sentAtMs) continue;
+      if (createdMs < bestMs) {
+        best = n;
+        bestMs = createdMs;
+      }
+    }
+    return best;
   }
 
   /** riff terminal task statuses — whitelist so future intermediate states are
@@ -1888,7 +1857,6 @@ export class RiffBackend implements SessionBackend {
     payload: Record<string, unknown>,
     attachments: RiffAttachment[],
     timeoutMs: number,
-    idempotencyKey: string | null,
   ): Promise<string> {
     // Assemble the request body FIRST (attachment reads can be slow on large
     // files / slow disks), THEN resolve the JWT immediately before fetch. The
@@ -1919,21 +1887,16 @@ export class RiffBackend implements SessionBackend {
     // freshness check reflects the token that actually goes on the wire. `body`
     // (string or FormData) is re-extractable per fetch, so the retry below can
     // reuse it.
-    // Idempotency: same key across a message's attempts → server returns the
-    // first task instead of building a duplicate. Null when the feature is off.
-    if (idempotencyKey) headers['X-Idempotency-Key'] = idempotencyKey;
     this.applyExtraHeaders(headers);
-    // Observability: record the outbound target + which routing/idempotency
-    // headers were attached (names + key presence only — never the JWT value).
-    // Makes "did this request carry the PPE/idempotency headers?" answerable from
-    // logs instead of guesswork.
+    // Observability: record the outbound target + which routing headers were
+    // attached (names only — never the JWT value). Makes "did this request carry
+    // the PPE/lane headers?" answerable from logs instead of guesswork.
     const routingHeaderKeys = Object.keys(headers).filter(k => k.toLowerCase() !== 'x-jwt-token' && k.toLowerCase() !== 'content-type');
-    logger.info(`[riff] → POST ${url} headers=[${routingHeaderKeys.join(',') || 'none'}] idempotencyKey=${idempotencyKey ? 'yes' : 'no'}`);
-    // The idempotency + routing headers live in `headers`, which `post` spreads —
-    // so the 401/403 retry below carries them too (a retry that dropped the
-    // idempotency key could build a duplicate task; one that dropped the lane
-    // headers would land in the wrong environment). The timeout is the caller's
-    // per-endpoint budget (create vs follow-up cold/hot), not a fixed constant.
+    logger.info(`[riff] → POST ${url} headers=[${routingHeaderKeys.join(',') || 'none'}]`);
+    // The routing headers live in `headers`, which `post` spreads — so the
+    // 401/403 retry below carries them too (a retry that dropped them would land
+    // in the wrong environment). The timeout is the caller's per-endpoint budget
+    // (create vs follow-up cold/hot), not a fixed constant.
     const post = (jwt: string | null): Promise<Response> => {
       const h = { ...headers };
       if (jwt) h['x-jwt-token'] = jwt;

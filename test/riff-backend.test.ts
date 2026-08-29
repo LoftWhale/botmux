@@ -1606,6 +1606,65 @@ describe('RiffBackend', () => {
       expect((be as any).followUpTimeoutMs()).toBe((be as any).followUpColdTimeoutMs);
     });
 
+    // The two tests above only prove the SELECTOR computes the right number. They
+    // say nothing about whether that number reaches the wire — swapping the
+    // request's budget back to the shared createTimeoutMs (i.e. undoing this whole
+    // fix) leaves them green. These assert the CONSUMER side: the ms actually
+    // handed to AbortSignal.timeout() for each endpoint.
+    /** Record the timeout budget passed to AbortSignal.timeout() per request, by
+     *  URL. Returns the collected pairs; restore() puts the real one back. */
+    function captureTimeouts() {
+      const seen: Array<{ url: string; ms: number }> = [];
+      const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+      let pending: number | null = null;
+      const spy = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms: number) => {
+        pending = ms;
+        return realTimeout(600_000); // never actually fires during the test
+      });
+      const realFetch = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+        if (pending != null) { seen.push({ url: String(url), ms: pending }); pending = null; }
+        return realFetch(url, init);
+      });
+      return { seen, restore: () => spy.mockRestore() };
+    }
+
+    it('the follow-up REQUEST carries the cold budget (not the shared create budget)', async () => {
+      const { be } = await primedFollowUp({ followUpHotTimeoutMs: 31_000, followUpColdTimeoutMs: 61_000 });
+      // Force the cold branch.
+      (be as any).lastTaskActivityMs = Date.now() - ((be as any).coldFollowUpThresholdMs + 1);
+      const { seen, restore } = captureTimeouts();
+      be.write('second');
+      await flush(); await flush();
+      restore();
+      const followUp = seen.find(s => s.url.includes('/api/task-follow-up'));
+      expect(followUp?.ms).toBe(61_000);
+      // Explicitly NOT the create budget — that swap is exactly the regression.
+      expect(followUp?.ms).not.toBe((be as any).createTimeoutMs);
+    });
+
+    it('the follow-up REQUEST carries the hot budget right after activity', async () => {
+      const { be } = await primedFollowUp({ followUpHotTimeoutMs: 32_000, followUpColdTimeoutMs: 62_000 });
+      const { seen, restore } = captureTimeouts();
+      be.write('second');
+      await flush(); await flush();
+      restore();
+      const followUp = seen.find(s => s.url.includes('/api/task-follow-up'));
+      expect(followUp?.ms).toBe(32_000);
+    });
+
+    it('the create REQUEST carries the create budget (create and follow-up no longer share one)', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.spawn('', [], {} as any);
+      const { seen, restore } = captureTimeouts();
+      be.write('first');
+      await flush(); await flush();
+      restore();
+      const create = seen.find(s => s.url.includes('/api/task-execute'));
+      expect(create?.ms).toBe((be as any).createTimeoutMs);
+      expect(create?.ms).not.toBe((be as any).followUpHotTimeoutMs);
+    });
+
     it('reconciles a timed-out follow-up: adopts the server-created child and streams it (no dup, no lost context)', async () => {
       const { be, ids } = await primedFollowUp();
       (be as any).reconcileRetryDelayMs = 0; // no real wait between reconcile attempts
@@ -1618,7 +1677,7 @@ describe('RiffBackend', () => {
         if (u.includes('/api/tasks?')) {
           return Response.json({ success: true, data: [
             { id: 'task-parent', threadId: 'session-1', status: 'completed' },
-            { id: 'task-child', threadId: 'session-1', status: 'running', followUpParentTaskId: 'task-parent' },
+            { id: 'task-child', threadId: 'session-1', status: 'running', followUpParentTaskId: 'task-parent', createdAt: new Date(Date.now() + 1_000).toISOString() },
           ] });
         }
         if (u.includes('/api2/task-stream')) return pendingSseResponse();
@@ -1649,7 +1708,7 @@ describe('RiffBackend', () => {
         if (u.includes('/api/task-follow-up')) throw timeoutError();
         if (u.includes('/api/tasks?')) {
           return Response.json({ success: true, data: [
-            { id: 'task-child', threadId: 'session-1', status: 'completed', followUpParentTaskId: 'task-parent' },
+            { id: 'task-child', threadId: 'session-1', status: 'completed', followUpParentTaskId: 'task-parent', createdAt: new Date(Date.now() + 1_000).toISOString() },
           ] });
         }
         if (u.includes('/api/task-detail')) return Response.json({ success: true, data: { task: {} } });
@@ -1720,12 +1779,12 @@ describe('RiffBackend', () => {
       expect(tasksAuth).toBe('owner-jwt');
     });
 
-    it('reconcile matches by clientRequestId even when the child parent was redirected (redirect-proof)', async () => {
-      // The real bug: riff redirects a botmux-origin follow-up's parent to the
-      // thread's LATEST node, so the child's followUpParentTaskId != the id we
-      // sent. A parent-only match misses it and (wrongly) resends. Matching by the
-      // crid we sent finds it regardless.
-      const be = makeBackend({ injectStatusLines: false, idempotencyKey: true });
+    it('reconcile does NOT adopt a child stranded by an EARLIER turn (created before we sent)', async () => {
+      // riff redirects a follow-up's parent to the thread's LATEST node, so several
+      // siblings can share one parent — including a task left behind by a previous
+      // timed-out turn. Adopting that one would replay the old turn's output and
+      // silently drop this turn's prompt. The send-time floor rules it out.
+      const be = makeBackend({ injectStatusLines: false });
       (be as any).reconcileRetryDelayMs = 0;
       be.spawn('', [], {} as any);
       be.write('first');
@@ -1735,144 +1794,58 @@ describe('RiffBackend', () => {
       (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-parent');
       await flush(); await flush();
 
-      let sentKey: string | undefined;
-      let followCount = 0;
-      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+      // A sibling with the RIGHT parent but created well BEFORE this follow-up.
+      const stranded = new Date(Date.now() - 600_000).toISOString();
+      fetchMock.mockImplementation(async (url: string | URL) => {
         const u = String(url);
-        calls.push({ url: u, init });
-        if (u.includes('/api/task-follow-up')) {
-          followCount++;
-          sentKey = (init?.headers as Record<string, string>)?.['X-Idempotency-Key'];
-          throw timeoutError();
-        }
+        calls.push({ url: u });
+        if (u.includes('/api/task-follow-up')) throw timeoutError();
         if (u.includes('/api/tasks?')) {
-          // Child exists with a REDIRECTED parent (not 'task-parent') but the crid
-          // we sent — a parent-only match would miss it; crid match finds it.
           return Response.json({ success: true, data: [
             { id: 'task-parent', status: 'completed' },
-            { id: 'task-child', status: 'running', followUpParentTaskId: 'some-newer-node', clientRequestId: sentKey },
+            { id: 'task-stranded', status: 'running', followUpParentTaskId: 'task-parent', createdAt: stranded },
           ] });
         }
-        if (u.includes('/api2/task-stream')) return pendingSseResponse();
         return pendingSseResponse();
       });
 
       be.write('second');
-      await flush(); await flush(); await flush();
+      await flush(); await flush(); await flush(); await flush();
 
-      expect(followCount).toBe(1);            // adopted via crid → NO resend
-      expect((be as any).currentTaskId).toBe('task-child');
+      // Never adopted the stale sibling; lineage kept so the next message continues.
+      expect((be as any).currentTaskId).toBe('task-parent');
+      expect(calls.some(c => c.url.includes('task-stranded'))).toBe(false);
     });
-  });
 
-  // ── 幂等键(第二段):X-Idempotency-Key + 超时自动重发,门控 OFF 默认 ──────────
-  describe('idempotency key (X-Idempotency-Key) + auto-resend, gated', () => {
-    function timeoutError(): Error {
-      const e = new Error('The operation was aborted due to timeout');
-      e.name = 'TimeoutError';
-      return e;
-    }
-    async function primed(config: Record<string, unknown> = {}) {
-      const be = makeBackend({ injectStatusLines: false, ...config });
-      const ids: Array<string | null> = [];
-      be.onTaskId((id) => ids.push(id));
+    it('reconcile skips a node with no parsable createdAt (fail closed, never a wrong adopt)', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      (be as any).reconcileRetryDelayMs = 0;
       be.spawn('', [], {} as any);
       be.write('first');
       await flush();
-      // create carries the header only when the feature is on — assert per-test.
       resolvers.shift()!(taskResponse('task-parent'));
       await flush();
       (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-parent');
       await flush(); await flush();
-      return { be, ids };
-    }
-    const hdr = (c: FetchCall) => (c.init?.headers as Record<string, string> | undefined)?.['X-Idempotency-Key'];
 
-    it('OFF (default): no X-Idempotency-Key header on create or follow-up', async () => {
-      const { be } = await primed();
-      be.write('second');
-      await flush();
-      const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
-      const follow = calls.find(c => c.url.includes('/api/task-follow-up'))!;
-      expect(hdr(exec)).toBeUndefined();
-      expect(hdr(follow)).toBeUndefined();
-    });
-
-    it('ON: both task-execute and task-follow-up carry an X-Idempotency-Key', async () => {
-      const { be } = await primed({ idempotencyKey: true });
-      be.write('second');
-      await flush();
-      const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
-      const follow = calls.find(c => c.url.includes('/api/task-follow-up'))!;
-      expect(hdr(exec)).toBeTruthy();
-      expect(hdr(follow)).toBeTruthy();
-      // Different user messages → different keys.
-      expect(hdr(exec)).not.toBe(hdr(follow));
-    });
-
-    it('OFF: a timeout + reconcile-miss does NOT auto-resend (keeps lineage, prompts user)', async () => {
-      const { be } = await primed();
-      (be as any).reconcileRetryDelayMs = 0;
-      let followCount = 0;
       fetchMock.mockImplementation(async (url: string | URL) => {
         const u = String(url);
         calls.push({ url: u });
-        if (u.includes('/api/task-follow-up')) { followCount++; throw timeoutError(); }
-        if (u.includes('/api/tasks?')) return Response.json({ success: true, data: [] });
-        return pendingSseResponse();
-      });
-      be.write('second');
-      await flush(); await flush(); await flush();
-      // Exactly ONE follow-up attempt — no resend when the feature is off.
-      expect(followCount).toBe(1);
-      expect((be as any).currentTaskId).toBe('task-parent'); // lineage kept
-    });
-
-    it('ON: timeout + reconcile-miss auto-resends ONCE with the SAME key → adopts the child', async () => {
-      const { be, ids } = await primed({ idempotencyKey: true });
-      (be as any).reconcileRetryDelayMs = 0;
-      const followKeys: Array<string | undefined> = [];
-      let followCount = 0;
-      fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
-        const u = String(url);
-        calls.push({ url: u, init });
-        if (u.includes('/api/task-follow-up')) {
-          followKeys.push((init?.headers as Record<string, string>)?.['X-Idempotency-Key']);
-          followCount++;
-          if (followCount === 1) throw timeoutError(); // first send times out
-          // resend: server accepts (dedup) and returns the task id
-          return Response.json({ success: true, data: { id: 'task-child', status: 'running', idempotentReplay: true } });
+        if (u.includes('/api/task-follow-up')) throw timeoutError();
+        if (u.includes('/api/tasks?')) {
+          return Response.json({ success: true, data: [
+            // Right parent, but createdAt missing / garbage → not a candidate.
+            { id: 'task-nodate', status: 'running', followUpParentTaskId: 'task-parent' },
+            { id: 'task-baddate', status: 'running', followUpParentTaskId: 'task-parent', createdAt: 'not-a-date' },
+          ] });
         }
-        if (u.includes('/api/tasks?')) return Response.json({ success: true, data: [] }); // reconcile finds nothing
-        if (u.includes('/api2/task-stream')) return pendingSseResponse();
         return pendingSseResponse();
       });
+
       be.write('second');
       await flush(); await flush(); await flush(); await flush();
-      expect(followCount).toBe(2); // one resend
-      // Same key on both attempts.
-      expect(followKeys[0]).toBeTruthy();
-      expect(followKeys[1]).toBe(followKeys[0]);
-      // Adopted the child from the resend, no lineage reset.
-      expect((be as any).currentTaskId).toBe('task-child');
-      expect(ids).not.toContain(null);
-    });
 
-    it('ON: resend that also times out → keeps lineage, does not reset', async () => {
-      const { be } = await primed({ idempotencyKey: true });
-      (be as any).reconcileRetryDelayMs = 0;
-      let followCount = 0;
-      fetchMock.mockImplementation(async (url: string | URL) => {
-        const u = String(url);
-        calls.push({ url: u });
-        if (u.includes('/api/task-follow-up')) { followCount++; throw timeoutError(); }
-        if (u.includes('/api/tasks?')) return Response.json({ success: true, data: [] });
-        return pendingSseResponse();
-      });
-      be.write('second');
-      await flush(); await flush(); await flush(); await flush(); await flush();
-      expect(followCount).toBe(2); // initial + one resend, then gives up
-      expect((be as any).currentTaskId).toBe('task-parent'); // lineage preserved
+      expect((be as any).currentTaskId).toBe('task-parent');
     });
   });
 
