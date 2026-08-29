@@ -203,6 +203,15 @@ export interface BinarySelfUpdateDeps {
  * download is discarded while the working binary is still in place. A release
  * that publishes no `.sha256` is a warning, not a failure — matching install.sh,
  * which has always tolerated that.
+ *
+ * ── WHY NO `realpathSync(target)` ─────────────────────────────────────────────
+ * Renaming over a SYMLINK replaces the link itself and orphans its target
+ * (measured). That would matter if `target` could be a symlink — but the default
+ * target is `process.execPath`, which the OS has already resolved: MEASURED with a
+ * compiled binary invoked through a symlink, `process.execPath` reports the real
+ * file, never the link. So the symlink case is unreachable on the production path,
+ * and resolving again would only add a failure mode of its own (an unreadable
+ * parent dir). install.sh's plain `mv` has the same semantics.
  */
 export async function replaceStandaloneBinary(
   version: string,

@@ -3037,8 +3037,21 @@ async function cmdUpgrade(): Promise<void> {
         return;
       }
       console.log(`🔄 升级中：下载 v${latest} 二进制并替换 ${strategy.target}`);
-      const r = await replaceStandaloneBinary(latest, strategy.target);
-      console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${latest}）。运行 botmux restart 以应用更新。`);
+      // 握与 dashboard / maintenance 同一把跨进程锁：这条路径是**写同一个文件**，
+      // 两个 update 并发跑会互相盖掉临时文件与 rename。锁文件父目录可能还不存在
+      // （daemon 从未在本机起过就先跑 update），先建再握，否则 ENOENT 会盖掉真实错误。
+      const lockTarget = globalInstallUpdateLockTarget();
+      mkdirSync(dirname(lockTarget), { recursive: true });
+      let acquired = false;
+      await withFileLock(lockTarget, async () => {
+        acquired = true;
+        const r = await replaceStandaloneBinary(latest, strategy.target);
+        console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${latest}）。运行 botmux restart 以应用更新。`);
+      }, { maxWaitMs: 2_000 });
+      if (!acquired) {
+        console.error('❌ 另一个更新正在进行中（dashboard 或定时任务），请稍后重试。');
+        process.exit(1);
+      }
     } catch (error) {
       console.error(`❌ 升级失败：${error instanceof Error ? error.message : error}`);
       process.exit(1);

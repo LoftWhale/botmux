@@ -146,6 +146,47 @@ describe('resolveUpdateStrategy', () => {
     expect(tryResolveGlobalInstallPlan('/', 'linux')).toBeNull();
   });
 
+  it('SAFETY: real pnpm/yarn/Windows subpackage layouts never become a self-replace', () => {
+    // The destructive misclassification would be calling a package-manager-owned
+    // file `curl-binary` and writing it ourselves. Walk the layouts that actually
+    // occur in the wild and assert none of them reach the self-replace path.
+    const layouts = [
+      // pnpm virtual store
+      '/root/.local/share/pnpm/global/5/.pnpm/botmux-linux-x64@3.18.4/node_modules/botmux-linux-x64/botmux',
+      // pnpm v11 content-addressed links
+      '/root/.local/share/pnpm/store/v11/links/@/botmux-linux-x64/3.18.4/x/node_modules/botmux-linux-x64/botmux',
+      // pnpm global with preserved symlinks
+      '/root/.local/share/pnpm/global/5/node_modules/botmux-linux-x64/botmux',
+      // yarn global
+      '/root/.config/yarn/global/node_modules/botmux-linux-x64/botmux',
+      // npm on Windows (no lib/ segment)
+      'C:\\Users\\u\\AppData\\Roaming\\npm\\node_modules\\botmux-linux-x64\\botmux',
+      // bun global
+      '/root/.bun/install/global/node_modules/botmux-linux-x64/botmux',
+    ];
+    for (const p of layouts) {
+      const s = resolveUpdateStrategy(true, p, '/', {}, '/root');
+      expect(s.kind, p).toBe('package-manager');
+      // And never the filesystem root, which is the pre-fix failure mode.
+      if (s.kind === 'package-manager') expect(s.packageRoot, p).not.toBe('/');
+    }
+  });
+
+  it('pnpm and npm subpackage layouts resolve to THEIR manager, not a forced npm', () => {
+    // The reason for translating to the sibling main package instead of computing
+    // a prefix here: the existing resolver already knows each manager's rules.
+    const pnpmMain = mainPackageRootForSubpackageBinary(
+      '/root/.local/share/pnpm/global/5/.pnpm/botmux-linux-x64@3.18.4/node_modules/botmux-linux-x64/botmux',
+    );
+    expect(formatGlobalInstallCommand(tryResolveGlobalInstallPlan(pnpmMain!, 'linux')!))
+      .toBe('pnpm add -g --global-dir /root/.local/share/pnpm/global botmux@latest');
+    const winMain = mainPackageRootForSubpackageBinary(
+      'C:\\Users\\u\\AppData\\Roaming\\npm\\node_modules\\botmux-linux-x64\\botmux',
+    );
+    expect(formatGlobalInstallCommand(tryResolveGlobalInstallPlan(winMain!, 'win32')!))
+      .toBe('npm install -g --prefix C:/Users/u/AppData/Roaming/npm botmux@latest');
+  });
+
   it('an unidentifiable standalone binary stays unsupported (fail closed)', () => {
     expect(resolveUpdateStrategy(true, '/tmp/dist-bin/botmux', '/', {}, '/home/u'))
       .toEqual({ kind: 'unsupported', reason: 'unknown-binary-location' });
