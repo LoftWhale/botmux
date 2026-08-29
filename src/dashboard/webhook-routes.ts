@@ -555,6 +555,10 @@ export async function handleWebhookRoute(
     ? undefined
     : idempotencyKeyOf(req, url, parsed.payload, connector);
   let idempotency: WebhookIdempotencyDecision = { kind: 'disabled' };
+  /** Where the reservation stands relative to dispatch. Read by the response
+   *  'close' hook, which must not release a reservation whose dispatch is still
+   *  running (a client abort fires 'close' while the turn is going to run). */
+  let dispatchPhase: 'none' | 'inflight' | 'settled' = 'none';
   if (idempotencyKey && !responseOptions.dryRun) {
     idempotency = inspectWebhookIdempotency(connector.id, idempotencyKey, rawBody);
     if (idempotency.kind === 'duplicate') {
@@ -585,26 +589,60 @@ export async function handleWebhookRoute(
     }
     if (idempotency.kind === 'first') {
       // `inspect` RESERVED the key for this request (so an overlapping duplicate
-      // is suppressed while we are still dispatching). The reservation must be
-      // resolved exactly once. Rather than patching each of the many early
-      // returns below (workflow tombstone, target checks, group-create failures,
-      // …), release it when the response completes unless a dispatch already
-      // settled it — `close` fires on normal completion, on a client abort, AND
-      // if this handler throws, so no path can leak a reservation that would
-      // permanently swallow the sender's retry.
+      // is suppressed while we are still dispatching). The reservation must end
+      // up resolved exactly once, across three distinct exits:
+      //
+      //   'none'     — we never reached a dispatch (workflow tombstone, target
+      //                checks, group-create failure, a throw). Nothing ran, so
+      //                RELEASE: the sender's retry must still be able to run it.
+      //   'inflight' — a dispatch is running. Do NOT release, even though the
+      //                response may already be over: a client that ABORTS mid
+      //                dispatch (exactly the timeout that provokes the retry we
+      //                exist to collapse) fires 'close' while the turn is still
+      //                going to run. Releasing there let the retry dispatch a
+      //                SECOND time — verified by probe before this guard existed.
+      //                The awaiting dispatch below settles it instead.
+      //   'settled'  — already resolved by the dispatch. Nothing to do.
       const reserved = idempotency;
-      res.once('close', () => settleWebhookIdempotency(connector.id, reserved.key, undefined));
+      res.once('close', () => {
+        if (dispatchPhase !== 'none') return;
+        settleWebhookIdempotency(connector.id, reserved.key, undefined);
+      });
     }
   }
-  /** Settle the reservation with the dispatched turn's id, so later retries of
-   *  this event resolve to `duplicate` and can be pointed at the turn that ran.
+  /** Dispatch, and resolve the idempotency reservation from the real outcome.
    *
-   *  A FAILED dispatch is deliberately NOT remembered: the event never ran, and
-   *  an at-least-once sender's retry is exactly the recovery mechanism that must
-   *  keep working. Leaving it unsettled lets the `close` hook release it. */
-  const commitIdempotency = (result: { body: TriggerResponse }): void => {
-    if (idempotency.kind !== 'first' || !result.body.ok) return;
-    settleWebhookIdempotency(connector.id, idempotency.key, result.body.triggerId ?? newTriggerId());
+   *  Success → keep the reservation as a dedup record carrying the turn's id, so
+   *  later retries resolve to `duplicate` and can be pointed at the turn that ran.
+   *
+   *  Failure → release it. The event never ran, and an at-least-once sender's
+   *  retry is exactly the recovery mechanism that must keep working.
+   *
+   *  Both outcomes are recorded here rather than in the response-close hook,
+   *  because 'close' cannot distinguish "handler exited before dispatching" from
+   *  "client hung up while the dispatch is still in flight". */
+  const dispatchWithIdempotency = async (trigger: TriggerRequest) => {
+    if (idempotency.kind === 'first') dispatchPhase = 'inflight';
+    try {
+      const result = await dispatchTriggerRequest(trigger, deps, auditMeta());
+      if (idempotency.kind === 'first') {
+        dispatchPhase = 'settled';
+        settleWebhookIdempotency(
+          connector.id,
+          idempotency.key,
+          result.body.ok ? (result.body.triggerId ?? newTriggerId()) : undefined,
+        );
+      }
+      return result;
+    } catch (err) {
+      // Never leave the key reserved on an unexpected throw — that would wedge
+      // every future retry of this event until the reservation ages out.
+      if (idempotency.kind === 'first') {
+        dispatchPhase = 'settled';
+        settleWebhookIdempotency(connector.id, idempotency.key, undefined);
+      }
+      throw err;
+    }
   };
   /** Echo the key back on a first (dispatched) delivery, so a caller can tell
    *  that suppression is actually armed for this connector — otherwise a sender
@@ -674,8 +712,7 @@ export async function handleWebhookRoute(
       options: responseOptions,
     };
 
-    const result = await dispatchTriggerRequest(trigger, deps, auditMeta());
-    commitIdempotency(result);
+    const result = await dispatchWithIdempotency(trigger);
     jsonRes(res, result.status, withIdempotencyEcho(result.body));
     return true;
   }
@@ -805,8 +842,7 @@ export async function handleWebhookRoute(
       },
     };
 
-    const result = await dispatchTriggerRequest(trigger, deps, auditMeta());
-    commitIdempotency(result);
+    const result = await dispatchWithIdempotency(trigger);
     jsonRes(res, result.status, { ...withIdempotencyEcho(result.body), lifecycle: { ...(dedupKey ? { dedupKey } : {}), action, chatId } });
     return true;
   }
@@ -860,8 +896,7 @@ export async function handleWebhookRoute(
     },
   };
 
-  const result = await dispatchTriggerRequest(trigger, deps, auditMeta());
-  commitIdempotency(result);
+  const result = await dispatchWithIdempotency(trigger);
   jsonRes(res, result.status, withIdempotencyEcho(result.body));
   return true;
 }

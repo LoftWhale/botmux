@@ -372,6 +372,37 @@ describe('inbound webhook idempotency', () => {
     expect(fixed.body.action).toBe('queued');
     expect(proxyToDaemon).toHaveBeenCalledTimes(1);
   });
+  it('does not release the reservation when the CLIENT ABORTS mid-dispatch', async () => {
+    // The upstream aborting on timeout is the very thing that provokes the retry
+    // this feature collapses — and 'close' fires on abort while the dispatch is
+    // still in flight. Releasing there made the retry dispatch a SECOND time.
+    await seedConnector();
+    proxyToDaemon.mockImplementation(async () => {
+      await new Promise(r => setTimeout(r, 400));
+      return {
+        status: 200,
+        text: async () => JSON.stringify({ ok: true, triggerId: `trg_${++dispatchCount}`, action: 'queued' }),
+      };
+    });
+    const headers = { 'content-type': 'application/json', 'x-idempotency-key': 'evt_abort' };
+    const raw = JSON.stringify(MR_EVENT);
+
+    const ac = new AbortController();
+    const inflight = fetch(`${baseUrl}/webhook/conn_idem/tok_secret_value`, {
+      method: 'POST', headers, body: raw, signal: ac.signal,
+    }).catch(() => null);
+    setTimeout(() => ac.abort(), 80);
+    await inflight;
+    // Let the abandoned dispatch finish and any close handler run.
+    await new Promise(r => setTimeout(r, 600));
+    expect(proxyToDaemon).toHaveBeenCalledTimes(1);   // the turn really ran
+
+    // The sender believes delivery failed and retries the same event: it must be
+    // recognised as a duplicate of the turn that is already running/ran.
+    const retry = await post('conn_idem', MR_EVENT, { 'x-idempotency-key': 'evt_abort' });
+    expect(retry.body.action).toBe('ignored');
+    expect(proxyToDaemon).toHaveBeenCalledTimes(1);
+  });
 });
 
 /**
