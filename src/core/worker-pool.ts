@@ -3,7 +3,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import { execSync, type ChildProcess } from 'node:child_process';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -26,7 +26,7 @@ import {
   markMessageListenerRunPreviewRunning,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
-import { spawnWorker } from './self-spawn.js';
+import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
@@ -14021,12 +14021,41 @@ export function reapOrphanWorkers(opts: {
   if (process.platform === 'win32') return 0;
   const procs = opts.procs ?? listProcesses();
   const kill = opts.kill ?? ((pid, signal) => { process.kill(pid, signal); });
-  const workerPath = opts.workerPath ?? join(__dirname, '..', 'worker.js');
+  // How THIS install's workers appear in a command line.
+  //
+  // Node: `<node> <dist>/worker.js` — the script path identifies the install.
+  //
+  // ⚠️ Compiled single-file binary: there IS no worker.js on disk. spawnWorker()
+  // launches `<binary> __worker` (see src/core/self-spawn.ts), while
+  // `join(__dirname,'..','worker.js')` evaluates to `/$bunfs/worker.js` — a
+  // process-private virtual path that appears in NO command line. MEASURED: a real
+  // compiled worker's cmdline is `<binary> __worker`, so the old predicate matched
+  // nothing and orphans were NEVER reaped in the compiled form. That is the failure
+  // this function exists to prevent: each orphan leaks ~0.5 GB and they accumulate
+  // across restarts (daemon.ts records an 841-orphan / ~65 GB incident).
+  //
+  // The compiled predicate keeps the same conservatism — it must still identify
+  // THIS install and not another botmux — by requiring the running executable's
+  // path AND the `__worker` token. Both are matched as substrings because
+  // /proc/<pid>/cmdline preserves argv[0] exactly as given, which may be relative
+  // (MEASURED: launching via a relative path yields a relative argv[0]), so the
+  // basename is the portion that reliably appears.
+  const standalone = isStandaloneBinary();
+  const workerPath = opts.workerPath ?? (standalone ? undefined : join(__dirname, '..', 'worker.js'));
+  const binaryName = standalone ? basename(process.execPath) : '';
+
+  /** Does this command line belong to a worker of THIS install? */
+  const isOurWorker = (cmd: string): boolean => {
+    if (workerPath !== undefined) return cmd.includes(workerPath);
+    // Compiled form: `<binary> __worker`. Require both parts so a stray process
+    // that merely mentions `__worker` (or a different botmux binary) is spared.
+    return cmd.includes(binaryName) && cmd.includes(WORKER_ENTRY_SUBCOMMAND);
+  };
 
   let reaped = 0;
   for (const p of procs) {
-    if (p.ppid !== 1) continue;                 // parent still alive → not an orphan
-    if (!p.cmd.includes(workerPath)) continue;  // not OUR worker script
+    if (p.ppid !== 1) continue;         // parent still alive → not an orphan
+    if (!isOurWorker(p.cmd)) continue;  // not OUR worker
     try {
       // SIGKILL, not SIGTERM: an orphan can be wedged in a sync code path (the
       // very failure mode that produced it) where SIGTERM is lost. It holds no

@@ -83,6 +83,15 @@ export function resolveEntrySpawn(entry: BotmuxEntry, distDir: string): { comman
 /** The set of hidden subcommand tokens, so the CLI dispatcher can recognize them. */
 export const ENTRY_SUBCOMMANDS: ReadonlySet<string> = new Set(Object.values(ENTRY_SUBCOMMAND));
 
+/**
+ * The hidden token a compiled binary is launched with to become a worker, i.e.
+ * `<binary> __worker`. Exported because the orphan reaper has to RECOGNIZE that
+ * command line in `ps` output: in the compiled form there is no `worker.js` path
+ * to match on, and a hardcoded `'__worker'` literal at the matching site would
+ * drift away from this map the moment the token changed.
+ */
+export const WORKER_ENTRY_SUBCOMMAND: string = ENTRY_SUBCOMMAND.worker;
+
 /** Map a hidden subcommand token back to its entry (null if not one). */
 export function entryForSubcommand(token: string): BotmuxEntry | null {
   for (const [entry, sub] of Object.entries(ENTRY_SUBCOMMAND)) {
