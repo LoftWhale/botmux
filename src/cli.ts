@@ -101,7 +101,7 @@ import { hasProtectedSessionMutationOwnership } from './core/session-mutation-gu
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
 import { reapLegacyPm2, liveGodAt } from './core/legacy-pm2-reaper.js';
-import { withFileLock, withFileLockSync } from './utils/file-lock.js';
+import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/file-lock.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq } from './cli/arg-utils.js';
@@ -3050,15 +3050,22 @@ async function cmdUpgrade(): Promise<void> {
           console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${latest}）。运行 botmux restart 以应用更新。`);
         }, { maxWaitMs: 2_000 });
       } catch (error) {
-        // ⚠️ withFileLock 拿不到锁时是 **抛异常**，不是安静返回 —— 所以「另一个更新
-        // 正在进行」这条提示必须在这里给。实测并发两个 `botmux update`：落败的那个
-        // 原先直接把内部信息透给用户（`file-lock timeout waiting for …lock (held by
-        // pid 630166, age 2222ms)`），而它其实是完全正常的互斥结果，不是故障。
-        if (!acquired) {
+        // ⚠️ 三态，不是二态。`withFileLock` 拿不到锁时是**抛异常**不是安静返回，
+        // 但 `acquired === false` 只证明「回调没执行」，**不等于「别人持锁」**：
+        // 回调之前还可能因 `open` 的 EACCES/ENOSPC、holder 写入失败、holder 元数据
+        // 不可读、stale-claim `link` 失败而抛错。只看 `acquired` 会把这些**真实故障
+        // 全部误报成「另一个更新正在进行」**——磁盘满被说成并发冲突，是最坏的那种
+        // 误导。所以必须同时要求它是 timeout 类型：
+        //   ① 超时且回调未进入        → 友好并发提示（正常互斥结果，不是故障）
+        //   ② 回调已进入后失败        → 透出真实错误（下载/校验/替换）
+        //   ③ 回调前的基础设施失败    → 同样透出真实错误
+        // 判类型而不是匹文案：file-lock 的文案被多处按字符串匹配，不能动，但新代码
+        // 应该用 FileLockTimeoutError（async/sync 两处语义一致）。
+        if (!acquired && error instanceof FileLockTimeoutError) {
           console.error('❌ 另一个更新正在进行中（dashboard 或定时任务），请稍后重试。');
           process.exit(1);
         }
-        throw error; // 已进入临界区后的真实失败（下载/校验/替换）交给外层统一报错
+        throw error; // ②③ 交给外层统一报错，不被友好文案吞掉
       }
     } catch (error) {
       console.error(`❌ 升级失败：${error instanceof Error ? error.message : error}`);

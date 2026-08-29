@@ -39,6 +39,7 @@ import {
 import { isMuslHost, releaseAssetName, releaseAssetBaseUrl, replaceStandaloneBinary } from '../src/core/binary-self-update.js';
 import { buildRestartLauncher, resolveStandaloneRestartExecutable } from '../src/core/maintenance.js';
 import { tryResolveGlobalInstallPlan, formatGlobalInstallCommand, resolveAutoUpdateSupport } from '../src/utils/global-install.js';
+import { withFileLock, FileLockTimeoutError } from '../src/utils/file-lock.js';
 import { botmuxVersionAt, diskVersionAt } from '../src/utils/install-info.js';
 
 const dirs: string[] = [];
@@ -390,6 +391,82 @@ describe('auto-update support is ONE predicate for UI and save-time validation',
     expect(resolveAutoUpdateSupport(curl).plan).toBeNull(); // ⟹ rollbackSupported false
   });
 
+});
+
+describe('concurrent updates report mutual exclusion, not lock internals', () => {
+  /**
+   * THE LOCK OUTCOME IS THREE-STATE, NOT TWO. `acquired === false` only proves the
+   * callback never ran — equally true when the lock infrastructure failed BEFORE the
+   * callback (`open` EACCES/ENOSPC/ENOENT, a failed holder write, an unreadable
+   * holder file, a stale-claim `link` error). Branching on `acquired` alone reports
+   * every one of those as "another update is already running", hiding a real fault
+   * (a full disk!) behind a benign message.
+   *
+   * A/B MEASURED with real pre-callback failures:
+   *   ENOENT parent : PRE-FIX => FRIENDLY   POST-FIX => RETHROW
+   *   symlinked lock: PRE-FIX => FRIENDLY   POST-FIX => RETHROW  (ELOOP)
+   */
+  const classify = (acquired: boolean, e: unknown): 'friendly' | 'rethrow' =>
+    (!acquired && e instanceof FileLockTimeoutError) ? 'friendly' : 'rethrow';
+
+  it('(1) lock timeout, callback never entered -> the friendly notice', async () => {
+    const dir = tmp();
+    const target = join(dir, 'busy');
+    let acquired = false;
+    let seen: unknown;
+    await withFileLock(target, async () => {
+      try {
+        await withFileLock(target, async () => { acquired = true; }, { maxWaitMs: 200 });
+      } catch (e) { seen = e; }
+    }, { maxWaitMs: 2_000 });
+    expect(seen).toBeInstanceOf(FileLockTimeoutError);
+    expect((seen as FileLockTimeoutError).code).toBe('FILE_LOCK_TIMEOUT');
+    expect(classify(acquired, seen)).toBe('friendly');
+    expect(acquired).toBe(false);
+  });
+
+  it('(2) a failure INSIDE the critical section surfaces as itself', async () => {
+    const dir = tmp();
+    let acquired = false;
+    let seen: unknown;
+    try {
+      await withFileLock(join(dir, 'x'), async () => {
+        acquired = true;
+        throw new Error('SHA-256 校验不通过');
+      }, { maxWaitMs: 500 });
+    } catch (e) { seen = e; }
+    expect(acquired).toBe(true);
+    expect(classify(acquired, seen)).toBe('rethrow');
+    expect((seen as Error).message).toContain('SHA-256');
+  });
+
+  it('(3) a pre-callback INFRASTRUCTURE failure also surfaces, not "another update"', async () => {
+    // A missing parent makes `open` throw ENOENT before the callback — the same
+    // shape as ENOSPC on a full disk. MUTATION CHECK: dropping the
+    // `instanceof FileLockTimeoutError` half of the predicate turns this red.
+    const dir = tmp();
+    let acquired = false;
+    let seen: unknown;
+    try {
+      await withFileLock(join(dir, 'no', 'such', 'dir', 'x'), async () => { acquired = true; }, { maxWaitMs: 400 });
+    } catch (e) { seen = e; }
+    expect(acquired).toBe(false);
+    expect(seen).toBeDefined();
+    expect(seen).not.toBeInstanceOf(FileLockTimeoutError);
+    expect((seen as NodeJS.ErrnoException).code).toBe('ENOENT');
+    // The whole point: `!acquired` holds here, yet this must NOT take the friendly path.
+    expect(classify(acquired, seen)).toBe('rethrow');
+  });
+
+  it('the timeout error keeps its historical message (call sites match it as text)', () => {
+    // workflows/v3/host.ts, daemon.ts and services/session-store.ts match this
+    // string; changing it while adding the type would break them silently.
+    const e = new FileLockTimeoutError('/tmp/x.lock', 1234, 2222);
+    expect(e.message).toBe('file-lock timeout waiting for /tmp/x.lock (held by pid 1234, age 2222ms)');
+    expect(e).toBeInstanceOf(Error);
+    expect(e.name).toBe('FileLockTimeoutError');
+  });
+
   it('SOURCE GUARD: the update lock\'s timeout is reported as "another update is running"', () => {
     /**
      * `withFileLock` THROWS when it cannot acquire the lock — it does not return
@@ -420,10 +497,15 @@ describe('auto-update support is ONE predicate for UI and save-time validation',
     const lockAt = cli.indexOf('withFileLock', branchStart);
     expect(lockAt, 'the self-replace branch no longer takes the update lock').toBeGreaterThan(branchStart);
     const block = cli.slice(branchStart, lockAt + 1200);
-    expect(block).toMatch(/catch[\s\S]{0,400}?if \(!acquired\)/);
+    // The friendly notice must be gated on BOTH halves: callback-not-entered AND a
+    // genuine lock timeout. Guarding on `!acquired` alone is the over-broad version
+    // that reported ENOSPC/ENOENT as "another update is running".
+    expect(block).toMatch(/catch[\s\S]{0,900}?if \(!acquired && error instanceof FileLockTimeoutError\)/);
     expect(block).toMatch(/另一个更新正在进行中/);
-    // ...and a genuine post-acquisition failure must still surface, not be swallowed.
+    // ...and every other failure — in-section OR pre-callback — must still surface.
     expect(block).toMatch(/throw error;/);
+    // Belt and braces: the bare predicate must NOT reappear anywhere in this window.
+    expect(block).not.toMatch(/if \(!acquired\)\s*\{/);
   });
 
   it('SOURCE GUARD: no update/rollback endpoint feeds resolveGlobalInstallPlan the "/" install root', () => {
