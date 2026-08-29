@@ -97,12 +97,22 @@ export function hashWebhookBody(rawBody: Buffer): string {
  *  prefix — we can stop at the first live one instead of scanning the tail.
  *  (The sibling `claimNonce` full-scans on every call; not copying that.)
  *
- *  An `inFlight` reservation is never evicted: dropping it would let a concurrent
- *  duplicate through, and its owner is about to settle it anyway. */
+ *  The two loops treat an `inFlight` reservation DIFFERENTLY, because they have
+ *  different evidence:
+ *
+ *  - Expiry (time-based): a reservation older than the TTL cannot still belong to
+ *    a live dispatch — the trigger API caps `timeoutMs` at 300s, so the 10-minute
+ *    window is >2x the longest legitimate dispatch. Reclaiming it is REQUIRED: a
+ *    dispatch that never resolves (hung daemon) would otherwise wedge that event
+ *    key permanently, and permanently losing an event is the exact failure this
+ *    module refuses elsewhere (fail-open). Verified by probe: without a deadline
+ *    an unsettled reservation still answered `duplicate` at TTL x 10000.
+ *  - Size cap (pressure-based): volume is NOT evidence that a dispatch finished,
+ *    so an in-flight reservation is never preempted here. Doing so would let an
+ *    alert storm reopen the concurrent/abort double-dispatch hole. */
 function evict(win: Map<string, Entry>, now: number): void {
   for (const [key, entry] of win) {
     if (entry.expiresAt > now) break;
-    if (entry.inFlight) continue;
     win.delete(key);
   }
   let overflow = win.size - WEBHOOK_IDEMPOTENCY_MAX_ENTRIES;

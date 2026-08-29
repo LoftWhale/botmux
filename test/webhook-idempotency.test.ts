@@ -426,16 +426,42 @@ describe('webhook idempotency store (time-dependent branches)', () => {
     ).toBe('first');
   });
 
-  it('never evicts an IN-FLIGHT reservation, even past the TTL', async () => {
+  it('never evicts an IN-FLIGHT reservation while it could still be a live dispatch', async () => {
     const store = await import('../src/services/webhook-idempotency.js');
     store.__testOnly_resetWebhookIdempotency();
     const t0 = 1_000_000;
     expect(store.inspectWebhookIdempotency('c', 'k', body, t0).kind).toBe('first');
-    // A slow first dispatch (never settled) outliving the TTL must still shield
-    // against a concurrent duplicate; evicting it would double-dispatch.
+    // A slow-but-legitimate dispatch: the trigger API caps timeoutMs at 300s, so
+    // anything inside the 600s window may still be running and must be shielded.
+    expect(store.inspectWebhookIdempotency('c', 'k', body, t0 + 300_000).kind).toBe('duplicate');
+    expect(store.inspectWebhookIdempotency('c', 'k', body, t0 + 599_000).kind).toBe('duplicate');
+  });
+
+  it('reclaims a reservation whose dispatch never settled, instead of wedging the key forever', async () => {
+    const store = await import('../src/services/webhook-idempotency.js');
+    store.__testOnly_resetWebhookIdempotency();
+    const t0 = 1_000_000;
+    store.inspectWebhookIdempotency('c', 'k', body, t0);   // reserved, never settled
+    // Past the window no live dispatch can still own it (max dispatch 300s < TTL
+    // 600s). Holding it forever would permanently swallow every retry of this
+    // event — the exact event loss this module refuses everywhere else.
     expect(
       store.inspectWebhookIdempotency('c', 'k', body, t0 + store.WEBHOOK_IDEMPOTENCY_TTL_MS + 1).kind,
-    ).toBe('duplicate');
+    ).toBe('first');
+  });
+
+  it('does not let an alert storm preempt an in-flight reservation via the size cap', async () => {
+    const store = await import('../src/services/webhook-idempotency.js');
+    store.__testOnly_resetWebhookIdempotency();
+    const t0 = 1_000_000;
+    // Volume is not evidence that a dispatch finished, so pressure-based eviction
+    // must skip in-flight entries (otherwise a storm reopens double-dispatch).
+    expect(store.inspectWebhookIdempotency('c', 'held', body, t0).kind).toBe('first');
+    for (let i = 0; i < store.WEBHOOK_IDEMPOTENCY_MAX_ENTRIES + 50; i++) {
+      store.inspectWebhookIdempotency('c', `k${i}`, body, t0);
+      store.settleWebhookIdempotency('c', `k${i}`, `trg_${i}`, t0);
+    }
+    expect(store.inspectWebhookIdempotency('c', 'held', body, t0).kind).toBe('duplicate');
   });
 
   it('enforces the entry cap without evicting in-flight reservations', async () => {
