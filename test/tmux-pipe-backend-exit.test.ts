@@ -25,7 +25,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync, readdirSync } from 'node
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
-import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
+import { spawnTsScript, tsRunnerPrefix, isBunRuntime } from './helpers/ts-runner.js';
 
 const FIXTURE = resolve(__dirname, 'fixtures/tmux-pipe-exit-fixture.ts');
 // Generous vs. the ~250ms the fixture needs: on a loaded box a slow start must
@@ -37,7 +37,7 @@ let fakeBinDir: string;
 let failingBinDir: string;
 
 /** Run the fixture; resolve with how it ended. `timedOut` means it wedged. */
-type FixtureMode = 'real' | 'nowake' | 'paneexit' | 'full' | 'spawnfail' | 'unlinked' | 'emfile' | 'directexit';
+type FixtureMode = 'real' | 'nowake' | 'paneexit' | 'full' | 'spawnfail' | 'unlinked' | 'emfile' | 'directexit' | 'wakefail';
 
 async function runFixture(mode: FixtureMode): Promise<{
   timedOut: boolean;
@@ -45,6 +45,7 @@ async function runFixture(mode: FixtureMode): Promise<{
   stdout: string;
 }> {
   const bin = mode === 'spawnfail' ? failingBinDir : fakeBinDir;
+  const extraEnv = mode === 'wakefail' ? { BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL: '1' } : {};
   // The emfile case needs a small fd table to exhaust. `sh -c 'ulimit -n …'`
   // is the portable way to lower RLIMIT_NOFILE for a child; 128 leaves room
   // for the runtime's own startup while still being quick to fill.
@@ -52,11 +53,11 @@ async function runFixture(mode: FixtureMode): Promise<{
     ? spawn(
       '/bin/sh',
       ['-c', `ulimit -n 128; exec "$0" "$@"`, tsRunnerPrefix().command, ...tsRunnerPrefix().prefixArgs, FIXTURE, mode],
-      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` } },
+      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...extraEnv, PATH: `${bin}:${process.env.PATH ?? ''}` } },
     )
     : spawnTsScript(FIXTURE, [mode], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+      env: { ...process.env, ...extraEnv, PATH: `${bin}:${process.env.PATH ?? ''}` },
     });
   let stdout = '';
   child.stdout?.on('data', (b) => { stdout += String(b); });
@@ -166,12 +167,18 @@ describe('TmuxPipeBackend fifo teardown', () => {
   // Fixing only the teardown sites would leave the original wedge reachable, so
   // the module installs a process-exit hook. This is its regression.
   it('lets the process exit with a LIVE backend and no teardown call at all', async () => {
+    const before = new Set(readdirSync(tmpdir()).filter((f) => f.startsWith('botmux-pipe-')));
     const r = await runFixture('directexit');
 
     expect(r.stdout).toContain('DIRECT_EXIT');
     expect(r.stdout).not.toContain('FIXTURE_NO_FIFO');
     expect(r.timedOut).toBe(false);
     expect(r.code).toBe(0);
+    // A named fifo is a filesystem object and outlives the process, so the exit
+    // hook has to unlink as well as wake — otherwise every teardown-bypassing
+    // exit strews /tmp with botmux-pipe-*.
+    const after = readdirSync(tmpdir()).filter((f) => f.startsWith('botmux-pipe-'));
+    expect(after.filter((f) => !before.has(f))).toEqual([]);
   }, EXIT_TIMEOUT_MS + 15_000);
 
   // Blocker found in review: acquiring the wake fd lazily AT teardown fails in
@@ -194,11 +201,31 @@ describe('TmuxPipeBackend fifo teardown', () => {
     expect(r.code).toBe(0);
   }, EXIT_TIMEOUT_MS + 15_000);
 
+  // Blocker found in review: without a wake fd the reader can be unblocked by
+  // NOBODY — not teardown, not the exit hook. Returning a backend in that state
+  // hands back a process that is already doomed to wedge, so spawn() must fail
+  // closed. The window is safe because the read stream does not exist yet.
+  it('fails closed (and leaves nothing behind) when the wake fd cannot be opened', async () => {
+    const r = await runFixture('wakefail');
+
+    expect(r.stdout).toContain('SPAWN_THREW=true LEAKED_READERS=0 FIFO_LEFT=false');
+    expect(r.timedOut).toBe(false);
+    expect(r.code).toBe(0);
+  }, EXIT_TIMEOUT_MS + 15_000);
+
   // Reverse mutation. Without this the tests above prove nothing: if the fifo
   // read were never actually parked, every variant would exit cleanly and they
   // would pass against the broken code too. This asserts the harness has teeth
   // by reproducing the pre-fix teardown and requiring it to hang.
-  it('reproduces the wedge when the wake-up byte is omitted', async () => {
+  //
+  // NODE ONLY. The wedge is a Node/libuv property — a blocking threadpool read
+  // that uv__threadpool_cleanup must join at exit. Bun's runtime ends the
+  // pending read on destroy()+close, so it never wedges and this expectation is
+  // simply false there (verified: 8/9 under `bunx --bun vitest`, this the only
+  // failure). The production bug is Node's, so skipping keeps the assertion
+  // honest instead of asserting one runtime's behaviour of the other; the eight
+  // positive cases still run under both.
+  it.skipIf(isBunRuntime())('reproduces the wedge when the wake-up byte is omitted', async () => {
     const r = await runFixture('nowake');
 
     expect(r.stdout).toContain('TEARDOWN');

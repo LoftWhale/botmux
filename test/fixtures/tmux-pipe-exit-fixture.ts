@@ -31,6 +31,10 @@
  *   directexit— live backend, kill() NEVER called, straight to process.exit().
  *              Covers sendFatalWorkerErrorAndExit / uncaughtException /
  *              parent-exit, which all bypass both teardown sites
+ *   wakefail — the wake-fd open fails during spawn(). Without a wake fd the
+ *              reader can never be unblocked, so spawn() must fail closed
+ *              rather than hand back a backend nothing can rescue.
+ *              BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL drives the injection.
  *   nowake   — reproduces the pre-fix teardown (destroy + unlink, no wake-up
  *              byte) and MUST hang, proving the harness has teeth
  */
@@ -72,7 +76,28 @@ if (mode === 'spawnfail') {
   }, 250);
 }
 
-if (mode !== 'spawnfail') {
+if (mode === 'wakefail') {
+  // The parent sets BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL=1. Without a wake fd the
+  // reader is unrescuable, so spawn() must fail closed and leave nothing behind
+  // rather than return a backend that will wedge the process at exit.
+  const doomed = new TmuxPipeBackend('bmx-exit-fixture');
+  let threw = false;
+  try {
+    doomed.spawn('/bin/true', [], { cwd: process.cwd(), cols: 80, rows: 24, env: {} });
+  } catch {
+    threw = true;
+  }
+  const fifoLeft = fs.existsSync((doomed as unknown as { fifoPath: string }).fifoPath);
+  process.stdout.write(`SPAWN_THREW=${threw} LEAKED_READERS=${readerRegistrySize()} FIFO_LEFT=${fifoLeft}\n`);
+  // Same reason as the spawnfail case: give libuv a turn to park a read, so a
+  // fail-open regression actually gets the chance to wedge this process.
+  setTimeout(() => {
+    process.stdout.write('EXITING\n');
+    process.exit(0);
+  }, 250);
+}
+
+if (mode !== 'spawnfail' && mode !== 'wakefail') {
 
 const backend = new TmuxPipeBackend('bmx-exit-fixture');
 backend.spawn('/bin/true', [], { cwd: process.cwd(), cols: 80, rows: 24, env: {} });

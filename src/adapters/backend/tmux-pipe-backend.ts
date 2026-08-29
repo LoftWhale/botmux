@@ -375,13 +375,31 @@ export class TmuxPipeBackend implements SessionBackend {
     // Acquire the wake-up write end NOW, while the pathname exists and the fd
     // table has room. Teardown must never need to allocate anything.
     // O_NONBLOCK so a full pipe fails with EAGAIN instead of parking here.
+    //
+    // FAIL CLOSED if this fails. Without a wake fd the reader can be unblocked
+    // by nobody — not teardown, not the exit hook — so continuing would build
+    // exactly the unkillable reader this whole fix exists to prevent (verified:
+    // a wake-open failure alone re-wedges the process). This is also the only
+    // moment where bailing is safe: the read stream does not exist yet, so no
+    // read is parked and there is nothing to unblock. The failure modes all
+    // mean the session is doomed anyway — EMFILE will sink the following
+    // execSync(tmux …) too, and ENOENT means the fifo pathname is already gone.
     try {
+      // Test seam: the fail-closed path below is only reachable when this open
+      // fails, and EMFILE/ENOENT cannot be provoked from a test without
+      // destabilising the whole process. Env-gated, so production never reads it.
+      if (process.env.BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL === '1') {
+        const injected: NodeJS.ErrnoException = new Error('EMFILE: injected by test');
+        injected.code = 'EMFILE';
+        throw injected;
+      }
       this.fifoWakeFd = fs.openSync(this.fifoPath, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
-    } catch {
-      // Extremely unlikely (we hold the read end, so no ENXIO). Losing the wake
-      // fd only costs the unblock path, so keep the session working rather than
-      // failing the spawn; teardown degrades to best-effort.
+    } catch (err) {
       this.fifoWakeFd = null;
+      try { fs.closeSync(fd); } catch { /* best effort */ }
+      this.fifoFd = null;
+      try { fs.unlinkSync(this.fifoPath); } catch { /* best effort */ }
+      throw err;
     }
     this.readStream = fs.createReadStream('', { fd, autoClose: false, highWaterMark: 64 * 1024 });
     // From here on a parked read can wedge process exit, so make this reader
@@ -949,15 +967,17 @@ export class TmuxPipeBackend implements SessionBackend {
   /**
    * Last-resort unblock for the process-exit hook.
    *
-   * Only writes the wake-up byte — no unlink, no stream teardown, nothing that
-   * could throw or block. The single job is to let the parked threadpool read
-   * return so uv__threadpool_cleanup can join it; the process is already on its
-   * way out, so the fifo file itself is the OS's problem. Safe to call after a
-   * real teardown (fifoWakeFd is null by then) and safe to call twice.
+   * Writes the wake-up byte so the parked threadpool read can return and
+   * uv__threadpool_cleanup can join it, then unlinks the fifo: a named fifo is
+   * a filesystem object and outlives the process, so skipping this would strew
+   * /tmp with botmux-pipe-* on every exit that bypasses teardown. Deliberately
+   * minimal otherwise — no stream teardown, nothing that could block. Safe
+   * after a real teardown (fifoWakeFd is null by then) and safe to call twice.
    */
   wakeFifoReaderForExit(): void {
     if (this.fifoWakeFd === null) return;
     try { fs.writeSync(this.fifoWakeFd, '\0'); } catch { /* already unblocked */ }
+    try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
   }
 
   private teardownFifoReader(): void {
