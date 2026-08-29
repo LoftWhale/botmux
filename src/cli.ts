@@ -12191,6 +12191,15 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'worker') await import('./worker.js');
   else if (__entrySubcommand === 'supervisor') await import('./index-supervisor.js');
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
+  // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
+  // process an adapter launches, not a fleet member. Without these branches the
+  // compiled binary re-execed itself with a `/$bunfs/…-runner.js` argv[0] that
+  // dispatch did not recognise, so it printed help and exited 0 — the user saw a
+  // help dump instead of a session, and nothing reported an error.
+  else if (__entrySubcommand === 'codex-app-runner') await import('./codex-app-runner.js');
+  else if (__entrySubcommand === 'dsh-runner') await import('./dsh-runner.js');
+  else if (__entrySubcommand === 'mira-runner') await import('./mira-runner.js');
+  else if (__entrySubcommand === 'mir-runner') await import('./mir-runner.js');
   // The entry module now drives the process (top-level main() keeps the event
   // loop alive for the daemon; the worker's IPC listener does the same; a
   // core-only bind failure exits from within). Park here so the normal dispatch
