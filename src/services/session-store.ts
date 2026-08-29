@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
@@ -552,12 +552,218 @@ function importJsonStoreToSqlite(dbFp: string, jsonFp: string): number {
   }
 }
 
+// ─── Orphaned import sidecar recovery ────────────────────────────────────────
+// A pre-fix import built `<db>.tmp` in WAL mode and published only the main
+// file with `renameSync`. Under Bun, `close()` skips the WAL checkpoint while a
+// prepared statement is still alive, so the schema and every row stayed in
+// `<db>.tmp-wal` while the published `.db` was a bare 4096-byte header. That
+// import path now uses DELETE mode (it cannot produce this shape any more), but
+// stores already poisoned by it stay broken forever: the import/cleanup branch
+// below is gated on `!existsSync(dbFp)` and the poisoned `.db` DOES exist, so
+// nothing ever looks at the orphans again.
+//
+// DETECTION uses the orphaned `<db>.tmp*` sidecars and nothing else. Verified
+// alternatives and why they are unusable:
+//   • `PRAGMA quick_check` / `integrity_check` return `ok` on a poisoned store
+//     (the file is structurally fine, its content simply never merged) — zero
+//     discriminating power against a legitimately empty store.
+//   • "the `sessions` table is missing" self-erases: `openDbForOwnStore` runs
+//     `CREATE TABLE IF NOT EXISTS`, so the very first open destroys the
+//     evidence. Measured going false→true across two opens while the `.tmp*`
+//     orphans persisted.
+// The orphan predicate cannot fire on a healthy store: the import builds on
+// `<db>.tmp` and only `renameSync`s it into place as the last step, under the
+// same lock, and its branch requires `.db` to be ABSENT. So ".db exists AND
+// .tmp* exists" is unreachable in a normal timeline — it is always crash
+// residue. A scan of 56 live production stores found zero `.tmp*` leftovers
+// (healthy stores carry only `-wal`/`-shm`), i.e. no false-positive surface.
+const IMPORT_TMP_SIDECAR_SUFFIXES = ['', '-journal', '-wal', '-shm'] as const;
+
+/** Every orphaned `<db>.tmp*` path a crashed pre-fix import may have left: the
+ *  temporary shell itself plus any of its journals. */
+function orphanedImportSidecars(dbFp: string): string[] {
+  return IMPORT_TMP_SIDECAR_SUFFIXES
+    .map(suffix => `${dbFp}.tmp${suffix}`)
+    .filter(path => existsSync(path));
+}
+
+/**
+ * Rows stranded in an orphaned import WAL, read WITHOUT touching the originals.
+ *
+ * ⚠️ DO NOT "recover" by renaming `<db>.tmp-wal` onto `<db>-wal` in place. A
+ * `-wal` is REPLACE semantics, not merge: once anything has opened the poisoned
+ * store, `CREATE TABLE IF NOT EXISTS` gives it a usable empty table and new
+ * sessions accumulate in the store's OWN `-wal`. Measured on Bun 1.4.0 — the
+ * in-place rename overwrites that live WAL and ALSO fails to replay (the
+ * orphan's frames describe the original bare shell, which the live writes have
+ * since moved past): a store holding 3 fresh sessions went to 0 rows and the 40
+ * stranded ones did not come back either. Net data destruction.
+ *
+ * So replay happens on a private COPY, and the caller merges the result without
+ * overwriting anything live. A damaged orphan degrades safely — truncated
+ * replays as 0 rows, garbled/zeroed/`-wal`-less shapes throw `no such table` —
+ * verified on both engines, never yielding half-parsed rows.
+ */
+function readStrandedImportRows(dbFp: string): [string, Session][] {
+  const walFp = `${dbFp}.tmp-wal`;
+  if (!existsSync(walFp)) return [];
+  const scratchFp = `${dbFp}.recover-${process.pid}-${randomUUID()}`;
+  const scratchPaths = ['', '-journal', '-wal', '-shm'].map(suffix => `${scratchFp}${suffix}`);
+  const dropScratch = (): void => {
+    for (const path of scratchPaths) {
+      try { unlinkSync(path); } catch { /* nothing to drop */ }
+    }
+  };
+  try {
+    // The published `.db` is the exact shell those WAL frames were written
+    // against, so it is the shell the replay must run on.
+    copyFileSync(dbFp, scratchFp);
+    copyFileSync(walFp, `${scratchFp}-wal`);
+    const db = openDatabaseSyncOrThrow(scratchFp);
+    try {
+      db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
+      const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
+      const entries: [string, Session][] = [];
+      for (const r of rows) {
+        try { entries.push([r.session_id, JSON.parse(r.row) as Session]); } catch { /* skip unparseable row */ }
+      }
+      return entries;
+    } finally {
+      db.close();
+    }
+  } finally {
+    dropScratch();
+  }
+}
+
+/**
+ * Repair a store poisoned by a crashed pre-fix import, in place, and report how
+ * many rows were rescued. MUST be called with the store's JSON file lock held —
+ * the same lock the import, daemon saves and offline CLI mutations use.
+ *
+ * TWO sources are merged, because neither alone is sufficient:
+ *   • the orphaned WAL — the only copy of anything written after the JSON was
+ *     frozen, and the only source at all if the JSON has since been removed;
+ *   • the frozen JSON — the import read exclusively from it, so it is a superset
+ *     of the stranded rows and the only source that survives a DAMAGED orphan.
+ * A partially-written orphan is precisely why both are needed: truncating one
+ * replays as "schema, zero rows" without any error, so trusting the orphan alone
+ * would delete it and report a healthy EMPTY store — the very silent-loss bug
+ * this function exists to end.
+ *
+ * Because of that silent shape, discarding the orphans requires POSITIVE
+ * ATTESTATION that the merge actually saw the store's contents — one of:
+ *   • the orphan replayed at least one row (the WAL demonstrably replayed), or
+ *   • a frozen snapshot was readable (its rows, or an existing-but-empty file,
+ *     attest an empty store; the import could only ever have copied from it).
+ * With no attestation at all, "zero rows" is indistinguishable from "damaged,
+ * contents unknown", so recovery fails closed and KEEPS the orphans for manual
+ * rescue instead of quietly certifying an empty store.
+ *
+ * Merge policy is `INSERT OR IGNORE`: rows that exist live always win. Both
+ * sources predate every live write by construction, so preferring live rows
+ * cannot lose newer state. Verified: 40 stranded + 3 live → 43, both kept.
+ *
+ * Orphans are removed only after the merge commits, so a crash mid-recovery
+ * leaves the store exactly as recoverable as it was before.
+ */
+function recoverPoisonedSqliteStore(dbFp: string, jsonFp: string): number {
+  let stranded: [string, Session][] = [];
+  try {
+    stranded = readStrandedImportRows(dbFp);
+  } catch (err) {
+    logger.error(`Could not replay the orphaned import WAL for ${dbFp}: ${err}`);
+  }
+
+  let frozen: [string, Session][] = [];
+  let frozenAttests = false;
+  try {
+    frozen = readJsonEntriesForImport(jsonFp);
+    // An existing snapshot file attests even when it holds no rows; a resolved
+    // legacy snapshot attests through the rows it contributed.
+    frozenAttests = frozen.length > 0 || existsSync(jsonFp);
+  } catch (err) {
+    logger.error(`Could not read the frozen JSON snapshot for ${dbFp}: ${err}`);
+  }
+
+  if (stranded.length === 0 && !frozenAttests) {
+    throw new Error(
+      `cannot recover ${dbFp}: the orphaned import WAL yielded no rows and no frozen JSON snapshot `
+      + 'could attest the store contents',
+    );
+  }
+
+  const db = openDbForOwnStore(dbFp);
+  let merged = 0;
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const insert = db.prepare('INSERT OR IGNORE INTO sessions (session_id, status, row) VALUES (?, ?, ?)');
+      for (const [key, value] of [...stranded, ...frozen]) {
+        const result = insert.run(key, sessionStatusText(value), JSON.stringify(value));
+        if (Number(result.changes) > 0) merged++;
+      }
+      db.exec('COMMIT');
+    } catch (err) {
+      try { db.exec('ROLLBACK'); } catch { /* txn already gone */ }
+      throw err;
+    }
+  } finally {
+    db.close();
+  }
+  // Committed: the orphans are now redundant. Removing them is what makes the
+  // store test healthy again, so it must not be skipped — but a failure here is
+  // not data loss (the next start simply re-runs an idempotent merge).
+  for (const path of orphanedImportSidecars(dbFp)) {
+    try { unlinkSync(path); } catch { /* best-effort orphan cleanup */ }
+  }
+  return merged;
+}
+
 // Sessions persisted before 2026-04-29 lack `cliId`; consumers must fall back to 'unknown' at the render boundary.
 function load(): void {
   if (loaded) return;
   ensureDir();
   const dbFp = getDbPath();
   const jsonFp = getFilePath();
+
+  // A poisoned store must never be mistaken for an empty one. Recover it before
+  // anything reads it, or fail closed so listSessionsStrict() throws instead of
+  // answering "there are no durable sessions".
+  if (existsSync(dbFp) && orphanedImportSidecars(dbFp).length > 0) {
+    if (!sqliteBootstrapAllowed) {
+      // A worker must not repair a store its still-running daemon owns. Report
+      // unavailable rather than serve the truncated view.
+      loadFailure = new Error(
+        `session store ${dbFp} has orphaned import sidecars (${orphanedImportSidecars(dbFp).join(', ')}); `
+        + 'a non-owning process may not recover it',
+      );
+      logger.error(`Refusing to load poisoned session store as a non-owner: ${loadFailure.message}`);
+      sessions = new Map();
+      loaded = true;
+      return;
+    }
+    try {
+      withFileLockSync(jsonFp, () => {
+        // Re-check under the lock: another owning process may have just fixed it.
+        if (orphanedImportSidecars(dbFp).length === 0) return;
+        const recovered = recoverPoisonedSqliteStore(dbFp, jsonFp);
+        logger.warn(
+          `Recovered ${recovered} session row(s) stranded by a crashed SQLite import into ${dbFp}; `
+          + 'removed the orphaned .tmp sidecars',
+        );
+      });
+    } catch (err) {
+      if (isTransientStoreContentionError(err)) throw err;
+      // Fail closed: the rows are still on disk, but this process cannot prove
+      // what the store holds, so it must not report an empty projection.
+      logger.error(`Failed to recover poisoned session store ${dbFp}: ${err}`);
+      loadFailure = err instanceof Error ? err : new Error(String(err));
+      sessions = new Map();
+      loaded = true;
+      return;
+    }
+  }
 
   if (!existsSync(dbFp) && sqliteBootstrapAllowed) {
     // First start on the SQLite engine: import this store's JSON rows (or
