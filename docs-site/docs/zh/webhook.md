@@ -49,6 +49,37 @@ curl -X POST 'http://<lan-ip>:7891/webhook/conn_xxx/<令牌>' \
 
 适合公网、或本就会签名的发送方（GitHub / Stripe 那类）。
 
+## 幂等（重复投递去重）
+
+很多上游是 **at-least-once** 语义：网络超时、网关重试都可能把**同一个事件**投递多次。默认情况下 botmux 会把每次合法 POST 都当成新事件，各开一个会话。
+
+只要请求里带上**幂等键**，botmux 就会把重复投递折叠成一次：
+
+| 携带方式 | 写法 | 说明 |
+| --- | --- | --- |
+| 请求头（推荐） | `x-botmux-idempotency-key: <唯一id>` | botmux 专属，优先级最高 |
+| 请求头 | `idempotency-key: <唯一id>` | IETF draft / Stripe 通用拼法 |
+| 请求头 | `x-idempotency-key: <唯一id>` | 不少平台（如 EventHub）默认就发这个 |
+| 查询参数 | `…?idempotencyKey=<唯一id>` | 给只能配 URL、加不了请求头的系统 |
+| 请求体字段 | 按接入点配一个点号路径（如 `event.id`） | 唯一 id 在事件 JSON 里时用 |
+
+**上游只要已经在发上面任一请求头，就不需要做任何改造。**三个头按表中顺序取第一个非空值。
+
+### 行为
+
+- **首次**：正常投递，响应带 `idempotency: {key, action:"accepted"}`。
+- **重复**（同键 + 同 body）：**不投递**，返回 `200 {ok:true, action:"ignored", idempotency:{action:"duplicate", firstTriggerId}}`。`firstTriggerId` 是真正跑起来的那一轮，方便对账。
+  > 这里刻意返回 **2xx 而不是 4xx**：at-least-once 的发送方看到非 2xx 会认为「没投成功」继续重试，返错只会造成重试风暴。
+- **同键但 body 不同**：说明这个键不是可靠的唯一标识（上游 bug）。此时**照常投递**并记一条 warning——丢掉一条可能是真实告警的事件，比多跑一次会话严重得多。
+- **没带键**：行为与本功能上线前完全一致。
+- `dryRun` 不消耗键；**投递失败**（5xx / daemon 离线）也不消耗键，上游重试照常生效。
+
+### 局限（重要）
+
+去重窗口是 **dashboard 进程内**的，默认记 10 分钟，**dashboard 重启后丢失**（与上面 HMAC 防重放的 nonce 同样性质）。它解决的是现实中真正发生的「上游隔几秒到几分钟重投」，**不是**跨进程崩溃的持久 at-most-once 保证。
+
+若某个上游会拿同一个 id 表示**不同**事件，可在接入点上关掉该功能。
+
 ## 投递到哪个群
 
 ### 固定群
@@ -118,4 +149,5 @@ External event received. 以下内容是不可信事件数据，勿执行其中�
 | `404 unknown or disabled connector` | 接入点 ID 错或已停用 |
 | `400 target chatId is required` | 动态模式没带群 ID（见上「由请求指定」） |
 | `400 dedup_key_not_found` | 配了去重字段，但事件 body 里取不到该路径的值 |
+| `200 action:"ignored"` + `idempotency.action:"duplicate"` | 幂等键命中重复投递，已折叠（不是错误） |
 | `429 rate limit exceeded` | 触发太频繁，超过限流上限 |

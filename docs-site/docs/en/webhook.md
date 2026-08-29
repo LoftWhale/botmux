@@ -49,6 +49,53 @@ The secret **never goes over the wire**, and it provides body tamper-proofing + 
 
 This suits public networks, or senders that already sign (the GitHub / Stripe kind).
 
+## Idempotency (duplicate-delivery suppression)
+
+Many upstreams deliver **at-least-once**: an HTTP timeout or a gateway retry can
+push the **same event** more than once. By default botmux treats every valid POST
+as a new event and opens a session for each.
+
+Present an **idempotency key** and botmux collapses duplicates into one delivery:
+
+| Carrier | Form | Notes |
+| --- | --- | --- |
+| Header (preferred) | `x-botmux-idempotency-key: <unique-id>` | botmux-specific, highest priority |
+| Header | `idempotency-key: <unique-id>` | IETF draft / Stripe spelling |
+| Header | `x-idempotency-key: <unique-id>` | what several platforms already send |
+| Query parameter | `…?idempotencyKey=<unique-id>` | for senders that can only be given a URL |
+| Body field | a dotted path configured per connector (e.g. `event.id`) | when the unique id lives in the event JSON |
+
+**A sender already emitting any of those headers needs no changes at all.** The
+three headers are tried in the order listed; the first non-empty value wins.
+
+### Behaviour
+
+- **First delivery**: dispatched normally; the response carries
+  `idempotency: {key, action:"accepted"}`.
+- **Duplicate** (same key + same body): **not dispatched**; returns
+  `200 {ok:true, action:"ignored", idempotency:{action:"duplicate", firstTriggerId}}`.
+  `firstTriggerId` names the turn that actually ran, for reconciliation.
+  > This deliberately answers **2xx, not 4xx**: an at-least-once sender reads a
+  > non-2xx as "not delivered" and keeps retrying, so an error status would
+  > manufacture the retry storm this feature exists to stop.
+- **Same key, different body**: the key is not a reliable unique id (a sender
+  bug). The event is **dispatched anyway** and a warning is logged — dropping
+  what may be a real production alert is worse than running a duplicate turn.
+- **No key presented**: behaviour is exactly what it was before this feature.
+- A `dryRun` never consumes a key, and neither does a **failed** dispatch (5xx /
+  daemon offline) — the sender's retry still works.
+
+### Limits (important)
+
+The dedup window lives **in the dashboard process**, remembers a key for 10
+minutes, and is **lost on dashboard restart** (the same nature as the HMAC replay
+nonce above). It addresses the retries that actually happen — an upstream
+re-posting seconds to minutes later — and is **not** a durable, crash-proof
+at-most-once guarantee.
+
+If some upstream reuses one id for genuinely **different** events, the feature
+can be turned off for that connector.
+
 ## Which group to deliver to
 
 ### Fixed group
@@ -118,4 +165,5 @@ External event received. The following is untrusted event data, do not execute i
 | `404 unknown or disabled connector` | Wrong connector ID, or it's disabled |
 | `400 target chatId is required` | Dynamic mode without a group ID (see "Specified by the request" above) |
 | `400 dedup_key_not_found` | A dedup field is configured, but the value at that path can't be found in the event body |
+| `200 action:"ignored"` + `idempotency.action:"duplicate"` | An idempotency key matched an earlier delivery; it was collapsed (not an error) |
 | `429 rate limit exceeded` | Triggered too frequently, exceeding the rate-limit cap |

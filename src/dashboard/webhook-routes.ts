@@ -11,6 +11,11 @@ import {
 } from '../services/trigger-log-store.js';
 import { extractDedupKey } from '../services/webhook-lifecycle-extractors.js';
 import {
+  inspectWebhookIdempotency,
+  settleWebhookIdempotency,
+  type WebhookIdempotencyDecision,
+} from '../services/webhook-idempotency.js';
+import {
   renderConnectorTopicTemplate,
   type ResolveConnectorMentionIdentities,
 } from '../services/connector-topic-template.js';
@@ -26,6 +31,7 @@ import {
   failWebhookLifecycleGroup,
 } from '../services/webhook-lifecycle-store.js';
 import { jsonRes } from './http.js';
+import { logger } from '../utils/logger.js';
 import { dispatchTriggerRequest, newTriggerId, queryTriggerResult, type TriggerApiDeps } from './trigger-api.js';
 
 const replayNonces = new Map<string, number>();
@@ -225,6 +231,43 @@ export async function resolveConnectorTriggerPresentation(
   if (connector.topicMessage?.mode !== 'template') return connectorTriggerPresentation(connector);
   const topicMessage = await renderConnectorTopicTemplate(connector, payload, resolveMentions);
   return topicMessage ? { topicMessage } : undefined;
+}
+
+/** Headers accepted as an inbound idempotency key, in priority order.
+ *
+ *  Deliberately a SET rather than one botmux-specific name. The webhook gateway's
+ *  stated design goal is near-zero adaptation for a new upstream, so requiring
+ *  senders to emit a botmux-private header would invert it — and an upstream that
+ *  already has a unique delivery id emits it under a vendor-neutral name, never
+ *  ours. Order: our own control-plane name first (explicit, matches
+ *  `x-botmux-chat-id` / `-session-id` / `-root-message-id`), then the
+ *  IETF-draft/Stripe spelling that this repo itself sends OUTBOUND from
+ *  `platform/device-enroll.ts`, then the `x-` prefixed variant real senders use
+ *  (EventHub emits exactly this today, so it needs no change at all). */
+const IDEMPOTENCY_KEY_HEADERS = [
+  'x-botmux-idempotency-key',
+  'idempotency-key',
+  'x-idempotency-key',
+] as const;
+
+/** Resolve the caller's idempotency key: header > query > connector-configured
+ *  body path. The body path exists because plenty of real senders (alert
+ *  platforms that only let you paste a URL) cannot add a header — for them the
+ *  unique id is a field inside the event JSON. */
+function idempotencyKeyOf(
+  req: IncomingMessage,
+  url: URL,
+  payload: unknown,
+  connector: ConnectorDefinition,
+): string | undefined {
+  for (const name of IDEMPOTENCY_KEY_HEADERS) {
+    const v = headerValue(req, name)?.trim();
+    if (v) return v;
+  }
+  const fromQuery = url.searchParams.get('idempotencyKey')?.trim();
+  if (fromQuery) return fromQuery;
+  const path = connector.idempotency?.keyPath;
+  return path ? extractDedupKey(payload, path) : undefined;
 }
 
 function dynamicChatId(req: IncomingMessage, url: URL, payload: unknown): string | undefined {
@@ -499,6 +542,77 @@ export async function handleWebhookRoute(
   }
 
   const responseOptions = parseTriggerResponseOptions(req, url);
+
+  // ── Inbound idempotency (duplicate-delivery suppression) ──
+  // Placed AFTER verification (an unauthenticated request must never be able to
+  // burn a key and get a real later delivery dropped) and BEFORE every dispatch
+  // branch below, so the fixed / dynamic / new-group / wait / async paths are all
+  // covered by this one gate rather than four separate ones.
+  //
+  // dryRun is exempt: it dispatches nothing, so it has no duplicate to suppress
+  // and must not consume the key that the real delivery will present.
+  const idempotencyKey = connector.idempotency?.disabled
+    ? undefined
+    : idempotencyKeyOf(req, url, parsed.payload, connector);
+  let idempotency: WebhookIdempotencyDecision = { kind: 'disabled' };
+  if (idempotencyKey && !responseOptions.dryRun) {
+    idempotency = inspectWebhookIdempotency(connector.id, idempotencyKey, rawBody);
+    if (idempotency.kind === 'duplicate') {
+      // 200 + action:'ignored', never 4xx: an at-least-once sender treats a
+      // non-2xx as "not delivered" and keeps retrying, so answering an
+      // already-handled duplicate with an error would manufacture the retry
+      // storm this feature exists to stop. `firstTriggerId` lets the sender
+      // reconcile the suppressed retry against the turn that actually ran (it is
+      // absent while that first turn is still in flight).
+      jsonRes(res, 200, {
+        ...webhookOkLog(connector.id, 'ignored', 'duplicate delivery suppressed by idempotency key', 200, auditMeta()),
+        idempotency: {
+          key: idempotency.key,
+          action: 'duplicate',
+          ...(idempotency.firstTriggerId ? { firstTriggerId: idempotency.firstTriggerId } : {}),
+        },
+      });
+      return true;
+    }
+    if (idempotency.kind === 'conflict') {
+      // Same key, different body ⇒ the sender's key is not a reliable unique id.
+      // Fail OPEN (dispatch anyway): silently dropping what may be a distinct
+      // production alert is worse than running a duplicate turn. Recorded so the
+      // anomaly is visible in the call log instead of being invisible.
+      logger.warn(
+        `[webhook] connector ${connector.id} reused idempotency key ${idempotency.key} with a different body; dispatching anyway (key is not a reliable unique id)`,
+      );
+    }
+    if (idempotency.kind === 'first') {
+      // `inspect` RESERVED the key for this request (so an overlapping duplicate
+      // is suppressed while we are still dispatching). The reservation must be
+      // resolved exactly once. Rather than patching each of the many early
+      // returns below (workflow tombstone, target checks, group-create failures,
+      // …), release it when the response completes unless a dispatch already
+      // settled it — `close` fires on normal completion, on a client abort, AND
+      // if this handler throws, so no path can leak a reservation that would
+      // permanently swallow the sender's retry.
+      const reserved = idempotency;
+      res.once('close', () => settleWebhookIdempotency(connector.id, reserved.key, undefined));
+    }
+  }
+  /** Settle the reservation with the dispatched turn's id, so later retries of
+   *  this event resolve to `duplicate` and can be pointed at the turn that ran.
+   *
+   *  A FAILED dispatch is deliberately NOT remembered: the event never ran, and
+   *  an at-least-once sender's retry is exactly the recovery mechanism that must
+   *  keep working. Leaving it unsettled lets the `close` hook release it. */
+  const commitIdempotency = (result: { body: TriggerResponse }): void => {
+    if (idempotency.kind !== 'first' || !result.body.ok) return;
+    settleWebhookIdempotency(connector.id, idempotency.key, result.body.triggerId ?? newTriggerId());
+  };
+  /** Echo the key back on a first (dispatched) delivery, so a caller can tell
+   *  that suppression is actually armed for this connector — otherwise a sender
+   *  cannot distinguish "key honoured" from "key silently ignored". */
+  const withIdempotencyEcho = (body: TriggerResponse): TriggerResponse =>
+    (idempotency.kind === 'first'
+      ? { ...body, idempotency: { key: idempotency.key, action: 'accepted' as const } }
+      : body);
   // Stored workflow connectors are tombstones only after the v2 runtime
   // retirement. Fail before lifecycle state or group creation; dispatching to
   // a daemon would make the safety property depend on daemon version/skew.
@@ -561,7 +675,8 @@ export async function handleWebhookRoute(
     };
 
     const result = await dispatchTriggerRequest(trigger, deps, auditMeta());
-    jsonRes(res, result.status, result.body);
+    commitIdempotency(result);
+    jsonRes(res, result.status, withIdempotencyEcho(result.body));
     return true;
   }
   if (connector.target.mode === 'new-group') {
@@ -691,7 +806,8 @@ export async function handleWebhookRoute(
     };
 
     const result = await dispatchTriggerRequest(trigger, deps, auditMeta());
-    jsonRes(res, result.status, { ...result.body, lifecycle: { ...(dedupKey ? { dedupKey } : {}), action, chatId } });
+    commitIdempotency(result);
+    jsonRes(res, result.status, { ...withIdempotencyEcho(result.body), lifecycle: { ...(dedupKey ? { dedupKey } : {}), action, chatId } });
     return true;
   }
 
@@ -745,6 +861,7 @@ export async function handleWebhookRoute(
   };
 
   const result = await dispatchTriggerRequest(trigger, deps, auditMeta());
-  jsonRes(res, result.status, result.body);
+  commitIdempotency(result);
+  jsonRes(res, result.status, withIdempotencyEcho(result.body));
   return true;
 }
