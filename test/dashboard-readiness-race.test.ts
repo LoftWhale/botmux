@@ -72,14 +72,19 @@ describe('dashboard readiness budget', () => {
   });
 
   it('does not spin on failures that waiting cannot fix', () => {
-    // Only `no-active-token` is a real answer FROM the dashboard: it is up, it just
-    // has no token yet. Nothing is gained by polling.
-    expect(dashboardFailureIsTerminal(failure('no-active-token'))).toBe(true);
-    expect(shouldKeepWaitingForDashboard({
-      elapsedMs: 0,
-      failure: failure('no-active-token'),
-      comingUp: true,   // live, and it STILL must not retry
-    })).toBe(false);
+    // Terminal = the dashboard ANSWERED. `no-active-token` (up, no token yet) and
+    // `http-error` (a 500 or malformed body — `reachedDashboard()` in
+    // dashboard-endpoint.ts classifies it as reached). Polling either changes
+    // nothing, and omitting `http-error` would burn the whole 90s budget on a live
+    // dashboard that answers 500 forever.
+    for (const reason of ['no-active-token', 'http-error'] as const) {
+      expect(dashboardFailureIsTerminal(failure(reason))).toBe(true);
+      expect(shouldKeepWaitingForDashboard({
+        elapsedMs: 0,
+        failure: failure(reason),
+        comingUp: true,   // live, and it STILL must not retry
+      })).toBe(false);
+    }
   });
 
   it('keeps waiting through a FRESH-INSTALL no-secret while the member is live', () => {

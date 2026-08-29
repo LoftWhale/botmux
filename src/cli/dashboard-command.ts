@@ -85,11 +85,16 @@ export const DASHBOARD_LIVENESS_GRACE_MS = 6_000;
  *
  * Treating either as terminal ended the poll early and then told the operator to
  * restart a dashboard that was coming up fine — the same misdiagnosis this module
- * fixes for `unreachable`. Only `no-active-token` is a real answer FROM the
- * dashboard (it is up, it just has no token yet), so only it is terminal.
+ * fixes for `unreachable`.
+ *
+ * Terminal is therefore "we got an answer FROM the dashboard": `no-active-token`
+ * (it is up, it just has no token yet) and `http-error`. The latter is exactly how
+ * `dashboard-endpoint.ts:reachedDashboard()` classifies it — a 500 or a malformed
+ * body means the dashboard replied, so waiting changes nothing, and leaving it out
+ * would spend the full 90s budget on a live dashboard that answers 500 forever.
  */
 export function dashboardFailureIsTerminal(failure: Extract<DashboardResult, { ok: false }>): boolean {
-  return failure.reason === 'no-active-token';
+  return failure.reason === 'no-active-token' || failure.reason === 'http-error';
 }
 
 /**
