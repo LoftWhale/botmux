@@ -886,15 +886,19 @@ export class RiffBackend implements SessionBackend {
   private reconcileTimeoutMs = 8_000;
   private reconcileMaxAttempts = 2;
   private reconcileRetryDelayMs = 1_500;
-  /** 对账「发送时刻下限」允许的时钟偏差。`createdAt` 由 riff 服务端时钟写入，而下限
-   *  取自本机 `Date.now()`——两台机器。本机稍快就会把自己刚建的子任务判早而永远认领
-   *  不到，故放宽这一档。它远小于「上一轮遗留任务」的时间距离（至少隔一整轮），
-   *  不会重新打开它要防的误接。字段化以便测试注入。 */
-  private reconcileClockSkewMs = 30_000;
-  /** riff 服务端时钟减本机时钟（ms），由 tasks 响应的 `Date` 头实测得出；未观测到
-   *  之前为 0（即先假设两边一致）。用于把「发送时刻」换算到服务端时间轴，再与
-   *  服务端写入的 `createdAt` 比较。 */
-  private serverClockOffsetMs = 0;
+  /** 对账「发送时刻下限」的容差，分两档（见 pickReconciledChild）：
+   *  - 已从 `Date` 头实测到服务端偏差 → 只需覆盖测量误差本身（`Date` 头整秒精度
+   *    ~0.5s + 一个往返 + 期间的小漂移），取 5s。
+   *  - 尚未观测到 `Date` 头（首次对账、代理剥掉了该头等） → 偏差完全未知，退回
+   *    30s 盲兜底：宁可窗口宽一些，也不要因本机时钟快而永远认领不到子任务。
+   *  容差直接就是误接窗口宽度（创建于本轮发送前该时长内的遗留任务会被误判为本轮
+   *  的），所以能测到偏差时必须收窄。字段化以便测试注入。 */
+  private reconcileClockSkewMs = 5_000;
+  private reconcileBlindClockSkewMs = 30_000;
+  /** riff 服务端时钟减本机时钟（ms），由 tasks 响应的 `Date` 头实测得出；`null`
+   *  表示尚未观测到（此时按偏差未知处理，走盲兜底容差）。用于把「发送时刻」换算到
+   *  服务端时间轴，再与服务端写入的 `createdAt` 比较。 */
+  private serverClockOffsetMs: number | null = null;
   /** 最近一次「任务活动」的 wall-clock ms（成功建任务/续任务，或收到任意 SSE 事件），
    *  本进程尚无活动时为 null。驱动 follow-up 冷/热判据：长时间空闲或全新进程
    *  （daemon 重启 resume）意味着 riff 沙箱大概率已被回收，下一次 follow-up 需同步
@@ -1789,12 +1793,17 @@ export class RiffBackend implements SessionBackend {
   ): RiffThreadNode | undefined {
     // `createdAt` is stamped by riff's clock (TaskService: `new Date()`), while
     // sentAtMs is ours — two different machines. Translate our send instant into
-    // riff's frame using the offset measured off the tasks response `Date` header
-    // (0 until one is observed, i.e. assume agreement), then subtract a small
-    // tolerance for the header's whole-second resolution + one round trip.
-    // A client running fast without this correction would reject its own child
-    // and silently never adopt.
-    const floorMs = sentAtMs + this.serverClockOffsetMs - this.reconcileClockSkewMs;
+    // riff's frame using the offset measured off the tasks response `Date` header,
+    // then subtract a tolerance. The tolerance IS the mis-adopt window (a leftover
+    // task created within it, just before we sent, still passes), so it is kept
+    // tight once the offset is known and only stays wide while it is unknown.
+    // CAVEAT: an intermediary (proxy/gateway) may rewrite `Date`, in which case
+    // the measured offset is that hop's clock, not riff's — harmless while the two
+    // agree to within the tolerance. A server-side NTP jump between stamping
+    // `createdAt` and sending the response is absorbed the same way.
+    const measured = this.serverClockOffsetMs;
+    const tolerance = measured === null ? this.reconcileBlindClockSkewMs : this.reconcileClockSkewMs;
+    const floorMs = sentAtMs + (measured ?? 0) - tolerance;
     let best: RiffThreadNode | undefined;
     let bestMs = Number.POSITIVE_INFINITY;
     for (const n of nodes) {

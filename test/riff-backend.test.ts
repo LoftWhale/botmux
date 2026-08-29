@@ -1839,6 +1839,94 @@ describe('RiffBackend', () => {
       expect((be as any).serverClockOffsetMs).toBeLessThan(-BEHIND_MS / 2);
     });
 
+    it('no Date header observed → falls back to the WIDE blind tolerance (never reject our own child)', async () => {
+      // Without a Date header the offset is unknown, so the floor cannot be
+      // trusted: a client running fast would reject its own child and reconcile
+      // would silently never adopt. The blind branch keeps the window wide on
+      // purpose — being over-inclusive beats being permanently blind.
+      const be = makeBackend({ injectStatusLines: false });
+      (be as any).reconcileRetryDelayMs = 0;
+      be.spawn('', [], {} as any);
+      be.write('first');
+      await flush();
+      resolvers.shift()!(taskResponse('task-parent'));
+      await flush();
+      (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-parent');
+      await flush(); await flush();
+
+      // 12s "early" — outside the tight 5s tolerance, inside the 30s blind one.
+      const child = new Date(Date.now() - 12_000).toISOString();
+      fetchMock.mockImplementation(async (url: string | URL) => {
+        const u = String(url);
+        calls.push({ url: u });
+        if (u.includes('/api/task-follow-up')) throw timeoutError();
+        if (u.includes('/api/tasks?')) {
+          // Deliberately NO date header (a proxy stripped it / first probe).
+          return new Response(JSON.stringify({ success: true, data: [
+            { id: 'task-child', status: 'running', followUpParentTaskId: 'task-parent', createdAt: child },
+          ] }), { status: 200, headers: { 'content-type': 'application/json' } });
+        }
+        return pendingSseResponse();
+      });
+
+      be.write('second');
+      await flush(); await flush(); await flush();
+
+      expect((be as any).serverClockOffsetMs).toBeNull(); // nothing was measured
+      expect((be as any).currentTaskId).toBe('task-child');
+    });
+
+    it('rapid resend: turn N must not adopt turn N-1 leftover that only became visible now', async () => {
+      // The window the tolerance directly controls. Sequence: turn N-1 times out,
+      // its reconcile sees nothing (child not yet queryable); the user resends
+      // seconds later; turn N also times out — and NOW turn N-1's child shows up.
+      // It shares the parent, so only the time floor separates them. With the
+      // tolerance measured-and-tight this is rejected; a loose one adopts it and
+      // replays the previous turn's output.
+      const be = makeBackend({ injectStatusLines: false });
+      (be as any).reconcileRetryDelayMs = 0;
+      be.spawn('', [], {} as any);
+      be.write('first');
+      await flush();
+      resolvers.shift()!(taskResponse('task-parent'));
+      await flush();
+      (be as any).handleSseEvent('event:done\ndata:{"status":"completed"}', 'task-parent');
+      await flush(); await flush();
+
+      let visible = false;
+      let leftoverCreatedAt = '';
+      fetchMock.mockImplementation(async (url: string | URL) => {
+        const u = String(url);
+        calls.push({ url: u });
+        if (u.includes('/api/task-follow-up')) throw timeoutError();
+        if (u.includes('/api/tasks?')) {
+          const data = visible
+            ? [
+                { id: 'task-parent', status: 'completed' },
+                { id: 'C1-leftover', status: 'running', followUpParentTaskId: 'task-parent', createdAt: leftoverCreatedAt },
+              ]
+            : [];
+          return Response.json({ success: true, data }, { headers: { date: new Date().toUTCString() } });
+        }
+        return pendingSseResponse();
+      });
+
+      be.write('turn N-1 (times out, child not yet visible)');
+      for (let i = 0; i < 6; i++) await flush();
+      expect((be as any).currentTaskId).toBe('task-parent'); // lineage kept
+
+      // That child was created while turn N-1 was being processed — i.e. seconds
+      // BEFORE turn N is sent below — and only becomes queryable now.
+      leftoverCreatedAt = new Date(Date.now() - 10_000).toISOString();
+      visible = true;
+
+      be.write('turn N (rapid resend, also times out)');
+      for (let i = 0; i < 8; i++) await flush();
+
+      expect((be as any).currentTaskId).not.toBe('C1-leftover');
+      expect((be as any).currentTaskId).toBe('task-parent');
+    });
+
     it('a stranded task still loses even when the server clock is skewed (offset shifts both sides)', async () => {
       // The offset correction must not become a blanket "adopt anything": with the
       // same skewed server, a task from an EARLIER turn is still out of range.
