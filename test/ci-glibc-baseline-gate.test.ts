@@ -70,8 +70,16 @@ describe('scripts/build-linux-glibc-baseline.sh — the floor is built AND prove
     // tag, or a local run on the dev box, would produce a higher-floor native while
     // every log line still said "glibc baseline". The assertion is that the runtime
     // libc is CHECKED, not that any particular image supplies it.
-    expect(BUILDER_CODE).toMatch(/getconf GNU_LIBC_VERSION/);
-    expect(BUILDER_CODE).toContain(`glibc ${FLOOR}`);
+    //
+    // ANCHOR THE FLOOR TO THE CHECK ITSELF, not to the file (measured): a bare
+    // `toContain('glibc 2.28')` is satisfied by the REFUSING **message** and by the
+    // header comment, so weakening the comparison to `grep -q "glibc 2"` — which
+    // accepts 2.9, 2.17, 2.29, anything — left all 10 assertions green. Requiring
+    // the literal to appear in the matcher invocation that follows `getconf` closes
+    // that, while still tolerating a different matcher (grep/awk) or extra flags.
+    expect(BUILDER_CODE).toMatch(
+      new RegExp(`getconf GNU_LIBC_VERSION[\\s\\S]{0,200}?(?:grep|awk)[^\\n]*glibc ${FLOOR.replace('.', '\\.')}`),
+    );
   });
 
   it('MECHANISM: asserts the embedded native does not exceed the floor', () => {
