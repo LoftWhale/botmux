@@ -25,16 +25,20 @@
  *         -li → .zshenv .zprofile .zshrc
  *   bash  -c  → (none)
  *         -i  → .bashrc
- *         -li → .bash_profile           ← NOT .bashrc
+ *         -li → the FIRST of .bash_profile → .bash_login → .profile
  *   fish      → ~/.config/fish/conf.d/*.fish in all three modes
  *
  * So the target per shell is the file that covers the most modes:
  *   • zsh  → ~/.zshenv                       (the only file read in all 3)
- *   • bash → ~/.bashrc AND ~/.bash_profile   (login vs interactive are disjoint)
+ *   • bash → ~/.bashrc AND its login file    (login vs interactive are disjoint)
  *   • fish → ~/.config/fish/conf.d/botmux.fish
  *
  * bash genuinely needs both: writing only `.bashrc` misses login shells, and
- * writing only `.bash_profile` misses ordinary interactive ones.
+ * writing only the login file misses ordinary interactive ones.
+ *
+ * ⚠️ bash's login file is "the first that EXISTS", not always `.bash_profile` —
+ * see bashLoginFile() below for why creating the wrong one destroys the user's
+ * existing login config.
  *
  * ── fish SYNTAX ──────────────────────────────────────────────────────────────
  * fish is not POSIX; `export PATH="$INSTALL_DIR:$PATH"` is not its syntax. (fish
@@ -68,6 +72,29 @@ export function detectShell(env = process.env) {
 }
 
 /**
+ * bash's LOGIN startup file, chosen without shadowing anything.
+ *
+ * ⚠️ bash reads only the FIRST of `.bash_profile` → `.bash_login` → `.profile`.
+ * So creating `.bash_profile` on a machine whose login config lives in
+ * `.profile` (or `.bash_login`) silently stops that file from ever being read.
+ * Measured — a sentinel exported from `.profile` is visible to `bash -lic`, and
+ * becomes MISSING the moment an unrelated `.bash_profile` appears; same for
+ * `.bash_login`. That is destroying the user's environment to fix a PATH entry,
+ * which is far worse than the bug being fixed.
+ *
+ * So: append to whichever of the three already exists (that is the file bash is
+ * actually reading), and only fall back to CREATING `.bash_profile` when none of
+ * them exists — in which case there is nothing to shadow.
+ */
+function bashLoginFile(home) {
+  for (const name of ['.bash_profile', '.bash_login', '.profile']) {
+    const file = join(home, name);
+    if (existsSync(file)) return file;
+  }
+  return join(home, '.bash_profile');
+}
+
+/**
  * The startup files to write for a shell, plus the line to write into each.
  * Returns [] when we have nothing safe to say.
  */
@@ -78,13 +105,16 @@ export function pathEntryTargets(shell, installDir, home = homedir()) {
       // .zshenv is the only file read by non-interactive, interactive and login
       // zsh alike, so a script/ssh command finds botmux too.
       return [{ file: join(home, '.zshenv'), line: posix }];
-    case 'bash':
+    case 'bash': {
       // Disjoint coverage — see header. Both, or one of the two common ways of
-      // opening a terminal is left broken.
-      return [
-        { file: join(home, '.bashrc'), line: posix },
-        { file: join(home, '.bash_profile'), line: posix },
-      ];
+      // opening a terminal is left broken. The login half must not shadow (above).
+      const login = bashLoginFile(home);
+      const targets = [{ file: join(home, '.bashrc'), line: posix }];
+      // When bash's login file IS .bashrc-adjacent there is nothing more to add;
+      // dedupe so we never append the same line to the same file twice.
+      if (login !== join(home, '.bashrc')) targets.push({ file: login, line: posix });
+      return targets;
+    }
     case 'fish':
       return [{
         file: join(home, '.config', 'fish', 'conf.d', 'botmux.fish'),

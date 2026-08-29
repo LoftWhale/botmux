@@ -119,11 +119,25 @@ MARKER='# added by botmux installer'
 
 path_line_present() {  # $1=file — already handled, by us or by the user's own line?
   [ -f "$1" ] || return 1
-  # Must be a PATH *assignment* mentioning our dir, not merely a line containing
-  # the word "path" (an install dir can itself contain "path"). Mirrors the regex
-  # in scripts/install-path-entry.mjs.
-  grep -q "$INSTALL_DIR" "$1" 2>/dev/null \
-    && grep -Eqi "export[[:space:]]+PATH[[:space:]]*=|^[[:space:]]*PATH[[:space:]]*=|set[[:space:]]+(-[[:alnum:]]+[[:space:]]+)*PATH|fish_add_path|path\+=|path=\(" "$1" 2>/dev/null
+  # Must be ONE LINE that both names our dir AND is a PATH assignment. Two
+  # independent greps would accept a file where a comment mentions the directory
+  # and an unrelated line exports PATH (measured false positive), and then we
+  # would skip a machine that is not actually configured. Mirrors the per-line
+  # predicate in scripts/install-path-entry.mjs.
+  grep -F "$INSTALL_DIR" "$1" 2>/dev/null \
+    | grep -Eqi "export[[:space:]]+PATH[[:space:]]*=|^[[:space:]]*PATH[[:space:]]*=|set[[:space:]]+(-[[:alnum:]]+[[:space:]]+)*PATH|fish_add_path|path\+=|path=\("
+}
+
+# bash's LOGIN file is the FIRST of .bash_profile → .bash_login → .profile that
+# EXISTS. Creating .bash_profile when the user's login config lives in .profile
+# (or .bash_login) silently stops that file from being read ever again — measured
+# with a sentinel: visible before, MISSING after. So append to whichever already
+# exists, and only create .bash_profile when none does (nothing to shadow then).
+bash_login_file() {
+  for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+    [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+  done
+  printf '%s\n' "$HOME/.bash_profile"
 }
 
 append_path_line() {  # $1=file  $2=line
@@ -154,7 +168,9 @@ case ":$PATH:" in
         else append_path_line "$f" "set -gx PATH \"$INSTALL_DIR\" \$PATH  $MARKER" && wrote=1; fi
         ;;
       *bash*)
-        for f in "$HOME/.bashrc" "$HOME/.bash_profile"; do
+        # .bashrc (interactive) and the login file are disjoint; write both, but
+        # never CREATE a login file that would shadow an existing one.
+        for f in "$HOME/.bashrc" "$(bash_login_file)"; do
           if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
         done
         ;;

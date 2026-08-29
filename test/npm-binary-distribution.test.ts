@@ -235,6 +235,15 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     expect(`${r.stdout}${r.stderr}`).toContain('PATH');
   });
 
+  it('touches no startup file when binDir is already on PATH', () => {
+    // An upgrade on a machine that was set up long ago must not keep appending
+    // to (or even creating) rc files it has nothing to add to.
+    const r = runPostinstall({ global: 'true', shell: '/usr/bin/zsh', binDirOnPath: true });
+    expect(r.status).toBe(0);
+    expect(r.wrote).toBe(true);                        // launcher still written
+    expect(existsSync(join(r.home, '.zshenv'))).toBe(false);
+  });
+
   it('the written launcher actually runs and preserves argument boundaries', () => {    const r = runPostinstall({ global: 'true' });
     const run = spawnSync(r.launcher, ['send', 'hello world'], { encoding: 'utf-8' });
     expect(run.status).toBe(0);

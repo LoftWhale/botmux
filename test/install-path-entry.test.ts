@@ -61,9 +61,48 @@ describe('pathEntryTargets', () => {
     expect(t.map(x => rel(x.file))).not.toContain('/.profile');
   });
 
-  it('bash gets BOTH .bashrc and .bash_profile (login vs interactive are disjoint)', () => {
+  it('bash gets BOTH .bashrc and a login file (login vs interactive are disjoint)', () => {
     const t = pathEntryTargets('bash', installDir, home);
-    expect(t.map(x => rel(x.file)).sort()).toEqual(['/.bash_profile', '/.bashrc']);
+    expect(t.map(x => rel(x.file))).toContain('/.bashrc');
+    expect(t).toHaveLength(2);
+  });
+
+  /**
+   * bash reads only the FIRST of .bash_profile → .bash_login → .profile. Creating
+   * .bash_profile on a machine whose login config lives in .profile silently stops
+   * that file from ever being read again — measured with a sentinel: visible to
+   * `bash -lic` before, MISSING after. Fixing a PATH entry must not cost the user
+   * their existing login config.
+   */
+  describe('bash login file is chosen without shadowing', () => {
+    const loginTarget = () =>
+      pathEntryTargets('bash', installDir, home).map(x => rel(x.file)).find(f => f !== '/.bashrc');
+
+    it('appends to .profile when that is the only login file present', () => {
+      writeFileSync(join(home, '.profile'), 'export SENTINEL=yes\n');
+      expect(loginTarget()).toBe('/.profile');
+    });
+
+    it('appends to .bash_login when that is the one present', () => {
+      writeFileSync(join(home, '.bash_login'), 'export SENTINEL=yes\n');
+      expect(loginTarget()).toBe('/.bash_login');
+    });
+
+    it('prefers .bash_profile when it exists (bash reads it first)', () => {
+      writeFileSync(join(home, '.bash_profile'), '');
+      writeFileSync(join(home, '.profile'), '');
+      expect(loginTarget()).toBe('/.bash_profile');
+    });
+
+    it('creates .bash_profile only when none of the three exists (nothing to shadow)', () => {
+      expect(loginTarget()).toBe('/.bash_profile');
+    });
+
+    it('never writes the same file twice', () => {
+      writeFileSync(join(home, '.profile'), '');
+      const files = pathEntryTargets('bash', installDir, home).map(x => x.file);
+      expect(new Set(files).size).toBe(files.length);
+    });
   });
 
   it('fish gets conf.d/botmux.fish with NATIVE fish syntax, not POSIX export', () => {
@@ -182,6 +221,18 @@ describe('the written file actually puts botmux on PATH (real shells)', () => {
     expect(runIn('fish', ['-c', 'botmux'])).toContain('BOTMUX_OK');
   });
 
+  it('bash keeps reading a pre-existing .profile (no shadowing) AND finds the command', () => {
+    if (!have('bash')) return;
+    // The exact failure mode: login config in .profile, no .bash_profile.
+    writeFileSync(join(home, '.profile'), 'export SENTINEL_FROM_PROFILE=yes\n');
+    fakeLauncher();
+    ensurePathEntry({ installDir, home, shell: 'bash' });
+    // Creating .bash_profile here would make this sentinel MISSING.
+    expect(runIn('bash', ['-lic', 'echo "S=${SENTINEL_FROM_PROFILE:-MISSING}"'])).toContain('S=yes');
+    expect(runIn('bash', ['-lic', 'botmux'])).toContain('BOTMUX_OK');
+    expect(runIn('bash', ['-ic', 'botmux'])).toContain('BOTMUX_OK');
+  });
+
   it('a POSIX shell finds it via .profile', () => {
     if (!have('dash')) return;
     fakeLauncher();
@@ -220,16 +271,42 @@ describe('install.sh stays in step with the shared module', () => {
     expect(branch).not.toContain('.profile');
   });
 
-  it('the bash branch writes BOTH .bashrc and .bash_profile', () => {
+  it('the bash branch writes .bashrc plus a resolved login file', () => {
     const branch = caseBranch('\\*bash\\*');
     expect(branch).toContain('.bashrc');
-    expect(branch).toContain('.bash_profile');
+    // The login half is resolved at runtime (see the shadowing test below), so a
+    // literal .bash_profile must NOT appear here.
+    expect(branch).toContain('bash_login_file');
   });
 
   it('the fish branch writes conf.d/botmux.fish using native fish syntax', () => {
     const branch = caseBranch('\\*fish\\*');
     expect(branch).toContain('conf.d/botmux.fish');
     expect(branch).toContain('set -gx PATH');
+  });
+
+  it('the bash branch resolves its login file instead of hardcoding .bash_profile', () => {
+    const branch = caseBranch('\\*bash\\*');
+    // Must go through the resolver; a literal $HOME/.bash_profile here would
+    // shadow an existing .profile/.bash_login (see the module header).
+    expect(branch).toContain('bash_login_file');
+    expect(branch).not.toContain('$HOME/.bash_profile');
+    expect(sh).toContain('bash_login_file()');
+    // The resolver must consider all three, in bash's own order.
+    const fn = sh.slice(sh.indexOf('bash_login_file()'));
+    expect(fn.slice(0, 400)).toContain('.bash_login');
+  });
+
+  it('its idempotence check is per-LINE, not two independent greps', () => {
+    // Two separate greps accept "dir named in a comment" + "unrelated PATH export
+    // on another line" and wrongly skip a machine that is not configured
+    // (reproduced). The dir and the assignment must be found on the SAME line,
+    // which here means piping the dir matches INTO the assignment match.
+    const fn = sh.slice(sh.indexOf('path_line_present()'), sh.indexOf('bash_login_file()'));
+    expect(fn).toContain('grep -F "$INSTALL_DIR"');
+    expect(fn).toMatch(/grep -F "\$INSTALL_DIR"[^\n]*\n?[^\n]*\|/);
+    // The old form ANDed two whole-file greps; that must not come back.
+    expect(fn).not.toMatch(/grep -q "\$INSTALL_DIR"[^\n]*&&/);
   });
 
   it('carries the same marker so the two installers recognise each other\'s line', () => {
