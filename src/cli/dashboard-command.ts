@@ -251,3 +251,28 @@ export async function executeDashboardCommand(
   }
   return { kind: 'endpoint', action, result: ensured };
 }
+
+/**
+ * `botmux dashboard`'s execution path, as ONE importable unit.
+ *
+ * Why this exists rather than inline wiring in `cli.ts`: the opt-in below is the
+ * whole fix for a dead `.dashboard-port`, and `cli.ts` exports nothing testable,
+ * so the only way to check it was a source-text assertion. Two such assertions
+ * were written and both were wrong — the first false-RED on a legitimate
+ * extract-to-local refactor, the second stayed GREEN when the flag-carrying call
+ * was fully disconnected from the caller actually passed down (flag present,
+ * command executed, wiring severed). A regex over nested callbacks cannot express
+ * "this options object reaches that caller"; a function can.
+ *
+ * `rescanWhenUnreachable: true` is correct HERE and only here: this is a one-shot
+ * human command, so at worst it scans the probe range once per invocation. The
+ * 500ms readiness poll must keep the default (false) or it would scan every tick.
+ *
+ * @param callEndpoint the raw endpoint caller; this wrapper is what adds the opt-in
+ */
+export async function executeDashboardCliCommand(
+  args: readonly string[],
+  callEndpoint: (path: DashboardEndpoint, opts: { rescanWhenUnreachable: boolean }) => Promise<DashboardResult>,
+): Promise<DashboardCommandExecution> {
+  return executeDashboardCommand(args, (path) => callEndpoint(path, { rescanWhenUnreachable: true }));
+}

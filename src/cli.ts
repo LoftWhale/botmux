@@ -148,7 +148,7 @@ import {
   DASHBOARD_COMMAND_USAGE,
   dashboardComingUpFromState,
   dashboardFailureIsTerminal,
-  executeDashboardCommand,
+  executeDashboardCliCommand,
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
   formatDashboardUnreachable,
@@ -3243,13 +3243,24 @@ function cmdUpgradeLocalDev(): void {
  * over {@link callDashboard}, which handles 404 disambiguation and self-heals a
  * stale `.dashboard-port` that points at the wrong service (e.g. daemon IPC).
  * See `src/cli/dashboard-endpoint.ts` for the why.
+ *
+ * `rescanWhenUnreachable` extends that self-heal to a recorded port with NOTHING
+ * listening on it. It must stay opt-in: during boot `unreachable` is the normal
+ * state and is resolved by retrying the same port, so scanning the range on every
+ * poll tick would be pure waste. `executeDashboardCliCommand` passes it for the
+ * one-shot `botmux dashboard`; the readiness poll below must NOT.
  */
-async function callDashboardEndpoint(path: DashboardEndpoint): Promise<DashboardResult> {
+async function callDashboardEndpoint(
+  path: DashboardEndpoint,
+  opts: { rescanWhenUnreachable?: boolean; requestTimeoutMs?: number } = {},
+): Promise<DashboardResult> {
   return callDashboard({
     configDir: CONFIG_DIR,
     defaultPort: 7891,
     envPort: process.env.BOTMUX_DASHBOARD_PORT,
     path,
+    rescanWhenUnreachable: opts.rescanWhenUnreachable,
+    requestTimeoutMs: opts.requestTimeoutMs,
   });
 }
 
@@ -3335,7 +3346,11 @@ async function printDashboardHintWithRetry(): Promise<void> {
   // 撑不住，实测会把 start/restart 的这段拖到近两倍。
   await ensureDevboxDashboardExportForCurrentPort();
   for (;;) {
-    last = await callDashboardEndpoint('/__cli/current');
+    // Bounded per request (NOT opted into rescanning): this loop's own budget is
+    // only consulted below, after the await returns, so a recorded port that
+    // accepts the connection and never answers would hang here forever and never
+    // reach that check. See requestTimeoutMs in dashboard-endpoint.ts.
+    last = await callDashboardEndpoint('/__cli/current', { requestTimeoutMs: stepMs * 4 });
     if (last.ok) {
       console.log(`   面板: botmux dashboard (${last.url})`);
       // 走中心化平台链接时，附带本地直连兜底，平台异常也能直接 ip:port 访问。
@@ -3373,7 +3388,11 @@ async function cmdDashboard(args: string[]): Promise<void> {
     && !args.some(arg => ['--help', '-h', 'help'].includes(arg.toLowerCase()))
     && (rawAction === undefined || rawAction === 'current' || rawAction === 'rotate');
   if (resolvesEndpoint) await ensureDevboxDashboardExportForCurrentPort();
-  const execution = await executeDashboardCommand(args, callDashboardEndpoint);
+  // The opt-in for a dead recorded port lives INSIDE executeDashboardCliCommand
+  // so it is directly testable (see its doc comment for why source-regex guards
+  // were not). `printDashboardHintWithRetry()` deliberately does not use this
+  // wrapper — a 500ms poll must never scan the probe range per tick.
+  const execution = await executeDashboardCliCommand(args, callDashboardEndpoint);
   if (execution.kind === 'help') {
     console.log(DASHBOARD_COMMAND_USAGE);
     return;
