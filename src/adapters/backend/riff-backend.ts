@@ -886,6 +886,11 @@ export class RiffBackend implements SessionBackend {
   private reconcileTimeoutMs = 8_000;
   private reconcileMaxAttempts = 2;
   private reconcileRetryDelayMs = 1_500;
+  /** 对账「发送时刻下限」允许的时钟偏差。`createdAt` 由 riff 服务端时钟写入，而下限
+   *  取自本机 `Date.now()`——两台机器。本机稍快就会把自己刚建的子任务判早而永远认领
+   *  不到，故放宽这一档。它远小于「上一轮遗留任务」的时间距离（至少隔一整轮），
+   *  不会重新打开它要防的误接。字段化以便测试注入。 */
+  private reconcileClockSkewMs = 30_000;
   /** 最近一次「任务活动」的 wall-clock ms（成功建任务/续任务，或收到任意 SSE 事件），
    *  本进程尚无活动时为 null。驱动 follow-up 冷/热判据：长时间空闲或全新进程
    *  （daemon 重启 resume）意味着 riff 沙箱大概率已被回收，下一次 follow-up 需同步
@@ -1769,21 +1774,28 @@ export class RiffBackend implements SessionBackend {
   }
 
   /** The thread node this follow-up created, or undefined. Requires BOTH the
-   *  parent link AND creation at/after `sentAtMs` (see the anchor notes on
-   *  reconcileAfterFollowUpTimeout — the parent alone can match a task stranded
-   *  by an earlier timed-out turn). Unparsable/absent createdAt → not a
-   *  candidate. Oldest qualifying node wins. */
+   *  parent link AND creation at/after `sentAtMs` minus a clock-skew allowance
+   *  (see the anchor notes on reconcileAfterFollowUpTimeout — the parent alone
+   *  can match a task stranded by an earlier timed-out turn). Unparsable/absent
+   *  createdAt → not a candidate. Oldest qualifying node wins. */
   private pickReconciledChild(
     nodes: RiffThreadNode[],
     parentTaskId: string,
     sentAtMs: number,
   ): RiffThreadNode | undefined {
+    // `createdAt` is stamped by riff's clock (TaskService: `new Date()`), while
+    // sentAtMs comes from ours — two different machines. A client running even
+    // slightly ahead would reject its own child and silently never adopt, so the
+    // floor is relaxed by reconcileClockSkewMs. The allowance is far smaller than
+    // the gap to a previous turn's stranded task (which is at least a whole turn
+    // old), so it does not reopen the mis-adopt it guards against.
+    const floorMs = sentAtMs - this.reconcileClockSkewMs;
     let best: RiffThreadNode | undefined;
     let bestMs = Number.POSITIVE_INFINITY;
     for (const n of nodes) {
       if (!n.id || n.followUpParentTaskId !== parentTaskId) continue;
       const createdMs = n.createdAt ? Date.parse(n.createdAt) : NaN;
-      if (!Number.isFinite(createdMs) || createdMs < sentAtMs) continue;
+      if (!Number.isFinite(createdMs) || createdMs < floorMs) continue;
       if (createdMs < bestMs) {
         best = n;
         bestMs = createdMs;

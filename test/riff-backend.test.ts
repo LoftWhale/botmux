@@ -1779,6 +1779,32 @@ describe('RiffBackend', () => {
       expect(tasksAuth).toBe('owner-jwt');
     });
 
+    it('reconcile still adopts when the server clock lags ours slightly (skew allowance)', async () => {
+      // createdAt is stamped by riff's clock, the floor by ours. A client running
+      // a little ahead must not reject its own child — that would silently turn
+      // reconcile into "never adopts".
+      const { be } = await primedFollowUp();
+      (be as any).reconcileRetryDelayMs = 0;
+      // Child looks 5s OLDER than our send instant, well inside the allowance.
+      const slightlyEarlier = new Date(Date.now() - 5_000).toISOString();
+      fetchMock.mockImplementation(async (url: string | URL) => {
+        const u = String(url);
+        calls.push({ url: u });
+        if (u.includes('/api/task-follow-up')) throw timeoutError();
+        if (u.includes('/api/tasks?')) {
+          return Response.json({ success: true, data: [
+            { id: 'task-child', status: 'running', followUpParentTaskId: 'task-parent', createdAt: slightlyEarlier },
+          ] });
+        }
+        return pendingSseResponse();
+      });
+
+      be.write('second');
+      await flush(); await flush(); await flush();
+
+      expect((be as any).currentTaskId).toBe('task-child');
+    });
+
     it('reconcile does NOT adopt a child stranded by an EARLIER turn (created before we sent)', async () => {
       // riff redirects a follow-up's parent to the thread's LATEST node, so several
       // siblings can share one parent — including a task left behind by a previous
