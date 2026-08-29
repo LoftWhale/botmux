@@ -1756,7 +1756,10 @@ export class RiffBackend implements SessionBackend {
       }
       // Diagnostic: what did the thread query return, and what are we matching on?
       // ids/times only — surfaces missing (timing/scope) vs present-but-unmatched.
-      logger.info(`[riff] reconcile attempt ${attempt}: match by parent=${parentTaskId.slice(0, 8)} createdAt>=${new Date(sentAtMs).toISOString()}, thread has ${nodes.length} node(s): ${nodes.map(n => `${n.id?.slice(0, 8)}(par=${n.followUpParentTaskId?.slice(0, 8) ?? 'none'},created=${n.createdAt ?? 'none'},${n.status})`).join(' ')}`);
+      // Print the EFFECTIVE floor (offset + tolerance applied), not the raw send
+      // instant: a log that names a different threshold than the code applies
+      // would send whoever debugs this down the wrong path.
+      logger.info(`[riff] reconcile attempt ${attempt}: match by parent=${parentTaskId.slice(0, 8)} createdAt>=${new Date(this.reconcileFloorMs(sentAtMs)).toISOString()} (sent=${new Date(sentAtMs).toISOString()}, serverOffset=${this.serverClockOffsetMs ?? 'unmeasured'}), thread has ${nodes.length} node(s): ${nodes.map(n => `${n.id?.slice(0, 8)}(par=${n.followUpParentTaskId?.slice(0, 8) ?? 'none'},created=${n.createdAt ?? 'none'},${n.status})`).join(' ')}`);
       const child = this.pickReconciledChild(nodes, parentTaskId, sentAtMs);
       if (child) {
         const childId = child.id;
@@ -1781,29 +1784,36 @@ export class RiffBackend implements SessionBackend {
     return false;
   }
 
+  /** The effective reconcile floor in riff's time frame: our send instant,
+   *  translated by the measured server clock offset, minus the tolerance.
+   *  `createdAt` is stamped by riff's clock (TaskService: `new Date()`), while
+   *  sentAtMs is ours — two different machines. The tolerance IS the mis-adopt
+   *  window (a leftover task created within it, just before we sent, still
+   *  passes), so it is kept tight once the offset is known and only stays wide
+   *  while it is unknown.
+   *  CAVEAT: an intermediary (proxy/gateway) may rewrite `Date`, in which case
+   *  the measured offset is that hop's clock, not riff's — harmless while the two
+   *  agree to within the tolerance. A server-side NTP jump between stamping
+   *  `createdAt` and sending the response is absorbed the same way.
+   *  Single-sourced so the diagnostic log can never name a different threshold
+   *  than the filter actually applies. */
+  private reconcileFloorMs(sentAtMs: number): number {
+    const measured = this.serverClockOffsetMs;
+    const tolerance = measured === null ? this.reconcileBlindClockSkewMs : this.reconcileClockSkewMs;
+    return sentAtMs + (measured ?? 0) - tolerance;
+  }
+
   /** The thread node this follow-up created, or undefined. Requires BOTH the
-   *  parent link AND creation at/after `sentAtMs` minus a clock-skew allowance
-   *  (see the anchor notes on reconcileAfterFollowUpTimeout — the parent alone
-   *  can match a task stranded by an earlier timed-out turn). Unparsable/absent
-   *  createdAt → not a candidate. Oldest qualifying node wins. */
+   *  parent link AND creation at/after the effective floor (see
+   *  reconcileFloorMs + the anchor notes on reconcileAfterFollowUpTimeout — the
+   *  parent alone can match a task stranded by an earlier timed-out turn).
+   *  Unparsable/absent createdAt → not a candidate. Oldest qualifying node wins. */
   private pickReconciledChild(
     nodes: RiffThreadNode[],
     parentTaskId: string,
     sentAtMs: number,
   ): RiffThreadNode | undefined {
-    // `createdAt` is stamped by riff's clock (TaskService: `new Date()`), while
-    // sentAtMs is ours — two different machines. Translate our send instant into
-    // riff's frame using the offset measured off the tasks response `Date` header,
-    // then subtract a tolerance. The tolerance IS the mis-adopt window (a leftover
-    // task created within it, just before we sent, still passes), so it is kept
-    // tight once the offset is known and only stays wide while it is unknown.
-    // CAVEAT: an intermediary (proxy/gateway) may rewrite `Date`, in which case
-    // the measured offset is that hop's clock, not riff's — harmless while the two
-    // agree to within the tolerance. A server-side NTP jump between stamping
-    // `createdAt` and sending the response is absorbed the same way.
-    const measured = this.serverClockOffsetMs;
-    const tolerance = measured === null ? this.reconcileBlindClockSkewMs : this.reconcileClockSkewMs;
-    const floorMs = sentAtMs + (measured ?? 0) - tolerance;
+    const floorMs = this.reconcileFloorMs(sentAtMs);
     let best: RiffThreadNode | undefined;
     let bestMs = Number.POSITIVE_INFINITY;
     for (const n of nodes) {
