@@ -535,6 +535,59 @@ export function legacyFleetAt(home: string): Pm2God | null {
   return godLooksLikeLegacyFleet(god) ? god : null;
 }
 
+/**
+ * What else is riding on this God, besides the legacy daemons in `procs`?
+ *
+ * Answers "would stopping this God take down something that is not ours". Used
+ * only by the CLI-less path, where the God must be SIGKILLed before its daemons
+ * (it respawns them otherwise) and there is no `pm2 delete` to remove rows
+ * selectively — so any other member means we must not touch it at all.
+ *
+ * TWO SOURCES, because either alone under-reports:
+ *  • the God's live children (`/proc/<pid>/task/<tid>/children`), minus the pids
+ *    we already identified as legacy daemons — this catches a plugin service whose
+ *    `pids/` record we cannot match by name;
+ *  • `pids/` entries whose app name is NOT a botmux core name — this catches an app
+ *    that is momentarily between processes (pm2 restart backoff) and therefore has
+ *    no live child right now.
+ *
+ * A child we cannot identify counts as "other": the question here is whether it is
+ * safe to kill the God, so anything unrecognised must be assumed to matter.
+ * Returns pids for children, and `-1` placeholders for name-only evidence (the
+ * caller only uses the count).
+ */
+function nonCoreGodChildren(god: Pm2God, procs: LegacyProc[]): number[] {
+  const out: number[] = [];
+  const corePids = new Set(procs.map((p) => p.pid));
+  if (god.pid > 0 && process.platform === 'linux') {
+    let tasks: string[] = [];
+    try { tasks = readdirSync(`/proc/${god.pid}/task`); } catch { /* cannot tell */ }
+    for (const tid of tasks) {
+      let raw: string;
+      try { raw = readFileSync(`/proc/${god.pid}/task/${tid}/children`, 'utf-8'); }
+      catch { continue; }
+      for (const tok of raw.trim().split(/\s+/)) {
+        const pid = parseInt(tok, 10);
+        if (!Number.isSafeInteger(pid) || pid <= 1) continue;
+        if (corePids.has(pid)) continue;              // a legacy daemon we will reap
+        if (!isAlive(pid)) continue;                  // already gone
+        out.push(pid);
+      }
+    }
+  }
+  // Name-only evidence: a non-core pid record with no live process right now.
+  try {
+    for (const file of readdirSync(join(god.home, 'pids'))) {
+      if (!file.endsWith('.pid')) continue;
+      const name = file.slice(0, -'.pid'.length);
+      const base = name.replace(/-\d+$/, '');
+      if (isBotmuxPm2Name(base) || isBotmuxPm2Name(name)) continue;   // core → not "other"
+      out.push(-1);
+    }
+  } catch { /* no pids/ dir */ }
+  return out;
+}
+
 export interface LegacyPm2ReapResult {
   /** True if a live legacy God was found and we attempted to reap it. */
   found: boolean;
@@ -602,6 +655,25 @@ export function reapLegacyPm2(configDir: string, pkgRoot: string, log: (m: strin
       }
       result.found = true;
       const procs = legacyProcsFromPidsDir(home);
+      // MIXED ROSTER, NO CLI → TOUCH NOTHING. Stopping a legacy fleet without pm2
+      // means SIGKILLing the God first (it would otherwise respawn everything we
+      // reap), and killing the God takes down EVERY app it supervises — including
+      // a plugin service sharing this home, which `botmux stop` does not bring
+      // back. With a CLI we delete selectively and can spare the God; here we
+      // cannot, so the only safe answer is to act on neither and say so.
+      //
+      // This is the CLI-less counterpart of the `otherRows` guard further down,
+      // and it must live HERE: that guard is in the pm2-CLI branch, which the
+      // compiled binary never reaches.
+      const others = nonCoreGodChildren(god, procs);
+      if (procs.length > 0 && others.length > 0) {
+        result.unresolved = true;
+        result.note = `legacy pm2 God at ${home} also supervises ${others.length} non-botmux `
+          + 'process(es) (plugin service?); stopping it without a pm2 CLI would take those down '
+          + 'too, so nothing was signalled';
+        log(result.note);
+        continue;
+      }
       if (procs.length === 0) {
         // A live God we cannot prove anything about. Say so plainly rather than
         // reporting success — the caller must be able to tell the old fleet may

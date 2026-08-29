@@ -7,6 +7,12 @@ import { createServer, type Server } from 'node:net';
 import { reapLegacyPm2, liveGodAt } from '../src/core/legacy-pm2-reaper.js';
 
 const dirs: string[] = [];
+/** Unique markers stamped into every fixture process's cmdline, so teardown can
+ *  verify by IDENTITY. Counting `ppid==1` survivors is unreliable (a container
+ *  subreaper reparents differently) and scanning by shape risks matching an
+ *  unrelated process — a marker is exact. */
+const fixtureMarkers: string[] = [];
+let fixtureSeq = 0;
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'legacy-pm2-')); dirs.push(d); return d; }
 
 // HERMETIC HOME: reapLegacyPm2 also scans homedir()/.pm2 (the shared default pm2
@@ -67,7 +73,21 @@ afterEach(() => {
   }
   for (const p of spawned.splice(0)) { try { p.kill('SIGKILL'); } catch { /* already gone */ } }
   for (const s of servers.splice(0)) { try { s.close(); } catch { /* already closed */ } }
+  // VERIFY BY IDENTITY, not by shape. Every fixture process carries a unique marker
+  // in its cmdline, so a leak is provable rather than guessed at: counting `ppid==1`
+  // survivors misses reparenting under a container subreaper, and matching on the
+  // process shape could flag someone else's process.
+  // ONE process-table scan for all markers (not one `ps` per marker), and the throw
+  // comes LAST so a detected leak never skips the remaining cleanup below.
+  const markers = fixtureMarkers.splice(0);
+  const psOut = markers.length > 0
+    ? (spawnSync('ps', ['-eo', 'args'], { encoding: 'utf-8' }).stdout || '')
+    : '';
+  const leakedMarkers = markers.filter((m) => psOut.includes(m));
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  if (leakedMarkers.length > 0) {
+    throw new Error(`fixture leaked ${leakedMarkers.length} process group(s): ${leakedMarkers.join(', ')}`);
+  }
 });
 
 /** Write an executable fake `pm2` at <pkgRoot>/node_modules/pm2/bin/pm2 that
@@ -120,6 +140,73 @@ function liveGodSupervising(home: string): { god: number; child: number } {
 }
 
 /**
+ * A live God whose cmdline really identifies it as a pm2 God, with one direct child
+ * per entry in `childTags`, and `pm2.pid` naming it.
+ *
+ * WHY THIS EXISTS: the CLI-less reap only kills the God when
+ * `looksLikePm2God(god.pid)` is true. Fixtures that point `pm2.pid` at the vitest
+ * process can never satisfy that (vitest's cmdline is not a God), so they silently
+ * skip the kill-God branch — a test asserting "the plugin survived" there proves
+ * nothing about the real shape. This models the real relationship: a God-titled
+ * parent that genuinely supervises the children we then reason about.
+ *
+ * Returns the God pid and the child pids, in `childTags` order.
+ */
+function liveGodWithChildren(home: string, childTags: string[]): { god: number; children: number[] } {
+  mkdirSync(home, { recursive: true });
+  // argv: [godTitle, ...childTags]; the parent spawns one child per tag, prints
+  // their pids, then idles. Detached so teardown can signal the whole group.
+  // REPORT VIA A FILE, NOT A PIPE. This suite waits with a synchronous busy-loop
+  // (`spinMs`, needed because the reaper itself is synchronous), which never yields
+  // to the event loop — so a `stdout.on('data')` handler would never run and the
+  // read would time out empty. Writing the pids to a file lets the waiter poll it
+  // with readFileSync. The `END` sentinel distinguishes a complete write from a
+  // partially flushed one.
+  const pidsFile = join(home, 'fixture-child-pids');
+  const script = `const {spawn}=require('child_process');const fs=require('fs');`
+    + `const tags=process.argv.slice(3);`
+    + `const mk=process.argv[1].split(' ').pop();`
+    + `const pids=tags.map(t=>spawn(process.execPath,['-e','setTimeout(()=>{},60000)',t,mk],{stdio:'ignore'}).pid);`
+    + `fs.writeFileSync(process.argv[2], pids.join(',')+'END');setTimeout(()=>{},60000);`;
+  const marker = `BOTMUX_FIXTURE_${process.pid}_${fixtureSeq++}`;
+  fixtureMarkers.push(marker);
+  const parent = spawn(process.execPath,
+    ['-e', script, `PM2 v6.0.14: God Daemon (/fake/.botmux/pm2) ${marker}`, pidsFile, ...childTags],
+    { stdio: 'ignore', detached: true });
+  spawned.push(parent);
+  groupLeaders.push(parent.pid!);
+  let out = '';
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline && !out.includes('END')) {
+    try { out = readFileSync(pidsFile, 'utf-8'); } catch { /* not written yet */ }
+    if (!out.includes('END')) spinMs(25);
+  }
+  const children = out.replace('END', '').trim().split(',').filter(Boolean).map((n) => Number(n));
+  if (children.length !== childTags.length || children.some((n) => !Number.isSafeInteger(n))) {
+    throw new Error(`fixture failed to report ${childTags.length} child pids: ${JSON.stringify(out)}`);
+  }
+  // Wait until /proc really lists them as this God's children — and FAIL LOUDLY if
+  // it never happens. Continuing with an unestablished relationship would produce a
+  // test that passes while exercising nothing (exactly the false negative this
+  // fixture was written to replace).
+  const seen = Date.now() + 5_000;
+  let established = false;
+  while (Date.now() < seen && !established) {
+    try {
+      const kids = readFileSync(`/proc/${parent.pid}/task/${parent.pid}/children`, 'utf-8')
+        .trim().split(/\s+/);
+      established = children.every((c) => kids.includes(String(c)));
+    } catch { /* keep waiting */ }
+    if (!established) spinMs(25);
+  }
+  if (!established) {
+    throw new Error(`fixture: /proc never showed ${JSON.stringify(children)} as children of God ${parent.pid}`);
+  }
+  writeFileSync(join(home, 'pm2.pid'), String(parent.pid));
+  return { god: parent.pid!, children };
+}
+
+/**
  * {@link liveGodSupervising} with control over the CHILD's cmdline, so a test can
  * model a God supervising a plugin service (`/opt/<plugin>/server.js`) instead of
  * a legacy daemon. That distinction is the whole point of the guard: the pm2 app
@@ -129,33 +216,15 @@ function liveGodSupervising(home: string): { god: number; child: number } {
  * with the name only in its `environ`. The script path is what distinguishes them.
  */
 function liveGodSupervisingTagged(home: string, childTag: string): { god: number; child: number } {
-  mkdirSync(home, { recursive: true });
-  // A parent that spawns one child with the given cmdline and then idles.
-  // Detached so teardown can signal the whole group (the child is not in
-  // `spawned`).
-  const parent = spawn(process.execPath, ['-e',
-    `const {spawn}=require('child_process');`
-    + `const c=spawn(process.execPath,['-e','setTimeout(()=>{},60000)',process.argv[1]],{stdio:'ignore'});`
-    + `process.stdout.write(String(c.pid));setTimeout(()=>{},60000);`, childTag],
-    { stdio: ['ignore', 'pipe', 'ignore'], detached: true });
-  spawned.push(parent);
-  groupLeaders.push(parent.pid!);
-  let out = '';
-  parent.stdout!.on('data', (d) => { out += String(d); });
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline && !out) spinMs(25);
-  // The child must be visible in /proc as the God's child before we assert on it.
-  const childPid = Number(out.trim());
-  const seen = Date.now() + 5_000;
-  while (Date.now() < seen) {
-    try {
-      const kids = readFileSync(`/proc/${parent.pid}/task/${parent.pid}/children`, 'utf-8');
-      if (kids.split(/\s+/).filter(Boolean).includes(String(childPid))) break;
-    } catch { /* keep waiting */ }
-    spinMs(25);
-  }
-  writeFileSync(join(home, 'pm2.pid'), String(parent.pid));
-  return { god: parent.pid!, child: childPid };
+  // Delegates to the file-reporting fixture. It MUST NOT read the child pid from a
+  // pipe: this suite waits with the synchronous `spinMs` busy-loop (the reaper it
+  // drives is synchronous), which never yields to the event loop, so a
+  // `stdout.on('data')` callback never runs and the wait always burns its full
+  // timeout — MEASURED: with 19 call sites that silently added minutes of dead
+  // waiting and made the CI job exceed its 20-minute limit before this file's
+  // tests ever reported.
+  const { god, children } = liveGodWithChildren(home, [childTag]);
+  return { god, child: children[0] };
 }
 
 /** A live God that has NO pm2.pid — only its RPC socket, WITH a real listener.
@@ -659,12 +728,12 @@ describe('reapLegacyPm2', () => {
     const pkgRoot = tmp(); // NO node_modules/pm2 here → mirrors the compiled binary
     const home = join(configDir, 'pm2');
     liveGodPidfile(home);
-    // Two botmux daemons + one plugin row (must be left alone) + one unrelated.
+    // CORE ONLY. A non-core row here would (correctly) make the reaper refuse to
+    // signal anything — stopping a legacy fleet without a CLI requires killing the
+    // God, which would take that other member down too. That case has its own test.
     const daemons = spawnSleepers(2);
-    const plugin = spawnSleepers(1)[0];
     writePm2AppPid(home, 'botmux-0', daemons[0]);
     writePm2AppPid(home, 'botmux-dashboard-7', daemons[1]);
-    writePm2AppPid(home, 'botmux-plugin-x', plugin);
 
     const r = reapLegacyPm2(configDir, pkgRoot, () => {});
 
@@ -672,13 +741,43 @@ describe('reapLegacyPm2', () => {
     expect(r.deleted.sort()).toEqual(['botmux-0', 'botmux-dashboard-7']);
     // The core daemons must actually be gone — this is the whole point.
     for (const pid of daemons) expect(alive(pid)).toBe(false);
-    // A plugin row is not core botmux; the reaper must not touch it.
-    expect(alive(plugin)).toBe(true);
     // `killed` stays false here: the God pidfile points at this test process,
     // whose cmdline is not a pm2 God, so the identity guard refuses to signal it
     // (see the pid-reuse test below). Stopping the daemons is the load-bearing
     // half — they are what holds the ports, the sqlite, and the Feishu stream.
     expect(r.killed).toBe(false);
+  });
+
+  it('CLI-less + mixed roster: signals NOTHING, because stopping the God needs a SIGKILL', () => {
+    // THE HAZARD, with a fixture that models the real parent/child relationship —
+    // the earlier version of this test wrote the God pidfile as vitest's own pid,
+    // whose cmdline is not a pm2 God, so `looksLikePm2God` was false and the
+    // kill-God branch NEVER RAN. "The plugin survived" therefore proved nothing.
+    //
+    // Here the God's cmdline really identifies it as a pm2 God and it really has
+    // both children. Without a pm2 CLI the only way to stop the legacy daemons is
+    // to SIGKILL the God first (otherwise it respawns them) — and that takes the
+    // plugin service down with it, which `botmux stop` does not undo. So the
+    // correct outcome is: touch nothing, report it honestly.
+    const configDir = tmp();
+    const pkgRoot = tmp();                  // no bundled pm2 → CLI-less path
+    const home = join(configDir, 'pm2');
+    const { god, children } = liveGodWithChildren(home, [
+      '/fake/dist/index-daemon.js',        // a legacy core daemon
+      '/opt/agent-chrome/server.js',       // a plugin service
+    ]);
+    writePm2AppPid(home, 'botmux-0', children[0]);
+    writePm2AppPid(home, 'botmux-plugin-agent-chrome', children[1]);
+
+    const r = reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    expect(r.found).toBe(true);
+    expect(r.unresolved).toBe(true);        // the operator must be told
+    expect(r.deleted).toEqual([]);
+    expect(r.killed).toBe(false);
+    // Nothing was signalled: God, legacy daemon AND plugin are all still up.
+    expect(alive(god)).toBe(true);
+    for (const pid of children) expect(alive(pid)).toBe(true);
   });
 
   it('refuses to signal a "God" pid whose cmdline is not a pm2 God', () => {
@@ -770,21 +869,30 @@ describe('reapLegacyPm2', () => {
     expect(calls).not.toContain('delete');
   });
 
-  it('STILL reaps when a legacy daemon runs under the SAME God as a plugin service', () => {
-    // The guard must not become a blanket exemption: a machine mid-migration can
-    // have both under one God, and the legacy half is still a double-run hazard.
+  it('CLI-less: a plugin child under the same God makes it refuse to signal the core daemon', () => {
+    // This case used to assert the OPPOSITE ("still reaps the legacy half"), which
+    // was the hazard itself: without a pm2 CLI, reaping the core daemon requires
+    // SIGKILLing the God first — and that God is also the plugin's supervisor. The
+    // legacy half being a double-run risk does not license taking an unrelated
+    // service down; that trade needs pm2's selective `delete`, which this path does
+    // not have. So: report it, signal nothing, and let the operator (or a machine
+    // with a pm2 CLI) resolve it.
     const configDir = tmp();
     const pkgRoot = tmp();                    // CLI-less path
     const home = join(configDir, 'pm2');
-    liveGodSupervisingTagged(home, '/opt/agent-chrome/server.js');
+    const { god, child: plugin } = liveGodSupervisingTagged(home, '/opt/agent-chrome/server.js');
     const [daemon] = spawnSleepers(1);        // a real, identifiable legacy daemon
     writePm2AppPid(home, 'botmux-0', daemon);
 
     const r = reapLegacyPm2(configDir, pkgRoot, () => {});
 
     expect(r.found).toBe(true);
-    expect(r.deleted).toEqual(['botmux-0']);
-    expect(alive(daemon)).toBe(false);
+    expect(r.unresolved).toBe(true);          // the operator is told, not misled
+    expect(r.deleted).toEqual([]);
+    expect(r.killed).toBe(false);
+    expect(alive(daemon)).toBe(true);         // ...and nothing was signalled
+    expect(alive(plugin)).toBe(true);
+    expect(alive(god)).toBe(true);
   });
 
   it('KNOWN LIMIT: CLI-less, a waiting-restart window looks like no fleet', () => {
