@@ -24,7 +24,8 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawnTsScript, isBunRuntime } from './helpers/ts-runner.js';
+import { spawn } from 'node:child_process';
+import { spawnTsScript, tsRunnerPrefix, isBunRuntime } from './helpers/ts-runner.js';
 
 const FIXTURE = resolve(__dirname, 'fixtures/tmux-pipe-exit-fixture.ts');
 // Generous vs. the ~250ms the fixture needs: on a loaded box a slow start must
@@ -34,6 +35,9 @@ const EXIT_TIMEOUT_MS = 20_000;
 
 let fakeBinDir: string;
 let failingBinDir: string;
+/** Static `ulimit -n 128; exec "$@"` wrapper — see the emfile note in runFixture. */
+let fdLimitWrapper: string;
+let wrapperDir: string;
 
 /** Run the fixture; resolve with how it ended. `timedOut` means it wedged. */
 type FixtureMode = 'real' | 'nowake' | 'paneexit' | 'full' | 'spawnfail' | 'unlinked' | 'emfile' | 'directexit' | 'wakefail';
@@ -45,14 +49,25 @@ async function runFixture(mode: FixtureMode): Promise<{
 }> {
   const bin = mode === 'spawnfail' ? failingBinDir : fakeBinDir;
   const extraEnv = mode === 'wakefail' ? { BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL: '1' } : {};
-  // No `sh -c 'ulimit -n …'` wrapper: threading interpreter paths through a
-  // shell string is what CodeQL flags as a command built from environment
-  // values, and it buys nothing here — the emfile fixture just opens fds until
-  // the OS refuses, which exhausts whatever limit the process happens to have.
-  const child = spawnTsScript(FIXTURE, [mode], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, ...extraEnv, PATH: `${bin}:${process.env.PATH ?? ''}` },
-  });
+  // The emfile case fills the fd table, so it MUST run under a low
+  // RLIMIT_NOFILE. This box allows 1,048,576 fds: opening a million of them
+  // burns kernel file objects, can push the shared host toward a global ENFILE,
+  // and would disturb the ~275 live daemon workers running alongside the tests.
+  //
+  // The limit is applied by a STATIC wrapper script (`ulimit -n 128; exec "$@"`)
+  // rather than an inline `sh -c` string. Same effect, but nothing dynamic is
+  // ever concatenated into shell source — the interpreter path arrives as a
+  // quoted argv element — which is what CodeQL flagged about the inline form.
+  const child = mode === 'emfile'
+    ? spawn(
+      fdLimitWrapper,
+      [tsRunnerPrefix().command, ...tsRunnerPrefix().prefixArgs, FIXTURE, mode],
+      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...extraEnv, PATH: `${bin}:${process.env.PATH ?? ''}` } },
+    )
+    : spawnTsScript(FIXTURE, [mode], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, ...extraEnv, PATH: `${bin}:${process.env.PATH ?? ''}` },
+    });
   let stdout = '';
   child.stdout?.on('data', (b) => { stdout += String(b); });
   child.stderr?.on('data', (b) => { stdout += String(b); });
@@ -91,11 +106,20 @@ beforeAll(() => {
     + 'esac\n',
   );
   chmodSync(failing, 0o755);
+
+  // Static wrapper: constant script body, everything dynamic arrives as argv.
+  // Its own dir, NOT fakeBinDir — that one goes on the child's PATH and must
+  // hold only the fake `tmux`.
+  wrapperDir = mkdtempSync(join(tmpdir(), 'botmux-fdlimit-'));
+  fdLimitWrapper = join(wrapperDir, 'with-low-fd-limit.sh');
+  writeFileSync(fdLimitWrapper, '#!/bin/sh\nulimit -n 128\nexec "$@"\n');
+  chmodSync(fdLimitWrapper, 0o755);
 });
 
 afterAll(() => {
   rmSync(fakeBinDir, { recursive: true, force: true });
   rmSync(failingBinDir, { recursive: true, force: true });
+  rmSync(wrapperDir, { recursive: true, force: true });
 });
 
 describe('TmuxPipeBackend fifo teardown', () => {
