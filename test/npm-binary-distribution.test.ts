@@ -168,6 +168,10 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     binDirOnPath?: boolean;
     /** $SHELL for the child, which decides WHICH startup file gets the PATH line. */
     shell?: string;
+    /** Candidate exits non-zero even for --version (for libc/runtime rejection). */
+    brokenBinary?: boolean;
+    /** Existing shared launcher that a rejected update must preserve byte-for-byte. */
+    existingLauncher?: string;
   }) {
     const base = tmp();
     const home = join(base, 'home');
@@ -199,8 +203,16 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
       writeFileSync(join(sub, 'package.json'), JSON.stringify({ name: `botmux-${process.platform}-${process.arch}`, version: '3.20.0' }));
       binary = join(sub, 'botmux');
       // Echoes argv so the launcher can be executed, not merely string-matched.
-      writeFileSync(binary, '#!/bin/sh\nprintf "BINARY-GOT:%s\\n" "$@"\n', { mode: 0o755 });
+      writeFileSync(binary, opts.brokenBinary
+        ? '#!/bin/sh\necho "GLIBC_2.34 not found" >&2\nexit 42\n'
+        : '#!/bin/sh\nprintf "BINARY-GOT:%s\\n" "$@"\n', { mode: 0o755 });
       chmodSync(binary, 0o755);
+    }
+
+    const launcher = join(home, '.botmux', 'bin', 'botmux');
+    if (opts.existingLauncher !== undefined) {
+      mkdirSync(join(home, '.botmux', 'bin'), { recursive: true });
+      writeFileSync(launcher, opts.existingLauncher, { mode: 0o755 });
     }
 
     const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: home };
@@ -212,7 +224,6 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
       encoding: 'utf-8',
       env,
     });
-    const launcher = join(home, '.botmux', 'bin', 'botmux');
     return { ...r, launcher, binary, home, wrote: existsSync(launcher) };
   }
 
@@ -265,6 +276,19 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     const run = spawnSync(r.launcher, ['send', 'hello world'], { encoding: 'utf-8' });
     expect(run.status).toBe(0);
     expect(run.stdout).toBe('BINARY-GOT:send\nBINARY-GOT:hello world\n');
+  });
+
+  it('rejects an unloadable candidate before changing the existing launcher', () => {
+    const previous = '#!/bin/sh\necho PREVIOUS_WORKING_BOTMUX\n';
+    const r = runPostinstall({
+      global: 'true',
+      brokenBinary: true,
+      existingLauncher: previous,
+    });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain('cannot run on this host');
+    expect(r.stderr).toContain('GLIBC_2.34 not found');
+    expect(readFileSync(r.launcher, 'utf-8')).toBe(previous);
   });
 
   it('npm_config_global ABSENT → writes nothing (this is `pnpm install` in the repo!)', () => {

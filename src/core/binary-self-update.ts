@@ -68,6 +68,7 @@ import {
   renameSync, rmSync, statSync, chmodSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { pipeline } from 'node:stream/promises';
 import { GITHUB_REPO } from './restart-report.js';
 import { getReleaseStream, resolveHttpProxy } from './release-download.js';
@@ -180,6 +181,8 @@ export interface BinarySelfUpdateDeps {
   fetchStream?: (url: string) => Promise<NodeJS.ReadableStream>;
   /** Read the published checksum for `asset`, or null when none is published. */
   fetchChecksum?: (url: string) => Promise<string | null>;
+  /** Execute the downloaded candidate before activation (injected for tests). */
+  probeBinary?: (path: string) => { status: number | null; signal?: NodeJS.Signals | null; error?: Error; stderr?: string | Buffer | null };
 }
 
 /**
@@ -238,6 +241,11 @@ export async function replaceStandaloneBinary(
       return null; // no checksum published (or unreachable) → warn, don't fail
     }
   });
+  const probeBinary = deps.probeBinary ?? ((path: string) => spawnSync(path, ['--version'], {
+    encoding: 'utf-8',
+    timeout: 30_000,
+    env: { ...process.env, BOTMUX_INSTALL_PROBE: '1' },
+  }));
 
   // Same directory as the target: keeps the rename intra-filesystem (EXDEV).
   const dir = dirname(target);
@@ -262,6 +270,17 @@ export async function replaceStandaloneBinary(
       throw new Error(`${asset} 下载内容异常（仅 ${bytes} 字节，疑似错误页而非二进制）`);
     }
     chmodSync(tmp, 0o755);
+    // Asset name + checksum prove identity, not runtime compatibility. In
+    // particular, npm's `libc: glibc` cannot express a GLIBC symbol-version
+    // floor; an embedded native built on a newer distro can still fail at dlopen.
+    // Probe the complete module graph before the atomic rename so self-update has
+    // the same fail-safe contract as npm postinstall and install.sh.
+    const probe = probeBinary(tmp);
+    if (probe.error || probe.status !== 0) {
+      const raw = probe.error?.message || probe.stderr || `exit ${probe.status ?? probe.signal ?? 'unknown'}`;
+      const detail = String(raw).trim().split('\n').slice(0, 8).join(' | ');
+      throw new Error(`${asset} 与当前主机不兼容，保留现有版本：${detail || 'candidate probe failed'}`);
+    }
     // Atomic swap. NOT a write to `target` — that is ETXTBSY (see header).
     renameSync(tmp, target);
     return { asset, target, bytes };

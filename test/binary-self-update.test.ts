@@ -592,6 +592,7 @@ describe('resolveStandaloneRestartExecutable — restart the NEW binary, not the
 
 describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
   const BIG = 1_100_000; // over the "this is an error page, not a binary" floor
+  const probeOk = () => ({ status: 0 });
 
   function fakeAsset(byte = 0x41, size = BIG): Buffer {
     return Buffer.alloc(size, byte);
@@ -608,6 +609,7 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
     const r = await replaceStandaloneBinary('3.99.0', target, {
       fetchStream: async () => Readable.from([payload]),
       fetchChecksum: async () => sha256(payload),
+      probeBinary: probeOk,
     });
     expect(r.bytes).toBe(BIG);
     expect(statSync(target).size).toBe(BIG);
@@ -658,6 +660,21 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
       .toEqual(['botmux']);
   });
 
+  it('an unloadable candidate is rejected before rename and leaves the working binary intact', async () => {
+    const dir = tmp();
+    const target = join(dir, 'botmux');
+    writeFileSync(target, 'OLD BINARY', { mode: 0o755 });
+    const payload = fakeAsset();
+    await expect(replaceStandaloneBinary('3.99.0', target, {
+      fetchStream: async () => Readable.from([payload]),
+      fetchChecksum: async () => sha256(payload),
+      probeBinary: () => ({ status: 1, stderr: 'GLIBC_2.34 not found' }),
+    })).rejects.toThrow(/GLIBC_2\.34/);
+    expect(readFileSync(target, 'utf-8')).toBe('OLD BINARY');
+    expect(execFileSync('ls', ['-A', dir], { encoding: 'utf-8' }).trim().split('\n').sort())
+      .toEqual(['botmux']);
+  });
+
   it('the temp file is a SIBLING of the target (an EXDEV rename would fail)', async () => {
     // The swap must be a rename within one filesystem. Writing to os.tmpdir() and
     // renaming across devices fails with EXDEV, and copying instead would
@@ -678,6 +695,7 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
         seen.push(...execFileSync('ls', ['-A', join(dir, 'nested')], { encoding: 'utf-8' }).trim().split('\n'));
         return sha256(payload);
       },
+      probeBinary: probeOk,
     });
     expect(seen.some(f => f.startsWith('.botmux-update.'))).toBe(true);
     // ...and it must have been a sibling of the target, not in os.tmpdir().

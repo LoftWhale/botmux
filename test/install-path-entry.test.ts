@@ -18,7 +18,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   detectShell,
   pathEntryTargets,
@@ -490,7 +490,7 @@ describe('install.sh — executed end to end (offline fixture)', () => {
       'while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac; done',
       'case "$url" in *.sha256) exit 1 ;; esac',
       '[ -n "$out" ] || exit 1',
-      'printf "#!/bin/sh\\necho BOTMUX_OK\\n" > "$out"',
+      'printf "#!/bin/sh\\nif [ \\\"${BOTMUX_FIXTURE_BINARY_FAIL:-}\\\" = true ]; then echo GLIBC_2.34-not-found >&2; exit 42; fi\\necho BOTMUX_OK\\n" > "$out"',
     ].join('\n'));
     return bin;
   }
@@ -533,6 +533,22 @@ describe('install.sh — executed end to end (offline fixture)', () => {
     expect(existsSync(join(zdot, '.zshenv'))).toBe(true);
     expect(existsSync(join(home, '.zshenv'))).toBe(false);
     expect(runIn('/usr/bin/zsh', ['-c', 'botmux'], { HOME: home, ZDOTDIR: zdot })).toContain('BOTMUX_OK');
+  });
+
+  it('probes before replacement and preserves an existing binary on failure', () => {
+    const installed = join(installDir, 'botmux');
+    writeFileSync(installed, '#!/bin/sh\necho PREVIOUS_WORKING_BOTMUX\n', { mode: 0o755 });
+    const bin = fakeBinDir(home);
+    const r = spawnSync('/bin/sh', [join(__dirname, '..', 'install.sh')], {
+      env: {
+        PATH: `${bin}:/usr/bin:/bin`, HOME: home, SHELL: '/bin/dash',
+        BOTMUX_INSTALL_DIR: installDir, BOTMUX_FIXTURE_BINARY_FAIL: 'true',
+      },
+      encoding: 'utf8', timeout: 60_000,
+    });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain('cannot run on this host');
+    expect(execFileSync(installed, { encoding: 'utf8' })).toContain('PREVIOUS_WORKING_BOTMUX');
   });
 
   it('makes fish find it — honouring $XDG_CONFIG_HOME, with fish syntax', () => {

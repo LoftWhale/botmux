@@ -100,10 +100,22 @@ else
   printf '%s\n' "⚠ no checksum published for $asset; skipping verification"
 fi
 
-# ── Install ───────────────────────────────────────────────────────────────────
+# ── Probe + atomically install ────────────────────────────────────────────────
+# os/arch/libc selection cannot express the minimum glibc symbol version. Run the
+# exact candidate before replacing a working installation: `--version` loads the
+# embedded node-pty native, so a GLIBC_x.y mismatch surfaces here without starting
+# a daemon or touching bot data. Stage on the destination filesystem so the final
+# rename is atomic even when /tmp and $INSTALL_DIR are different mounts.
 mkdir -p "$INSTALL_DIR"
 chmod +x "$tmp/$asset"
-mv "$tmp/$asset" "$INSTALL_DIR/botmux"
+candidate="$INSTALL_DIR/.botmux-install-$$"
+cp "$tmp/$asset" "$candidate"
+chmod +x "$candidate"
+trap 'rm -rf "$tmp"; rm -f "$candidate"' EXIT
+if ! probe_output="$("$candidate" --version 2>&1)"; then
+  err "downloaded $asset cannot run on this host; existing botmux was preserved: $probe_output"
+fi
+mv "$candidate" "$INSTALL_DIR/botmux"
 printf '%s\n' "✅ installed botmux → $INSTALL_DIR/botmux"
 
 # ── PATH: write it, don't just suggest it ─────────────────────────────────────

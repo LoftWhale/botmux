@@ -47,6 +47,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, chmodS
 import { dirname, join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 /** Abort the install with a reason. There is no Node fallback any more (see header). */
@@ -169,6 +170,30 @@ try {
   const mode = statSync(binary).mode;
   if ((mode & 0o111) === 0) chmodSync(binary, 0o755);
 } catch { /* best effort; the exec below will surface a real problem */ }
+
+// Do not activate a platform package merely because npm selected the right
+// os/cpu/libc tuple. That metadata cannot express a glibc symbol-version floor:
+// a binary built on Ubuntu 24.04 is still "linux-x64 + glibc", yet its embedded
+// node-pty native may require GLIBC_2.34 and die on Debian 10 (glibc 2.28).
+//
+// Probe the exact candidate before touching the shared launcher. `--version`
+// loads the complete compiled module graph (including node-pty), but starts no
+// daemon and writes no bot data. A failed global npm update can then roll back
+// while every already-running daemon and every shell keeps using the old launcher.
+const probe = spawnSync(binary, ['--version'], {
+  encoding: 'utf-8',
+  timeout: 30_000,
+  env: { ...process.env, BOTMUX_INSTALL_PROBE: '1' },
+});
+if (probe.error || probe.status !== 0) {
+  const raw = probe.error?.message || probe.stderr || probe.stdout || `exit ${probe.status ?? probe.signal ?? 'unknown'}`;
+  const detail = String(raw).trim().split('\n').slice(0, 8).join(' | ');
+  fail(
+    `${SUBPACKAGE} cannot run on this host; the existing botmux launcher was not changed.`,
+    `${detail || 'candidate probe failed'}. Install a compatible release or upgrade the host OS; `
+      + 'do not replace glibc in-place on a live machine.',
+  );
+}
 
 // ── Write the single launcher ──────────────────────────────────────────────────
 // Same path + same atomic-write discipline as the daemon and `pnpm use:here` use
