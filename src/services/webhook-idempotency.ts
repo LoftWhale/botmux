@@ -4,14 +4,17 @@
  *
  * WHY THIS IS NOT `idempotency-store.ts`. The repo already has a hardened
  * at-most-once dispatch lease (reserved→attempting, file-locked CAS, boot
- * reconcile) keyed on `options.idempotencyKey`. It cannot be reused here: its
- * scope lock (trigger-types.ts) rejects any target carrying a `chatId`, and
- * EVERY real webhook shape has one (fixed group, dynamic group, or a just-created
- * new-group). Widening that lock is explicitly deferred to its own PR by the
- * comment there, and doing it casually would put the webhook edge inside a
- * machine whose invariants are tuned for a different guarantee. So this module
- * solves the strictly weaker, strictly local problem: "have I already accepted
- * this exact event id?" — at the trusted webhook edge, before any dispatch.
+ * reconcile) keyed on `options.idempotencyKey`. Its scope lock (trigger-types.ts)
+ * admits only a fresh async-virtual trigger: `asyncReturnSessionId` with no
+ * `sessionId` / `rootMessageId` / `chatId`, and no wait/dryRun. Exactly ONE
+ * webhook shape can satisfy that — dynamic mode with `?async=1` and no chat
+ * supplied (verified: that shape validates, while fixed-group, dynamic-with-chat,
+ * new-group, plain and wait all return 400). Reusing the lease for that sliver
+ * would give one webhook feature two different guarantees depending on the
+ * connector's mode, and widening the lock is a separate high-risk change its own
+ * comment defers to another PR. So this module solves the strictly weaker,
+ * strictly local problem across the WHOLE matrix: "have I already accepted this
+ * exact event id?" — at the trusted webhook edge, before any dispatch.
  *
  * GUARANTEE (deliberately weaker than the daemon lease — read this before
  * relying on it). This is a best-effort in-process dedup window, the same
