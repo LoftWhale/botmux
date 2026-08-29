@@ -11,6 +11,7 @@ import {
 } from '../services/trigger-log-store.js';
 import { extractDedupKey } from '../services/webhook-lifecycle-extractors.js';
 import {
+  dispatchDidRun,
   inspectWebhookIdempotency,
   settleWebhookIdempotency,
   type WebhookIdempotencyDecision,
@@ -140,18 +141,54 @@ function claimNonce(connectorId: string, nonce: string, ttlSeconds: number): boo
   return true;
 }
 
+/** Two-stage limiting, because one bucket cannot serve both purposes.
+ *
+ *  `admission` runs at the very edge (before the body is read or the signature is
+ *  checked) and meters EVERY request, so an unauthenticated flood cannot make the
+ *  gateway do unbounded body reads and audit writes. Moving the single old limiter
+ *  behind verification — to stop a collapsed duplicate from being answered 429 —
+ *  silently removed that protection: a bad-token flood then returned 401 forever
+ *  with the limiter never engaging (verified by probe).
+ *
+ *  `dispatch` meters only deliveries that will actually reach a daemon. A
+ *  duplicate we are going to collapse consumes no downstream resource, so it must
+ *  not spend this quota (and must never be answered 429, which an at-least-once
+ *  sender reads as "not delivered").
+ *
+ *  Both stages share the connector's configured limit; the admission bucket is
+ *  deliberately more permissive (x4) so an honest sender that trips a retry never
+ *  gets rejected at the edge before its duplicate can be recognised and folded. */
+const rateBucketsAdmission = new Map<string, { windowStart: number; count: number }>();
+
+function consumeBucket(
+  buckets: Map<string, { windowStart: number; count: number }>,
+  key: string,
+  windowSeconds: number,
+  maxRequests: number,
+): boolean {
+  const now = Date.now();
+  const cur = buckets.get(key);
+  if (!cur || now - cur.windowStart >= windowSeconds * 1000) {
+    buckets.set(key, { windowStart: now, count: 1 });
+    return true;
+  }
+  if (cur.count >= maxRequests) return false;
+  cur.count += 1;
+  return true;
+}
+
+/** Edge admission: metered before any body read / signature verification. */
+function admissionAllowed(connector: ConnectorDefinition): boolean {
+  const rl = connector.rateLimit;
+  if (!rl || rl.windowSeconds <= 0 || rl.maxRequests <= 0) return true;
+  return consumeBucket(rateBucketsAdmission, connector.id, rl.windowSeconds, rl.maxRequests * 4);
+}
+
+/** Dispatch quota: consumed only by a delivery that will really be dispatched. */
 function rateAllowed(connector: ConnectorDefinition): boolean {
   const rl = connector.rateLimit;
   if (!rl || rl.windowSeconds <= 0 || rl.maxRequests <= 0) return true;
-  const now = Date.now();
-  const cur = rateBuckets.get(connector.id);
-  if (!cur || now - cur.windowStart >= rl.windowSeconds * 1000) {
-    rateBuckets.set(connector.id, { windowStart: now, count: 1 });
-    return true;
-  }
-  if (cur.count >= rl.maxRequests) return false;
-  cur.count += 1;
-  return true;
+  return consumeBucket(rateBuckets, connector.id, rl.windowSeconds, rl.maxRequests);
 }
 
 function parsePayload(rawBody: Buffer): { payload: unknown; rawText: string } {
@@ -375,18 +412,42 @@ function webhookOkLog(
   },
 ): TriggerResponse {
   const triggerId = newTriggerId();
-  appendTriggerLog({
-    triggerId,
-    connectorId,
-    ...(meta.requestId ? { requestId: meta.requestId } : {}),
-    action,
-    status: 'ok',
-    request: meta.request,
-    ...(meta.target ? { target: meta.target } : {}),
-    response: webhookAuditResponse(status, meta.startedAtMs),
-    createdAt: meta.createdAt,
-  });
+  // Best-effort audit: a log-write failure must not turn a successful
+  // suppression into a 5xx, which an at-least-once sender would read as "not
+  // delivered" and retry forever (the exact storm this path exists to stop).
+  try {
+    appendTriggerLog({
+      triggerId,
+      connectorId,
+      ...(meta.requestId ? { requestId: meta.requestId } : {}),
+      action,
+      status: 'ok',
+      request: meta.request,
+      ...(meta.target ? { target: meta.target } : {}),
+      response: webhookAuditResponse(status, meta.startedAtMs),
+      createdAt: meta.createdAt,
+    });
+  } catch (err) {
+    logger.warn(`[webhook] audit log write failed (delivery unaffected): ${(err as Error).message}`);
+  }
   return { ok: true, triggerId, action, message };
+}
+
+/** Carries the "release my idempotency reservation" duty out to the exported
+ *  wrapper, so a `finally` covering the WHOLE handler owns it.
+ *
+ *  This replaced a `res.once('close')` release. `close` fires when the client
+ *  hangs up, which is NOT when the handler stops: the handler can be parked on a
+ *  pre-effect `await` (template mention resolution, lifecycle begin) and then
+ *  resume and cross into real side effects — creating a group, dispatching a turn
+ *  — after the reservation was already handed back. Probe (verified, fixed-group
+ *  connector, 400ms mention resolve, abort at 80ms): the retry dispatched AND the
+ *  original handler resumed and dispatched, two turns for one event. Scoping the
+ *  release to the handler's lifetime makes "who releases" a lexical question
+ *  instead of an event-ordering one, so a future side effect added anywhere below
+ *  is covered without anyone remembering to re-check a flag. */
+interface ReservationGuard {
+  release?: () => void;
 }
 
 export async function handleWebhookRoute(
@@ -394,6 +455,24 @@ export async function handleWebhookRoute(
   res: ServerResponse,
   url: URL,
   deps: WebhookRouteDeps,
+): Promise<boolean> {
+  const guard: ReservationGuard = {};
+  try {
+    return await handleWebhookRouteImpl(req, res, url, deps, guard);
+  } finally {
+    // Runs on every exit — normal return, early return, or throw. A dispatch that
+    // resolved the reservation clears this first, so the only thing released here
+    // is a reservation whose event never actually ran.
+    guard.release?.();
+  }
+}
+
+async function handleWebhookRouteImpl(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  deps: WebhookRouteDeps,
+  guard: ReservationGuard,
 ): Promise<boolean> {
   // Second path segment (optional) carries the bearer token for `token` mode:
   //   /webhook/<connectorId>            → token via query / Authorization header
@@ -405,6 +484,9 @@ export async function handleWebhookRoute(
   const startedAtMs = Date.now();
   const connectorId = decodeURIComponent(m[1]);
   let requestId: string | undefined;
+  /** HMAC mode only: the caller's nonce, claimed AFTER the idempotency verdict so a
+   *  verbatim signed retry can be folded rather than answered 409 replay. */
+  let hmacNonce: string | undefined;
   let auditRequest = webhookAuditRequest(req, url);
   let auditTarget: TriggerLogTarget | undefined;
   const auditMeta = () => ({ createdAt, startedAtMs, requestId, request: auditRequest, target: auditTarget });
@@ -491,7 +573,10 @@ export async function handleWebhookRoute(
     return true;
   }
 
-  if (!rateAllowed(connector)) {
+  // Edge admission: meters EVERY POST before the body is read or the signature
+  // checked, so an unauthenticated flood stays bounded. The narrower dispatch
+  // quota is charged later, only for deliveries that really reach a daemon.
+  if (!admissionAllowed(connector)) {
     fail(429, 'rate_limited', 'connector rate limit exceeded');
     return true;
   }
@@ -529,25 +614,39 @@ export async function handleWebhookRoute(
       fail(401, 'replay', 'timestamp outside tolerance window');
       return true;
     }
-    if (!claimNonce(connector.id, nonce, verify.toleranceSeconds)) {
-      fail(409, 'replay', 'nonce replay detected');
-      return true;
-    }
+    // Signature BEFORE the nonce claim. Two reasons, both found in review:
+    //  * An unauthenticated caller must not be able to write into `replayNonces`
+    //    (uncapped, TTL-only) by sending a bogus signature with a fresh nonce.
+    //  * The nonce claim is deferred until after the idempotency verdict, so a
+    //    gateway that replays the SAME signed request verbatim — same timestamp,
+    //    nonce, signature, body and key, which is what an at-least-once retry
+    //    normally looks like — is folded as a duplicate instead of being answered
+    //    409 replay, which the sender reads as "not delivered" and retries again.
     const secret = getWebhookSecret(verify.secretRef);
     if (!secret || !verifyWebhookSignature(secret, ts, rawBody, sig)) {
       fail(401, 'invalid_signature', 'signature verification failed');
       return true;
     }
+    // Deferred: claimed below, only once we know this delivery is not a duplicate
+    // we are about to collapse. Replaying an authenticated request has no side
+    // effect of its own — the idempotency gate is what makes that safe.
+    hmacNonce = nonce;
     requestId = nonce;
   }
 
   const responseOptions = parseTriggerResponseOptions(req, url);
 
   // ── Inbound idempotency (duplicate-delivery suppression) ──
-  // Placed AFTER verification (an unauthenticated request must never be able to
-  // burn a key and get a real later delivery dropped) and BEFORE every dispatch
-  // branch below, so the fixed / dynamic / new-group / wait / async paths are all
-  // covered by this one gate rather than four separate ones.
+  // Ordering matters in three ways:
+  //  * AFTER verification — an unauthenticated request must never be able to burn
+  //    a key and get a real later delivery dropped.
+  //  * BEFORE the rate limiter — a duplicate we are going to collapse consumes no
+  //    downstream resource, so it must not be answered 429. It used to be: the
+  //    limiter ran first, a duplicate got 429, and an at-least-once sender read
+  //    that as "not delivered" and retried, which then hit the limiter again — the
+  //    suppression path was unreachable exactly when it was needed most.
+  //  * BEFORE every dispatch branch — fixed / dynamic / new-group / wait / async
+  //    are all covered by this one gate instead of four separate ones.
   //
   // dryRun is exempt: it dispatches nothing, so it has no duplicate to suppress
   // and must not consume the key that the real delivery will present.
@@ -555,29 +654,59 @@ export async function handleWebhookRoute(
     ? undefined
     : idempotencyKeyOf(req, url, parsed.payload, connector);
   let idempotency: WebhookIdempotencyDecision = { kind: 'disabled' };
-  /** Where the reservation stands relative to dispatch. Read by the response
-   *  'close' hook, which must not release a reservation whose dispatch is still
-   *  running (a client abort fires 'close' while the turn is going to run). */
-  let dispatchPhase: 'none' | 'inflight' | 'settled' = 'none';
+  const suppressDuplicate = (key: string, firstTriggerId?: string): true => {
+    // 200 + action:'ignored', never 4xx: an at-least-once sender treats a non-2xx
+    // as "not delivered" and keeps retrying, so answering an already-handled
+    // duplicate with an error would manufacture the retry storm this feature
+    // exists to stop. `firstTriggerId` lets the sender reconcile the suppressed
+    // retry against the turn that actually ran.
+    jsonRes(res, 200, {
+      ...webhookOkLog(connector.id, 'ignored', 'duplicate delivery suppressed by idempotency key', 200, auditMeta()),
+      idempotency: { key, action: 'duplicate', ...(firstTriggerId ? { firstTriggerId } : {}) },
+    });
+    return true;
+  };
   if (idempotencyKey && !responseOptions.dryRun) {
-    idempotency = inspectWebhookIdempotency(connector.id, idempotencyKey, rawBody);
-    if (idempotency.kind === 'duplicate') {
-      // 200 + action:'ignored', never 4xx: an at-least-once sender treats a
-      // non-2xx as "not delivered" and keeps retrying, so answering an
-      // already-handled duplicate with an error would manufacture the retry
-      // storm this feature exists to stop. `firstTriggerId` lets the sender
-      // reconcile the suppressed retry against the turn that actually ran (it is
-      // absent while that first turn is still in flight).
-      jsonRes(res, 200, {
-        ...webhookOkLog(connector.id, 'ignored', 'duplicate delivery suppressed by idempotency key', 200, auditMeta()),
-        idempotency: {
-          key: idempotency.key,
-          action: 'duplicate',
-          ...(idempotency.firstTriggerId ? { firstTriggerId: idempotency.firstTriggerId } : {}),
-        },
-      });
+    // Resolve to a terminal verdict. An `in_flight` verdict means a delivery of
+    // this same event is mid-flight and its outcome is unknown; we must not ACK
+    // that as handled (if it then fails, a sender that stopped retrying has lost
+    // the event), so we join it and re-inspect. The loop is bounded because each
+    // pass either returns, becomes `first`, or the owner reservation's deadline
+    // has passed and the slot is reclaimed.
+    for (;;) {
+      idempotency = inspectWebhookIdempotency(connector.id, idempotencyKey, rawBody);
+      if (idempotency.kind !== 'in_flight') break;
+      // Tie the wait to THIS request's lifetime: if our client hangs up we stop
+      // holding a resolver on the owner's entry. This cancels only our own waiter —
+      // the owner reservation is untouched.
+      const waitAbort = new AbortController();
+      const onClose = () => waitAbort.abort();
+      res.once('close', onClose);
+      let outcome;
+      try {
+        outcome = await idempotency.join(waitAbort.signal);
+      } finally {
+        res.removeListener('close', onClose);
+      }
+      if (outcome.kind === 'ran') return suppressDuplicate(idempotency.key, outcome.triggerId);
+      if (outcome.kind === 'aborted') {
+        // Our client is gone. Stop here: re-inspecting could make a disconnected
+        // request become the new owner and dispatch, which is the opposite of
+        // cancelling. Nothing was reserved by us, so there is nothing to release.
+        return true;
+      }
+      // 'released' — the first delivery failed or its slot was reclaimed, so the
+      // event did NOT run. Re-inspect rather than dispatching straight away:
+      // several waiters can wake together and only one may take over as `first`.
+    }
+    if (idempotency.kind === 'overloaded') {
+      // Too many duplicates of this same event are already parked. Answer a
+      // RETRYABLE 503 (never 2xx: nothing has been confirmed, and an
+      // at-least-once sender must come back) and do not dispatch.
+      fail(503, 'trigger_failed', 'too many concurrent duplicate deliveries for this idempotency key; retry shortly');
       return true;
     }
+    if (idempotency.kind === 'duplicate') return suppressDuplicate(idempotency.key, idempotency.firstTriggerId);
     if (idempotency.kind === 'conflict') {
       // Same key, different body ⇒ the sender's key is not a reliable unique id.
       // Fail OPEN (dispatch anyway): silently dropping what may be a distinct
@@ -588,58 +717,63 @@ export async function handleWebhookRoute(
       );
     }
     if (idempotency.kind === 'first') {
-      // `inspect` RESERVED the key for this request (so an overlapping duplicate
-      // is suppressed while we are still dispatching). The reservation must end
-      // up resolved exactly once, across three distinct exits:
-      //
-      //   'none'     — we never reached a dispatch (workflow tombstone, target
-      //                checks, group-create failure, a throw). Nothing ran, so
-      //                RELEASE: the sender's retry must still be able to run it.
-      //   'inflight' — a dispatch is running. Do NOT release, even though the
-      //                response may already be over: a client that ABORTS mid
-      //                dispatch (exactly the timeout that provokes the retry we
-      //                exist to collapse) fires 'close' while the turn is still
-      //                going to run. Releasing there let the retry dispatch a
-      //                SECOND time — verified by probe before this guard existed.
-      //                The awaiting dispatch below settles it instead.
-      //   'settled'  — already resolved by the dispatch. Nothing to do.
+      // `inspect` RESERVED the key for this request. Hand the release duty to the
+      // wrapper's `finally` (see ReservationGuard): it must outlive every early
+      // return, throw, AND a client hang-up, because the handler can be parked on
+      // a pre-effect await and later resume into real side effects.
       const reserved = idempotency;
-      res.once('close', () => {
-        if (dispatchPhase !== 'none') return;
-        settleWebhookIdempotency(connector.id, reserved.key, undefined);
-      });
+      guard.release = () => settleWebhookIdempotency(connector.id, reserved.key, reserved.token, undefined);
     }
   }
+
+  // Nonce replay guard, claimed now that this delivery is NOT a duplicate we are
+  // collapsing. A duplicate short-circuited above without touching the nonce map,
+  // so a verbatim at-least-once retry folds to 200 ignored; anything reaching here
+  // is a distinct delivery, and a repeated nonce on a distinct delivery is a real
+  // replay. (Signature was verified above, so this map can only be written by an
+  // authenticated caller.)
+  if (hmacNonce && !claimNonce(connector.id, hmacNonce, connector.verify.toleranceSeconds)) {
+    fail(409, 'replay', 'nonce replay detected');
+    return true;
+  }
+
+  // The limiter runs only for deliveries we are actually going to act on, so a
+  // collapsed duplicate never consumes quota (and never gets a retry-provoking
+  // 429). Placed after the idempotency gate for exactly that reason.
+  if (!rateAllowed(connector)) {
+    fail(429, 'rate_limited', 'connector rate limit exceeded');
+    return true;
+  }
+
   /** Dispatch, and resolve the idempotency reservation from the real outcome.
    *
-   *  Success → keep the reservation as a dedup record carrying the turn's id, so
-   *  later retries resolve to `duplicate` and can be pointed at the turn that ran.
+   *  Ran (see `dispatchDidRun`) → keep the reservation as a dedup record carrying
+   *  the turn's id, so later retries fold onto it. This is NOT `body.ok`: a
+   *  `wait_timeout` reports ok:false about a turn that was already dispatched and
+   *  is probably still running, and releasing there let a retry run it twice.
    *
-   *  Failure → release it. The event never ran, and an at-least-once sender's
-   *  retry is exactly the recovery mechanism that must keep working.
-   *
-   *  Both outcomes are recorded here rather than in the response-close hook,
-   *  because 'close' cannot distinguish "handler exited before dispatching" from
-   *  "client hung up while the dispatch is still in flight". */
+   *  Otherwise → release (clear the guard's duty by settling it here), so an
+   *  at-least-once sender's retry can still run an event that never happened. */
   const dispatchWithIdempotency = async (trigger: TriggerRequest) => {
-    if (idempotency.kind === 'first') dispatchPhase = 'inflight';
     try {
       const result = await dispatchTriggerRequest(trigger, deps, auditMeta());
       if (idempotency.kind === 'first') {
-        dispatchPhase = 'settled';
+        guard.release = undefined;
         settleWebhookIdempotency(
           connector.id,
           idempotency.key,
-          result.body.ok ? (result.body.triggerId ?? newTriggerId()) : undefined,
+          idempotency.token,
+          dispatchDidRun(result.body) ? (result.body.triggerId ?? newTriggerId()) : undefined,
         );
       }
       return result;
     } catch (err) {
-      // Never leave the key reserved on an unexpected throw — that would wedge
-      // every future retry of this event until the reservation ages out.
+      // An unexpected throw is commit-unknown; stay fail-open (release) so the
+      // event is not permanently swallowed. The guard's finally would do this
+      // anyway — doing it here keeps the intent explicit.
       if (idempotency.kind === 'first') {
-        dispatchPhase = 'settled';
-        settleWebhookIdempotency(connector.id, idempotency.key, undefined);
+        guard.release = undefined;
+        settleWebhookIdempotency(connector.id, idempotency.key, idempotency.token, undefined);
       }
       throw err;
     }
@@ -648,7 +782,10 @@ export async function handleWebhookRoute(
    *  that suppression is actually armed for this connector — otherwise a sender
    *  cannot distinguish "key honoured" from "key silently ignored". */
   const withIdempotencyEcho = (body: TriggerResponse): TriggerResponse =>
-    (idempotency.kind === 'first'
+    // Only claim 'accepted' when the turn actually ran. A failed dispatch (e.g.
+    // daemon_offline) has already RELEASED the key, so echoing accepted there would
+    // contradict both the type's meaning ("dispatched") and the store's state.
+    (idempotency.kind === 'first' && dispatchDidRun(body)
       ? { ...body, idempotency: { key: idempotency.key, action: 'accepted' as const } }
       : body);
   // Stored workflow connectors are tombstones only after the v2 runtime

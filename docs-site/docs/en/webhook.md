@@ -82,8 +82,20 @@ three headers are tried in the order listed; the first non-empty value wins.
   bug). The event is **dispatched anyway** and a warning is logged — dropping
   what may be a real production alert is worse than running a duplicate turn.
 - **No key presented**: behaviour is exactly what it was before this feature.
+- A duplicate arriving while the **first delivery is still in flight** is not ACKed
+  early: it waits for the real outcome. If that first delivery succeeds it is
+  answered `ignored`; if it fails, this request **takes over the dispatch** (so a
+  sender that would have stopped retrying on a 2xx cannot lose the event).
+- Too many concurrent duplicates of one event get a retryable **503** — never a
+  2xx, and nothing is dispatched.
 - A `dryRun` never consumes a key, and neither does a **failed** dispatch (5xx /
   daemon offline) — the sender's retry still works.
+- A `wait`-mode **timeout (504) does not release the key**: that turn was already
+  dispatched and is probably still running, so a retry is folded rather than run
+  a second time.
+- In HMAC mode a gateway that **replays the identical signed request** (same
+  timestamp, nonce, signature and body) is folded to `200 ignored` as well — the
+  nonce replay guard no longer answers 409 ahead of the idempotency check.
 
 ### Limits (important)
 
@@ -92,6 +104,12 @@ minutes, and is **lost on dashboard restart** (the same nature as the HMAC repla
 nonce above). It addresses the retries that actually happen — an upstream
 re-posting seconds to minutes later — and is **not** a durable, crash-proof
 at-most-once guarantee.
+
+If a delivery never returns an outcome (a wedged downstream), its key is reclaimed
+once the window passes. That is a deliberate trade: **better to allow one possible
+duplicate than to swallow that event key forever.** A connector tracks at most
+10000 keys and parks at most 64 waiters per event; beyond those bounds it degrades
+to "no dedup" or answers a retryable 503 rather than growing without limit.
 
 If some upstream reuses one id for genuinely **different** events, the feature
 can be turned off for that connector.
