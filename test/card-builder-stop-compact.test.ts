@@ -130,8 +130,12 @@ describe('buildStreamingCard: stop button (stop_turn)', () => {
 });
 
 describe('buildStreamingCard: compact button (compact_session)', () => {
-  it('renders when context percentUsed is available', () => {
-    const card = build({ status: 'working', usage: { context: { percentUsed: 45 } } });
+  // 判据是「这个 CLI 有没有能收 /compact 的输入通道」，**不是**「有没有上下文百分比」。
+  // 旧实现拿 percentUsed 当闸门，而只有 codex（native model_context_window）和 pi
+  // （读 ~/.pi/agent/models.json）算得出百分比；Claude Code 的 transcript 里没有任何
+  // 上下文窗口字段 ⟹ Claude 会话永远看不到压缩按钮，而 Claude 恰恰最需要 /compact。
+  it('renders for Claude Code even with NO context percentage (the regression this fixes)', () => {
+    const card = build({ status: 'working', cliId: 'claude-code' });
     const btn = findButton(headerActions(card), 'compact_session');
     expect(btn).toBeTruthy();
     expect(btn.text.content).toContain('压缩');
@@ -140,39 +144,85 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
     expect(btn.value.session_id).toBe(SID);
   });
 
-  it('is hidden when usage is absent or carries no context window (graceful degradation)', () => {
-    expect(findButton(headerActions(build({ status: 'working' })), 'compact_session')).toBeFalsy();
-    expect(findButton(headerActions(build({ status: 'working', usage: { context: null } })), 'compact_session')).toBeFalsy();
-    expect(findButton(headerActions(build({ status: 'working', usage: {} })), 'compact_session')).toBeFalsy();
+  it('renders for a Claude session that only reports usedTokens (no window ⇒ no percent)', () => {
+    // 真实 Claude 形态：只有 usedTokens，没有 windowTokens / percentUsed。
+    const card = build({
+      status: 'working',
+      cliId: 'claude-code',
+      usage: { context: { usedTokens: 411_100 } },
+    });
+    expect(findButton(headerActions(card), 'compact_session')).toBeTruthy();
+  });
+
+  it('still renders when a percentage IS available (codex/pi shape)', () => {
+    const card = build({ status: 'working', usage: { context: { percentUsed: 45 } } });
+    expect(findButton(headerActions(card), 'compact_session')).toBeTruthy();
+  });
+
+  it('is hidden for remote CLIs and codex-app (no local input channel to receive /compact)', () => {
+    for (const cliId of ['riff', 'mojo', 'codex-app']) {
+      const card = build({ status: 'working', cliId, usage: { context: { percentUsed: 45 } } });
+      expect(findButton(headerActions(card), 'compact_session'), `cliId=${cliId}`).toBeFalsy();
+    }
   });
 });
 
-describe('buildStreamingCard: context-headroom indicator', () => {
-  it('renders a grey indicator below the threshold', () => {
-    const card = build({ status: 'working', usage: { context: { percentUsed: 45 } } });
-    // hidden 模式 + 无 usedTokens → pushStreamBody 不产出 markdown，指示条是首个 markdown。
-    const md = card.elements.find((e: any) => e.tag === 'markdown');
-    expect(md).toBeTruthy();
-    expect(md.content).toContain('45%');
-    expect(md.content).toContain("color='grey'");
-    expect(md.content).not.toContain('建议压缩');
+describe('buildStreamingCard: context headroom lives ONLY in the usage footer', () => {
+  // 防回归：曾经有一行独立的 `📊 上下文 N%`，与 usage footer 同源 ⟹ 同一个百分比在
+  // 一张卡上出现两次（footer 还多带绝对值）。合并后整张卡对「上下文百分比」只能有一处。
+  it('never renders the context percentage twice on one card', () => {
+    const card = build({
+      status: 'working',
+      displayMode: 'screenshot',
+      usage: { context: { usedTokens: 34_300, windowTokens: 258_400, percentUsed: 13 } },
+    });
+    const withPct = card.elements.filter(
+      (e: any) => e.tag === 'markdown' && typeof e.content === 'string' && e.content.includes('13%'),
+    );
+    expect(withPct).toHaveLength(1);
+    // 留下的那一处是 footer——带绝对值与窗口，不是光秃秃的百分比。
+    expect(withPct[0].content).toContain('34.3K');
+    expect(withPct[0].content).toContain('258.4K');
   });
 
-  it('turns red and suggests compacting at or above the default 80% threshold', () => {
-    const card = build({ status: 'working', usage: { context: { percentUsed: 85 } } });
-    const md = card.elements.find((e: any) => e.tag === 'markdown');
-    expect(md.content).toContain('85%');
-    expect(md.content).toContain("color='red'");
-    expect(md.content).toContain('建议压缩');
+  it('appends the compact hint to the footer line (not a separate row) and turns it red', () => {
+    const card = build({
+      status: 'working',
+      usage: { context: { usedTokens: 220_000, windowTokens: 258_400, percentUsed: 85 } },
+    });
+    const hinted = card.elements.filter(
+      (e: any) => e.tag === 'markdown' && typeof e.content === 'string' && e.content.includes('建议压缩'),
+    );
+    // 提示只出现一次，且就在那条 usage footer 上（同一元素里既有百分比也有提示）。
+    expect(hinted).toHaveLength(1);
+    expect(hinted[0].content).toContain('85%');
+    expect(hinted[0].content).toContain("color='red'");
+  });
+
+  it('stays grey with no hint below the threshold', () => {
+    const card = build({
+      status: 'working',
+      usage: { context: { usedTokens: 34_300, windowTokens: 258_400, percentUsed: 13 } },
+    });
+    const footer = card.elements.find(
+      (e: any) => e.tag === 'markdown' && typeof e.content === 'string' && e.content.includes('13%'),
+    );
+    expect(footer.content).toContain("color='grey'");
+    expect(footer.content).not.toContain('建议压缩');
   });
 
   it('respects a configured threshold (dashboard.contextCompactThreshold)', () => {
     mergeDashboardConfig({ contextCompactThreshold: 50 });
     expect(contextCompactThreshold()).toBe(50);
-    const card = build({ status: 'working', usage: { context: { percentUsed: 60 } } });
-    const md = card.elements.find((e: any) => e.tag === 'markdown');
-    expect(md.content).toContain("color='red'");
-    expect(md.content).toContain('建议压缩');
+    const card = build({
+      status: 'working',
+      usage: { context: { usedTokens: 155_000, windowTokens: 258_400, percentUsed: 60 } },
+    });
+    const footer = card.elements.find(
+      (e: any) => e.tag === 'markdown' && typeof e.content === 'string' && e.content.includes('60%'),
+    );
+    expect(footer.content).toContain('建议压缩');
+    expect(footer.content).toContain("color='red'");
   });
 
   it('falls back to the default 80 for invalid threshold values', () => {
@@ -180,14 +230,25 @@ describe('buildStreamingCard: context-headroom indicator', () => {
       mergeDashboardConfig({ contextCompactThreshold: bad as any });
       expect(contextCompactThreshold()).toBe(DEFAULT_CONTEXT_COMPACT_THRESHOLD);
     }
-    // 80 本身合法、生效；79 仍灰色。
     mergeDashboardConfig({ contextCompactThreshold: 80 });
     expect(contextCompactThreshold()).toBe(80);
   });
 
-  it('renders nothing without context data (graceful degradation)', () => {
+  it('renders no context text at all without context data (graceful degradation)', () => {
     const card = build({ status: 'working' });
     expect(card.elements.some((e: any) => e.tag === 'markdown' && e.content.includes('上下文'))).toBe(false);
+  });
+
+  it('shows usedTokens with no percentage when the CLI reports no window (Claude shape)', () => {
+    const card = build({ status: 'working', usage: { context: { usedTokens: 411_100 } } });
+    const footer = card.elements.find(
+      (e: any) => e.tag === 'markdown' && typeof e.content === 'string' && e.content.includes('上下文'),
+    );
+    expect(footer.content).toContain('411.1K');
+    expect(footer.content).not.toContain('%');
+    // 没有百分比 ⟹ 阈值判断天然不触发，不会误报「建议压缩」。
+    expect(footer.content).not.toContain('建议压缩');
+    expect(footer.content).toContain("color='grey'");
   });
 });
 
@@ -205,10 +266,14 @@ describe('buildStreamingCard: interrupted status (transient card-side state)', (
 
 describe('buildStreamingCard: signature stability', () => {
   it('still builds with the original positional args (no new required params)', () => {
-    // 新增渲染全部是条件性的：不传 usage / 不传新参数时卡片与之前等价。
+    // 新增渲染都不需要新参数：不传 usage 也能建卡。
     const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working'));
     expect(card.header.template).toBe('blue');
     expect(findButton(headerActions(card), 'stop_turn')).toBeTruthy();
-    expect(findButton(headerActions(card), 'compact_session')).toBeFalsy();
+    // 压缩按钮不再依赖 usage/百分比：cliId 缺省回退 claude-code（有输入通道）⟹ 应显示。
+    // 这正是本次修复的核心——Claude 会话此前因为拿不到百分比而永远没有这个按钮。
+    expect(findButton(headerActions(card), 'compact_session')).toBeTruthy();
+    // 没有 usage ⟹ 不渲染任何上下文文字（不会凭空冒出百分比或「建议压缩」）。
+    expect(card.elements.some((e: any) => e.tag === 'markdown' && e.content.includes('上下文'))).toBe(false);
   });
 });

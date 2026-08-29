@@ -72,8 +72,7 @@ export const messages: Record<string, string> = {
   'card.private.snapshot_note_no_terminal': '🔒 仅你可见的静态快照（不会实时刷新）。当前后端不提供 Web 终端。',
 
   // ─── 上下文余量指示 ──────────────────────────────────────────────────────
-  'card.context.indicator': '上下文 {pct}%',
-  'card.context.over_threshold': '上下文 {pct}% · 建议压缩',
+  'card.context.compact_hint': '建议压缩',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',

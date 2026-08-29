@@ -896,7 +896,9 @@ function pushStreamBody(
   // Native Context / Token usage line (grey, small) when this bot displays usage
   // on the streaming card. Missing metrics are omitted independently by
   // cardUsageFooterSegment; a fully-empty snapshot renders nothing.
-  const usageSeg = usage ? cardUsageFooterSegment(usage, locale, 'streaming') : null;
+  const usageSeg = usage
+    ? cardUsageFooterSegment(usage, locale, 'streaming', { compactHintThreshold: contextCompactThreshold() })
+    : null;
   if (usageSeg) {
     // Usage metrics + runtime identity render as ONE single-line text run in a
     // single markdown element, joined by ` · ` — not a two-column split. This
@@ -910,10 +912,14 @@ function pushStreamBody(
     // runtime → the metrics render alone, unchanged.
     const runtimeSeg = usage ? cardUsageRuntimeSegment(usage, true) : null;
     const line = runtimeSeg ? `${usageSeg} · ${runtimeSeg}` : usageSeg;
+    // 上下文吃紧时整行转红（而不是另起一行报警）：提示就在用量数字旁边，一眼可见，
+    // 且不多占卡片高度。判据是 usageSeg 里是否已带「建议压缩」——由
+    // cardUsageFooterSegment 按 contextCompactThreshold() 决定，此处不重复算阈值。
+    const overThreshold = usageSeg.includes(t('card.context.compact_hint', undefined, locale));
     elements.push({
       tag: 'markdown',
       text_size: 'notation_small_v2',
-      content: `<font color='grey'>${line}</font>`,
+      content: `<font color='${overThreshold ? 'red' : 'grey'}'>${line}</font>`,
     });
   }
 }
@@ -961,21 +967,13 @@ export function buildStreamingCard(
   // ── Output body (shared with the private snapshot card) ──────────────────
   pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage });
 
-  // ── 上下文余量指示（header 之下、控制行之上的显著位置）────────────────────
-  // 数据来自 usage.context.percentUsed（worker-pool 的 getDaemonStreamingCardUsageSnapshot
-  // 算好传入）；无 contextWindow 数据（percentUsed 非有限数）时不渲染——优雅降级。
-  const contextPct = usage?.context?.percentUsed;
-  const hasContextPct = typeof contextPct === 'number' && Number.isFinite(contextPct);
-  if (hasContextPct) {
-    const pct = Math.min(100, Math.round(contextPct));
-    const overThreshold = pct >= contextCompactThreshold();
-    elements.push({
-      tag: 'markdown',
-      content: overThreshold
-        ? `<font color='red'>⚠️ ${t('card.context.over_threshold', { pct }, locale)}</font>`
-        : `<font color='grey'>📊 ${t('card.context.indicator', { pct }, locale)}</font>`,
-    });
-  }
+  // ── 上下文余量：**不再单独渲染一行** ────────────────────────────────────
+  // 曾经这里 push 过一行 `📊 上下文 N%`，但卡片下方本来就有 usage footer
+  // （md-card.ts 的 cardUsageFooterSegment，streaming 变体）在渲染
+  // `上下文 34.3K/258.4K (13%) · 累计 … · 模型`——两者**同源**（都读
+  // usage.context.percentUsed），于是同一个百分比在一张卡上出现两次，而这一行还
+  // 比 footer 少了绝对值。唯一不冗余的是「超阈值提醒」，已折进 footer 那一行
+  // （见 cardUsageFooterSegment 的 compactHintThreshold）。
 
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
@@ -1028,10 +1026,17 @@ export function buildStreamingCard(
       value: { action: 'get_write_link', ...actionBase },
     });
   }
-  // 「🗜️ 压缩」：仅在有上下文占用数据时出现（无 contextWindow 的 CLI 优雅降级为不渲染）。
-  // 点击走 card-handler 的 compact_session → daemon 的 deliverPassthroughToExistingSession
-  // （raw_input 透传 /compact，含完整 turn 生命周期），不新造压缩逻辑。
-  if (hasContextPct) {
+  // 「🗜️ 压缩」：只要该 CLI 有能接收 /compact 的输入通道就显示——**不再要求有上下文
+  // 百分比**。此前条件是 hasContextPct，但只有 codex（native model_context_window）和
+  // pi（读 ~/.pi/agent/models.json）算得出百分比；Claude Code 的 transcript 里根本没有
+  // 上下文窗口字段（只有 model），于是 Claude 会话永远看不到压缩按钮——而 Claude 恰好
+  // 是最需要 /compact 的一家。百分比是「快满了吗」的提示，与「能不能压缩」无关，用它当
+  // 闸门是拿错了判据。
+  // 判据与「停止」按钮一致：remote CLI（riff/mojo）无本地终端可驱动、codex-app（App
+  // Runner）无 PTY 输入通道，两者点了也只会被 handler 拒；其余 CLI 一律显示（/compact
+  // 是全局 best-effort 透传，CLI 认得就生效、认不得顶多回一句 unknown command）。
+  // handler 侧的真实前置是「worker 活着 + passthrough 已接线」，不含百分比。
+  if (!isRemoteCliId(cliId) && effectiveCliId !== 'codex-app') {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.compact', undefined, locale) },

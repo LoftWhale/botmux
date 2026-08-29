@@ -352,6 +352,7 @@ export function cardUsageFooterSegment(
   usage: CardUsageSnapshot,
   locale?: Locale,
   variant: 'footer' | 'streaming' = 'footer',
+  opts?: { compactHintThreshold?: number },
 ): string | null {
   const parts: string[] = [];
   if (usage.context && isNonNegativeFinite(usage.context.usedTokens)) {
@@ -360,11 +361,23 @@ export function cardUsageFooterSegment(
     const windowSuffix = isNonNegativeFinite(window) && window > 0
       ? `/${compactTokenCount(window)}`
       : '';
-    const percentSuffix = isNonNegativeFinite(usage.context.percentUsed)
-      ? ` (${Math.min(100, Math.round(usage.context.percentUsed))}%)`
-      : '';
+    const pct = isNonNegativeFinite(usage.context.percentUsed)
+      ? Math.min(100, Math.round(usage.context.percentUsed))
+      : undefined;
+    const percentSuffix = pct !== undefined ? ` (${pct}%)` : '';
     const suffix = `${windowSuffix}${percentSuffix}`;
-    parts.push(`${t('card.usage.context', undefined, locale)} ${used}${suffix}`);
+    // 「建议压缩」提示（streaming 卡片）。曾经它是**独立一行** `📊 上下文 N%`，
+    // 与本 footer 同源（都读 percentUsed）⟹ 同一个百分比在一张卡上出现两次，
+    // 且那一行还比这里少了绝对值。现在只在这一行的上下文段尾追加提示，不再多占一行。
+    // 无百分比（Claude Code 的 transcript 没有上下文窗口字段）时天然不触发。
+    const threshold = opts?.compactHintThreshold;
+    const overThreshold = pct !== undefined
+      && isNonNegativeFinite(threshold)
+      && pct >= (threshold as number);
+    parts.push(
+      `${t('card.usage.context', undefined, locale)} ${used}${suffix}`
+      + (overThreshold ? ` · ${t('card.context.compact_hint', undefined, locale)}` : ''),
+    );
   }
   // Footer variant is context-only (keeps the cramped reply-card footer clean);
   // the token breakdown below is streaming-only.

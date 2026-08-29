@@ -69,8 +69,7 @@ export const messages: Record<string, string> = {
   'card.private.snapshot_note_no_terminal': '🔒 Private static snapshot (visible only to you, not live-updating). This backend does not provide a Web Terminal.',
 
   // ─── Context headroom indicator ──────────────────────────────────────────
-  'card.context.indicator': 'Context {pct}%',
-  'card.context.over_threshold': 'Context {pct}% · compact recommended',
+  'card.context.compact_hint': 'compact recommended',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
