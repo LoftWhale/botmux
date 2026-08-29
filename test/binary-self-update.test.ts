@@ -390,6 +390,42 @@ describe('auto-update support is ONE predicate for UI and save-time validation',
     expect(resolveAutoUpdateSupport(curl).plan).toBeNull(); // ⟹ rollbackSupported false
   });
 
+  it('SOURCE GUARD: the update lock\'s timeout is reported as "another update is running"', () => {
+    /**
+     * `withFileLock` THROWS when it cannot acquire the lock — it does not return
+     * quietly. So an `if (!acquired)` check placed AFTER the await is dead code, and
+     * the rejection falls through to the generic error printer.
+     *
+     * MEASURED by running two `botmux update` processes against one real compiled
+     * binary: the loser printed
+     *   ❌ 升级失败：file-lock timeout waiting for …/npm-global-update.lock
+     *      (held by pid 630166, age 2222ms)
+     * i.e. lock internals, for what is a perfectly normal mutual-exclusion outcome.
+     * After the fix it prints "另一个更新正在进行中（dashboard 或定时任务），请稍后重试。"
+     *
+     * Pinned at the source level because reaching this branch behaviourally needs two
+     * real processes racing a ~170MB download — reasonable to do by hand once (and I
+     * did), not in a unit test.
+     */
+    const cli = readFileSync(resolve('src/cli.ts'), 'utf-8');
+    // The self-replace branch must wrap its lock acquisition in try/catch and
+    // translate a not-acquired rejection, rather than testing `acquired` after it.
+    //
+    // Take a window from the branch head to its `withFileLock` call plus what
+    // follows. NOT "up to the first `return;`" — the branch returns early for
+    // "already latest", which truncated the window before the lock code and made
+    // every assertion below vacuously false (measured: a 355-char window).
+    const branchStart = cli.indexOf("strategy.kind === 'self-replace'");
+    expect(branchStart, 'the self-replace branch moved — update this guard').toBeGreaterThan(0);
+    const lockAt = cli.indexOf('withFileLock', branchStart);
+    expect(lockAt, 'the self-replace branch no longer takes the update lock').toBeGreaterThan(branchStart);
+    const block = cli.slice(branchStart, lockAt + 1200);
+    expect(block).toMatch(/catch[\s\S]{0,400}?if \(!acquired\)/);
+    expect(block).toMatch(/另一个更新正在进行中/);
+    // ...and a genuine post-acquisition failure must still surface, not be swallowed.
+    expect(block).toMatch(/throw error;/);
+  });
+
   it('SOURCE GUARD: no update/rollback endpoint feeds resolveGlobalInstallPlan the "/" install root', () => {
     /**
      * ⚠️ WHY A SOURCE ASSERTION AND NOT A BEHAVIOURAL ONE. The pure-function test

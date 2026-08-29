@@ -3043,14 +3043,22 @@ async function cmdUpgrade(): Promise<void> {
       const lockTarget = globalInstallUpdateLockTarget();
       mkdirSync(dirname(lockTarget), { recursive: true });
       let acquired = false;
-      await withFileLock(lockTarget, async () => {
-        acquired = true;
-        const r = await replaceStandaloneBinary(latest, strategy.target);
-        console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${latest}）。运行 botmux restart 以应用更新。`);
-      }, { maxWaitMs: 2_000 });
-      if (!acquired) {
-        console.error('❌ 另一个更新正在进行中（dashboard 或定时任务），请稍后重试。');
-        process.exit(1);
+      try {
+        await withFileLock(lockTarget, async () => {
+          acquired = true;
+          const r = await replaceStandaloneBinary(latest, strategy.target);
+          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${latest}）。运行 botmux restart 以应用更新。`);
+        }, { maxWaitMs: 2_000 });
+      } catch (error) {
+        // ⚠️ withFileLock 拿不到锁时是 **抛异常**，不是安静返回 —— 所以「另一个更新
+        // 正在进行」这条提示必须在这里给。实测并发两个 `botmux update`：落败的那个
+        // 原先直接把内部信息透给用户（`file-lock timeout waiting for …lock (held by
+        // pid 630166, age 2222ms)`），而它其实是完全正常的互斥结果，不是故障。
+        if (!acquired) {
+          console.error('❌ 另一个更新正在进行中（dashboard 或定时任务），请稍后重试。');
+          process.exit(1);
+        }
+        throw error; // 已进入临界区后的真实失败（下载/校验/替换）交给外层统一报错
       }
     } catch (error) {
       console.error(`❌ 升级失败：${error instanceof Error ? error.message : error}`);
