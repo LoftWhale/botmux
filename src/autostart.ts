@@ -50,6 +50,22 @@ export interface AutostartState {
 
 const LABEL = 'com.botmux.daemon';
 const SERVICE_NAME = 'botmux.service';
+
+/**
+ * Env marker the generated boot hooks set on themselves, so `botmux start` can
+ * tell it was launched at boot rather than by a person.
+ *
+ * WHY OUR OWN MARKER: systemd's `INVOCATION_ID` would match ANY systemd-run
+ * process, not specifically our boot hook, and launchd/Windows set nothing
+ * comparable — this works identically on all three.
+ *
+ * MUST BE CONSUMED AND DELETED by whoever reads it (see `cmdStart`). The fleet
+ * spawns the supervisor with `{...process.env}`, and daemons/workers/session CLIs
+ * inherit from there; a marker left in the environment would make any later
+ * `botmux start` in a descendant look like a boot hook and silently skip the
+ * autostart refresh and the dashboard hint.
+ */
+export const AUTOSTART_UNIT_ENV = 'BOTMUX_AUTOSTART_UNIT';
 const WINDOWS_TASK_NAME = 'botmux-daemon';
 
 function platform(): 'macos' | 'linux' | 'windows' | 'unsupported' {
@@ -161,6 +177,8 @@ ${program}
     <dict>
         <key>PATH</key>
         <string>${path}</string>
+        <key>${AUTOSTART_UNIT_ENV}</key>
+        <string>1</string>
     </dict>
     <key>StandardOutPath</key>
     <string>${outLog}</string>
@@ -265,6 +283,7 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${opts.configDir}
 Environment=PATH=${currentPath()}
+Environment=${AUTOSTART_UNIT_ENV}=1
 ExecStart=${launchCommand(opts, 'start')}
 ExecStop=${launchCommand(opts, 'stop')}
 
@@ -415,6 +434,7 @@ export function windowsScriptContent(opts: AutostartOpts): string {
   return `@echo off
 setlocal
 set "PATH=${path}"
+set "${AUTOSTART_UNIT_ENV}=1"
 cd /d "${cwd}"
 ${launchCommand(opts, 'start', true)} >> "${outLog}" 2>> "${errLog}"
 `;

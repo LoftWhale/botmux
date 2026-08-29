@@ -44,6 +44,7 @@ import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchC
 import { withBotSteerDirective } from './core/bot-steer-directive.js';
 import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
 import {
+  AUTOSTART_UNIT_ENV,
   enableAutostart,
   disableAutostart,
   autostartStatus,
@@ -2331,7 +2332,14 @@ async function cmdStart(): Promise<void> {
   await ensureSystemDependencies();
 
   const botsForCheck = await preflightConfiguredBotCredentials();
-  await startConfiguredFleet(botsForCheck);
+  // The boot hook marks itself so purely presentational waiting can be skipped
+  // there (see startConfiguredFleet). CONSUME AND DELETE: the fleet spawns the
+  // supervisor with `{...process.env}` and daemons/workers/session CLIs inherit
+  // from there, so a marker left behind would make any later `botmux start` in a
+  // descendant look like a boot hook.
+  const bootHookStart = process.env[AUTOSTART_UNIT_ENV] === '1';
+  delete process.env[AUTOSTART_UNIT_ENV];
+  await startConfiguredFleet(botsForCheck, { bootHookStart });
 }
 
 /** Validate before systemd handoff so a predictable failure cannot stop the old fleet. */
@@ -2368,7 +2376,7 @@ async function preflightConfiguredBotCredentials() {
 
 async function startConfiguredFleet(
   botsForCheck: ReturnType<typeof loadBotsJson>,
-  options: { systemdServiceStart?: boolean } = {},
+  options: { bootHookStart?: boolean } = {},
 ): Promise<void> {
 
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
@@ -2406,17 +2414,27 @@ async function startConfiguredFleet(
   console.log(`\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
   console.log(`   日志: botmux logs`);
   console.log(`   状态: botmux status`);
-  // If the user previously enabled autostart, sync the unit file in case
-  // node/cli.js paths changed since (nvm switch, npm upgrade, etc.).
-  // A Type=forking unit necessarily has a live start Job/activating state
-  // until this ExecStart child returns. The parent repair transaction already
-  // wrote and daemon-reloaded the unit; self-refresh here would reject that
-  // expected in-flight state and make every systemd start fail.
-  if (!options.systemdServiceStart
+  // If the user previously enabled autostart, sync the unit file in case the
+  // launch paths changed since (nvm switch, npm upgrade, a move between the Node
+  // and compiled forms).
+  // NOT UNDER THE BOOT HOOK ITSELF: the unit is `Type=oneshot` with
+  // `RemainAfterExit=yes`, so this ExecStart child IS the start job — rewriting
+  // and `daemon-reload`ing the very unit that is mid-transaction is at best
+  // pointless and at worst makes the start fail.
+  if (!options.bootHookStart
       && refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
     console.log(`   autostart 主 unit 已同步到当前启动路径`);
   }
-  await printDashboardHintWithRetry();
+  // NOT UNDER systemd. Nobody reads a dashboard link at boot, and this poll waits
+  // up to DASHBOARD_READY_WAIT_MS (90s) — exactly the DefaultTimeoutStartUSec on a
+  // stock user manager (VERIFIED: `systemctl --user show -p
+  // DefaultTimeoutStartUSec` → 1min 30s), with the credential preflight, legacy
+  // reap and plugin reconcile already spent before we get here. A slow fleet would
+  // push this Type=oneshot unit past that deadline; systemd would call the start a
+  // failure and, under the default KillMode=control-group, take the freshly
+  // started supervisor down with the unit — so fixing the unit's path would be
+  // undone by waiting inside it. Purely presentational: skip it.
+  if (!options.bootHookStart) await printDashboardHintWithRetry();
 }
 
 /**
@@ -2599,8 +2617,15 @@ async function cmdRestart(): Promise<void> {
       console.log(`autostart 主 unit 已同步到当前启动路径`);
     }
     console.log('✅ daemon 已重启');
-    await printDashboardHintWithRetry();
   }, { maxWaitMs: 5_000 });
+  // OUTSIDE THE FLEET MUTATION LOCK, deliberately. This poll waits up to
+  // DASHBOARD_READY_WAIT_MS (90s) and reads nothing the lock protects — it only
+  // asks the dashboard for a link. Holding the lock across it would block every
+  // other fleet mutation (`start`, `stop`, `start-bot`, plugin reconcile) for that
+  // whole time, and those callers give up after 5s with a lock timeout. The
+  // restart itself, its health gate, the plugin reconcile and the autostart sync
+  // all stay inside.
+  await printDashboardHintWithRetry();
 }
 
 
@@ -3199,33 +3224,45 @@ async function ensureDevboxDashboardExportForCurrentPort(): Promise<void> {
 }
 
 /**
- * Is the supervisor currently running a dashboard member? Answers "is it worth
- * waiting for the dashboard to start answering", so it is deliberately about the
- * PROCESS, not about whether the HTTP port is up yet.
+ * Is the supervisor going to have a dashboard answering shortly — i.e. is one
+ * running, or scheduled to be? Answers "is it worth waiting", so the question is
+ * about the SUPERVISOR'S INTENT, not about a pid existing at this instant.
  *
- * Reads the supervisor's own fleet state and verifies the recorded pid is really
- * alive, because a `launching`/`online` row can outlive the process it names (a
- * crash between writes, or a state file left by a previous boot). Anything it
- * cannot determine — no state file, no dashboard row, unreadable — is reported as
- * NOT live: this only shortens a wait, and the caller still prints its soft
- * fallback, so a false negative costs one skipped poll loop while a false
- * positive would hang `start`/`restart` for the whole budget.
+ * A pid-only check was wrong in a way that reproduced the very bug this helps fix:
+ * after a crash the supervisor records `status='launching', pid=0` and holds a
+ * restart timer (fleet-supervisor.ts, handleExit), so during that backoff a
+ * pid-based check says "not live", the poll stops, and `botmux dashboard` advises a
+ * restart — while the supervisor was about to bring it back on its own.
+ *
+ *  • No live supervisor → nothing will start anything. false.
+ *  • `launching` → true even with pid 0: that IS the supervisor saying "coming up".
+ *  • `online` → the recorded pid must really be alive; an `online` row can outlive
+ *    the process it names (a crash between state writes, or a stale state file).
+ *  • `stopped` / `errored` → the supervisor has given up. false.
+ *  • No row yet → `null`, meaning "cannot tell yet": a just-started supervisor has
+ *    not written the dashboard row, which must not be read as "never will".
  *
  * `fleet-runtime` is imported dynamically to match every other use of it in this
  * file — it pulls in the supervisor machinery, which the CLI deliberately keeps
  * off its startup path.
  */
-async function dashboardMemberLive(): Promise<boolean> {
+async function dashboardMemberComingUp(): Promise<boolean | null> {
   try {
     const { fleetStatePath, DASHBOARD_PROCESS_NAME } = await import('./core/fleet-runtime.js');
     const { readFleetState } = await import('./core/fleet-state-store.js');
     const state = readFleetState(fleetStatePath());
-    const proc = state?.procs?.find((p) => p.name === DASHBOARD_PROCESS_NAME);
-    if (!proc || proc.status === 'stopped' || proc.status === 'errored') return false;
+    if (!state) return null;                       // no state file yet → cannot tell
+    const supervisorAlive = Number.isSafeInteger(state.supervisorPid) && state.supervisorPid > 1
+      && ((): boolean => { try { process.kill(state.supervisorPid, 0); return true; } catch { return false; } })();
+    if (!supervisorAlive) return false;            // nobody left to start anything
+    const proc = state.procs?.find((p) => p.name === DASHBOARD_PROCESS_NAME);
+    if (!proc) return null;                        // row not written yet → cannot tell
+    if (proc.status === 'stopped' || proc.status === 'errored') return false;
+    if (proc.status === 'launching') return true;  // pid is 0 by design during backoff
     if (!Number.isSafeInteger(proc.pid) || proc.pid <= 1) return false;
     try { process.kill(proc.pid, 0); return true; } catch { return false; }
   } catch {
-    return false;
+    return null;                                   // unreadable → cannot tell
   }
 }
 
@@ -3265,7 +3302,7 @@ async function printDashboardHintWithRetry(): Promise<void> {
       failure: last,
       // Only asked when a retry is otherwise possible, so a fast boot never pays
       // for reading the fleet state.
-      dashboardMemberLive: dashboardFailureIsTerminal(last) ? false : await dashboardMemberLive(),
+      comingUp: dashboardFailureIsTerminal(last) ? false : await dashboardMemberComingUp(),
     });
     if (!keepWaiting) break;
     await new Promise(r => setTimeout(r, stepMs));
@@ -3314,13 +3351,19 @@ async function cmdDashboard(args: string[]): Promise<void> {
   const recordedPort = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
     || process.env.BOTMUX_DASHBOARD_PORT
     || '7891';
-  if (r.reason === 'no-secret') {
+  // Every non-terminal failure shape is reachable while the dashboard is still
+  // booting, so ask ONCE whether a dashboard member is actually live and let that
+  // decide the advice. Telling the operator to restart a healthy, still-booting
+  // dashboard throws away the boot that was about to succeed — see
+  // dashboardFailureIsTerminal for why `no-secret`/`wrong-service` are transient.
+  const stillComingUp = dashboardFailureIsTerminal(r) ? false : await dashboardMemberComingUp();
+  if (stillComingUp !== false) {
+    console.error(formatDashboardUnreachable(recordedPort, stillComingUp));
+    if (r.reason === 'wrong-service' && r.detail) console.error(`  详情: ${r.detail}`);
+  } else if (r.reason === 'no-secret') {
     console.error('Dashboard not initialised. Run `botmux restart` first.');
   } else if (r.reason === 'unreachable') {
-    // "Run restart" is only right when nothing is coming up; with a live
-    // dashboard member it would throw away a boot that is about to succeed.
-    // See formatDashboardUnreachable / DASHBOARD_READY_WAIT_MS.
-    console.error(formatDashboardUnreachable(recordedPort, await dashboardMemberLive()));
+    console.error(formatDashboardUnreachable(recordedPort, false));
   } else if (r.reason === 'wrong-service') {
     // 127.0.0.1:<port> answered, but it isn't the dashboard (typically the
     // daemon IPC server holding a port the stale .dashboard-port points at),

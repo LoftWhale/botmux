@@ -1,12 +1,14 @@
 import { describe, expect, it, afterEach } from 'vitest';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  AUTOSTART_UNIT_ENV,
   launchProgram, launchCommand, unitContent, plistContent, windowsScriptContent,
   type AutostartOpts,
 } from '../src/autostart.js';
+import { createDashboardAutostartController } from '../src/dashboard/autostart-api.js';
 
 /**
  * Regression tests for the autostart boot hook under the COMPILED BINARY.
@@ -98,6 +100,21 @@ describe('autostart boot hook — compiled binary (standalone) shape', () => {
     expect(bat).toContain(`"${BINARY}" "start"`);
   });
 
+  it('injects the boot marker into all three artifacts', () => {
+    // `botmux start` needs to know it was launched at boot so it can skip the
+    // purely presentational dashboard wait — that wait is up to 90s, exactly the
+    // stock `DefaultTimeoutStartUSec` (VERIFIED: `systemctl --user show -p
+    // DefaultTimeoutStartUSec` → 1min 30s), and our unit sets no TimeoutStartSec,
+    // so blocking inside it would make systemd fail the start and (default
+    // KillMode=control-group) take the supervisor down with it.
+    expect(unitContent(opts())).toContain(`Environment=${AUTOSTART_UNIT_ENV}=1`);
+    expect(plistContent(opts()))
+      .toContain(`<key>${AUTOSTART_UNIT_ENV}</key>\n        <string>1</string>`);
+    expect(windowsScriptContent(opts())).toContain(`set "${AUTOSTART_UNIT_ENV}=1"`);
+    // Same on the Node shape: the hazard is about boot, not about runtime form.
+    expect(unitContent(nodeOpts())).toContain(`Environment=${AUTOSTART_UNIT_ENV}=1`);
+  });
+
   it('the rendered ExecStart actually starts botmux (not: prints help and exits 0)', () => {
     // THE HEART OF THE BUG. A string assertion alone would have passed even in
     // production, because the broken command was still a well-formed command
@@ -147,6 +164,86 @@ describe('autostart boot hook — compiled binary (standalone) shape', () => {
     expect(r.status).toBe(0);              // systemd saw success...
     expect(r.stdout).toContain('usage');   // ...while botmux only printed help
     expect(r.stdout).not.toContain('DAEMON_STARTED');
+  });
+});
+
+describe('Dashboard autostart toggle — the same __dirname bug, second call site', () => {
+  // `defaultRunner()` hardcoded `[process.execPath, join(pkgRoot,'dist','cli.js'),
+  // 'autostart', …]`. In the compiled binary `process.execPath` IS the botmux
+  // binary and there is no cli.js on disk, so the bogus path became an unknown
+  // subcommand: help printed, exit 0, state unchanged, and the controller reported
+  // `command_failed` — the Dashboard's autostart toggle was simply dead in the
+  // shipped build. Exercised through the CONTROLLER with its real default runner,
+  // because the bug lived in the runner, not in the helper it now calls.
+  // FIXTURE CONTRACT: the controller no-ops when already in the target state and
+  // then re-reads to confirm the state flipped, so `inspect` must be driven by the
+  // RUNNER'S REAL SIDE EFFECT — here, the argv log the fake binary writes. Each case
+  // gets its own tmp dir and its own log, and each starts in the state OPPOSITE to
+  // its target. If the runner is ever changed to not write that file, these tests
+  // would stop exercising it, so keep the side effect and the `enabled` predicate in
+  // step.
+  function fakeBotmux(dir: string, argvLog: string): string {
+    const bin = join(dir, 'botmux');
+    writeFileSync(bin, [
+      '#!/bin/sh',
+      `printf '%s\\n' "$@" >> ${JSON.stringify(argvLog)}`,
+      // Behave like the real CLI: only `autostart` is a known subcommand here.
+      'if [ "$1" != "autostart" ]; then echo "usage: botmux <command>"; exit 0; fi',
+      'exit 0',
+    ].join('\n'), { mode: 0o755 });
+    chmodSync(bin, 0o755);
+    return bin;
+  }
+
+  it('standalone: invokes `<binary> autostart enable`, with no /$bunfs and no cli.js', async () => {
+    const dir = tmp();
+    const argvLog = join(dir, 'argv.log');
+    const bin = fakeBotmux(dir, argvLog);
+    // Model the real flow: the controller no-ops if already in the target state,
+    // and after running it re-reads and fails unless the state FLIPPED. So the
+    // first read reports the old value; the fake binary flips it by writing argv.
+    const controller = createDashboardAutostartController({
+      // No `run` override: this must go through the real defaultRunner.
+      opts: opts({ execPath: bin }),
+      inspect: () => ({ supported: true, enabled: existsSync(argvLog) }),
+    });
+
+    await controller.setEnabled(true);
+
+    const argv = readFileSync(argvLog, 'utf-8').trim().split('\n');
+    expect(argv).toEqual(['autostart', 'enable']);   // no cli.js argument at all
+    expect(argv.join(' ')).not.toContain('$bunfs');
+  });
+
+  it('standalone: disable maps to `<binary> autostart disable`', async () => {
+    const dir = tmp();
+    const argvLog = join(dir, 'argv.log');
+    const bin = fakeBotmux(dir, argvLog);
+    const controller = createDashboardAutostartController({
+      opts: opts({ execPath: bin }),
+      inspect: () => ({ supported: true, enabled: !existsSync(argvLog) }),
+    });
+
+    await controller.setEnabled(false);
+
+    expect(readFileSync(argvLog, 'utf-8').trim().split('\n')).toEqual(['autostart', 'disable']);
+  });
+
+  it('Node: still invokes `node <pkgRoot>/dist/cli.js autostart enable`', async () => {
+    // The path that already worked must keep working — the fix must not "succeed"
+    // by breaking it.
+    const dir = tmp();
+    const argvLog = join(dir, 'argv.log');
+    const bin = fakeBotmux(dir, argvLog);
+    const controller = createDashboardAutostartController({
+      opts: nodeOpts({ execPath: bin }),
+      inspect: () => ({ supported: true, enabled: existsSync(argvLog) }),
+    });
+
+    await controller.setEnabled(true);
+
+    expect(readFileSync(argvLog, 'utf-8').trim().split('\n'))
+      .toEqual([`${NODE_PKG_ROOT}/dist/cli.js`, 'autostart', 'enable']);
   });
 });
 

@@ -396,8 +396,19 @@ function boundUnixSocketPaths(): Set<string> | null {
   return out;
 }
 
-/** Parse `pm2 jlist` stdout (may be prefixed by log lines) into the app array. */
-function parseJlist(stdout: string): Array<{ name?: unknown }> {
+/**
+ * Parse `pm2 jlist` stdout (may be prefixed by log lines) into the app array, or
+ * `null` when it cannot be parsed at all.
+ *
+ * `null` VS `[]` IS A SAFETY DISTINCTION, not a style choice. An empty array is
+ * pm2 authoritatively saying "no apps", which the caller uses to conclude "no
+ * legacy rows here, leave this God alone". Unparseable output means we do not know
+ * the roster — pm2 can exit 0 with truncated or interleaved stdout — and treating
+ * that as "confirmed empty" would silently skip a real legacy fleet on the CLI
+ * path. Same boundary as an unclassifiable row: unreadable must never read as
+ * absent.
+ */
+function parseJlist(stdout: string): Array<{ name?: unknown }> | null {
   try {
     const parsed = JSON.parse(stdout);
     if (Array.isArray(parsed)) return parsed;
@@ -408,7 +419,7 @@ function parseJlist(stdout: string): Array<{ name?: unknown }> {
       if (Array.isArray(parsed)) return parsed;
     } catch { /* try an earlier '[' */ }
   }
-  return [];
+  return null;
 }
 
 /**
@@ -431,14 +442,7 @@ function parseJlist(stdout: string): Array<{ name?: unknown }> {
  * So decide from what the God actually supervises, not from the directory name:
  *
  *  1. Live, identity-verified legacy daemons in `pids/` → yes, a real fleet.
- *  2. A legacy app name among the God's own log files → yes. DURABLE, and it
- *     covers a window the other signals do not: while pm2 is restarting a crashed
- *     app, its `pids/` record is DELETED and it has no process yet, so both live
- *     signals read empty — MEASURED at ~3s for a default restart delay (`jlist`
- *     reported `status: waiting restart` throughout). Without this a `restart`
- *     landing inside that window would call a real legacy fleet "not a fleet" and
- *     skip reaping it, which is the one direction that must never happen.
- *  3. Otherwise look at the God's direct children — a pm2 God's apps ARE its
+ *  2. Otherwise look at the God's direct children — a pm2 God's apps ARE its
  *     direct children (verified: an app started under a throwaway PM2_HOME had
  *     the God as its ppid). A child counts as fleet evidence only if its cmdline
  *     identifies it as a legacy botmux daemon, the same test `pids/` entries must
@@ -454,27 +458,49 @@ function parseJlist(stdout: string): Array<{ name?: unknown }> {
  * `looksLikeLegacyBotmuxDaemon` already tests — so reuse it rather than parse
  * another process's environment.
  *
- * Step 2 reads `/proc/<pid>/task/<tid>/children`, the kernel's own child list: no
- * subprocess, and identical under glibc and musl (the reason nothing here uses
- * `ps` — see `cmdlineOf`). Verified readable with a positive control on the same
- * box: the user's systemd reported 102 children while the God reported none.
+ * ── KNOWN GAP, ACCEPTED DELIBERATELY ────────────────────────────────────────
+ * Both signals above are LIVE, and pm2 has a window in which a real legacy app
+ * has neither: when an app exits, pm2 DELETES its `pids/` record and sets
+ * `waiting restart`, and the replacement process does not exist until the restart
+ * delay elapses (MEASURED: ~3s; `pm2 jlist` reported `status: waiting restart`
+ * throughout). While EVERY legacy core app is in that state at once, this returns
+ * false and the reaper skips the home silently.
  *
- * `children` IS PER-TASK, so every task is scanned, not just the main thread. pm2's
- * God does fork from its main thread (MEASURED: its app appeared in the main task's
- * list), but a main-task-only read would report "no fleet" for anything spawned off
- * a worker thread — a false negative that skips reaping a live fleet, the one
- * direction that must never happen here.
+ * That is NOT limited to some exotic mass-crash: a SINGLE-BOT fleet hits it on
+ * every single app restart, because one app down IS all of them down. The general
+ * condition is "no current legacy core app has either a pid record or a live
+ * child".
  *
- * FAILS CLOSED everywhere it cannot measure (socket-only God with no pid, no
- * /proc, or an unreadable task dir — `children` also needs CONFIG_PROC_CHILDREN):
- * "yes". A wrong yes costs only the stale warning this exists to remove; a wrong
- * no would skip reaping a live fleet and leave two fleets on the same Feishu
- * events. A child whose cmdline is unreadable is NOT fleet evidence, matching how
- * `legacyProcsFromPidsDir` refuses to act on anything it cannot identify.
+ * What this costs is VISIBILITY, not reaping. On master the same window produced
+ * an `unresolved` warning — but `cleanupLegacyPm2` only PRINTS it (its return
+ * value is discarded at all five call sites) and the new supervisor starts
+ * regardless, and the old God brings its daemon back moments later either way. So
+ * master could not prevent that double-run; it only announced the possibility.
+ * This version drops the announcement in exchange for removing a warning that
+ * fires 100% of the time on every machine that ever ran a legacy fleet and now
+ * has a plugin God — plus the unconditional `pm2 kill` that took plugin services
+ * down with it.
+ *
+ * DO NOT "FIX" THIS WITH HISTORICAL EVIDENCE. `logs/<app>-out.log` survives both
+ * `pm2 delete` and `pm2 kill` (MEASURED), so keying on it re-creates exactly the
+ * permanent false alarm above on any migrated host. Its mtime does not work
+ * either: pm2 6.0.14 has both `God.writeExitSeparator` call sites commented out
+ * (lib/God.js:307,365) and only logs exits to `pm2.log`, so a silent daemon's
+ * per-app logs are not touched on exit — MEASURED with logs backdated 20 days,
+ * still 20 days old inside the window. The God's open log fds are equally useless:
+ * they close for the duration of the window too (MEASURED with a positive
+ * control — 2 fds before the crash, 0 throughout, 2 again after respawn).
+ * The real fix is to ask the LIVE God (`pm2 jlist` / its RPC socket, which does
+ * report `waiting restart`), which needs a standalone self-entry so the compiled
+ * binary can reach `src/cli/pm2-readonly.ts`. Deliberately out of scope here.
+ *
+ * Everything else fails CLOSED — socket-only God with no pid, non-Linux, or an
+ * unreadable /proc all return "yes, treat as a fleet" — because those are cases
+ * where we cannot measure at all, as opposed to the window above where we can and
+ * the honest answer is "nothing is running right now".
  */
 function godLooksLikeLegacyFleet(god: Pm2God): boolean {
   if (legacyProcsFromPidsDir(god.home).length > 0) return true;
-  if (homeHasLegacyAppLogs(god.home)) return true;
   if (god.pid <= 0) return true;                   // socket-only → cannot tell
   if (process.platform !== 'linux') return true;   // no /proc → cannot tell
   let tasks: string[];
@@ -494,33 +520,6 @@ function godLooksLikeLegacyFleet(god: Pm2God): boolean {
   }
   if (!readAny) return true;                       // could not read ANY task → cannot tell
   return children.some((pid) => looksLikeLegacyBotmuxDaemon(pid));
-}
-
-/**
- * Has this home EVER hosted a legacy botmux app, per the God's own log files?
- *
- * A DURABLE third signal, needed because the other two are both transient. pm2
- * names its per-app logs `logs/<app name>-out.log` / `-error.log`, and unlike
- * `pids/` those files are NOT removed when an app stops — so they still say what
- * this God is for during the window described in `godLooksLikeLegacyFleet`.
- *
- * MEASURED under one real God running both kinds: `botmux-0-out.log` alongside
- * `botmux-plugin-agent-chrome-out.log`. The names are app-name-prefixed, so the
- * same `isBotmuxPm2Name` test that filters `pids/` and `jlist` rows separates
- * them here too — a plugin-only home yields no match.
- *
- * This is evidence of history, not of a live process, which is why it is only
- * consulted to decide "might this God be the legacy fleet's" — never to signal
- * anything. Acting on it means at worst re-examining a God we then find nothing
- * to reap under (a warning), rather than skipping a live fleet.
- */
-function homeHasLegacyAppLogs(home: string): boolean {
-  let entries: string[];
-  try { entries = readdirSync(join(home, 'logs')); } catch { return false; }
-  return entries.some((f) => {
-    const m = /^(.+?)-(?:out|error)\.log$/.exec(f);
-    return m ? isBotmuxPm2Name(m[1].replace(/-\d+$/, '')) || isBotmuxPm2Name(m[1]) : false;
-  });
 }
 
 /**
@@ -581,11 +580,15 @@ export function reapLegacyPm2(configDir: string, pkgRoot: string, log: (m: strin
   const pm2 = resolvePm2Bin(pkgRoot);
 
   for (const { home, exclusive } of homes) {
-    // For the EXCLUSIVE home, "a God is live" is not enough to act on: the plugin
-    // subsystem shares this directory, so require evidence of an actual legacy
-    // fleet (see legacyFleetAt). The shared home is decided by its botmux rows
-    // further down, as before.
-    const god = exclusive ? legacyFleetAt(home) : liveGodAt(home);
+    // LAYER BY CAPABILITY. `legacyFleetAt`'s two live signals are a FALLBACK for
+    // having no pm2 to ask, so they must not gate the CLI path: `pids/` and the
+    // God's children are both empty during pm2's restart window, while `jlist`
+    // still reports the row as `waiting restart`. Filtering first would throw away
+    // the authoritative answer and lose reap capability master has (a single-bot
+    // fleet hits that window on every app restart).
+    //   • CLI available  → `liveGodAt`, then let `jlist` row names decide below.
+    //   • CLI-less + exclusive → the live signals, our only evidence.
+    const god = (exclusive && !pm2) ? legacyFleetAt(home) : liveGodAt(home);
     if (!god) continue;
 
     // ── No usable pm2 CLI: reap from the God's own pid files ─────────────────
@@ -665,32 +668,82 @@ export function reapLegacyPm2(configDir: string, pkgRoot: string, log: (m: strin
       continue;
     }
     const apps = parseJlist(jlist.stdout || '');
+    if (apps === null) {
+      // pm2 exited 0 but we cannot read its roster (truncated/interleaved stdout).
+      // "Unknown roster" must not be read as "no legacy rows": act on nothing, and
+      // on the exclusive home tell the operator we could not confirm.
+      if (exclusive) {
+        result.found = true;
+        result.unresolved = true;
+        result.note = `pm2 jlist output unparseable at ${home}; cannot confirm whether a legacy fleet is running`;
+        log(result.note);
+      } else {
+        log(`pm2 jlist output unparseable at shared ${home}; not claiming it`);
+      }
+      continue;
+    }
     const botmuxNames = apps.map((a) => a?.name).filter(isBotmuxPm2Name) as string[];
 
-    // The shared default home is only our concern if it actually holds botmux
-    // rows; a God with no botmux rows there belongs entirely to the user.
-    if (!exclusive && botmuxNames.length === 0) continue;
+    // NO botmux ROWS → NOT OUR CONCERN, in EITHER home. For the shared default
+    // that has always been true (a God with no botmux rows belongs entirely to the
+    // user). It is equally true for the "exclusive" home, which is not exclusive
+    // after all: the plugin subsystem shares it, and `isBotmuxPm2Name` excludes
+    // `botmux-plugin-*`, so a plugin-only God lands here — previously it fell
+    // through to the unconditional `pm2 kill` below and took the plugin's services
+    // down. The row names are pm2's own answer, so this is the authoritative
+    // version of the same test `legacyFleetAt` approximates without a CLI.
+    if (botmuxNames.length === 0) continue;
 
     result.found = true;
     log(`legacy pm2 God detected (PM2_HOME=${home}, pid ${god.pid > 0 ? god.pid : 'unknown (no pm2.pid; detected via rpc.sock)'}, ${botmuxNames.length} botmux row(s)${exclusive ? '' : ', shared home'}); reaping`);
 
     // Delete each botmux row (best-effort, one at a time so one failure doesn't
     // abort the rest).
+    let deletedHere = 0;
     for (const name of botmuxNames) {
       const del = spawnSync(pm2, ['delete', name], { env, encoding: 'utf-8', timeout: 15_000 });
-      if (!del.error && del.status === 0) { result.deleted.push(name); log(`  pm2 delete ${name}`); }
+      if (!del.error && del.status === 0) { result.deleted.push(name); deletedHere++; log(`  pm2 delete ${name}`); }
       else log(`  pm2 delete ${name} failed: ${del.error?.message ?? `exit ${del.status}`}`);
     }
 
-    // Kill the God ONLY when the home is exclusively botmux's. Never kill the
-    // shared default God — deleting the botmux rows is enough there.
-    if (exclusive) {
+    // KILL THE GOD ONLY WHEN NOTHING ELSE IS RIDING ON IT. Two independent
+    // reasons, and the second one is why `exclusive` alone is not enough:
+    //  • The SHARED default home may host the user's own apps — deleting the
+    //    botmux rows is all we may ever do there.
+    //  • The "exclusive" home is shared with plugin services. A MIXED roster
+    //    (`botmux-0` next to `botmux-plugin-agent-chrome`) is the most likely
+    //    state mid-migration, and killing the God there takes the plugin's
+    //    services down with it. `cmdStop` does not reconcile plugin services by
+    //    default, so a plain `botmux stop` would leave them down for good.
+    // With a CLI we can delete selectively, so a leftover non-core row means the
+    // God still has a job: delete the legacy rows and leave it running. A failed
+    // core delete must NOT be escalated to `pm2 kill` either — that would use the
+    // God's death to paper over a selective failure; report it unresolved instead.
+    //
+    // AN UNCLASSIFIABLE ROW COUNTS AS "OTHER". This decides whether to SIGKILL a
+    // supervisor, so a row whose name is missing or not a string must be treated as
+    // something we are not allowed to take down — never as absent.
+    const otherRows = apps
+      .filter((a) => !isBotmuxPm2Name(a?.name))
+      .map((a) => (typeof a?.name === 'string' ? a.name : '<unnamed row>'));
+    // Count THIS home's deletes, not the global tally: comparing
+    // `result.deleted.length` would silently depend on the exclusive home being
+    // iterated first.
+    const allCoreDeleted = deletedHere === botmuxNames.length;
+    if (exclusive && otherRows.length === 0 && allCoreDeleted) {
       const kill = spawnSync(pm2, ['kill'], { env, encoding: 'utf-8', timeout: 15_000 });
       if (!kill.error && kill.status === 0) {
         result.killed = true; log(`  pm2 kill (God at ${home})`);
         removeStaleGodRecords(home, log);
       }
       else { result.unresolved = true; log(`  pm2 kill failed at ${home}: ${kill.error?.message ?? `exit ${kill.status}`}`); }
+    } else if (exclusive && !allCoreDeleted) {
+      result.unresolved = true;
+      log(`  ${botmuxNames.length - deletedHere} botmux row(s) survived delete at ${home}; `
+        + 'leaving the God alone rather than killing it to force the issue');
+    } else if (exclusive) {
+      log(`  left pm2 God at ${home} running: ${otherRows.length} non-botmux row(s) still use it `
+        + `(${otherRows.slice(0, 3).join(', ')})`);
     } else {
       log(`  left shared pm2 God at ${home} running (only botmux rows removed)`);
     }

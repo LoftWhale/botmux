@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DASHBOARD_LIVENESS_GRACE_MS,
   DASHBOARD_READY_WAIT_MS,
   dashboardFailureIsTerminal,
   formatDashboardUnreachable,
@@ -41,13 +42,13 @@ describe('dashboard readiness budget', () => {
     expect(shouldKeepWaitingForDashboard({
       elapsedMs: 10_000,
       failure: failure('unreachable'),
-      dashboardMemberLive: true,
+      comingUp: true,
     })).toBe(true);
     // ...and still at 44s, where the old 6s budget had long since given up.
     expect(shouldKeepWaitingForDashboard({
       elapsedMs: 44_000,
       failure: failure('unreachable'),
-      dashboardMemberLive: true,
+      comingUp: true,
     })).toBe(true);
   });
 
@@ -57,7 +58,7 @@ describe('dashboard readiness budget', () => {
     expect(shouldKeepWaitingForDashboard({
       elapsedMs: 0,
       failure: failure('unreachable'),
-      dashboardMemberLive: false,
+      comingUp: false,
     })).toBe(false);
   });
 
@@ -66,22 +67,71 @@ describe('dashboard readiness budget', () => {
     expect(shouldKeepWaitingForDashboard({
       elapsedMs: DASHBOARD_READY_WAIT_MS,
       failure: failure('unreachable'),
-      dashboardMemberLive: true,
+      comingUp: true,
     })).toBe(false);
   });
 
   it('does not spin on failures that waiting cannot fix', () => {
-    // A file-backed secret/token will not appear mid-poll, and `wrong-service`
-    // means discovery already failed to find a dashboard anywhere.
-    for (const reason of ['no-secret', 'no-active-token', 'wrong-service'] as const) {
-      expect(dashboardFailureIsTerminal(failure(reason))).toBe(true);
-      expect(shouldKeepWaitingForDashboard({
-        elapsedMs: 0,
-        failure: failure(reason),
-        dashboardMemberLive: true,   // live, and it STILL must not retry
-      })).toBe(false);
-    }
-    expect(dashboardFailureIsTerminal(failure('unreachable'))).toBe(false);
+    // Only `no-active-token` is a real answer FROM the dashboard: it is up, it just
+    // has no token yet. Nothing is gained by polling.
+    expect(dashboardFailureIsTerminal(failure('no-active-token'))).toBe(true);
+    expect(shouldKeepWaitingForDashboard({
+      elapsedMs: 0,
+      failure: failure('no-active-token'),
+      comingUp: true,   // live, and it STILL must not retry
+    })).toBe(false);
+  });
+
+  it('keeps waiting through a FRESH-INSTALL no-secret while the member is live', () => {
+    // `.dashboard-secret` is created by the dashboard ITSELF during boot
+    // (loadOrCreateSecret() at module scope in dashboard.ts), so on a fresh install
+    // the supervisor has a live dashboard pid well before that line runs. Treating
+    // this as terminal ended the poll early and then advised a restart of a
+    // perfectly healthy, still-booting dashboard.
+    expect(dashboardFailureIsTerminal(failure('no-secret'))).toBe(false);
+    expect(shouldKeepWaitingForDashboard({
+      elapsedMs: 2_000,
+      failure: failure('no-secret'),
+      comingUp: true,
+    })).toBe(true);
+    // ...but with no live member it really is "not initialised" — stop at once.
+    expect(shouldKeepWaitingForDashboard({
+      elapsedMs: 2_000,
+      failure: failure('no-secret'),
+      comingUp: false,
+    })).toBe(false);
+  });
+
+  it('treats a `launching` member with pid 0 as coming up', () => {
+    // The supervisor records `status='launching', pid=0` while a crashed member is
+    // in restart backoff (fleet-supervisor.ts handleExit). A pid-based check called
+    // that "not live", ended the poll, and then advised a restart — of a dashboard
+    // the supervisor was about to bring back itself. `comingUp` is the supervisor's
+    // INTENT, so that state is `true` and this predicate must keep waiting.
+    expect(shouldKeepWaitingForDashboard({
+      elapsedMs: 20_000,
+      failure: failure('unreachable'),
+      comingUp: true,
+    })).toBe(true);
+  });
+
+  it('keeps waiting through the initial "cannot tell yet" (no state/row written)', () => {
+    // A just-started supervisor has not written the dashboard row, so the first
+    // observation is legitimately unknown. Reading that as "nothing is coming up"
+    // would end the wait at t=0 on every single start.
+    expect(shouldKeepWaitingForDashboard({
+      elapsedMs: 0,
+      failure: failure('unreachable'),
+      comingUp: null,
+    })).toBe(true);
+    // ...but unknown forever must not hold the full 90s budget: after the grace
+    // window it stops, preserving the old whole-budget behaviour for that stretch.
+    expect(shouldKeepWaitingForDashboard({
+      elapsedMs: DASHBOARD_LIVENESS_GRACE_MS,
+      failure: failure('unreachable'),
+      comingUp: null,
+    })).toBe(false);
+    expect(DASHBOARD_LIVENESS_GRACE_MS).toBeLessThan(DASHBOARD_READY_WAIT_MS);
   });
 });
 
@@ -111,5 +161,12 @@ describe('`botmux dashboard` unreachable message', () => {
     // misleading advice for the booting case.
     expect(formatDashboardUnreachable(7891, true))
       .not.toBe(formatDashboardUnreachable(7891, false));
+  });
+
+  it('"cannot tell" gets the wait-and-retry advice, not restart', () => {
+    // When we do not know, the honest advice is "wait", never "restart" — the
+    // restart is the destructive option.
+    expect(formatDashboardUnreachable(7891, null))
+      .toBe(formatDashboardUnreachable(7891, true));
   });
 });

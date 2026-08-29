@@ -57,45 +57,91 @@ export function formatDashboardSuccessLines(result: Extract<DashboardResult, { o
  */
 export const DASHBOARD_READY_WAIT_MS = 90_000;
 
-/** Failure reasons that no amount of waiting can change: a file-backed
- *  secret/token will not appear mid-poll, and `wrong-service` means the port file
- *  points at a non-dashboard server that discovery already failed to resolve. */
+/**
+ * How long to keep polling before the liveness gate may end the wait.
+ *
+ * A just-started supervisor has not written its dashboard row yet, so the very
+ * first observation can legitimately be "cannot tell" — which must not be read as
+ * "nothing is coming up". This is the old whole-budget value, so the previous
+ * behaviour is preserved for that initial stretch and the gate only starts cutting
+ * waits short once the state file has had time to appear.
+ */
+export const DASHBOARD_LIVENESS_GRACE_MS = 6_000;
+
+/**
+ * Failure reasons that prove we REACHED the dashboard, so waiting cannot change
+ * them. This is the "did we get an answer from the dashboard itself" question —
+ * NOT "is this backed by a file", which is the distinction an earlier version got
+ * wrong in both directions:
+ *
+ *  • `no-secret` looks file-backed and permanent, but `.dashboard-secret` is
+ *    created BY the dashboard during its own boot (`loadOrCreateSecret()`, called
+ *    at module scope in dashboard.ts). On a fresh install the supervisor has a live
+ *    dashboard pid well before that line runs, so the first poll legitimately sees
+ *    `no-secret` and it resolves on its own moments later.
+ *  • `wrong-service` is not permanent either: another service can hold the recorded
+ *    port while the dashboard has not bound its own yet, which makes discovery fail
+ *    now and succeed once it binds.
+ *
+ * Treating either as terminal ended the poll early and then told the operator to
+ * restart a dashboard that was coming up fine — the same misdiagnosis this module
+ * fixes for `unreachable`. Only `no-active-token` is a real answer FROM the
+ * dashboard (it is up, it just has no token yet), so only it is terminal.
+ */
 export function dashboardFailureIsTerminal(failure: Extract<DashboardResult, { ok: false }>): boolean {
-  return failure.reason === 'no-secret'
-    || failure.reason === 'no-active-token'
-    || failure.reason === 'wrong-service';
+  return failure.reason === 'no-active-token';
 }
 
 /**
  * Should the readiness poll take another turn?
  *
- * Two independent bounds, and BOTH matter. The clock alone would spend the (now
- * much larger) budget in full on a fleet that has no dashboard member at all, or
- * whose dashboard already died — so liveness gates it: keep waiting only while
- * the supervisor still reports a live dashboard process. Liveness alone would
- * spin forever on a member that is up but never binds its port.
+ * Three independent bounds, and all of them matter:
+ *  • the clock — liveness alone would spin forever on a member that is up but
+ *    never binds its port;
+ *  • whether the failure is terminal — no point polling an answer that will not
+ *    change;
+ *  • whether a dashboard is coming up — the clock alone would spend the (now much
+ *    larger) budget in full on a fleet that has no dashboard member, or whose
+ *    dashboard the supervisor has given up on.
+ *
+ * `comingUp` is deliberately TRI-STATE. `null` means "cannot tell yet" (no state
+ * file, or the supervisor has not written the dashboard row), which is normal in
+ * the first moments and must not end the wait; before
+ * DASHBOARD_LIVENESS_GRACE_MS it keeps waiting, after it stops rather than hold
+ * the full budget on a fleet whose state never appears.
  */
 export function shouldKeepWaitingForDashboard(input: {
   elapsedMs: number;
   budgetMs?: number;
+  graceMs?: number;
   failure: Extract<DashboardResult, { ok: false }>;
-  dashboardMemberLive: boolean;
+  /** true = running or scheduled; false = definitely not; null = cannot tell yet. */
+  comingUp: boolean | null;
 }): boolean {
   if (input.elapsedMs >= (input.budgetMs ?? DASHBOARD_READY_WAIT_MS)) return false;
   if (dashboardFailureIsTerminal(input.failure)) return false;
-  return input.dashboardMemberLive;
+  if (input.comingUp === null) {
+    return input.elapsedMs < (input.graceMs ?? DASHBOARD_LIVENESS_GRACE_MS);
+  }
+  return input.comingUp;
 }
 
 /**
- * The message for an `unreachable` result — the one an operator sees from
- * `botmux dashboard`.
+ * The message for a failure that may just mean "not up yet" — the one an operator
+ * sees from `botmux dashboard`.
  *
  * "Run restart" is right ONLY when nothing is coming up. With a live dashboard
- * member, nothing is broken and a restart would be actively counterproductive, so
- * say "wait" instead. See DASHBOARD_READY_WAIT_MS for the measurement.
+ * member, nothing is broken and a restart would throw away a boot that is about to
+ * succeed, so say "wait" instead. Covers every non-terminal shape, because they
+ * are all reachable while the dashboard is still booting: the port not listening
+ * yet (`unreachable`), the secret not written yet (`no-secret` — the dashboard
+ * creates it itself), and the port not bound yet so discovery finds someone else
+ * on the recorded one (`wrong-service`). See DASHBOARD_READY_WAIT_MS.
  */
-export function formatDashboardUnreachable(port: string | number, dashboardMemberLive: boolean): string {
-  if (dashboardMemberLive) {
+export function formatDashboardUnreachable(port: string | number, comingUp: boolean | null): string {
+  // `null` ("cannot tell yet") is treated as coming up: the honest advice when we
+  // do not know is "wait and retry", never "restart".
+  if (comingUp !== false) {
     return `dashboard 正在启动中，还没开始在 127.0.0.1:${port} 上应答（大 fleet 可能要几十秒）。`
       + '稍等几秒后重新运行 `botmux dashboard` 即可，不需要 restart。';
   }

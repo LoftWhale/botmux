@@ -295,7 +295,7 @@ describe('reapLegacyPm2', () => {
     expect(r.found).toBe(false);
   });
 
-  it('detects a live God, deletes its botmux rows, and kills it', () => {
+  it('deletes its botmux rows but SPARES a God other rows still use', () => {
     const configDir = tmp();
     const pkgRoot = tmp();
     const jlist = JSON.stringify([
@@ -314,7 +314,12 @@ describe('reapLegacyPm2', () => {
     expect(r.found).toBe(true);
     // Only the two core botmux rows are deleted (not plugin-x, not other-app).
     expect(r.deleted.sort()).toEqual(['botmux', 'botmux-0']);
-    expect(r.killed).toBe(true);
+    // ...and because plugin-x / some-other-app still ride this God, it is SPARED.
+    // Killing it would take a plugin service down with the legacy fleet, and
+    // `botmux stop` does not bring plugin services back.
+    expect(r.killed).toBe(false);
+    // Sparing it is a DELIBERATE outcome, not a cleanup failure.
+    expect(r.unresolved).toBe(false);
 
     const calls = readFileSync(logFile, 'utf-8');
     expect(calls).toContain('jlist');
@@ -322,7 +327,42 @@ describe('reapLegacyPm2', () => {
     expect(calls).toContain('delete botmux-0');
     expect(calls).not.toContain('delete botmux-plugin-x');
     expect(calls).not.toContain('delete some-other-app');
-    expect(calls).toContain('kill');
+    expect(calls).not.toContain('kill');
+  });
+
+  it('kills the God when the legacy rows were the ONLY thing on it', () => {
+    // The complement of the case above: nothing else uses this God, so once its
+    // botmux rows are gone it has no reason to exist and is torn down (leaving it
+    // would keep a stale God around that detection then reports forever).
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    const logFile = fakePm2(pkgRoot, { jlist: JSON.stringify([{ name: 'botmux' }, { name: 'botmux-0' }]) });
+    liveGodSupervising(join(configDir, 'pm2'));
+
+    const r = reapLegacyPm2(configDir, pkgRoot);
+
+    expect(r.deleted.sort()).toEqual(['botmux', 'botmux-0']);
+    expect(r.killed).toBe(true);
+    expect(readFileSync(logFile, 'utf-8')).toContain('kill');
+  });
+
+  it('treats an UNCLASSIFIABLE jlist row as something it must not kill', () => {
+    // This decides whether to tear down a supervisor, so a row with a missing or
+    // non-string name must count as "someone else's", never as absent. Reading it
+    // as absent would let a plugin-bearing God be killed on a malformed roster.
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    const logFile = fakePm2(pkgRoot, {
+      jlist: JSON.stringify([{ name: 'botmux-0' }, { name: null }, {}]),
+    });
+    const { god } = liveGodSupervising(join(configDir, 'pm2'));
+
+    const r = reapLegacyPm2(configDir, pkgRoot);
+
+    expect(r.deleted).toEqual(['botmux-0']);
+    expect(r.killed).toBe(false);
+    expect(readFileSync(logFile, 'utf-8')).not.toContain('kill');
+    expect(alive(god)).toBe(true);
   });
 
   // ── The gap that would have doubled the fleet ───────────────────────────────
@@ -482,11 +522,12 @@ describe('reapLegacyPm2', () => {
     const r = reapLegacyPm2(configDir, pkgRoot);
     expect(r.found).toBe(true);
     expect(r.deleted).toEqual(['botmux-claude']);
-    expect(r.killed).toBe(true);
+    // `unrelated` still uses this God, so only the botmux row goes.
+    expect(r.killed).toBe(false);
     const calls = readFileSync(logFile, 'utf-8');
     expect(calls).toContain('delete botmux-claude');
     expect(calls).not.toContain('delete unrelated');
-    expect(calls).toContain('kill');
+    expect(calls).not.toContain('kill');
   });
 
   it('prefers a live pidfile over the socket probe (pid is reported)', () => {
@@ -720,10 +761,13 @@ describe('reapLegacyPm2', () => {
     expect(r.killed).toBe(false);
     expect(r.deleted).toEqual([]);
     expect(alive(god)).toBe(true);
-    // The guard runs BEFORE any pm2 invocation, so pm2 is never spawned at all —
-    // the fake's log file is not even created. Assert that directly rather than
-    // reading a file whose absence is itself the pass condition.
-    expect(existsSync(logFile)).toBe(false);
+    // pm2 IS consulted here — with a CLI available its roster is the authoritative
+    // answer, and asking it is what proves there are no core rows. What must not
+    // happen is acting on that answer destructively.
+    const calls = readFileSync(logFile, 'utf-8');
+    expect(calls).toContain('jlist');
+    expect(calls).not.toContain('kill');
+    expect(calls).not.toContain('delete');
   });
 
   it('STILL reaps when a legacy daemon runs under the SAME God as a plugin service', () => {
@@ -743,36 +787,48 @@ describe('reapLegacyPm2', () => {
     expect(alive(daemon)).toBe(false);
   });
 
-  it('STILL treats it as a fleet while pm2 is RESTARTING a crashed legacy app', () => {
-    // THE WINDOW: when a pm2 app dies, pm2 DELETES its pids/ record and has no
-    // process for it until the restart delay elapses — MEASURED at ~3s under a
-    // real God, with `jlist` reporting `status: waiting restart` throughout. So
-    // both live signals (pids/, God children) read EMPTY for a real legacy fleet.
-    // A `restart` landing in that window must not conclude "not a fleet" and skip
-    // reaping — that is the double-run this module exists to prevent. pm2's own
-    // per-app LOG FILES are not deleted with the app, so they still identify the
-    // home. (Verified on the affected devbox that its logs/ dir is EMPTY, so this
-    // durable signal does not resurrect the false alarm fixed above.)
+  it('KNOWN LIMIT: CLI-less, a waiting-restart window looks like no fleet', () => {
+    // DOCUMENTED GAP, pinned so nobody "fixes" it with historical evidence again.
+    // When pm2 restarts a crashed app it deletes the `pids/` record and has no
+    // replacement process until the restart delay elapses (MEASURED ~3s), so with
+    // no pm2 CLI both live signals read empty for a REAL legacy fleet and the home
+    // is skipped silently. A SINGLE-BOT fleet hits this on every app restart — one
+    // app down is all of them down.
+    //
+    // Why it is accepted: the same window on master produced an `unresolved`
+    // warning, but `cleanupLegacyPm2` only PRINTS it (its return value is discarded
+    // at every call site) and the supervisor starts anyway, so master could not
+    // prevent the double-run either — it only announced it. What is lost is
+    // visibility, and the price of keeping it was a warning that fired 100% of the
+    // time on every migrated host with a plugin God.
+    //
+    // DO NOT re-add `logs/<app>-out.log` as evidence: those files survive both
+    // `pm2 delete` and `pm2 kill` (MEASURED), so keying on them restores exactly
+    // that permanent false alarm. Their mtime does not work either — pm2 6.0.14 has
+    // both `God.writeExitSeparator` calls commented out (lib/God.js:307,365), so a
+    // silent daemon's logs are untouched on exit (MEASURED: backdated 20 days, still
+    // 20 days old inside the window). The God's open log fds close for the window
+    // too (MEASURED with a positive control: 2 → 0 → 2). The real fix is asking the
+    // live God via `jlist`/RPC, which needs a standalone self-entry — out of scope.
     const configDir = tmp();
-    const pkgRoot = tmp();
+    const pkgRoot = tmp();                    // no bundled pm2 → CLI-less path
     const home = join(configDir, 'pm2');
-    // A God supervising only a plugin service right now...
-    liveGodSupervisingTagged(home, '/opt/agent-chrome/server.js');
-    // ...with NO pids/ records at all (pm2 removed the crashed app's file)...
-    // ...but the legacy app's logs still on disk, exactly as pm2 leaves them.
+    // A God whose only child is a plugin service, no botmux pids/ records, and
+    // legacy logs left on disk from the fleet that used to run here.
+    const { god } = liveGodSupervisingTagged(home, '/opt/agent-chrome/server.js');
     mkdirSync(join(home, 'logs'), { recursive: true });
     writeFileSync(join(home, 'logs', 'botmux-0-out.log'), '');
-    writeFileSync(join(home, 'logs', 'botmux-0-error.log'), '');
 
     const r = reapLegacyPm2(configDir, pkgRoot, () => {});
 
-    expect(r.found).toBe(true);        // treated as a fleet → reaping is attempted
-    expect(r.unresolved).toBe(true);   // ...and honestly reported as unconfirmed
+    expect(r.found).toBe(false);        // the known gap: treated as "no fleet"
+    expect(r.unresolved).toBe(false);
+    expect(alive(god)).toBe(true);      // and nothing is killed
   });
 
   it('plugin-only log files are not mistaken for a legacy fleet', () => {
-    // The other side of the same signal: a home that only ever ran plugin
-    // services has `botmux-plugin-*` logs, which must NOT count (MEASURED: one
+    // The other side of the same evidence: a home that only ever ran plugin
+    // services has `botmux-plugin-*` logs, which must never count (MEASURED: one
     // God produced `botmux-0-out.log` and `botmux-plugin-agent-chrome-out.log`
     // side by side, so the names really are the discriminator).
     const configDir = tmp();
@@ -781,13 +837,93 @@ describe('reapLegacyPm2', () => {
     const { god } = liveGodSupervisingTagged(home, '/opt/agent-chrome/server.js');
     mkdirSync(join(home, 'logs'), { recursive: true });
     writeFileSync(join(home, 'logs', 'botmux-plugin-agent-chrome-out.log'), '');
-    writeFileSync(join(home, 'logs', 'botmux-plugin-agent-chrome-error.log'), '');
 
     const r = reapLegacyPm2(configDir, pkgRoot, () => {});
 
     expect(r.found).toBe(false);
     expect(r.unresolved).toBe(false);
     expect(alive(god)).toBe(true);
+  });
+
+  // ── CLI available: pm2's own roster is authoritative ────────────────────────
+  it('CLI path still reaps a waiting-restart row when both live signals are empty', () => {
+    // THE REAP-CAPABILITY REGRESSION. `pids/` and the God's children are BOTH empty
+    // during pm2's restart backoff (a single-bot fleet hits that on every restart),
+    // but `jlist` still reports the row. Gating the CLI path on those live signals
+    // threw away the authoritative answer and lost reaping master had — so the live
+    // signals must only be the CLI-LESS fallback.
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    const home = join(configDir, 'pm2');
+    const logFile = fakePm2(pkgRoot, { jlist: JSON.stringify([{ name: 'botmux-0' }]) });
+    // A God with NO botmux pids/ records and only a plugin child: exactly what the
+    // waiting-restart window looks like from the filesystem.
+    liveGodSupervisingTagged(home, '/opt/agent-chrome/server.js');
+
+    const r = reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    expect(r.found).toBe(true);
+    expect(r.deleted).toEqual(['botmux-0']);        // reaped via jlist, not pids/
+    expect(readFileSync(logFile, 'utf-8')).toContain('delete botmux-0');
+  });
+
+  it('CLI path leaves a MIXED roster\'s God alive (plugin services keep running)', () => {
+    // The likeliest mid-migration state: one legacy row beside a plugin row under
+    // one God. `pm2 kill` there takes the plugin's services down with it, and
+    // `botmux stop` does not reconcile plugin services — so they stay down. With a
+    // CLI we can delete selectively, so the God must survive.
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    const home = join(configDir, 'pm2');
+    const logFile = fakePm2(pkgRoot, {
+      jlist: JSON.stringify([{ name: 'botmux-0' }, { name: 'botmux-plugin-agent-chrome' }]),
+    });
+    const { god } = liveGodSupervisingTagged(home, '/opt/agent-chrome/server.js');
+
+    const r = reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    const calls = readFileSync(logFile, 'utf-8');
+    expect(r.deleted).toEqual(['botmux-0']);            // legacy row removed
+    expect(calls).toContain('delete botmux-0');
+    expect(calls).not.toContain('delete botmux-plugin-agent-chrome');
+    expect(r.killed).toBe(false);                       // ...God spared
+    expect(r.unresolved).toBe(false);                   // on purpose, not a failure
+    expect(calls).not.toContain('kill');
+    expect(alive(god)).toBe(true);
+  });
+
+  it('treats UNPARSEABLE jlist output as unknown, not as an empty roster', () => {
+    // pm2 can exit 0 with truncated or interleaved stdout. `botmuxNames.length===0`
+    // is used as pm2 authoritatively saying "no legacy rows here, leave this God
+    // alone" — so an unreadable roster must not reach that conclusion, or a real
+    // legacy fleet is skipped silently on the CLI path. Same boundary as an
+    // unclassifiable row: unreadable is never absent.
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    const home = join(configDir, 'pm2');
+    const binDir = join(pkgRoot, 'node_modules', 'pm2', 'bin');
+    mkdirSync(binDir, { recursive: true });
+    const logFile = join(pkgRoot, 'pm2-calls.log');
+    const bin = join(binDir, 'pm2');
+    // exit 0, but stdout is not a parseable array (a truncated dump).
+    writeFileSync(bin, [
+      '#!/usr/bin/env node',
+      `const fs=require('fs');`,
+      `fs.appendFileSync(${JSON.stringify(logFile)}, process.argv.slice(2).join(' ')+'\\n');`,
+      `if(process.argv[2]==='jlist'){process.stdout.write('[{"name":"botmux-0"');}`,
+      `process.exit(0);`,
+    ].join('\n'), { mode: 0o755 });
+    chmodSync(bin, 0o755);
+    const { god } = liveGodSupervising(home);
+
+    const r = reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    expect(r.found).toBe(true);
+    expect(r.unresolved).toBe(true);          // operator is told we could not confirm
+    expect(r.deleted).toEqual([]);
+    expect(r.killed).toBe(false);
+    expect(alive(god)).toBe(true);
+    expect(readFileSync(logFile, 'utf-8')).not.toContain('kill');
   });
 
   it('does NOT mark the shared-home outcome unresolved (its God is spared by design)', () => {
