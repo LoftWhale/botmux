@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
+  closeSync,
   mkdtempSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   truncateSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -41,6 +45,17 @@ function pinnedBunVersion(): string {
 }
 
 const SESSION_ROWS = 40;
+/** A poisoned publish leaves the main file as a bare SQLite header. */
+const POISONED_SHELL_BYTES = 4096;
+
+/** Invalidate a WAL by zeroing its 32-byte header. SQLite then IGNORES the file
+ *  entirely (verified: `PRAGMA wal_checkpoint(PASSIVE)` reports `log:0`) while
+ *  every byte of data stays on disk — the shape that makes "the replay returned
+ *  rows" a lie about the orphan. */
+function zeroWalHeader(walPath: string): void {
+  const fd = openSync(walPath, 'r+');
+  try { writeSync(fd, Buffer.alloc(32, 0), 0, 32, 0); } finally { closeSync(fd); }
+}
 
 function frozenJsonRows(): Record<string, unknown> {
   const rows: Record<string, unknown> = {};
@@ -70,7 +85,8 @@ const POISON_FIXTURE_SOURCE = String.raw`
   const { Database } = require('bun:sqlite');
   const { mkdirSync, existsSync, renameSync, statSync } = require('node:fs');
   const { join } = require('node:path');
-  const [dataDir, appId, repoRoot] = process.argv.slice(2);
+  const [dataDir, appId, repoRoot, rowCountArg] = process.argv.slice(2);
+  const rowCount = rowCountArg === undefined || rowCountArg === '' ? ${SESSION_ROWS} : Number(rowCountArg);
 
   const probeDir = join(dataDir, '__schema_probe');
   mkdirSync(probeDir, { recursive: true });
@@ -97,7 +113,7 @@ const POISON_FIXTURE_SOURCE = String.raw`
   for (const stmt of ddl) tmp.exec(stmt);
   tmp.exec('BEGIN');
   const insert = tmp.prepare('INSERT OR REPLACE INTO sessions (session_id, status, row) VALUES (?, ?, ?)');
-  for (let i = 0; i < ${SESSION_ROWS}; i++) {
+  for (let i = 0; i < rowCount; i++) {
     insert.run('s' + i, 'active', JSON.stringify({ sessionId: 's' + i, chatId: 'oc_chat',
       rootMessageId: 'om_s' + i, title: 't' + i, status: 'active',
       createdAt: '2026-01-01T00:00:00.000Z', scope: 'topic' }));
@@ -112,6 +128,7 @@ const POISON_FIXTURE_SOURCE = String.raw`
   console.log('FIXTURE ' + JSON.stringify({
     runtime: typeof Bun === 'undefined' ? 'node' : 'bun',
     bunVersion: typeof Bun === 'undefined' ? null : Bun.version,
+    rowCount,
     db: size(dbFp),
     tmpWal: size(dbFp + '.tmp-wal'),
   }));
@@ -130,7 +147,7 @@ const POISON_FIXTURE_SOURCE = String.raw`
 const LIVE_WRITE_SOURCE = String.raw`
   const { Database } = require('bun:sqlite');
   const { join } = require('node:path');
-  const [dataDir, appId, rowsJson] = process.argv.slice(2);
+  const [dataDir, appId, rowsJson, checkpointMode] = process.argv.slice(2);
   const rows = JSON.parse(rowsJson);
   const dbFp = join(dataDir, 'session-stores', appId, 'sessions.db');
   const db = new Database(dbFp);
@@ -145,12 +162,33 @@ const LIVE_WRITE_SOURCE = String.raw`
       rootMessageId: 'om_' + row.id, title: row.title, status: 'active',
       createdAt: '2026-02-02T00:00:00.000Z', scope: 'topic' }));
   }
+  // Fold those writes into the MAIN file, so a later replay can echo them back
+  // even when the orphan WAL is unreadable. Read from the SINGLE destructuring
+  // above: a second argv read would not be substituted by the caller (which
+  // replaces the FIRST occurrence only) and would silently see the real child
+  // argv instead.
+  if (checkpointMode === 'checkpoint') db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
   const written = db.prepare('SELECT count(*) c FROM sessions').get().c;
   db.close();
+  // Prove the rows really are in the MAIN file (not just its -wal): reopening a
+  // copy of the main file alone must still see them. Must run AFTER close(), or
+  // the copy would be taken while this writer still holds the database.
+  const { copyFileSync, unlinkSync } = require('node:fs');
+  const mainProbe = dbFp + '.mainprobe';
+  for (const suffix of ['', '-wal', '-shm']) { try { unlinkSync(mainProbe + suffix); } catch {} }
+  copyFileSync(dbFp, mainProbe);
+  let mainOnlyRows = -1;
+  try {
+    const probe = new Database(mainProbe);
+    mainOnlyRows = probe.prepare('SELECT count(*) c FROM sessions').get().c;
+    probe.close();
+  } catch { mainOnlyRows = -1; }
+  for (const suffix of ['', '-wal', '-shm']) { try { unlinkSync(mainProbe + suffix); } catch {} }
   console.log('LIVEWRITE ' + JSON.stringify({
     runtime: typeof Bun === 'undefined' ? 'node' : 'bun',
     seenBefore,
     written,
+    mainOnlyRows,
   }));
 `;
 
@@ -173,7 +211,10 @@ const LOAD_PROBE_SOURCE = String.raw`
   console.log('PROBE ' + JSON.stringify(out));
 `;
 
-type FixtureReport = { runtime: string; bunVersion: string | null; db: number | null; tmpWal: number | null };
+type FixtureReport = {
+  runtime: string; bunVersion: string | null; rowCount: number;
+  db: number | null; tmpWal: number | null;
+};
 type ProbeReport = {
   runtime: string;
   bunVersion: string | null;
@@ -223,12 +264,12 @@ describe('recovering a session store poisoned by a crashed SQLite import', () =>
   function poison(
     dataDir: string,
     home: string,
-    opts: { liveRows?: { id: string; title: string }[] } = {},
+    opts: { liveRows?: { id: string; title: string }[]; checkpoint?: boolean; rows?: number } = {},
   ): FixtureReport {
     const env = { HOME: home, SESSION_DATA_DIR: dataDir };
     const source = POISON_FIXTURE_SOURCE.replace(
       'process.argv.slice(2)',
-      JSON.stringify([dataDir, 'appA', process.cwd()]),
+      JSON.stringify([dataDir, 'appA', process.cwd(), String(opts.rows ?? SESSION_ROWS)]),
     );
     const child = runBunChild(source, env);
     const report = parseTagged<FixtureReport>(child.stdout, child.stderr, 'FIXTURE');
@@ -247,18 +288,25 @@ describe('recovering a session store poisoned by a crashed SQLite import', () =>
       // Separate process on purpose — see LIVE_WRITE_SOURCE.
       const liveSource = LIVE_WRITE_SOURCE.replace(
         'process.argv.slice(2)',
-        JSON.stringify([dataDir, 'appA', JSON.stringify(opts.liveRows)]),
+        JSON.stringify([dataDir, 'appA', JSON.stringify(opts.liveRows), opts.checkpoint ? 'checkpoint' : '']),
       );
       const liveChild = runBunChild(liveSource, env);
       expect(liveChild.status, `live-write step failed:\n${liveChild.stderr}`).toBe(0);
-      const liveReport = parseTagged<{ runtime: string; seenBefore: number; written: number }>(
-        liveChild.stdout, liveChild.stderr, 'LIVEWRITE',
-      );
+      const liveReport = parseTagged<{
+        runtime: string; seenBefore: number; written: number; mainOnlyRows: number;
+      }>(liveChild.stdout, liveChild.stderr, 'LIVEWRITE');
       expect(liveReport.runtime).toBe('bun');
       // Proof the poisoned store really did serve an EMPTY table to the writer:
       // it saw none of the stranded rows, and afterwards holds only the fresh ones.
       expect(liveReport.seenBefore).toBe(0);
       expect(liveReport.written).toBe(opts.liveRows.length);
+      if (opts.checkpoint) {
+        // Positive proof the fixture reproduces the live-MAIN blind spot: the
+        // rows are readable from a copy of the main file with NO sidecars, so a
+        // later replay echoes them even when the orphan WAL is unreadable. If
+        // this ever stops holding, the case below silently tests nothing.
+        expect(liveReport.mainOnlyRows).toBe(opts.liveRows.length);
+      }
       // ...and the orphan still holds the real data.
       expect(readdirSync(join(dataDir, 'session-stores', 'appA')).filter(n => n.includes('.tmp')).sort())
         .toEqual(['sessions.db.tmp-shm', 'sessions.db.tmp-wal']);
@@ -391,22 +439,222 @@ describe('recovering a session store poisoned by a crashed SQLite import', () =>
     });
   });
 
-  it('re-runs an idempotent merge when a previous cleanup left a stray sidecar', () => {
+  it('treats a lone leftover .tmp-shm as still poisoned rather than a healthy empty store', () => {
     withDirs((dataDir, home) => {
+      // A lone `.tmp-shm` must stay a poison signal. It is tempting to wave it
+      // through — it carries no rows — but if a real poisoned store's WAL is
+      // deleted out from under it, ignoring the `-shm` would load an EMPTY store
+      // and call it healthy. With no snapshot to attest, that must fail closed.
+      poison(dataDir, home);
+      expect(load(dataDir, home).strict).toBe(SESSION_ROWS);
+      writeFileSync(join(dataDir, 'session-stores', 'appA', 'sessions.db.tmp-shm'), Buffer.alloc(32_768));
+
+      const after = load(dataDir, home);
+      expect(after.strict).toBe('THREW:SessionStoreUnavailableError');
+      expect(readdirSync(join(dataDir, 'session-stores', 'appA')).filter(n => n.includes('.tmp')).length)
+        .toBeGreaterThan(0);
+    });
+  });
+
+  it('converges on a lone leftover .tmp-shm when a snapshot can still attest', () => {
+    withDirs((dataDir, home) => {
+      // Same ambiguous shape, but here a readable snapshot says what the store
+      // held, so recovery may safely proceed, merge nothing new, and clear it.
       poison(dataDir, home);
       writeFileSync(join(dataDir, 'sessions-appA.json'), JSON.stringify(frozenJsonRows()));
       expect(load(dataDir, home).strict).toBe(SESSION_ROWS);
-
-      // A crash between the two unlinkSync calls leaves one orphan behind. The
-      // next start must re-detect it and converge WITHOUT losing the rows the
-      // first pass already merged (the merge is idempotent) — and must not
-      // strand the store as permanently unhealthy either.
       writeFileSync(join(dataDir, 'session-stores', 'appA', 'sessions.db.tmp-shm'), Buffer.alloc(32_768));
 
       const after = load(dataDir, home);
       expect(after.visible).toBe(SESSION_ROWS);
       expect(after.strict).toBe(SESSION_ROWS);
       expect(readdirSync(join(dataDir, 'session-stores', 'appA')).filter(n => n.includes('.tmp'))).toEqual([]);
+    });
+  });
+
+  it('never produces a shm-only leftover when cleanup succeeds', () => {
+    withDirs((dataDir, home) => {
+      // The invariant behind the case above: a completed recovery removes the
+      // row-bearing WAL LAST, so it can never leave the ambiguous shm-only shape
+      // that would otherwise have to be treated as benign.
+      poison(dataDir, home);
+      writeFileSync(join(dataDir, 'sessions-appA.json'), JSON.stringify(frozenJsonRows()));
+      expect(load(dataDir, home).strict).toBe(SESSION_ROWS);
+      expect(readdirSync(join(dataDir, 'session-stores', 'appA')).filter(n => n.includes('.tmp'))).toEqual([]);
+    });
+  });
+
+  it('archives the orphan instead of deleting it when the WAL cannot be proven to have replayed', () => {
+    withDirs((dataDir, home) => {
+      poison(dataDir, home);
+      // Both sources degrade at once, each missing the SAME session: a truncated
+      // orphan (replays a prefix, no error) beside a snapshot that no longer has
+      // s7. The merge converges on an incomplete store, so the orphan's bytes
+      // must be preserved for forensics — under a name that does NOT re-trigger
+      // recovery, or every later start would re-recover and every worker would
+      // fail closed. Preservation is the promise; replayability is not (a WAL
+      // truncated mid-transaction yields no rows at all, before or after).
+      truncateSync(join(dataDir, 'session-stores', 'appA', 'sessions.db.tmp-wal'), 20_000);
+      const orphanWalBytesBefore = statSync(join(dataDir, 'session-stores', 'appA', 'sessions.db.tmp-wal')).size;
+      const trimmed = frozenJsonRows();
+      delete trimmed.s7;
+      writeFileSync(join(dataDir, 'sessions-appA.json'), JSON.stringify(trimmed));
+
+      const after = load(dataDir, home);
+      expect(after.strict).toBe(SESSION_ROWS - 1);
+      expect(after.ids).not.toContain('s7');
+      const names = readdirSync(join(dataDir, 'session-stores', 'appA'));
+      // Evidence kept: the ORIGINAL orphan bytes beside the shell they pair with.
+      const archiveDb = names.filter(n => /\.unrecovered-.*\.db$/.test(n));
+      expect(archiveDb).toHaveLength(1);
+      expect(names.filter(n => /\.unrecovered-.*\.db-wal$/.test(n))).toHaveLength(1);
+      // ...and "kept" only means something if the BYTES survived and the shell
+      // still matches. A truncated orphan may well replay nothing (measured: 0
+      // rows both before and after recovery — the damage, not the archiving, is
+      // what lost them), so the honest property to pin is preservation: every
+      // byte of the orphan is still there, paired with the pre-merge shell.
+      // Asserting "it replays N rows" would be asserting the damage away.
+      const archiveWalBytes = statSync(join(dataDir, 'session-stores', 'appA', `${archiveDb[0]}-wal`)).size;
+      expect(archiveWalBytes).toBe(orphanWalBytesBefore);
+      // The archived shell must be the pre-merge one: the merge adds rows to the
+      // live database, so a shell copied afterwards would no longer pair with
+      // these WAL frames. It is therefore strictly smaller than the live file.
+      const archiveShellBytes = statSync(join(dataDir, 'session-stores', 'appA', archiveDb[0])).size;
+      expect(archiveShellBytes).toBe(POISONED_SHELL_BYTES);
+      expect(statSync(join(dataDir, 'session-stores', 'appA', 'sessions.db')).size)
+        .toBeGreaterThan(archiveShellBytes);
+      // ...and the poison predicate no longer fires, so the store stays usable.
+      expect(names.filter(n => n.includes('.tmp'))).toEqual([]);
+      expect(load(dataDir, home).strict).toBe(SESSION_ROWS - 1);
+    });
+  });
+
+  it('does not mistake rows living in the main file for a replayed orphan WAL', () => {
+    withDirs((dataDir, home) => {
+      // The scratch replay is a COMPOSITE of "main file + orphan WAL", and
+      // SQLite silently ignores an orphan with an invalid header. Old code that
+      // wrote new sessions and checkpointed them into the main file therefore
+      // makes the replay return rows even when the orphan is unreadable —
+      // "we got rows" must not be read as "the WAL replayed", or the still-
+      // stranded originals get deleted as redundant.
+      poison(dataDir, home, { liveRows: [{ id: 'NEW0', title: 'live 0' }], checkpoint: true });
+      zeroWalHeader(join(dataDir, 'session-stores', 'appA', 'sessions.db.tmp-wal'));
+
+      const after = load(dataDir, home);
+      // No snapshot and no provable replay ⟹ refuse, keep everything.
+      expect(after.strict).toBe('THREW:SessionStoreUnavailableError');
+      expect(readdirSync(join(dataDir, 'session-stores', 'appA')).filter(n => n.includes('.tmp-wal')))
+        .toEqual(['sessions.db.tmp-wal']);
+    });
+  });
+
+  it('accepts a readable legacy snapshot that holds zero rows for this bot', () => {
+    withDirs((dataDir, home) => {
+      // A store whose import legitimately had NOTHING to copy: the poisoned
+      // shell carries only schema. The only snapshot is a flat legacy file whose
+      // rows all belong to a DIFFERENT app, so it filters down to zero rows here
+      // — yet it was READ, which positively attests this bot held nothing.
+      // Judging attestation by row count instead of by "which source resolved"
+      // would wrongly report the store unavailable forever.
+      const report = poison(dataDir, home, { rows: 0 });
+      expect(report.rowCount).toBe(0);
+      writeFileSync(join(dataDir, 'sessions.json'), JSON.stringify({
+        OTHERBOT: {
+          sessionId: 'OTHERBOT', larkAppId: 'appZ', chatId: 'oc_other', rootMessageId: 'om_other',
+          title: 'someone else', status: 'active', createdAt: '2026-01-01T00:00:00.000Z', scope: 'topic',
+        },
+      }));
+
+      const after = load(dataDir, home);
+      expect(after.strict).toBe(0);
+      expect(after.ids).toEqual([]);
+      // ...and the poison signal is cleared, so this does not re-recover forever.
+      expect(readdirSync(join(dataDir, 'session-stores', 'appA')).filter(n => n.includes('.tmp'))).toEqual([]);
+    });
+  });
+
+  it('keeps the row-bearing WAL when an earlier sidecar cannot be removed', () => {
+    withDirs((dataDir, home) => {
+      // Cleanup order is the invariant that makes "lone .tmp-shm" unreachable as
+      // benign residue. Force the FIRST unlink to fail (a directory cannot be
+      // unlinked, even by root) and the row-bearing WAL must survive: the store
+      // still tests as poisoned and the next start retries, instead of decaying
+      // into the ambiguous shm-only shape with the evidence already gone.
+      poison(dataDir, home);
+      writeFileSync(join(dataDir, 'sessions-appA.json'), JSON.stringify(frozenJsonRows()));
+      const storeDir = join(dataDir, 'session-stores', 'appA');
+      rmSync(join(storeDir, 'sessions.db.tmp-shm'), { force: true });
+      mkdirSync(join(storeDir, 'sessions.db.tmp-shm'), { recursive: true });
+
+      const after = load(dataDir, home);
+      // The merge itself still commits — the rows are rescued either way.
+      expect(after.strict).toBe(SESSION_ROWS);
+      // ...but the WAL is deliberately NOT deleted while a sibling remains.
+      expect(readdirSync(storeDir)).toContain('sessions.db.tmp-wal');
+    });
+  });
+
+  it('finishes an interrupted cleanup on the next start with no snapshot to lean on', () => {
+    withDirs((dataDir, home) => {
+      // The retry path, with every crutch removed: NO snapshot at all, so the
+      // only thing that can authorise finishing the job is a durable record that
+      // the previous pass already merged this orphan's rows.
+      //
+      // Deriving that from a replay observation is not sound — a truncated orphan
+      // beside live rows can look identical to "already merged" — so the merge
+      // writes a RECEIPT keyed by the orphan's content digest, in the same
+      // transaction as the rows. Without it this store would fail closed forever
+      // even though its 40 rows are safely in the main file.
+      poison(dataDir, home);
+      const storeDir = join(dataDir, 'session-stores', 'appA');
+      // Block the first cleanup: a directory cannot be unlinked, even by root.
+      rmSync(join(storeDir, 'sessions.db.tmp-shm'), { force: true });
+      mkdirSync(join(storeDir, 'sessions.db.tmp-shm'), { recursive: true });
+
+      expect(load(dataDir, home).strict).toBe(SESSION_ROWS);
+      // Cleanup was interrupted, so the row-bearing WAL is still there.
+      expect(readdirSync(storeDir)).toContain('sessions.db.tmp-wal');
+
+      // Unblock and restart: this must converge, not refuse.
+      rmSync(join(storeDir, 'sessions.db.tmp-shm'), { recursive: true, force: true });
+      const retry = load(dataDir, home);
+      expect(retry.visible).toBe(SESSION_ROWS);
+      expect(retry.strict).toBe(SESSION_ROWS);
+      expect(readdirSync(storeDir).filter(n => n.includes('.tmp'))).toEqual([]);
+      // No evidence needed archiving: the rows were accounted for, not lost.
+      expect(readdirSync(storeDir).filter(n => n.includes('unrecovered'))).toEqual([]);
+      // ...and it stays converged.
+      expect(load(dataDir, home).strict).toBe(SESSION_ROWS);
+    });
+  });
+
+  it('keeps the receipt usable across repeated interrupted cleanups', () => {
+    withDirs((dataDir, home) => {
+      // Interrupt cleanup TWICE with no snapshot anywhere. Each restart must
+      // still find the receipt written by the first successful merge, so the
+      // store converges instead of refusing. Reading that receipt must also not
+      // write to the store — a `CREATE TABLE` on the read path would grow the
+      // main file (measured 12288 → 20480 bytes) before the archive is taken,
+      // leaving any archived shell no longer paired with its WAL frames.
+      poison(dataDir, home);
+      const storeDir = join(dataDir, 'session-stores', 'appA');
+      const blocker = join(storeDir, 'sessions.db.tmp-shm');
+      rmSync(blocker, { force: true });
+      mkdirSync(blocker, { recursive: true });
+      expect(load(dataDir, home).strict).toBe(SESSION_ROWS);
+      expect(readdirSync(storeDir)).toContain('sessions.db.tmp-wal');
+
+      // Second start, still blocked: must not lose rows and must not archive.
+      const blocked = load(dataDir, home);
+      expect(blocked.strict).toBe(SESSION_ROWS);
+      expect(readdirSync(storeDir).filter(n => n.includes('unrecovered'))).toEqual([]);
+
+      // Unblock: converges, nothing archived, nothing lost.
+      rmSync(blocker, { recursive: true, force: true });
+      const done = load(dataDir, home);
+      expect(done.strict).toBe(SESSION_ROWS);
+      expect(readdirSync(storeDir).filter(n => n.includes('.tmp'))).toEqual([]);
+      expect(readdirSync(storeDir).filter(n => n.includes('unrecovered'))).toEqual([]);
     });
   });
 
@@ -423,6 +671,25 @@ describe('recovering a session store poisoned by a crashed SQLite import', () =>
       // The orphans stay on disk so the rows remain manually rescuable.
       expect(readdirSync(join(dataDir, 'session-stores', 'appA')).filter(n => n.includes('.tmp')).length)
         .toBeGreaterThan(0);
+    });
+  });
+
+  it('refuses when a partly-accepted orphan sits beside rows already in the main file', () => {
+    withDirs((dataDir, home) => {
+      // The shape that tempts a shortcut: SQLite accepts some frames from the
+      // orphan (so "was the WAL looked at?" says yes) while the rows on screen
+      // come from the main file. It is NOT evidence that a previous pass merged
+      // this orphan — only a receipt is — so this must refuse and keep the file.
+      //
+      // Truncated at 20 KiB, not header-zeroed: that keeps `acceptedFrames > 0`,
+      // which is precisely what distinguishes this from the header-zero case and
+      // stops a single relaxed condition from passing both.
+      poison(dataDir, home, { liveRows: [{ id: 'NEW0', title: 'live 0' }], checkpoint: true });
+      truncateSync(join(dataDir, 'session-stores', 'appA', 'sessions.db.tmp-wal'), 20_480);
+
+      const after = load(dataDir, home);
+      expect(after.strict).toBe('THREW:SessionStoreUnavailableError');
+      expect(readdirSync(join(dataDir, 'session-stores', 'appA'))).toContain('sessions.db.tmp-wal');
     });
   });
 
