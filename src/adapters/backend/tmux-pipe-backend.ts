@@ -198,6 +198,9 @@ export class TmuxPipeBackend implements SessionBackend {
   private readonly paneTarget: string;
   private readonly fifoPath: string;
   private readStream: fs.ReadStream | null = null;
+  /** Read end of the fifo, kept so teardown can close it explicitly.
+   *  `createReadStream(..., { autoClose: false })` never closes it for us. */
+  private fifoFd: number | null = null;
   /** Streaming UTF-8 decoder. The fifo read emits raw Buffer chunks at libuv's
    *  64KB highWaterMark boundary, which can fall in the middle of a multi-byte
    *  character (CJK = 3 bytes, box-drawing = 3 bytes, emoji = 4 bytes). Decoding
@@ -321,6 +324,7 @@ export class TmuxPipeBackend implements SessionBackend {
     // exact bug ate the bridge final_output pipeline on first ship: an
     // strace showed worker only read its IPC fd, never the fifo.)
     const fd = fs.openSync(this.fifoPath, fs.constants.O_RDWR);
+    this.fifoFd = fd;
     this.readStream = fs.createReadStream('', { fd, autoClose: false, highWaterMark: 64 * 1024 });
 
     this.readStream.on('data', (chunk) => {
@@ -577,11 +581,7 @@ export class TmuxPipeBackend implements SessionBackend {
       } catch { /* pane may already be gone — benign */ }
       this.pipeAttached = false;
     }
-    if (this.readStream) {
-      try { this.readStream.destroy(); } catch { /* already closed */ }
-      this.readStream = null;
-    }
-    try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
+    this.teardownFifoReader();
   }
 
   destroySession(): void {
@@ -846,6 +846,47 @@ export class TmuxPipeBackend implements SessionBackend {
     }
   }
 
+  /**
+   * Tear down the fifo reader so this process can actually exit.
+   *
+   * `readStream.destroy()` alone is NOT enough, and getting this wrong wedges
+   * the whole worker: libuv services the (deliberately blocking, see spawn())
+   * fifo read from its threadpool, and destroy() only detaches the JS stream —
+   * the threadpool thread stays parked inside the kernel `read()`. Because we
+   * hold the fifo O_RDWR, a writer always exists, so that read never sees EOF
+   * and never returns. `process.exit()` then blocks forever in
+   * uv__threadpool_cleanup joining that thread, with the event loop already
+   * stopped so the process cannot even self-kill on a timer. Observed in
+   * production as every worker of a daemon stuck mid-exit: the daemon still
+   * considered them live and kept delivering turns, so each message came back
+   * as "Worker 未能接收这条消息" (worker.input_delivery_failed) forever.
+   *
+   * The wake-up byte is what unblocks that read. It goes through a SEPARATE
+   * O_WRONLY|O_NONBLOCK fd rather than our own O_RDWR one on purpose: at
+   * teardown nobody is draining the pipe any more, so if tmux left it full a
+   * blocking write would hang exactly like the bug we are fixing (verified —
+   * a blocking write here reproduces the wedge, the non-blocking one returns
+   * EAGAIN and we simply move on; the reader is being torn down regardless).
+   * The byte is never observed by callers: the stream is destroyed first, so
+   * it is read by nobody and dies with the fifo on the unlink below.
+   */
+  private teardownFifoReader(): void {
+    if (this.readStream) {
+      try { this.readStream.destroy(); } catch { /* already closed */ }
+      this.readStream = null;
+    }
+    try {
+      const wakeFd = fs.openSync(this.fifoPath, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+      try { fs.writeSync(wakeFd, '\0'); } catch { /* EAGAIN when full — the read is already unblocked */ }
+      fs.closeSync(wakeFd);
+    } catch { /* fifo already unlinked/gone — nothing parked on it */ }
+    if (this.fifoFd !== null) {
+      try { fs.closeSync(this.fifoFd); } catch { /* already closed */ }
+      this.fifoFd = null;
+    }
+    try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
+  }
+
   private handlePaneExit(): void {
     if (this.exited) return;
     this.exited = true;
@@ -856,11 +897,7 @@ export class TmuxPipeBackend implements SessionBackend {
       } catch { /* pane may already be gone — benign */ }
       this.pipeAttached = false;
     }
-    if (this.readStream) {
-      try { this.readStream.destroy(); } catch { /* already closed */ }
-      this.readStream = null;
-    }
-    try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
+    this.teardownFifoReader();
     this.fireExit(1, null);
   }
 
