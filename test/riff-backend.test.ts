@@ -1805,6 +1805,69 @@ describe('RiffBackend', () => {
       expect((be as any).currentTaskId).toBe('task-child');
     });
 
+    it('reconcile corrects for a MEASURED server clock offset (Date header), beyond the fixed tolerance', async () => {
+      // A server running 10 minutes behind us stamps createdAt 10 minutes "early".
+      // The fixed 30s tolerance cannot absorb that — only translating our send
+      // instant into the server's frame (via the response Date header) can. Without
+      // it the child is rejected and reconcile silently never adopts.
+      const { be } = await primedFollowUp();
+      (be as any).reconcileRetryDelayMs = 0;
+      const BEHIND_MS = 600_000;
+      const serverNow = () => new Date(Date.now() - BEHIND_MS);
+      fetchMock.mockImplementation(async (url: string | URL) => {
+        const u = String(url);
+        calls.push({ url: u });
+        if (u.includes('/api/task-follow-up')) throw timeoutError();
+        if (u.includes('/api/tasks?')) {
+          return Response.json(
+            { success: true, data: [
+              // Created "now" in the SERVER's frame — i.e. it really is this
+              // follow-up's child, it just looks 10 min old from here.
+              { id: 'task-child', status: 'running', followUpParentTaskId: 'task-parent', createdAt: serverNow().toISOString() },
+            ] },
+            { headers: { date: serverNow().toUTCString() } },
+          );
+        }
+        return pendingSseResponse();
+      });
+
+      be.write('second');
+      await flush(); await flush(); await flush();
+
+      expect((be as any).currentTaskId).toBe('task-child');
+      // The offset was actually measured off the header, not assumed zero.
+      expect((be as any).serverClockOffsetMs).toBeLessThan(-BEHIND_MS / 2);
+    });
+
+    it('a stranded task still loses even when the server clock is skewed (offset shifts both sides)', async () => {
+      // The offset correction must not become a blanket "adopt anything": with the
+      // same skewed server, a task from an EARLIER turn is still out of range.
+      const { be } = await primedFollowUp();
+      (be as any).reconcileRetryDelayMs = 0;
+      const BEHIND_MS = 600_000;
+      const serverNow = () => new Date(Date.now() - BEHIND_MS);
+      fetchMock.mockImplementation(async (url: string | URL) => {
+        const u = String(url);
+        calls.push({ url: u });
+        if (u.includes('/api/task-follow-up')) throw timeoutError();
+        if (u.includes('/api/tasks?')) {
+          return Response.json(
+            { success: true, data: [
+              // An hour old in the SERVER's own frame → a previous turn's leftover.
+              { id: 'task-stranded', status: 'running', followUpParentTaskId: 'task-parent', createdAt: new Date(serverNow().getTime() - 3_600_000).toISOString() },
+            ] },
+            { headers: { date: serverNow().toUTCString() } },
+          );
+        }
+        return pendingSseResponse();
+      });
+
+      be.write('second');
+      await flush(); await flush(); await flush(); await flush();
+
+      expect((be as any).currentTaskId).toBe('task-parent');
+    });
+
     it('reconcile does NOT adopt a child stranded by an EARLIER turn (created before we sent)', async () => {
       // riff redirects a follow-up's parent to the thread's LATEST node, so several
       // siblings can share one parent — including a task left behind by a previous
