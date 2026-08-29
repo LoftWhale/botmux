@@ -446,9 +446,11 @@ describe('API-only bot mode — non-client direct-Feishu paths (source lock)', (
     // The worker uploads via its OWN client (utils/lark-upload), bypassing the
     // daemon getBot gate, so the no-transport capability must ride the init
     // message. Covers apiOnly bot AND a normal bot in an HTTP virtual session.
+    // The gate is derived from the CENTRAL larkTransportEnabled predicate keyed on
+    // the init message (msg.chatId/msg.apiOnly), NOT ambient/cfg — so a normal bot
+    // in an HTTP virtual session (real creds, apiOnly=false) is still disabled.
     const workerSource = readFileSync(resolve('src/worker.ts'), 'utf8');
-    expect(workerSource).toContain('apiOnlyForUpload = msg.apiOnly === true');
-    expect(workerSource).toContain("msg.chatId?.startsWith('http_async_')");
+    expect(workerSource).toContain('apiOnlyForUpload = !sessionLarkTransportEnabled({ chatId: msg.chatId, apiOnly: msg.apiOnly })');
     expect(workerSource).toContain("if (apiOnlyForUpload)");
     // worker-pool forwards apiOnly on the init message (both fork sites).
     const wpSource = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');

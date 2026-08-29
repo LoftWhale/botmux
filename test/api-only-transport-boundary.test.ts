@@ -66,6 +66,16 @@ describe('larkTransportEnabled — central no-Feishu predicate', () => {
     expect(isHttpVirtualSession('oc_real')).toBe(false);
     expect(isHttpVirtualSession('doc:tok')).toBe(false);
   });
+  it('tolerates a nullish chatId (a missing surface is not an HTTP virtual chat)', () => {
+    // Hardened when converging worker.ts's four inline copies onto this predicate:
+    // one site (screenshot-upload gate) fed a `msg.chatId` that could be undefined,
+    // and inline code guarded with `?.` — so the central helper must not throw.
+    expect(isHttpVirtualSession(undefined)).toBe(false);
+    expect(isHttpVirtualSession(null)).toBe(false);
+    // A nullish chatId with a non-apiOnly bot ⇒ transport still enabled (no crash).
+    expect(larkTransportEnabled({ chatId: undefined, apiOnly: false })).toBe(true);
+    expect(larkTransportEnabled({ chatId: undefined, apiOnly: true })).toBe(false);
+  });
 });
 
 describe('triggerSessionTurn — apiOnly request-shape fail-closed', () => {
