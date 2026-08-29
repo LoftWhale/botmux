@@ -260,10 +260,36 @@ function normalizeFormForOptions(form: OnboardingFormState, cliState: CliOptions
 }
 
 /**
+ * 从克隆源 Bot 的配置行推出表单预填值。
+ *
+ * 目录必须按**源自己的形态**映射，不能一律 fixed：源只有 workingDir 时若按
+ * fixed 预填，目标会带上 defaultWorkingDir，而后端取目录是
+ * `defaultWorkingDir ?? workingDir` —— 目标那个 '~' 会反过来把源目录遮蔽掉，
+ * 新会话直接在 ~ 起，源的仓库目录静默丢失。
+ */
+export function cloneSourceDefaultsFrom(source: {
+  cliId?: string | null;
+  defaultWorkingDir?: string | null;
+  workingDir?: string | null;
+  model?: string | null;
+} | undefined): CloneSourceDefaults | undefined {
+  if (!source) return undefined;
+  return {
+    ...(source.cliId ? { cliId: source.cliId } : {}),
+    ...(source.defaultWorkingDir
+      ? { workingDir: source.defaultWorkingDir, dirMode: 'fixed' as const }
+      : source.workingDir
+        ? { workingDir: source.workingDir, dirMode: 'card' as const }
+        : {}),
+    ...(source.model ? { model: source.model } : {}),
+  };
+}
+
+/**
  * 把克隆源的配置铺进表单初值。只覆盖源上确实有值的项，其余保持普通新建的默认，
  * 这样表单展示的就是克隆真正会用的配置（cloneBotConfig 之后仍以源为准）。
  */
-function applyCloneDefaults(
+export function applyCloneDefaults(
   form: OnboardingFormState,
   defaults: CloneSourceDefaults | undefined,
 ): OnboardingFormState {

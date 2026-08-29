@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { openBotOnboarding } from './bot-onboarding.js';
+import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
 import {
   agentSelectionKey,
   cliIdOf,
@@ -855,16 +855,10 @@ export function BotDefaultsPage() {
                 setOnboardingBusy(true);
                 // 把源 Bot 的 CLI / 目录 / model 一并带进弹窗预填：克隆时后端会用
                 // 源 Bot 覆盖这几项，表单必须显示真正会生效的值，否则用户白填。
-                const source = bots.find(bot => bot.larkAppId === sourceAppId);
-                const sourceDefaults = source
-                  ? {
-                      ...(source.cliId ? { cliId: source.cliId } : {}),
-                      ...(source.defaultWorkingDir
-                        ? { workingDir: source.defaultWorkingDir, dirMode: 'fixed' as const }
-                        : {}),
-                      ...(source.model ? { model: source.model } : {}),
-                    }
-                  : undefined;
+                // 映射规则（含目录两种互斥形态）见 cloneSourceDefaultsFrom。
+                const sourceDefaults = cloneSourceDefaultsFrom(
+                  bots.find(bot => bot.larkAppId === sourceAppId),
+                );
                 void openBotOnboarding(sourceAppId, sourceDefaults).finally(() => setOnboardingBusy(false));
               }}
             />
