@@ -66,6 +66,22 @@ describe('package.json — lockfile safety and packaging', () => {
   it('the file named in `files` actually exists on disk', () => {
     expect(existsSync(POSTINSTALL)).toBe(true);
   });
+
+  it('ships the PATH helper too (postinstall imports it at install time)', () => {
+    // ⚠️ Without this the whole suite stays green while the published tarball
+    // silently regresses to "just print a PATH hint": the fixture copies the
+    // helper in directly rather than consulting the manifest, and the
+    // missing-helper case deliberately asserts fail-soft. So dropping this one
+    // `files` line would reintroduce the exact npm bug this PR fixes.
+    const helper = 'scripts/install-path-entry.mjs';
+    const shipped = manifest.files.some(
+      (f: string) => f === helper || f === 'scripts/' || f === 'scripts',
+    );
+    expect(shipped).toBe(true);
+    expect(existsSync(resolve(helper))).toBe(true);
+    // And postinstall must actually be the thing that pulls it in.
+    expect(readFileSync(POSTINSTALL, 'utf-8')).toContain('./install-path-entry.mjs');
+  });
 });
 
 describe('inject-optional-binaries — release-time version wiring', () => {
@@ -244,7 +260,8 @@ describe('postinstall-bin — writes the launcher ONLY for a real global install
     expect(existsSync(join(r.home, '.zshenv'))).toBe(false);
   });
 
-  it('the written launcher actually runs and preserves argument boundaries', () => {    const r = runPostinstall({ global: 'true' });
+  it('the written launcher actually runs and preserves argument boundaries', () => {
+    const r = runPostinstall({ global: 'true' });
     const run = spawnSync(r.launcher, ['send', 'hello world'], { encoding: 'utf-8' });
     expect(run.status).toBe(0);
     expect(run.stdout).toBe('BINARY-GOT:send\nBINARY-GOT:hello world\n');

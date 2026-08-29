@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { cliAuthBind, loadDashboardSecret, signCliAuth } from '../dashboard/auth.js';
+import { loopbackFetchImpl } from '../core/loopback-fetch.js';
 
 /**
  * Loopback HMAC client for the dashboard process's `/__cli/*` endpoints, used by
@@ -90,61 +91,6 @@ export function classifyDashboard401(bodyText: string): DashboardResult {
   };
 }
 
-/**
- * `fetch` for loopback only — **never** the global one.
- *
- * ⚠️ 不要「简化」成 `fetch`。Bun 的 `fetch` 会自动走 `$http_proxy`，而它**不认
- * `no_proxy` 里的 CIDR 写法**（`127.0.0.0/8` 这种）。公司内网开发机的 shell rc 普遍
- * 默认 export 一个 http_proxy + CIDR 形式的 no_proxy，于是这个**本机 loopback 请求
- * 被发到公司代理**，代理拒绝转发内网 IP，回一个 nginx HTML `403 Forbidden` ——
- * 用户看到的就是 `Dashboard lookup failed: 403 <html>…`，而 dashboard 其实活得好好的
- * （它的 `/__cli/*` 只回 JSON，从不回 HTML，所以 HTML 响应本身就是「被代理劫持」的指纹）。
- *
- * 实测（Bun 1.4.0，受控假代理 + 独立标记响应，含 `bun build --compile` 编译态）：
- *
- *   no_proxy=127.0.0.0/8 时          fetch → 403 经代理 ／ node:http → 直连 ✅
- *   fetch(…, {proxy:''/undefined/null})  → 仍然经代理（选项存在 ≠ 生效）
- *   启动后 delete process.env.http_proxy → 仍然经代理（Bun 启动时已快照代理配置）
- *
- * 所以能可靠禁掉代理的只剩「不走 fetch」：`node:http` 完全无视代理 env，Node 与 Bun
- * 下行为一致。同仓先例见 `src/cli/supervisor-shutdown-client.ts`（本机 IPC 也走 node:http）。
- */
-async function loopbackFetch(
-  url: string,
-  init: { method: string; headers: Record<string, string> },
-): Promise<Response> {
-  const { request } = await import('node:http');
-  const target = new URL(url);
-  return new Promise<Response>((resolve, reject) => {
-    const req = request(
-      {
-        // Dial the parsed host/port explicitly rather than handing node:http the
-        // URL, so no proxy-aware URL handling can re-target the request.
-        host: target.hostname,
-        port: target.port,
-        path: `${target.pathname}${target.search}`,
-        method: init.method,
-        headers: init.headers,
-      },
-      res => {
-        const chunks: Buffer[] = [];
-        res.on('data', (chunk: Buffer | string) => chunks.push(Buffer.from(chunk)));
-        res.on('end', () => resolve(new Response(Buffer.concat(chunks), {
-          status: res.statusCode ?? 0,
-          headers: Object.fromEntries(
-            Object.entries(res.headers)
-              .filter(([, v]) => typeof v === 'string')
-              .map(([k, v]) => [k, v as string]),
-          ),
-        })));
-        res.on('error', reject);
-      },
-    );
-    req.on('error', reject);
-    req.end();
-  });
-}
-
 /** Issue a single HMAC-authed request to one candidate port. */
 export async function requestDashboardAt(opts: {
   host: string;
@@ -155,7 +101,7 @@ export async function requestDashboardAt(opts: {
 }): Promise<DashboardResult> {
   const { host, port, path, secret } = opts;
   // Default is the proxy-immune loopback client above, NOT the global `fetch`.
-  const fetchImpl = opts.fetchImpl ?? (loopbackFetch as unknown as FetchImpl);
+  const fetchImpl = opts.fetchImpl ?? loopbackFetchImpl;
   // Bind the credential to method + path + the port we're dialing. A malicious
   // server handed these headers during discovery therefore can't forward them
   // to a different `/__cli/*` route or to the real dashboard on another port —
@@ -218,7 +164,7 @@ export async function callDashboard(opts: {
   const probeSpan = opts.probeSpan ?? 20;
   const persistPort = opts.persistPort ?? true;
   // Same reason as in requestDashboardAt: the default must stay proxy-immune.
-  const fetchImpl = opts.fetchImpl ?? (loopbackFetch as unknown as FetchImpl);
+  const fetchImpl = opts.fetchImpl ?? loopbackFetchImpl;
 
   const secretPath = join(opts.configDir, '.dashboard-secret');
   let secret: string | null;

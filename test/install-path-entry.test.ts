@@ -297,16 +297,18 @@ describe('install.sh stays in step with the shared module', () => {
     expect(fn.slice(0, 400)).toContain('.bash_login');
   });
 
-  it('its idempotence check is per-LINE, not two independent greps', () => {
-    // Two separate greps accept "dir named in a comment" + "unrelated PATH export
-    // on another line" and wrongly skip a machine that is not configured
-    // (reproduced). The dir and the assignment must be found on the SAME line,
-    // which here means piping the dir matches INTO the assignment match.
+  it('its idempotence check is per-LINE and quote-aware, not two independent greps', () => {
     const fn = sh.slice(sh.indexOf('path_line_present()'), sh.indexOf('bash_login_file()'));
-    expect(fn).toContain('grep -F "$INSTALL_DIR"');
-    expect(fn).toMatch(/grep -F "\$INSTALL_DIR"[^\n]*\n?[^\n]*\|/);
+    // (a) our own line is recognised by marker + the exact quoted dir …
+    expect(fn).toContain('grep -F "$MARKER"');
+    expect(fn).toContain('grep -Fq "$QUOTED_DIR"');
+    // (b) … and a hand-written line by whole-token comparison, skipping comments.
+    expect(fn).toContain('awk');
+    expect(fn).toMatch(/\^\[\[:space:\]\]\*#/);
     // The old form ANDed two whole-file greps; that must not come back.
     expect(fn).not.toMatch(/grep -q "\$INSTALL_DIR"[^\n]*&&/);
+    // Behaviour for all of this is covered by the end-to-end fixture below; these
+    // assertions only stop a refactor from quietly deleting one of the two halves.
   });
 
   it('carries the same marker so the two installers recognise each other\'s line', () => {
@@ -315,3 +317,371 @@ describe('install.sh stays in step with the shared module', () => {
 });
 
 void existsSync;
+
+describe('the emitted PATH statement is idempotent at RUNTIME', () => {
+  function have(bin: string): boolean {
+    try { execFileSync('command', ['-v', bin], { shell: true, stdio: 'ignore' }); return true; }
+    catch { return false; }
+  }
+
+  /**
+   * Count how many times installDir appears in PATH after `depth` nested shells.
+   *
+   * ⚠️ The inner script MUST be single-quoted. Wrapping it in double quotes (e.g.
+   * via JSON.stringify) lets the PARENT shell expand `$PATH` before the child ever
+   * runs, so the number printed is the parent's snapshot and the probe reports 1 no
+   * matter what — measured: with an unconditional prepend, the double-quoted form
+   * gave 1 at depth 2 while the single-quoted form correctly gave 2 (and 3 at
+   * depth 3). Nested shells DO re-read the rc file and DO keep growing PATH.
+   */
+  function occurrencesAtDepth(bin: string, flag: string, env: Record<string, string>, depth: number): number {
+    // Build inside-out, quoting with single quotes at every level.
+    let script = 'echo $PATH';
+    for (let i = 1; i < depth; i++) {
+      script = `${bin} ${flag} '${script.replace(/'/g, `'\\''`)}'`;
+    }
+    const out = execFileSync(bin, [flag, script], {
+      env: { PATH: '/usr/bin:/bin', ...env },
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000,
+    });
+    return out.trim().split(':').filter(p => p === installDir).length;
+  }
+
+  function launcher() {
+    writeFileSync(join(installDir, 'botmux'), '#!/bin/sh\necho BOTMUX_OK\n', { mode: 0o755 });
+  }
+
+  /**
+   * Two independent ways the same defect shows up, both asserted:
+   *
+   *  · NESTED shells — each child re-reads the rc file, so an unconditional prepend
+   *    grows PATH once per level (measured against the old form: 2 at depth 2, 3 at
+   *    depth 3). See occurrencesAtDepth's note on why the inner script has to be
+   *    single-quoted, or the parent expands `$PATH` first and the probe is blind.
+   *  · RE-SOURCING inside ONE shell — the real-world case of a `.bash_profile` that
+   *    also sources `.bashrc`, or any tool that re-reads your env.
+   */
+  it('zsh: one occurrence when .zshenv is re-sourced, and when nested', () => {
+    if (!have('zsh')) return;
+    launcher();
+    ensurePathEntry({ installDir, home, shell: 'zsh', env: {} });
+    const rc = join(home, '.zshenv');
+    const out = execFileSync('zsh', [
+      '-c', `source ${JSON.stringify(rc)}; source ${JSON.stringify(rc)}; echo "$PATH"`,
+    ], { env: { PATH: '/usr/bin:/bin', HOME: home, ZDOTDIR: home }, encoding: 'utf8', timeout: 20_000 });
+    expect(out.trim().split(':').filter(p => p === installDir)).toHaveLength(1);
+    for (const depth of [1, 2, 3]) {
+      expect(occurrencesAtDepth('zsh', '-c', { HOME: home, ZDOTDIR: home }, depth)).toBe(1);
+    }
+  }, 40_000);
+
+  it('a POSIX shell: one occurrence when .profile is re-sourced, and when nested', () => {
+    if (!have('dash')) return;
+    launcher();
+    ensurePathEntry({ installDir, home, shell: 'other', env: {} });
+    const rc = join(home, '.profile');
+    const out = execFileSync('dash', [
+      '-lc', `. ${JSON.stringify(rc)}; . ${JSON.stringify(rc)}; echo "$PATH"`,
+    ], { env: { PATH: '/usr/bin:/bin', HOME: home }, encoding: 'utf8', timeout: 20_000 });
+    expect(out.trim().split(':').filter(p => p === installDir)).toHaveLength(1);
+    for (const depth of [1, 2, 3]) {
+      expect(occurrencesAtDepth('dash', '-lc', { HOME: home }, depth)).toBe(1);
+    }
+  }, 40_000);
+
+  it('bash: one occurrence even though .bashrc AND the login file both carry it', () => {
+    if (!have('bash')) return;
+    launcher();
+    ensurePathEntry({ installDir, home, shell: 'bash', env: {} });
+    // A login bash reads the login file; if it also sources .bashrc the statement
+    // runs twice in ONE shell — the guard has to hold for that too.
+    writeFileSync(join(home, '.bash_profile'),
+      `${readFileSync(join(home, '.bash_profile'), 'utf8')}\n. "$HOME/.bashrc"\n`);
+    for (const depth of [1, 2]) {
+      expect(occurrencesAtDepth('bash', '-lc', { HOME: home }, depth)).toBe(1);
+    }
+  }, 40_000);
+
+  it('fish: one occurrence even when conf.d is sourced twice in one shell', () => {
+    if (!have('fish')) return;
+    launcher();
+    ensurePathEntry({ installDir, home, shell: 'fish', env: {} });
+    const conf = join(home, '.config', 'fish', 'conf.d', 'botmux.fish');
+    // Sourcing the file twice in ONE shell is the sharpest probe here: 1 occurrence
+    // with the `contains` guard, 3 without it (measured).
+    const count = execFileSync('fish', [
+      '-c', `source ${JSON.stringify(conf)}; source ${JSON.stringify(conf)}; for p in $PATH; echo $p; end`,
+    ], {
+      env: { PATH: '/usr/bin:/bin', HOME: home },
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000,
+    }).trim().split('\n').filter(p => p === installDir).length;
+    expect(count).toBe(1);
+    expect(execFileSync('fish', ['-c', 'botmux'], {
+      env: { PATH: '/usr/bin:/bin', HOME: home }, encoding: 'utf8', timeout: 20_000,
+    })).toContain('BOTMUX_OK');
+  }, 40_000);
+
+  it('still prepends when the directory is NOT yet on PATH (positive control)', () => {
+    if (!have('dash')) return;
+    launcher();
+    ensurePathEntry({ installDir, home, shell: 'other', env: {} });
+    // Guard against "made it idempotent by never adding anything".
+    expect(occurrencesAtDepth('dash', '-lc', { HOME: home }, 1)).toBe(1);
+    expect(execFileSync('dash', ['-lc', 'botmux'], {
+      env: { PATH: '/usr/bin:/bin', HOME: home }, encoding: 'utf8', timeout: 20_000,
+    })).toContain('BOTMUX_OK');
+  }, 40_000);
+
+  it('a directory with shell metacharacters is still not executed', () => {
+    if (!have('dash')) return;
+    const evil = join(home, `d $(touch ${join(home, 'PWNED_RT')})`);
+    mkdirSync(evil, { recursive: true });
+    writeFileSync(join(evil, 'botmux'), '#!/bin/sh\necho BOTMUX_OK\n', { mode: 0o755 });
+    ensurePathEntry({ installDir: evil, home, shell: 'other', env: {} });
+    execFileSync('dash', ['-lc', 'true'], { env: { PATH: '/usr/bin:/bin', HOME: home }, timeout: 20_000 });
+    expect(existsSync(join(home, 'PWNED_RT'))).toBe(false);
+  }, 40_000);
+});
+
+/**
+ * install.sh executed END-TO-END, offline.
+ *
+ * WHY A REAL RUN AND NOT MORE REGEX: this suite twice shipped a semantic drift
+ * between install.sh and install-path-entry.mjs that every source-text assertion
+ * missed — the two-independent-greps false positive, and awk's `-v` mangling of
+ * the quoted spelling (`q'\''bin` arriving as `q'''bin`) which silently appended a
+ * duplicate line on every re-install. Only running the script catches those, so
+ * the shell half gets behavioural coverage of the same cases the .mjs half has.
+ *
+ * Offline by construction: fake `uname`/`ldd`/`curl` on PATH, so nothing is
+ * downloaded and no network is touched.
+ */
+/**
+ * The emitted STATEMENT has to be idempotent too, not only the file write.
+ *
+ * An unconditional `export PATH=<dir>:$PATH` re-prepends on every shell startup, so
+ * nested shells — and a `.bash_profile` that sources `.bashrc` within one login —
+ * keep growing PATH. Measured before the fix: the same directory appeared twice at
+ * nesting depth 2. That is persistent environment pollution caused by us writing
+ * the rc file, so it needs a real-shell regression, not a source assertion.
+ */
+describe('install.sh — executed end to end (offline fixture)', () => {
+  /** Build a PATH containing only our fakes plus the real tools the script needs. */
+  function fakeBinDir(root: string): string {
+    const bin = join(root, 'fakebin');
+    mkdirSync(bin, { recursive: true });
+    const write = (name: string, body: string) => {
+      const p = join(bin, name);
+      writeFileSync(p, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    };
+    write('uname', 'case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; *) echo Linux ;; esac');
+    // Claim glibc so the script does not pick the -musl asset.
+    write('ldd', 'echo "ldd (GNU libc) 2.36"');
+    // `curl -fSL <url> -o <file>` writes a stand-in binary; the .sha256 fetch fails
+    // (exit 1) so the script takes its documented "no checksum published" path.
+    write('curl', [
+      'out=""; url=""',
+      'while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac; done',
+      'case "$url" in *.sha256) exit 1 ;; esac',
+      '[ -n "$out" ] || exit 1',
+      'printf "#!/bin/sh\\necho BOTMUX_OK\\n" > "$out"',
+    ].join('\n'));
+    return bin;
+  }
+
+  function runInstaller(opts: {
+    home: string;
+    shell: string;
+    installDir: string;
+    env?: Record<string, string>;
+  }): { status: number | null; stdout: string; stderr: string } {
+    const bin = fakeBinDir(opts.home);
+    const r = execFileSync('/bin/sh', [join(__dirname, '..', 'install.sh')], {
+      env: {
+        // A deliberately minimal environment: only what the script may rely on.
+        PATH: `${bin}:/usr/bin:/bin`,
+        HOME: opts.home,
+        SHELL: opts.shell,
+        BOTMUX_INSTALL_DIR: opts.installDir,
+        ...opts.env,
+      },
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000,
+    });
+    return { status: 0, stdout: r, stderr: '' };
+  }
+
+  function runIn(shell: string, args: string[], env: Record<string, string>): string {
+    return execFileSync(shell, args, {
+      env: { PATH: '/usr/bin:/bin', ...env },
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000,
+    });
+  }
+
+  it('installs the binary and makes zsh find it — honouring $ZDOTDIR', () => {
+    if (!existsSync('/usr/bin/zsh')) return;
+    const zdot = join(home, 'zdot');
+    mkdirSync(zdot, { recursive: true });
+    runInstaller({ home, shell: '/usr/bin/zsh', installDir, env: { ZDOTDIR: zdot } });
+
+    // The PATH line must land in $ZDOTDIR/.zshenv, NOT $HOME/.zshenv.
+    expect(existsSync(join(zdot, '.zshenv'))).toBe(true);
+    expect(existsSync(join(home, '.zshenv'))).toBe(false);
+    expect(runIn('/usr/bin/zsh', ['-c', 'botmux'], { HOME: home, ZDOTDIR: zdot })).toContain('BOTMUX_OK');
+  });
+
+  it('makes fish find it — honouring $XDG_CONFIG_HOME, with fish syntax', () => {
+    if (!existsSync('/usr/bin/fish')) return;
+    const xdg = join(home, 'xdg');
+    mkdirSync(xdg, { recursive: true });
+    runInstaller({ home, shell: '/usr/bin/fish', installDir, env: { XDG_CONFIG_HOME: xdg } });
+
+    const conf = join(xdg, 'fish', 'conf.d', 'botmux.fish');
+    expect(existsSync(conf)).toBe(true);
+    expect(readFileSync(conf, 'utf8')).toContain('set -gx PATH');
+    expect(runIn('/usr/bin/fish', ['-c', 'botmux'], { HOME: home, XDG_CONFIG_HOME: xdg })).toContain('BOTMUX_OK');
+  });
+
+  it('does not shadow an existing .profile for bash, and works in both modes', () => {
+    if (!existsSync('/bin/bash')) return;
+    writeFileSync(join(home, '.profile'), 'export SENTINEL_FROM_PROFILE=yes\n');
+    runInstaller({ home, shell: '/bin/bash', installDir });
+
+    // Creating .bash_profile here would make the sentinel unreachable.
+    expect(existsSync(join(home, '.bash_profile'))).toBe(false);
+    expect(runIn('/bin/bash', ['-lic', 'echo "S=${SENTINEL_FROM_PROFILE:-MISSING}"'], { HOME: home }))
+      .toContain('S=yes');
+    expect(runIn('/bin/bash', ['-lic', 'botmux'], { HOME: home })).toContain('BOTMUX_OK');
+    expect(runIn('/bin/bash', ['-ic', 'botmux'], { HOME: home })).toContain('BOTMUX_OK');
+  });
+
+  it('is idempotent — a second install leaves the rc file byte-identical', () => {
+    runInstaller({ home, shell: '/bin/dash', installDir });
+    const after1 = readFileSync(join(home, '.profile'), 'utf8');
+    runInstaller({ home, shell: '/bin/dash', installDir });
+    expect(readFileSync(join(home, '.profile'), 'utf8')).toBe(after1);
+    expect((after1.match(/added by botmux installer/g) ?? [])).toHaveLength(1);
+  });
+
+  it('is idempotent for an install dir containing a single quote', () => {
+    // The case awk's `-v` mangling broke: the written line is shell-quoted, so the
+    // raw bytes are absent from the file and a naive check re-appends every run.
+    const quoted = join(home, "q'bin");
+    mkdirSync(quoted, { recursive: true });
+    runInstaller({ home, shell: '/bin/dash', installDir: quoted });
+    runInstaller({ home, shell: '/bin/dash', installDir: quoted });
+    const body = readFileSync(join(home, '.profile'), 'utf8');
+    expect((body.match(/added by botmux installer/g) ?? [])).toHaveLength(1);
+    // …and the quoting must still work: sh resolves the command.
+    expect(runIn('/bin/dash', ['-lc', 'botmux'], { HOME: home })).toContain('BOTMUX_OK');
+  });
+
+  it('is idempotent when BOTMUX_INSTALL_DIR carries a trailing slash', () => {
+    runInstaller({ home, shell: '/bin/dash', installDir: `${installDir}/` });
+    runInstaller({ home, shell: '/bin/dash', installDir: `${installDir}/` });
+    const body = readFileSync(join(home, '.profile'), 'utf8');
+    expect((body.match(/added by botmux installer/g) ?? [])).toHaveLength(1);
+  });
+
+  it('preserves an existing rc file that lacks a trailing newline', () => {
+    writeFileSync(join(home, '.profile'), 'alias ll="ls -la"');   // no newline
+    runInstaller({ home, shell: '/bin/dash', installDir });
+    const lines = readFileSync(join(home, '.profile'), 'utf8').split('\n');
+    expect(lines[0]).toBe('alias ll="ls -la"');
+    expect(lines[1]).toContain(installDir);
+  });
+
+  it('does not execute shell syntax present in the install dir', () => {
+    // The command-injection case: the line we write is evaluated on every startup.
+    const evil = join(home, 'dir $(touch ' + join(home, 'PWNED') + ')');
+    mkdirSync(evil, { recursive: true });
+    runInstaller({ home, shell: '/bin/dash', installDir: evil });
+    runIn('/bin/dash', ['-lc', 'true'], { HOME: home });
+    expect(existsSync(join(home, 'PWNED'))).toBe(false);
+  });
+
+  /**
+   * The RUNTIME idempotence guard has to hold for the shell installer too.
+   * Without this, reverting install.sh's statement to an unconditional prepend
+   * leaves the whole runtime group green (measured) — the .mjs tests all go through
+   * ensurePathEntry and never touch install.sh.
+   */
+  it('the statement it writes is idempotent at runtime (POSIX, re-sourced)', () => {
+    if (!existsSync('/bin/dash')) return;
+    runInstaller({ home, shell: '/bin/dash', installDir });
+    // Re-sourcing in ONE shell is asserted alongside nesting: it is the real-world
+    // `.bash_profile` sources `.bashrc` case, and it stays discriminating regardless
+    // of how the nested probe is quoted.
+    const rc = join(home, '.profile');
+    const out = runIn('/bin/dash', [
+      '-lc', `. ${JSON.stringify(rc)}; . ${JSON.stringify(rc)}; echo "$PATH"`,
+    ], { HOME: home });
+    expect(out.trim().split(':').filter(p => p === installDir)).toHaveLength(1);
+    // …and nesting must still be clean.
+    // Single quotes: a double-quoted inner script would let this shell expand $PATH.
+    const nested = runIn('/bin/dash', ['-lc', "/bin/dash -lc 'echo $PATH'"], { HOME: home });
+    expect(nested.trim().split(':').filter(p => p === installDir)).toHaveLength(1);
+  }, 40_000);
+
+  it('the statement it writes is idempotent at runtime (fish, double source)', () => {
+    if (!existsSync('/usr/bin/fish')) return;
+    const xdg = join(home, 'xdg');
+    mkdirSync(xdg, { recursive: true });
+    runInstaller({ home, shell: '/usr/bin/fish', installDir, env: { XDG_CONFIG_HOME: xdg } });
+    const conf = join(xdg, 'fish', 'conf.d', 'botmux.fish');
+    // Source it twice in one shell — the sharpest probe for this guard (see the
+    // .mjs counterpart for the measured numbers).
+    const out = runIn('/usr/bin/fish', [
+      '-c', `source ${JSON.stringify(conf)}; source ${JSON.stringify(conf)}; for p in $PATH; echo $p; end`,
+    ], { HOME: home, XDG_CONFIG_HOME: xdg });
+    expect(out.trim().split('\n').filter(p => p === installDir)).toHaveLength(1);
+  }, 40_000);
+
+  it('adds the entry when only a SIBLING directory is on PATH', () => {
+    // `<installDir>-old` must not count as configured — otherwise the real
+    // directory is never added and the command stays missing.
+    writeFileSync(join(home, '.profile'), `export PATH="${installDir}-old:$PATH"\n`);
+    runInstaller({ home, shell: '/bin/dash', installDir });
+    const body = readFileSync(join(home, '.profile'), 'utf8');
+    expect((body.match(/added by botmux installer/g) ?? [])).toHaveLength(1);
+  });
+
+  it('adds a working line back when OUR OWN generated line was commented out', () => {
+    // The marker is still on the line, so a marker-based fast path that forgets to
+    // skip comments reports "configured" and never restores a working entry —
+    // measured: install.sh left 0 active PATH lines while the .mjs half said false.
+    writeFileSync(join(home, '.profile'),
+      `# export PATH='${installDir}'":$PATH"  ${PATH_ENTRY_MARKER}\n`);
+    runInstaller({ home, shell: '/bin/dash', installDir });
+    const active = readFileSync(join(home, '.profile'), 'utf8')
+      .split('\n').filter(l => l.trim() && !l.trim().startsWith('#'));
+    expect(active).toHaveLength(1);
+    expect(active[0]).toContain(installDir);
+    expect(runIn('/bin/dash', ['-lc', 'botmux'], { HOME: home })).toContain('BOTMUX_OK');
+  });
+
+  it('does not duplicate when our own generated line is present and ACTIVE', () => {
+    // Positive control for the test above: the marker fast path must still work.
+    runInstaller({ home, shell: '/bin/dash', installDir });
+    const once = readFileSync(join(home, '.profile'), 'utf8');
+    runInstaller({ home, shell: '/bin/dash', installDir });
+    expect(readFileSync(join(home, '.profile'), 'utf8')).toBe(once);
+  });
+
+  it('recognises a user line that differs only by a trailing slash', () => {
+    // Exercises the awk half's normalisation: dir passed WITH a trailing slash,
+    // the user's existing entry written WITHOUT one (or vice versa).
+    writeFileSync(join(home, '.profile'), `export PATH="${installDir}:$PATH"\n`);
+    const before = readFileSync(join(home, '.profile'), 'utf8');
+    runInstaller({ home, shell: '/bin/dash', installDir: `${installDir}/` });
+    expect(readFileSync(join(home, '.profile'), 'utf8')).toBe(before);
+  });
+
+  it('leaves the file alone when the directory is ALREADY on PATH', () => {
+    // Positive control for the two tests above: the predicate must still be able
+    // to say "already configured", or it would just always append.
+    writeFileSync(join(home, '.profile'), `export PATH="${installDir}:$PATH"\n`);
+    const before = readFileSync(join(home, '.profile'), 'utf8');
+    runInstaller({ home, shell: '/bin/dash', installDir });
+    expect(readFileSync(join(home, '.profile'), 'utf8')).toBe(before);
+  });
+});

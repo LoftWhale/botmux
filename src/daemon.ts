@@ -648,6 +648,7 @@ import {
   type VcMeetingSealedReceiverSessionBinding,
 } from './services/vc-meeting-im-routing.js';
 import { VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT } from './services/vc-meeting-listener-output-protocol.js';
+import { loopbackFetch } from './core/loopback-fetch.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -2818,7 +2819,7 @@ async function fetchVcMeetingDaemonJson(
       path,
       headers: vcAuthenticatedHeaders,
     });
-    const upstream = await fetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, {
+    const upstream = await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, {
       ...init,
       headers: authenticatedHeaders,
       signal: init.signal ?? controller.signal,

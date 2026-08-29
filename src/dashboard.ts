@@ -242,6 +242,7 @@ import {
 } from './services/skill-registry-store.js';
 import { readSkillPackRegistry } from './services/skill-pack-store.js';
 import { dashboardSessionActionTimeoutMs, type DashboardSessionAction } from './dashboard/session-action-timeout.js';
+import { loopbackFetch } from './core/loopback-fetch.js';
 import {
   cloneSkillPack,
   createSkillPack,
@@ -2445,7 +2446,7 @@ async function proxyToDaemon(
   for (const [key, value] of Object.entries(authHeaders)) {
     headers.set(key, value);
   }
-  const upstream = await fetch(
+  const upstream = await loopbackFetch(
     `http://127.0.0.1:${d.ipcPort}${daemonPath}`,
     { ...init, headers },
   );

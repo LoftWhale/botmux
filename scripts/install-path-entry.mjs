@@ -95,16 +95,50 @@ function bashLoginFile(home) {
 }
 
 /**
+ * Quote a path for literal use inside a shell startup file.
+ *
+ * ⚠️ SECURITY, not cosmetics. The install dir is caller-controlled
+ * (`BOTMUX_INSTALL_DIR`, or just an unusual home), and the line we write is
+ * EXECUTED by the user's shell on every startup. Interpolating it into double
+ * quotes lets `$(…)`, backticks and `$VAR` run: measured — an install dir
+ * containing `$(touch /tmp/PWNED)` created that file the first time zsh started,
+ * and did so on every shell thereafter.
+ *
+ * Single quotes make the shell treat every byte literally; the only character
+ * needing care is `'` itself, closed and re-opened via `'\''`. This form is
+ * identical in POSIX shells and in fish.
+ */
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+/**
  * The startup files to write for a shell, plus the line to write into each.
  * Returns [] when we have nothing safe to say.
+ *
+ * `env` is read for the two relocation variables below; both are honoured
+ * because writing the un-relocated path produces a file the shell never reads —
+ * the same class of bug as writing `.profile` for zsh.
  */
-export function pathEntryTargets(shell, installDir, home = homedir()) {
-  const posix = `export PATH="${installDir}:$PATH"  ${PATH_ENTRY_MARKER}`;
+export function pathEntryTargets(shell, installDir, home = homedir(), env = process.env) {
+  const q = shellQuote(installDir);
+  // ⚠️ The STATEMENT has to be idempotent too, not just the file write. An
+  // unconditional `export PATH=<dir>:$PATH` re-prepends on every shell startup, so
+  // a nested or re-sourced shell keeps growing PATH — measured: the same directory
+  // appeared twice at nesting depth 2, and `.bash_profile` files that source
+  // `.bashrc` hit it within a single login. `case` is POSIX and quote-safe (no
+  // subshell, no `grep`), and the `:` padding makes it an exact ELEMENT test, so a
+  // sibling like `<dir>-old` never satisfies it.
+  const posix = `case ":$PATH:" in *:${q}:*) ;; *) export PATH=${q}":$PATH" ;; esac  ${PATH_ENTRY_MARKER}`;
   switch (shell) {
-    case 'zsh':
-      // .zshenv is the only file read by non-interactive, interactive and login
-      // zsh alike, so a script/ssh command finds botmux too.
-      return [{ file: join(home, '.zshenv'), line: posix }];
+    case 'zsh': {
+      // ⚠️ zsh reads its dotfiles from $ZDOTDIR when that is set, falling back to
+      // $HOME. Writing $HOME/.zshenv on a machine with ZDOTDIR set produces a file
+      // zsh never reads — measured: `zsh -c botmux` → "command not found".
+      const zdotdir = env.ZDOTDIR?.trim();
+      const base = zdotdir ? zdotdir : home;
+      return [{ file: join(base, '.zshenv'), line: posix }];
+    }
     case 'bash': {
       // Disjoint coverage — see header. Both, or one of the two common ways of
       // opening a terminal is left broken. The login half must not shadow (above).
@@ -115,11 +149,20 @@ export function pathEntryTargets(shell, installDir, home = homedir()) {
       if (login !== join(home, '.bashrc')) targets.push({ file: login, line: posix });
       return targets;
     }
-    case 'fish':
+    case 'fish': {
+      // ⚠️ fish's config dir is $XDG_CONFIG_HOME/fish, defaulting to ~/.config/fish.
+      // Same failure as ZDOTDIR above — measured: with XDG_CONFIG_HOME set, a file
+      // under ~/.config/fish is ignored, while the same line under
+      // $XDG_CONFIG_HOME/fish/conf.d works (positive control).
+      const xdg = env.XDG_CONFIG_HOME?.trim();
+      const configHome = xdg ? xdg : join(home, '.config');
       return [{
-        file: join(home, '.config', 'fish', 'conf.d', 'botmux.fish'),
-        line: `set -gx PATH "${installDir}" $PATH  ${PATH_ENTRY_MARKER}`,
+        file: join(configHome, 'fish', 'conf.d', 'botmux.fish'),
+        // fish: `contains` is its own exact list-element test — PATH is a real list
+        // here, so no delimiter padding is needed.
+        line: `contains ${q} $PATH; or set -gx PATH ${q} $PATH  ${PATH_ENTRY_MARKER}`,
       }];
+    }
     case 'other':
     case 'unknown':
     default:
@@ -132,12 +175,34 @@ export function fileAlreadyHasEntry(file, installDir) {
   if (!existsSync(file)) return false;
   let text;
   try { text = readFileSync(file, 'utf8'); } catch { return false; }
-  // Any line that already puts the directory on PATH counts — the user may have
-  // added it by hand in a form we would not generate, and appending a second
-  // entry would be noise, not a fix. Match the ASSIGNMENT forms rather than the
-  // bare word "path": a temp/checkout directory can easily contain "path" in its
-  // name (measured — a `/tmp/bmx-path-XXXX` fixture matched a bare `\bpath\b` and
-  // made an unrelated comment line look like a PATH export).
+
+  // ⚠️ TWO SEPARATE PREDICATES, deliberately not one clever one.
+  //
+  // Attempt #1 searched for the raw directory as a substring: `<installDir>-old`,
+  // `/backup<installDir>` and `<installDir>/other` all counted as configured, so
+  // the REAL directory was never written (measured, written=0 for each).
+  // Attempt #2 split the line into tokens and compared them — but the line we
+  // WRITE for a directory containing a quote is
+  //     export PATH='/x/q'\''bin'":$PATH"
+  // and ANY tokenizer that treats `'` as a separator shreds that into `/x/q`,
+  // `\`, `bin`, so the quoted spelling can never match a token (measured: marker
+  // count 1 → 2 on every re-install). Shell quoting cannot be undone by splitting
+  // on characters.
+  //
+  // So: recognise OUR line by its own known syntax (marker + the exact quoted
+  // form we would generate), and use conservative whole-token matching only for a
+  // line the USER wrote by hand.
+  const ourQuoted = shellQuote(installDir);
+  const lines = text.split('\n').filter(l => !/^\s*#/.test(l));
+
+  // (a) Our own line, byte-for-byte on the part that identifies the directory.
+  //     `PATH=` + the exact quoted dir is enough; the suffix may legitimately
+  //     differ (`":$PATH"` vs fish's ` $PATH`).
+  if (lines.some(l => l.includes(PATH_ENTRY_MARKER) && l.includes(ourQuoted))) return true;
+
+  // (b) A hand-written line. Compare whole PATH elements, and do NOT treat quotes
+  //     as element separators — strip the wrapping quotes first, then split on the
+  //     characters that actually delimit PATH elements.
   const PATH_ASSIGNMENT = new RegExp(
     [
       'export\\s+PATH\\s*=',      // POSIX: export PATH="…"
@@ -149,7 +214,17 @@ export function fileAlreadyHasEntry(file, installDir) {
     ].join('|'),
     'i',
   );
-  return text.split('\n').some(l => l.includes(installDir) && PATH_ASSIGNMENT.test(l));
+  const target = installDir.replace(/\/+$/, '');
+  return lines.some(l => {
+    if (!PATH_ASSIGNMENT.test(l)) return false;
+    // Quotes here are shell syntax around a plain path (the quote-containing case
+    // is handled by (a)); dropping them leaves the path bytes intact.
+    const bare = l.replace(/["']/g, '');
+    return bare
+      .split(/[:\s()=]+/)
+      .map(t => t.replace(/\/+$/, ''))
+      .some(t => t !== '' && t === target);
+  });
 }
 
 /**
@@ -161,9 +236,10 @@ export function fileAlreadyHasEntry(file, installDir) {
  */
 export function ensurePathEntry(opts) {
   const installDir = opts.installDir;
+  const env = opts.env ?? process.env;
   const home = opts.home ?? homedir();
-  const shell = opts.shell ?? detectShell();
-  const targets = pathEntryTargets(shell, installDir, home);
+  const shell = opts.shell ?? detectShell(env);
+  const targets = pathEntryTargets(shell, installDir, home, env);
 
   const written = [], skipped = [], failed = [];
   for (const { file, line } of targets) {

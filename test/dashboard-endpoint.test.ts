@@ -326,6 +326,21 @@ void existsSync;
  *     the only way to observe the actual proxying behaviour.
  */
 describe('loopback client ignores $http_proxy (403 nginx regression)', () => {
+  /**
+   * Locate a bun binary the way CI actually provides one: `oven-sh/setup-bun`
+   * only prepends it to PATH (it sets no BUN_PATH), so PATH is the source of
+   * truth. $BUN_PATH stays supported as an explicit override.
+   */
+  function resolveBun(): string | undefined {
+    if (process.env.BUN_PATH && existsSync(process.env.BUN_PATH)) return process.env.BUN_PATH;
+    for (const dir of (process.env.PATH ?? '').split(':')) {
+      if (!dir) continue;
+      const candidate = join(dir, 'bun');
+      if (existsSync(candidate)) return candidate;
+    }
+    return undefined;
+  }
+
   const ENDPOINT_SRC = join(__dirname, '..', 'src', 'cli', 'dashboard-endpoint.ts');
 
   it('never falls back to the global fetch for the default client (shape guard)', () => {
@@ -335,19 +350,38 @@ describe('loopback client ignores $http_proxy (403 nginx regression)', () => {
     // routes a 127.0.0.1 request through $http_proxy when no_proxy is a CIDR.
     const globalFetchFallbacks = src.match(/fetchImpl\s*\?\?\s*fetch\b/g) ?? [];
     expect(globalFetchFallbacks).toEqual([]);
-    const loopbackDefaults = src.match(/fetchImpl\s*\?\?\s*\(loopbackFetch\b/g) ?? [];
+    const loopbackDefaults = src.match(/fetchImpl\s*\?\?\s*loopbackFetchImpl\b/g) ?? [];
     expect(loopbackDefaults).toHaveLength(2);
-    // And the client itself must be built on node:http, not fetch.
-    expect(src).toMatch(/await import\(['"]node:http['"]\)/);
+    // …and the client it defaults to must itself be built on node:http.
+    const client = readFileSync(join(__dirname, '..', 'src', 'core', 'loopback-fetch.ts'), 'utf8');
+    expect(client).toMatch(/from 'node:buffer'|requestLiteralLoopback/);
+    expect(client).not.toMatch(/\bawait fetch\(|=\s*fetch\(/);
+  });
+
+  it('the daemon-IPC wrapper does not use the global fetch either', () => {
+    // Same defect, different wrapper: fetchDaemonIpc is the loopback client for
+    // 30+ call sites (resume/suspend/lang/term-link/dashboard→daemon). Verified
+    // with a real Bun process against a stand-in proxy: the global fetch returned
+    // the proxy's 403, loopbackFetch reached the daemon.
+    const ipc = readFileSync(join(__dirname, '..', 'src', 'core', 'daemon-ipc-auth.ts'), 'utf8');
+    expect(ipc).toContain('loopbackFetch(');
+    expect(ipc).not.toMatch(/return fetch\(|await fetch\(/);
   });
 
   it('a real Bun process reaches the dashboard directly with a CIDR no_proxy', async () => {
-    const bun = [
-      process.env.BUN_PATH,
-      join(process.env.HOME ?? '/root', '.bun', 'bin', 'bun'),
-      '/root/.bun/bin/bun',
-    ].find(p => p && existsSync(p));
-    if (!bun) { expect(true).toBe(true); return; }   // no bun available; shape guard still covers CI
+    const bun = resolveBun();
+    if (!bun) {
+      // ⚠️ Never silently pass in CI. This lookup used to check only $BUN_PATH,
+      // $HOME/.bun/bin/bun and a hardcoded /root/.bun/bin/bun — and
+      // test/unit-setup.ts rewrites process.env.HOME to an isolated temp dir
+      // before test modules load, so on a non-root GitHub runner all three miss
+      // and the real proxy assertion never ran while the suite stayed green
+      // (measured: found=NONE under the isolated HOME). setup-bun only puts bun
+      // on PATH, so PATH is what we resolve; if CI still cannot find it that is a
+      // broken workflow, not a reason to skip.
+      if (process.env.CI) throw new Error('bun not found on PATH; this test must not be skipped in CI');
+      return;
+    }
 
     const { createServer } = await import('node:http');
     const servers: import('node:http').Server[] = [];

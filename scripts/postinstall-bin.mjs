@@ -261,5 +261,3 @@ if (!(process.env.PATH ?? '').split(':').includes(binDir)) {
     console.log(`[botmux] add ${binDir} to your PATH so this launcher is the \`botmux\` your shell finds`);
   }
 }
-
-

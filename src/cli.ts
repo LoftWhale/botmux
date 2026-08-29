@@ -194,6 +194,7 @@ import {
   type BotCollaborationFactsByAppId,
 } from './cli/bots-list-output.js';
 import { ensureBotChatGrantMatrix, requestExactChatGrant } from './cli/exact-chat-grant-client.js';
+import { loopbackFetch } from './core/loopback-fetch.js';
 import {
   buildFooterAddressing,
   hasKnownBotMention,
@@ -4962,7 +4963,7 @@ async function postSessionCliIpc(
   } satisfies RequestInit;
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
-    : fetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+    : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
 }
 
 /** `botmux preview <port>` registers a reachable loopback Web service for the
@@ -9406,7 +9407,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         try { secret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
         const res = secret
           ? await fetchDaemonIpc(attentionPort, '/api/attention', request, secret)
-          : await fetch(`http://127.0.0.1:${attentionPort}/api/attention`, request);
+          : await loopbackFetch(`http://127.0.0.1:${attentionPort}/api/attention`, request);
         if (!res.ok) throw new Error(`daemon HTTP ${res.status}`);
         attentionRaised = true;
         console.error(`🙋 已举手：本会话已进 dashboard「需要你」列（用户回复后自动撤下）`);
@@ -9530,7 +9531,7 @@ async function postCurrentSessionDaemonRoute(input: {
     relayDir,
     process.env.BOTMUX_ORIGIN_CHANNEL_ID,
   );
-  return fetch(`http://127.0.0.1:${port}${input.path}`, {
+  return loopbackFetch(`http://127.0.0.1:${port}${input.path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -10751,7 +10752,7 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
     }
     res = hostSecret
       ? await fetchDaemonIpc(daemon.ipcPort, '/api/asks', init, hostSecret)
-      : await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, init);
+      : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, init);
   } catch (fetchErr) {
     // Socket refused / reset / timeout → daemon is down or restarting → retryable.
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
@@ -11255,7 +11256,7 @@ async function cmdSessionReady(): Promise<void> {
         try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
       }
       if (!hostSecret) {
-        await fetch(`http://127.0.0.1:${ipcPort}/api/session-ready`, init);
+        await loopbackFetch(`http://127.0.0.1:${ipcPort}/api/session-ready`, init);
       } else {
         await fetchDaemonIpc(ipcPort, '/api/session-ready', init, hostSecret);
       }
@@ -11356,7 +11357,7 @@ async function cmdUserPromptHook(): Promise<void> {
     const path = `/api/sessions/${encodeURIComponent(sessionId)}/prompt-ctx/claim`;
     const res = hostSecret
       ? await fetchDaemonIpc(ipcPort, path, init, hostSecret)
-      : await fetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+      : await loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
     if (res.status !== 200) process.exit(0);
     const data = await res.json() as { envelope?: unknown };
     const envelope = typeof data?.envelope === 'string' ? data.envelope : undefined;
