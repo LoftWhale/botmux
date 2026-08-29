@@ -431,7 +431,14 @@ function parseJlist(stdout: string): Array<{ name?: unknown }> {
  * So decide from what the God actually supervises, not from the directory name:
  *
  *  1. Live, identity-verified legacy daemons in `pids/` → yes, a real fleet.
- *  2. Otherwise look at the God's direct children — a pm2 God's apps ARE its
+ *  2. A legacy app name among the God's own log files → yes. DURABLE, and it
+ *     covers a window the other signals do not: while pm2 is restarting a crashed
+ *     app, its `pids/` record is DELETED and it has no process yet, so both live
+ *     signals read empty — MEASURED at ~3s for a default restart delay (`jlist`
+ *     reported `status: waiting restart` throughout). Without this a `restart`
+ *     landing inside that window would call a real legacy fleet "not a fleet" and
+ *     skip reaping it, which is the one direction that must never happen.
+ *  3. Otherwise look at the God's direct children — a pm2 God's apps ARE its
  *     direct children (verified: an app started under a throwaway PM2_HOME had
  *     the God as its ppid). A child counts as fleet evidence only if its cmdline
  *     identifies it as a legacy botmux daemon, the same test `pids/` entries must
@@ -467,6 +474,7 @@ function parseJlist(stdout: string): Array<{ name?: unknown }> {
  */
 function godLooksLikeLegacyFleet(god: Pm2God): boolean {
   if (legacyProcsFromPidsDir(god.home).length > 0) return true;
+  if (homeHasLegacyAppLogs(god.home)) return true;
   if (god.pid <= 0) return true;                   // socket-only → cannot tell
   if (process.platform !== 'linux') return true;   // no /proc → cannot tell
   let tasks: string[];
@@ -486,6 +494,33 @@ function godLooksLikeLegacyFleet(god: Pm2God): boolean {
   }
   if (!readAny) return true;                       // could not read ANY task → cannot tell
   return children.some((pid) => looksLikeLegacyBotmuxDaemon(pid));
+}
+
+/**
+ * Has this home EVER hosted a legacy botmux app, per the God's own log files?
+ *
+ * A DURABLE third signal, needed because the other two are both transient. pm2
+ * names its per-app logs `logs/<app name>-out.log` / `-error.log`, and unlike
+ * `pids/` those files are NOT removed when an app stops — so they still say what
+ * this God is for during the window described in `godLooksLikeLegacyFleet`.
+ *
+ * MEASURED under one real God running both kinds: `botmux-0-out.log` alongside
+ * `botmux-plugin-agent-chrome-out.log`. The names are app-name-prefixed, so the
+ * same `isBotmuxPm2Name` test that filters `pids/` and `jlist` rows separates
+ * them here too — a plugin-only home yields no match.
+ *
+ * This is evidence of history, not of a live process, which is why it is only
+ * consulted to decide "might this God be the legacy fleet's" — never to signal
+ * anything. Acting on it means at worst re-examining a God we then find nothing
+ * to reap under (a warning), rather than skipping a live fleet.
+ */
+function homeHasLegacyAppLogs(home: string): boolean {
+  let entries: string[];
+  try { entries = readdirSync(join(home, 'logs')); } catch { return false; }
+  return entries.some((f) => {
+    const m = /^(.+?)-(?:out|error)\.log$/.exec(f);
+    return m ? isBotmuxPm2Name(m[1].replace(/-\d+$/, '')) || isBotmuxPm2Name(m[1]) : false;
+  });
 }
 
 /**

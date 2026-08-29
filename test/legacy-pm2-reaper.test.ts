@@ -743,6 +743,53 @@ describe('reapLegacyPm2', () => {
     expect(alive(daemon)).toBe(false);
   });
 
+  it('STILL treats it as a fleet while pm2 is RESTARTING a crashed legacy app', () => {
+    // THE WINDOW: when a pm2 app dies, pm2 DELETES its pids/ record and has no
+    // process for it until the restart delay elapses — MEASURED at ~3s under a
+    // real God, with `jlist` reporting `status: waiting restart` throughout. So
+    // both live signals (pids/, God children) read EMPTY for a real legacy fleet.
+    // A `restart` landing in that window must not conclude "not a fleet" and skip
+    // reaping — that is the double-run this module exists to prevent. pm2's own
+    // per-app LOG FILES are not deleted with the app, so they still identify the
+    // home. (Verified on the affected devbox that its logs/ dir is EMPTY, so this
+    // durable signal does not resurrect the false alarm fixed above.)
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    const home = join(configDir, 'pm2');
+    // A God supervising only a plugin service right now...
+    liveGodSupervisingTagged(home, '/opt/agent-chrome/server.js');
+    // ...with NO pids/ records at all (pm2 removed the crashed app's file)...
+    // ...but the legacy app's logs still on disk, exactly as pm2 leaves them.
+    mkdirSync(join(home, 'logs'), { recursive: true });
+    writeFileSync(join(home, 'logs', 'botmux-0-out.log'), '');
+    writeFileSync(join(home, 'logs', 'botmux-0-error.log'), '');
+
+    const r = reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    expect(r.found).toBe(true);        // treated as a fleet → reaping is attempted
+    expect(r.unresolved).toBe(true);   // ...and honestly reported as unconfirmed
+  });
+
+  it('plugin-only log files are not mistaken for a legacy fleet', () => {
+    // The other side of the same signal: a home that only ever ran plugin
+    // services has `botmux-plugin-*` logs, which must NOT count (MEASURED: one
+    // God produced `botmux-0-out.log` and `botmux-plugin-agent-chrome-out.log`
+    // side by side, so the names really are the discriminator).
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    const home = join(configDir, 'pm2');
+    const { god } = liveGodSupervisingTagged(home, '/opt/agent-chrome/server.js');
+    mkdirSync(join(home, 'logs'), { recursive: true });
+    writeFileSync(join(home, 'logs', 'botmux-plugin-agent-chrome-out.log'), '');
+    writeFileSync(join(home, 'logs', 'botmux-plugin-agent-chrome-error.log'), '');
+
+    const r = reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    expect(r.found).toBe(false);
+    expect(r.unresolved).toBe(false);
+    expect(alive(god)).toBe(true);
+  });
+
   it('does NOT mark the shared-home outcome unresolved (its God is spared by design)', () => {
     // `unresolved` drives an operator-facing warning, so it must not fire on the
     // normal shared-home path: there we deliberately never kill the God, and
