@@ -285,6 +285,24 @@ describe('claude-code buildArgs', () => {
     expect(sys).toContain('</botmux_routing>');
   });
 
+  it('keeps identity name/open_id but drops the @-collaboration routing_rules for no-transport', () => {
+    // codex #1098 review: identityBlock carries the same @/silence/collaboration
+    // semantics as routingInner and IS injected even for a NORMAL bot on an HTTP
+    // task (botName/botOpenId passed unconditionally, R1). Gate it too — keep the
+    // harmless name/open_id facts, drop only the routing_rules.
+    const on = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', noTransport: true });
+    expect(on).toContain('<identity>');
+    expect(on).toContain('<name>Bot</name>');
+    expect(on).toContain('<open_id>ou_x</open_id>');
+    expect(on).not.toContain('<routing_rules>');
+    expect(on).not.toContain('MUST');       // mention_must gone
+    expect(on).not.toContain('botmux send'); // no --mention directive anywhere
+    // Transport-enabled keeps the full identity routing_rules (baseline).
+    const off = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x' });
+    expect(off).toContain('<routing_rules>');
+    expect(off).toContain('botmux send --mention');
+  });
+
   it('keeps the full routing block for a transport-enabled session (default, no gate)', () => {
     // Guard the negative: without noTransport the send/@/silence lines stay,
     // byte-for-byte the pre-feature baseline (default arg is falsy/omitted).

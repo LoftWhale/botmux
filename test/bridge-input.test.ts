@@ -5,7 +5,7 @@
  * botmux send" hints.
  */
 import { describe, it, expect } from 'vitest';
-import { buildBridgeInputContent, buildFollowUpContent } from '../src/core/session-manager.js';
+import { buildBridgeInputContent, buildFollowUpContent, buildNewTopicPrompt } from '../src/core/session-manager.js';
 import type { LarkAttachment, LarkMention } from '../src/types.js';
 
 describe('buildBridgeInputContent', () => {
@@ -165,5 +165,32 @@ describe('buildBridgeInputContent', () => {
     });
     expect(out).toContain('<botmux_reminder>');
     expect(out).toContain('BOTMUX_NOTHING_TO_SEND');
+  });
+
+  // ── no-transport identity gate (质量①, codex #1098 review): the non-injects
+  //    first-turn <identity> block carries short_routing (the --mention collab
+  //    requirement). For an HTTP virtual session it must keep name/open_id but
+  //    drop routing_rules — botIdentity reaches HTTP turns even for a normal bot.
+  it('drops the identity routing_rules for an HTTP virtual first turn, keeps name/open_id', () => {
+    const out = buildNewTopicPrompt(
+      'hi', 'sid-http', 'codex', undefined, undefined, undefined, undefined, undefined,
+      { name: 'MyBot', openId: 'ou_abc' }, 'en', undefined,
+      { larkAppId: 'app1', chatId: 'http_async_x' },
+    );
+    expect(out).toContain('<identity>');
+    expect(out).toContain('<name>MyBot</name>');
+    expect(out).toContain('<open_id>ou_abc</open_id>');
+    expect(out).not.toContain('<routing_rules>');
+    expect(out).not.toContain('botmux send'); // no --mention directive leaks
+  });
+
+  it('keeps the identity routing_rules for a real Feishu first turn', () => {
+    const out = buildNewTopicPrompt(
+      'hi', 'sid-real', 'codex', undefined, undefined, undefined, undefined, undefined,
+      { name: 'MyBot', openId: 'ou_abc' }, 'en', undefined,
+      { larkAppId: 'app1', chatId: 'oc_realchat' },
+    );
+    expect(out).toContain('<routing_rules>');
+    expect(out).toContain('botmux send --mention');
   });
 });

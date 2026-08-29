@@ -168,6 +168,16 @@ export function buildBotmuxSystemPromptText(opts: {
   const workflowHint = workflowDiscoveryHint(locale);
   const prose = (key: string): string =>
     escapeXmlTagLikeTokens(t(key, undefined, locale));
+  // identity carries the bot's name/open_id PLUS routing_rules that are the same
+  // @/collaboration/silence semantics gated out of routingInner above. For a
+  // no-transport session these routing_rules are noise and `rule_silent_when_other`
+  // has slight tension with http_response_mode — so drop the rules but KEEP the
+  // name/open_id (a program task may legitimately reference who it is; those are
+  // harmless facts, not collaboration directives). NOTE: `botName`/`botOpenId` are
+  // passed unconditionally from cfg (worker.ts) even for a NORMAL bot serving an
+  // HTTP task (R1) — so this block IS injected there; gating only routingInner
+  // would leave the same @-rules leaking via identity. Mirrors the session-manager
+  // non-injects path (short_routing) which is gated the same way.
   const identityBlock =
     botName || botOpenId
       ? [
@@ -175,13 +185,17 @@ export function buildBotmuxSystemPromptText(opts: {
         '<identity>',
         `  <name>${botName ?? unknown}</name>`,
         `  <open_id>${botOpenId ?? unknown}</open_id>`,
-        '  <routing_rules>',
-        `    ${prose('ai.identity.routing_intro')}`,
-        `    ${prose('ai.identity.rule_own_part')}`,
-        `    ${prose('ai.identity.rule_silent_when_other')}`,
-        `    ${prose('ai.identity.rule_no_proactive_pull')}`,
-        `    ${prose('ai.identity.mention_must')}`,
-        '  </routing_rules>',
+        ...(noTransport
+          ? []
+          : [
+            '  <routing_rules>',
+            `    ${prose('ai.identity.routing_intro')}`,
+            `    ${prose('ai.identity.rule_own_part')}`,
+            `    ${prose('ai.identity.rule_silent_when_other')}`,
+            `    ${prose('ai.identity.rule_no_proactive_pull')}`,
+            `    ${prose('ai.identity.mention_must')}`,
+            '  </routing_rules>',
+          ]),
         '</identity>',
       ]
       : [];

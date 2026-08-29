@@ -1136,11 +1136,19 @@ export function buildNewTopicPrompt(
   const unknown = t('ai.identity.unknown', undefined, locale);
   let identityBlock = '';
   if (botIdentity && (botIdentity.name || botIdentity.openId)) {
+    // No-transport (apiOnly bot / HTTP virtual chat): keep name/open_id but drop
+    // the short_routing rule (--mention collaboration requirement) — same gate as
+    // the routing block above and the system-prompt identity path in
+    // buildBotmuxSystemPromptText. botIdentity is passed even for a NORMAL bot
+    // running an HTTP task (R1), so this block reaches HTTP turns and must gate too.
+    const identityNoTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
     identityBlock = [
       '<identity>',
       `  <name>${xmlEscape(botIdentity.name ?? unknown)}</name>`,
       `  <open_id>${xmlEscape(botIdentity.openId ?? unknown)}</open_id>`,
-      `  <routing_rules>${escapeXmlTagLikeTokens(t('ai.identity.short_routing', undefined, locale))}</routing_rules>`,
+      ...(identityNoTransport
+        ? []
+        : [`  <routing_rules>${escapeXmlTagLikeTokens(t('ai.identity.short_routing', undefined, locale))}</routing_rules>`]),
       '</identity>',
     ].join('\n');
   }
