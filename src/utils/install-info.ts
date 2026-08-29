@@ -11,6 +11,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isStandaloneBinary } from '../core/self-spawn.js';
 
 /** Pure check: is `rootDir` a source working copy rather than an npm install? */
 export function isLocalDevInstallAt(rootDir: string): boolean {
@@ -19,10 +20,32 @@ export function isLocalDevInstallAt(rootDir: string): boolean {
 
 let cached: boolean | undefined;
 
-/** Classify this running install. Cached — it cannot change at runtime. */
+/**
+ * Classify this running install. Cached — it cannot change at runtime.
+ *
+ * ⚠️ A COMPILED BINARY IS NEVER A SOURCE CHECKOUT, and the naive check cannot
+ * see that. `packageRoot()` walks up looking for package.json; inside a
+ * single-file executable there is none on disk (the module graph lives in the
+ * virtual `/$bunfs/`), so it returns `/` — and the test then becomes "does the
+ * FILESYSTEM ROOT have .git or src?". On this box neither exists so the answer is
+ * accidentally correct, but plenty of container images do have `/src`, and there
+ * the compiled binary would be misclassified as a dev checkout and sent down the
+ * `git pull --ff-only` update path.
+ *
+ * The standalone check is therefore an explicit early return, not a refinement of
+ * the filesystem probe. Node behaviour is bit-for-bit unchanged.
+ */
 export function isLocalDevInstall(): boolean {
-  if (cached === undefined) cached = isLocalDevInstallAt(packageRoot());
+  if (cached === undefined) {
+    cached = isStandaloneBinary() ? false : isLocalDevInstallAt(packageRoot());
+  }
   return cached;
+}
+
+/** Test seam: drop the cached classification. Production never calls this — the
+ *  answer genuinely cannot change within one process. */
+export function __resetLocalDevInstallCacheForTests(): void {
+  cached = undefined;
 }
 
 /**

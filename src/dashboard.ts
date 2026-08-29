@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
+import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
@@ -4054,7 +4055,16 @@ const server = createServer(async (req, res) => {
       const current = currentInstalledVersion();
       const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
       const installManager = detectGlobalInstallManager(packageRoot);
-      const installPlan = tryResolveGlobalInstallPlan(packageRoot);
+      // A compiled binary has no package.json, so `packageRoot` is "/" and the
+      // plan resolution always fails — which used to grey out the update button
+      // and tell an npm user their install method is unsupported. Resolve the
+      // strategy by BINARY LOCATION first; only fall back to the package-root
+      // classification for the Node path (unchanged there).
+      const updateStrategy = currentUpdateStrategy(packageRoot);
+      const installPlan = updateStrategy.kind === 'package-manager'
+        ? tryResolveGlobalInstallPlan(updateStrategy.packageRoot)
+        : null;
+      const selfReplace = updateStrategy.kind === 'self-replace';
       // Compare against the npm `latest` dist-tag (always stable; the update
       // button installs `@latest`). isNewerVersion uses semver precedence, so a
       // canary running AHEAD of the latest stable (e.g. 2.87.0-canary.0 vs
@@ -4101,9 +4111,13 @@ const server = createServer(async (req, res) => {
         // the wrapper points at is a real git worktree; otherwise the button
         // stays disabled (there is nothing to pull).
         localDevUpdatable: localDev && isGitWorktree(resolveLocalDevCheckoutDir()),
-        updateSupported: installPlan !== null,
-        updateManager: installPlan?.manager ?? installManager,
-        updateCommand: installPlan ? formatGlobalInstallCommand(installPlan) : null,
+        updateSupported: installPlan !== null || selfReplace,
+        // The standalone binary is not owned by a package manager; report it as
+        // its own kind rather than letting the UI claim "npm/pnpm/Bun only".
+        updateManager: selfReplace ? 'binary' : (installPlan?.manager ?? installManager),
+        updateCommand: selfReplace
+          ? `botmux update（下载并替换 ${updateStrategy.target}）`
+          : installPlan ? formatGlobalInstallCommand(installPlan) : null,
         node: checkNode(),
         installs: detectBotmuxInstalls(),
       });
@@ -4181,6 +4195,48 @@ const server = createServer(async (req, res) => {
           // have been pulled already and only needed a build).
           restartRequired: true,
           localDev: true,
+        });
+      }
+      // 编译版独立二进制（install.sh 形态）：没有包管理器拥有这个文件，改为下载
+      // 对应平台的 release 资产、校验 SHA-256 后原子替换自身。npm 子包形态不走
+      // 这里 —— 那棵树归 npm 所有，交回 npm 更新（见 binary-self-update.ts 头部）。
+      const runStrategy = currentUpdateStrategy(botmuxInstallRoot());
+      if (runStrategy.kind === 'self-replace') {
+        if (updateInFlight) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        updateInFlight = true;
+        let acquired = false;
+        let blockedByRestart = false;
+        let oldVersion = '';
+        let newVersion = '';
+        try {
+          const latest = await cachedLatestVersion(false);
+          if (!latest.value) {
+            return jsonRes(res, 503, { ok: false, error: 'version_lookup_failed' });
+          }
+          oldVersion = currentInstalledVersion();
+          newVersion = latest.value;
+          await withFileLock(globalInstallUpdateLockTarget(), async () => {
+            acquired = true;
+            if (hasActiveRestartLease()) { blockedByRestart = true; return; }
+            await replaceStandaloneBinary(newVersion, runStrategy.target);
+          }, { maxWaitMs: 2_000 });
+        } catch (e) {
+          if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+          return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
+        } finally {
+          updateInFlight = false;
+        }
+        if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
+        return jsonRes(res, 200, {
+          ok: true,
+          oldVersion,
+          newVersion,
+          // The swapped binary is on disk but THIS process still runs (and reports)
+          // the old baked version, so `changed` cannot be derived by re-reading —
+          // it is the version comparison that decided to update at all.
+          changed: newVersion !== oldVersion,
+          restartRequired: true,
+          manager: 'binary',
         });
       }
       let installPlan: GlobalInstallPlan;

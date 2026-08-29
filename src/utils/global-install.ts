@@ -12,6 +12,11 @@ import { readdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { posix, win32 } from 'node:path';
 import { botmuxInstallRoot } from './install-info.js';
+// Import the SHAPE CLASSIFIER only (pure, no network / no release logic), not the
+// whole self-update module: binary-self-update.ts pulls in restart-report →
+// install-info, and importing that side of it from here would close an import
+// cycle through this very module.
+import { currentBinaryInstallShape } from '../core/binary-install-shape.js';
 
 export type GlobalInstallManager = 'npm' | 'pnpm' | 'bun';
 export type DetectedInstallManager = GlobalInstallManager | 'yarn' | 'unknown';
@@ -255,6 +260,13 @@ export function tryResolveGlobalInstallPlan(
 }
 
 export function isAutoUpdateSupportedInstall(): boolean {
+  // A compiled binary is not owned by a package manager, so the plan resolution
+  // below cannot classify it (its package root is "/"). It CAN still auto-update
+  // — either by handing back to npm (subpackage shape) or by replacing itself
+  // (install.sh shape) — so ask the binary-shape resolver too. Without this the
+  // Settings toggle refuses to save with `unsupported_install_no_autoupdate` on
+  // every binary install, which is now the default way botmux ships.
+  if (currentBinaryInstallShape() !== 'unknown') return true;
   return tryResolveGlobalInstallPlan() !== null;
 }
 

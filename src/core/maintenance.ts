@@ -35,16 +35,25 @@ import {
 import {
   isLocalDevInstall,
   botmuxVersion,
+  botmuxInstallRoot,
   botmuxVersionAt,
   botmuxCliEntry,
   botmuxCliEntryAt,
 } from '../utils/install-info.js';
 import {
   resolveGlobalInstallPlan,
+  formatGlobalInstallCommand,
+  UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
 } from '../utils/global-install.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { scrubWorkflowWorkerEnv, stripDashboardH5Env } from '../utils/child-env.js';
+import { isStandaloneBinary } from './self-spawn.js';
+import {
+  currentUpdateStrategy,
+  replaceStandaloneBinary,
+  type UpdateStrategy,
+} from './binary-self-update.js';
 
 export interface MaintenanceState {
   /** Local date the auto-update run was last handled (fired or skipped). */
@@ -64,6 +73,23 @@ export interface MaintenanceDeps {
   currentVersion: () => string;
   /** Updates the owning npm/pnpm/Bun global install (download/install only). */
   runUpdate: () => void;
+  /**
+   * What `runUpdate` actually installed, or '' when it could not be determined.
+   *
+   * ⚠️ WHY THIS EXISTS — `currentVersion()` CANNOT SEE A SELF-REPLACE. For a
+   * package-manager update the new version lands in the install's package.json,
+   * so re-reading it afterwards observes the change. A compiled binary has no
+   * package.json: its version is BAKED IN at compile time and read from this
+   * process's own env, so after swapping the file on disk `currentVersion()`
+   * still returns the OLD version (measured). The tick's `after !== before` gate
+   * would then be false, it would log "already on the latest version", and it
+   * would never restart onto the binary it just installed.
+   *
+   * So the self-replace path reports the version it installed explicitly, and the
+   * tick treats that as authoritative. Returns '' for the package-manager path,
+   * which keeps using the re-read comparison exactly as before.
+   */
+  installedVersion?: () => string;
   writeIntent: (intent: RestartIntent) => void;
   /** Spawn a detached `botmux restart` (this process is then killed by pm2). */
   triggerRestart: () => void;
@@ -109,7 +135,10 @@ export function runMaintenanceTick(deps: MaintenanceDeps): void {
     deps.withUpdateLock(() => {
       before = deps.currentVersion();
       deps.runUpdate();
-      after = deps.currentVersion();
+      // The self-replace path reports what it installed, because re-reading the
+      // version cannot observe a swapped binary (see MaintenanceDeps.installedVersion).
+      const reported = deps.installedVersion?.() ?? '';
+      after = reported || deps.currentVersion();
       if (after !== before && cfg.autoRestart?.enabled) {
         deps.writeIntent({ kind: 'update', oldVersion: before, newVersion: after, at: new Date(now).toISOString() });
         try {
@@ -208,6 +237,36 @@ export function installLatestBotmuxSync(plan: GlobalInstallPlan = resolveGlobalI
 }
 
 /**
+ * Apply an update for whatever install shape this process is, resolving the
+ * strategy first so a compiled binary is handled instead of being rejected as an
+ * "unsupported install".
+ *
+ * Shared by the CLI (`botmux update`), the dashboard's `/api/update/run` and the
+ * scheduled auto-update so the three cannot drift — they previously all funnelled
+ * into `resolveGlobalInstallPlan`, which is exactly the call that fails in
+ * compiled mode.
+ *
+ * @param spec  the version spec for the package-manager path, and the version to
+ *              download for the self-replace path ('latest' resolves upstream).
+ */
+export async function applyBotmuxUpdate(
+  installRoot: string,
+  version: string,
+): Promise<{ strategy: UpdateStrategy['kind']; detail: string }> {
+  const strategy = currentUpdateStrategy(installRoot);
+  if (strategy.kind === 'unsupported') {
+    throw new UnsupportedGlobalInstallError('unknown', process.execPath);
+  }
+  if (strategy.kind === 'self-replace') {
+    const r = await replaceStandaloneBinary(version, strategy.target);
+    return { strategy: 'self-replace', detail: `${r.asset} → ${r.target}` };
+  }
+  const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, `botmux@${version}`);
+  installLatestBotmuxSync(plan);
+  return { strategy: 'package-manager', detail: formatGlobalInstallCommand(plan) };
+}
+
+/**
  * Cross-process lock target that serializes global botmux updates
  * between the scheduled auto-update (this daemon process) and a
  * dashboard-triggered manual update (the separate `botmux-dashboard` process),
@@ -234,14 +293,27 @@ export function globalInstallUpdateLockTarget(): string {
  * restarts the rest (the 2026-06-11 incident). `setsid` starts it in a brand
  * new session, reparented to init, immune to botmux-0's teardown. Without
  * setsid we fall back to a plain spawn (still detached by the caller).
+ *
+ * ⚠️ COMPILED BINARY: there is no `cli.js` to pass. Under Node the shape is
+ * `node <dist/cli.js> restart`, where argv[2] is `restart`. A single-file
+ * executable IS the CLI, so the same shape becomes `<binary> <cli.js path>
+ * restart` — and argv[2] is then the PATH, not `restart`. MEASURED on the real
+ * v3.18.4 binary: it printed the help banner and **exited 0**, i.e. a restart
+ * that silently never happened while reporting success. So in standalone mode the
+ * entry argument is dropped entirely and the binary is invoked as
+ * `<binary> restart`.
  */
 export function buildRestartLauncher(
   node: string,
   cliEntry: string,
   hasSetsid: boolean,
+  standalone = false,
 ): { cmd: string; args: string[] } {
-  if (hasSetsid) return { cmd: 'setsid', args: [node, cliEntry, 'restart'] };
-  return { cmd: node, args: [cliEntry, 'restart'] };
+  // A compiled binary dispatches its own subcommands; passing a cli.js path
+  // would shift `restart` to argv[3] where nothing reads it.
+  const entryArgs = standalone ? ['restart'] : [cliEntry, 'restart'];
+  if (hasSetsid) return { cmd: 'setsid', args: [node, ...entryArgs] };
+  return { cmd: node, args: entryArgs };
 }
 
 export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
@@ -317,8 +389,13 @@ export function spawnDetachedRestart(
   } catch {
     fd = undefined; // fall back to discarding output rather than failing the restart
   }
+  // A compiled binary has no cli.js on disk: `botmuxCliEntryAt` would hand back a
+  // path that does not exist (measured: "/dist/cli.js"), and passing it shifts the
+  // subcommand out of argv[2]. buildRestartLauncher drops it in that mode; we
+  // still compute it for the Node path, which is unchanged.
+  const standalone = isStandaloneBinary();
   const cliEntry = activePackageRoot ? botmuxCliEntryAt(activePackageRoot) : botmuxCliEntry();
-  const { cmd, args } = buildRestartLauncher(process.execPath, cliEntry, setsidAvailable());
+  const { cmd, args } = buildRestartLauncher(process.execPath, cliEntry, setsidAvailable(), standalone);
   const child = spawn(cmd, args, {
     detached: true,
     stdio: fd !== undefined ? ['ignore', fd, fd] : 'ignore',
@@ -344,11 +421,45 @@ export function spawnDetachedRestart(
   return child;
 }
 
+/**
+ * Perform a binary self-replace in a CHILD process and block until it finishes.
+ *
+ * WHY A CHILD AND NOT AN `await` HERE: `runMaintenanceTick` is synchronous and
+ * runs inside `withFileLockSync`, so it cannot await the download. Re-execing this
+ * same binary with a hidden `__self-update` subcommand keeps the lock semantics
+ * byte-identical to the package-manager branch (spawn one child, wait, throw on a
+ * non-zero exit) without turning the whole tick async — which would change the
+ * locking shape for the npm path too, the one that is currently working.
+ *
+ * Returns the version that was installed (printed by the child on its last line),
+ * or '' when the child reported success without a parseable version.
+ */
+export function runSelfReplaceBlocking(version = 'latest'): string {
+  const result = spawnSync(process.execPath, ['__self-update', version], {
+    cwd: globalInstallUpdateCwd(),
+    env: process.env,
+    encoding: 'utf-8',
+    // The download is ~100MB+ over a possibly proxied link; the package-manager
+    // branch has no timeout either (npm's own) so match that and let the outer
+    // schedule slip a day rather than killing a partial swap.
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const detail = (result.stderr || result.stdout || '').trim().split('\n').slice(-3).join('; ');
+    throw new Error(`self-update exited with ${result.status ?? result.signal ?? 'unknown status'}${detail ? `: ${detail}` : ''}`);
+  }
+  const m = /BOTMUX_SELF_UPDATE_VERSION=(\S+)/.exec(result.stdout || '');
+  return m?.[1] ?? '';
+}
+
 function productionDeps(): MaintenanceDeps {
   // Kept after a successful resolve so post-pnpm-update version/restart lookups
   // use the stable global node_modules/botmux symlink, not the removed
   // .pnpm/botmux@old runtime realpath.
   let installPlan: GlobalInstallPlan | undefined;
+  // Set by the self-replace path only (see MaintenanceDeps.installedVersion).
+  let selfReplacedTo = '';
   return {
     now: () => Date.now(),
     readConfig: () => readGlobalConfig().maintenance,
@@ -364,9 +475,25 @@ function productionDeps(): MaintenanceDeps {
       ? botmuxVersionAt(installPlan.activePackageRoot)
       : botmuxVersion(),
     runUpdate: () => {
-      installPlan ??= resolveGlobalInstallPlan();
+      selfReplacedTo = '';
+      const strategy = currentUpdateStrategy(botmuxInstallRoot());
+      if (strategy.kind === 'unsupported') {
+        throw new UnsupportedGlobalInstallError('unknown', process.execPath);
+      }
+      if (strategy.kind === 'self-replace') {
+        // The compiled binary owns its own file (install.sh location). The tick
+        // is synchronous and holds a cross-process lock, so run the async
+        // download to completion here rather than restructuring the whole tick:
+        // `runSelfReplaceBlocking` re-execs this binary with a hidden subcommand
+        // that performs the swap, which keeps the lock semantics identical to the
+        // package-manager branch (one child, awaited, non-zero exit ⇒ throw).
+        selfReplacedTo = runSelfReplaceBlocking();
+        return;
+      }
+      installPlan ??= resolveGlobalInstallPlan(strategy.packageRoot);
       installLatestBotmuxSync(installPlan);
     },
+    installedVersion: () => selfReplacedTo,
     writeIntent: (intent) => writeRestartIntent(intent),
     triggerRestart: () => {
       const leaseId = claimRestartLease();
