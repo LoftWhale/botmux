@@ -1816,6 +1816,12 @@ export interface OpenPlatformAppSummary {
 export interface OpenPlatformApiClient {
   apiOrigin: string;
   postJson(path: string, body?: unknown): Promise<unknown>;
+  /**
+   * 语义幂等的 console POST（重复调用无副作用：设值型 switch、只读拉取）。
+   * 与 GET/HEAD 同权享受完整的瞬态错误退避重试，且**预算只在 fetchRaw 这一层**
+   * —— 调用方不要再在外面套第二轮 retry，那会与内层相乘（实测 3×3=9 次）。
+   */
+  postJsonIdempotent(path: string, body?: unknown): Promise<unknown>;
   postForm(path: string, body: FormData): Promise<unknown>;
 }
 
@@ -1855,7 +1861,9 @@ export async function createOpenPlatformApiClient(
     };
   }
 
-  const request = async (path: string, body?: BodyInit, contentType?: string): Promise<unknown> => {
+  const request = async (
+    path: string, body?: BodyInit, contentType?: string, opts: { idempotent?: boolean } = {},
+  ): Promise<unknown> => {
     const url = `${apiOrigin}${path}`;
     const response = await session.fetchRaw(fetcher, url, {
       method: 'POST',
@@ -1867,7 +1875,7 @@ export async function createOpenPlatformApiClient(
         ...(contentType ? { 'content-type': contentType } : {}),
       },
       body,
-    });
+    }, 10, opts);
     let data: any;
     try {
       data = await response.json();
@@ -1885,9 +1893,16 @@ export async function createOpenPlatformApiClient(
 
   const postJson = async (path: string, body?: unknown): Promise<unknown> =>
     request(path, body === undefined ? undefined : JSON.stringify(body), body === undefined ? undefined : 'application/json');
+  const postJsonIdempotent = async (path: string, body?: unknown): Promise<unknown> =>
+    request(
+      path,
+      body === undefined ? undefined : JSON.stringify(body),
+      body === undefined ? undefined : 'application/json',
+      { idempotent: true },
+    );
   const postForm = async (path: string, body: FormData): Promise<unknown> => request(path, body);
 
-  return { ok: true, client: { apiOrigin, postJson, postForm }, identity };
+  return { ok: true, client: { apiOrigin, postJson, postJsonIdempotent, postForm }, identity };
 }
 
 /**
@@ -2102,10 +2117,8 @@ export async function createOpenPlatformAppWithClient(
     // robot/event switch 都是幂等设值,故对宿主机↔飞书的瞬态网络抖动小步重试:
     // 一次 undici `fetch failed` 不该让「应用已建成但没启用能力」半途而废
     // (那会把用户丢进手动读 Secret + CLI 续跑的恢复路径)。
-    await retryIdempotentOnTransientNetworkError(() =>
-      client.postJson(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true }));
-    await retryIdempotentOnTransientNetworkError(() =>
-      client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 })); // WebSocket
+    await client.postJsonIdempotent(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true });
+    await client.postJsonIdempotent(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 }); // WebSocket
 
     // 模板建出来的应用，「权限可访问的数据范围」出生就是 `mode:'all'`（console 上
     // 显示「全部」）——而这里紧接着就要发**第一个版本**。不先收窄，这一版就带着
@@ -2143,8 +2156,7 @@ export async function createOpenPlatformAppWithClient(
     // 读 Secret 是纯只读 POST(getAppSecret 同款,不触碰 reset),幂等可重试:
     // 应用已建成、已发布,唯独最后一步读 Secret 撞网络抖动而失败最可惜——
     // 重试让它自愈,而不是把整条链路判死。
-    const appSecret = await retryIdempotentOnTransientNetworkError(() =>
-      fetchOpenPlatformAppSecret(client, appId!));
+    const appSecret = await fetchOpenPlatformAppSecret(client, appId!, { idempotentRetry: true });
     return { appId, appSecret };
   } catch (err) {
     throw new CreatedOpenPlatformAppError(appId, err);
@@ -2312,8 +2324,13 @@ export async function listOpenPlatformApps(
 export async function fetchOpenPlatformAppSecret(
   client: OpenPlatformApiClient,
   clientId: string,
+  opts: { idempotentRetry?: boolean } = {},
 ): Promise<string> {
-  const payload = await client.postJson(`/developers/v1/secret/${clientId}`, {});
+  // 纯只读 POST（不触碰 reset）⟹ 语义幂等。建应用链路显式开启重试：应用已建成
+  // 已发布，唯独最后一步读 Secret 撞网络抖动最可惜。预算只在 fetchRaw 一层。
+  const payload = opts.idempotentRetry
+    ? await client.postJsonIdempotent(`/developers/v1/secret/${clientId}`, {})
+    : await client.postJson(`/developers/v1/secret/${clientId}`, {});
   const record = asRecord(payload);
   const secret = pickString(asRecord(record.data), ['secret']) ?? pickString(record, ['secret']);
   if (!secret) throw new Error('开放平台没有返回 secret 字段');
@@ -2477,37 +2494,66 @@ const TRANSIENT_FETCH_RETRY_DELAYS_MS = [300, 900];
 /**
  * 「TLS 握手完成之前连接就断了」——Node 内置 `_tls_wrap.js` 的 `onConnectEnd`
  * 唯一产出这句话（`ConnResetException`，code=ECONNRESET）。它的关键性质是
- * **可证明零副作用**，因此连非幂等写请求都能安全重放：
+ * **可证明零副作用**，因此连非幂等写请求都能安全重放。
  *
- *   • 结构上：该监听器在建 socket 时 `prependListener('end', onConnectEnd)` 挂上，
- *     并在 `onConnectSecure` 里 `removeListener('end', onConnectEnd)` 摘掉 ——
- *     所以它只可能在 `secureConnect` 之前触发。握手没完成 ⟹ 没有任何加密通道，
- *     HTTP 请求行 / 头 / body 一个字节都没能发出去。
+ * 证明链（Node + undici 的 dispatch 时序，**不是**「握手未完成 ⟹ 没有加密通道」
+ * —— 那个说法对 TLS 1.3 不成立：ServerHello 之后的握手消息已加密，协议还定义了
+ * 0-RTT early data。成立的是下面这条客户端实现约束）：
+ *   • undici 的 connector 只在 TLSSocket 的 `secureConnect` 监听器里回调
+ *     （`socket.setNoDelay(true).once('secureConnect', … cb(null, this))`），
+ *     HTTP client 拿到这个 socket 之后才 dispatch/write 请求；
+ *   • `onConnectEnd` 只在建 socket 时 `prependListener('end', …)` 挂上，并在
+ *     `onConnectSecure` 里摘掉。注意源码顺序是**先** `emit('secureConnect')`
+ *     **再** `removeListener`，所以不能说成「先摘监听器再交给 undici」；成立的是：
+ *     远端 FIN / `end` 只可能在后续 I/O 分派中被处理，而那时监听器已摘。因此这句
+ *     错误产出时，`secureConnect` 监听器没有成功走完 ⟹ undici 还没拿到可 dispatch
+ *     的连接 ⟹ 应用请求行 / 头 / body 未写出；
+ *   • Node 目前也没有让 fetch 走 TLS 0-RTT early data 的路径。
  *   • 实测（本机 TCP 抓包型探针）：服务端只收到 1583 字节且首字节 0x16
  *     （TLS handshake record），文本里 **不含** 请求方法、路径与 body 字段；
  *     对照组「握手完成后才断」收到 248 字节应用数据，且错误换成
  *     `UND_ERR_SOCKET / other side closed` —— 两类错误可靠可分。
  *
+ * 代理场景下「零字节」限定为**目标应用的 HTTP 请求**：HTTP proxy 的 CONNECT 可能
+ * 已经发给代理，但目标 POST 尚未通过隧道发出，故「无重复副作用」的结论仍成立。
+ *
  * ⚠️ 仅此一句话享受该待遇。`ECONNRESET` 本身**不够**：连接建成、请求已送达后
  * 被 RST 同样是 ECONNRESET，那种情况服务端可能已处理，重放会重复提交。
+ *
+ * ⚠️ 该形态绑定 Node/undici。Bun 原生 fetch 对同一真实故障抛的是顶层 `TypeError`
+ * （message `The socket connection was closed unexpectedly...`、code=ECONNRESET、
+ * **无 cause**），不满足本判据 ⟹ 不命中、不重试（保持旧行为）。这是已知的跨运行时
+ * 缺口而非安全问题；要覆盖 Bun 必须先为它的文案建立同等级的「只可能握手前」证明。
  */
 const PRE_TLS_DISCONNECT_MESSAGE =
   'Client network socket disconnected before secure TLS connection was established';
 
 /**
  * 传输层失败是否**可证明「请求未送达」**，即重放绝不会产生重复副作用。
- * 只认上面那一句 pre-TLS 断连（外层可能被 undici 包成
- * `TypeError('fetch failed', { cause })`，也可能藏在 happy-eyeballs 的
- * AggregateError 里，故顺 cause 链找）。
+ * 只认 {@link PRE_TLS_DISCONNECT_MESSAGE} 那一句（唯一可证明未送达的
+ * ECONNRESET）。外层会被 undici 包成 `TypeError('fetch failed', { cause })`，
+ * 故顺**单一 cause 链**找。
+ *
+ * ⚠️ 刻意**不支持 AggregateError**，这是有意收窄而非遗漏：
+ *   • 真实的 Node pre-TLS 断连本来就不是聚合体 —— `net.internalConnectMultiple`
+ *     只在**所有** TCP connect 尝试失败时才构造 `NodeAggregateError`（成员一律
+ *     来自 `createConnectionError(…, 'connect', …)`），而这句文案由
+ *     `_tls_wrap.onConnectEnd` 在某条腿 connect **成功之后**才可能产出，两者
+ *     互斥；
+ *   • 一旦支持聚合体，就要对 `.errors` 与 `AggregateError` 同样合法的 `.cause`
+ *     同时做全称量词检查，任一遗漏都是 fail-open（实测：
+ *     `new AggregateError([preTls], '', { cause: socketHangUp })` 会被放行）。
+ *     provably 的证明责任配不上这点收益。
+ *
+ * 同理，精确文案的节点若**自带 cause**，说明它不是我们证明过的那个
+ * `ConnResetException`（Node 构造它时不挂 cause），一律 fail-closed。
  */
 function isProvablyUnsentTransportError(err: unknown, depth = 0): boolean {
   if (depth > 4 || !(err instanceof Error)) return false;
   if (err.name === 'AbortError' || err.name === 'TimeoutError') return false;
+  if (err instanceof AggregateError) return false;
   if ((err as { code?: unknown }).code === 'ECONNRESET' && err.message === PRE_TLS_DISCONNECT_MESSAGE) {
-    return true;
-  }
-  if (err instanceof AggregateError && err.errors.some(item => isProvablyUnsentTransportError(item, depth + 1))) {
-    return true;
+    return err.cause === undefined;
   }
   return isProvablyUnsentTransportError((err as { cause?: unknown }).cause, depth + 1);
 }
@@ -2527,26 +2573,6 @@ function isLikelyTransientNetworkError(err: unknown, depth = 0): boolean {
     return err.cause === undefined || isLikelyTransientNetworkError(err.cause, depth + 1);
   }
   return isLikelyTransientNetworkError((err as { cause?: unknown }).cause, depth + 1);
-}
-
-// 对「幂等」console 请求复用 fetchRaw 的瞬态退避:传输层抖动(fetch failed /
-// ECONNRESET 等)时小步重试,一次网络毛刺不再中断整条链路。API 层拒绝
-// (OpenPlatformApiError、HTTP 非 2xx、code!=0)无 code / cause,isLikely… 判 false,
-// 只会立刻抛出而不会被重放。
-// ⚠️ 只能包装「重复调用无副作用」的请求。app_version/create、publish/commit 这类
-// 「传输失败即结果未知、重放会重复提交/撞版本号」的非幂等写操作绝不能用本包装
-// (与 fetchRaw 只对 GET/HEAD 重试同源:见其上方注释)。
-async function retryIdempotentOnTransientNetworkError<T>(fn: () => Promise<T>): Promise<T> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return await fn();
-    } catch (err) {
-      if (attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isLikelyTransientNetworkError(err)) {
-        throw err;
-      }
-      await sleep(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt]);
-    }
-  }
 }
 
 class MutableCookieJar {
@@ -2574,7 +2600,13 @@ class MutableCookieJar {
     };
   }
 
-  async fetchRaw(fetcher: typeof fetch, url: string, init: RequestInit = {}, maxHops = 10): Promise<Response> {
+  async fetchRaw(
+    fetcher: typeof fetch,
+    url: string,
+    init: RequestInit = {},
+    maxHops = 10,
+    opts: { idempotent?: boolean } = {},
+  ): Promise<Response> {
     let current = url;
     let referer: string | undefined;
     // 幂等的 GET/HEAD：任意瞬态网络错误都可小步退避重试。
@@ -2583,8 +2615,12 @@ class MutableCookieJar {
     // 可证明请求一个字节都没发出去（见 isProvablyUnsentTransportError），重放
     // 不可能产生重复副作用；不放过它的代价是一次网络毛刺就让用户的改名/改头像
     // 整轮失败。
+    // `opts.idempotent` 让调用方声明「这个 POST 重复调用无副作用」（robot/event
+    // switch 设值、只读拉 Secret），从而与 GET/HEAD 同权：认全部瞬态错误。
+    // 关键是预算**只此一层**——历史上这三处在外层另包了一轮 retry，与内层相乘
+    // 成 9 次（实测 4.8s 退避）；预算集中在这里后总尝试恒为 3。
     const method = (init.method ?? 'GET').toUpperCase();
-    const retryable = method === 'GET' || method === 'HEAD';
+    const retryable = opts.idempotent === true || method === 'GET' || method === 'HEAD';
     for (let hop = 0; hop <= maxHops; hop += 1) {
       const headers = new Headers(init.headers);
       const cookieHeader = getCookieHeader(this.cookies, current);

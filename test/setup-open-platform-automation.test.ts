@@ -46,6 +46,7 @@ import {
   readStoredCookiesFromSessionFile,
   safeErrorMessage,
   selectPrivilegesNeedingAppAvailability,
+  type OpenPlatformApiClient,
   type StoredCookie,
   vcListenerEventGateError,
   writeRedirectWhitelist,
@@ -3341,6 +3342,120 @@ describe('pre-TLS 断连：可证明未送达，写操作也重试', () => {
     const h = await postWith(aborted, 1);
     await expect(h.client.postJson('/developers/v1/base_info/cli_x', {})).rejects.toThrow('fetch failed');
     expect(h.attempts()).toBe(1);
+  });
+
+  // AggregateError 一律不支持（有意收窄）：真实 Node pre-TLS 断连不是聚合体
+  // ——`net.internalConnectMultiple` 只在**所有** TCP connect 失败时构造
+  // NodeAggregateError，而这句文案由 `_tls_wrap.onConnectEnd` 在某条腿 connect
+  // **成功之后**才可能产出，两者互斥。支持聚合体就得对 `.errors` 与同样合法的
+  // `.cause` 都做全称量词检查，任一遗漏即 fail-open，证明责任配不上收益。
+  it.each([
+    ['全部成员都是 pre-TLS 文案', () => new AggregateError([
+      Object.assign(new Error('Client network socket disconnected before secure TLS connection was established'), { code: 'ECONNRESET' }),
+    ], '')],
+    ['混合成员（一条已送达）', () => new AggregateError([
+      Object.assign(new Error('Client network socket disconnected before secure TLS connection was established'), { code: 'ECONNRESET' }),
+      Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }),
+    ], '')],
+    ['成员安全但 aggregate 自带不安全 cause', () => new AggregateError([
+      Object.assign(new Error('Client network socket disconnected before secure TLS connection was established'), { code: 'ECONNRESET' }),
+    ], '', { cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) })],
+    ['空 errors', () => new AggregateError([], '')],
+  ])('AggregateError（%s）的写操作一律不重试', async (_label, mk) => {
+    const h = await postWith(() => new TypeError('fetch failed', { cause: mk() }), 1);
+    await expect(h.client.postJson('/developers/v1/app_version/create/cli_x', {}))
+      .rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(1);
+  });
+
+  it('精确文案节点自带 cause 时 fail-closed（Node 构造 ConnResetException 不挂 cause）', async () => {
+    const tampered = () => {
+      const leaf = Object.assign(
+        new Error('Client network socket disconnected before secure TLS connection was established'),
+        { code: 'ECONNRESET' },
+      );
+      (leaf as any).cause = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+      return new TypeError('fetch failed', { cause: leaf });
+    };
+    const h = await postWith(tampered, 1);
+    await expect(h.client.postJson('/developers/v1/publish/commit/cli_x/v1', {}))
+      .rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(1);
+  });
+
+  // 运行时边界：本特判绑定 Node/undici 的错误形态。Bun 原生 fetch 对同一真实
+  // 故障（accept 后立即断）抛的是顶层 `TypeError`、message
+  // `The socket connection was closed unexpectedly...`、code=ECONNRESET、**无
+  // cause**，不满足精确文案 ⟹ 不会命中。这是**已知的跨运行时缺口**而非安全
+  // 问题（不重试 = 保持旧行为）；要覆盖 Bun 必须先为它的文案建立同等级
+  // 「只可能握手前」证明，不能只凭 code=ECONNRESET。本用例把该边界钉住，
+  // 避免日后有人误以为 Bun 路径已被覆盖。
+  it('Bun 原生 pre-TLS 错误形态（无 cause）不命中特判 —— 已知跨运行时缺口', async () => {
+    const bunShaped = () => Object.assign(
+      new TypeError('The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()'),
+      { code: 'ECONNRESET' },
+    );
+    const h = await postWith(bunShaped, 1);
+    await expect(h.client.postJson('/developers/v1/base_info/cli_x', {}))
+      .rejects.toThrow('socket connection was closed');
+    expect(h.attempts()).toBe(1);
+  });
+});
+
+// 语义幂等的 console POST（robot/event switch 设值、只读拉 Secret）与 GET/HEAD 同权
+// 认全部瞬态错误，但**预算只在 fetchRaw 这一层**。历史上这三处在外层另包了一轮
+// retry，与内层相乘成 3×3=9 次（实测 4.8s 退避）；更隐蔽的是**异构错误序列**——
+// 内层先遇 2 次 pre-TLS、第 3 次是普通 reset 时，外层看到的是普通 reset 于是又跑
+// 一轮，最坏仍能到 9。故断言各种序列下总尝试恒为 3。
+describe('语义幂等 POST 的统一重试预算（防乘法重试回归）', () => {
+  const PRE_TLS = 'Client network socket disconnected before secure TLS connection was established';
+  const preTls = () => new TypeError('fetch failed', {
+    cause: Object.assign(new Error(PRE_TLS), { code: 'ECONNRESET' }),
+  });
+  const genericReset = () => new TypeError('fetch failed', {
+    cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+  });
+
+  /** 按序列逐次抛错（用尽后继续抛最后一个），返回真实发出的 POST 次数。 */
+  async function attemptsFor(
+    sequence: Array<() => Error>,
+    call: (client: OpenPlatformApiClient) => Promise<unknown>,
+  ): Promise<number> {
+    let posts = 0;
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') {
+        const idx = posts;
+        posts += 1;
+        throw (sequence[idx] ?? sequence[sequence.length - 1])();
+      }
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+    const clientResult = await createOpenPlatformApiClient([cookie()], { fetchImpl });
+    expect(clientResult.ok).toBe(true);
+    if (!clientResult.ok) throw new Error('client construction failed');
+    await expect(call(clientResult.client)).rejects.toThrow();
+    return posts;
+  }
+
+  it.each([
+    ['全部 pre-TLS', [preTls]],
+    ['全部普通 reset', [genericReset]],
+    // 这一格是真实乘法 bug 的形态：外层只按「最终错误」短路时守不住 3。
+    ['异构：pre-TLS, pre-TLS, 普通 reset…', [preTls, preTls, genericReset]],
+    ['异构：普通 reset, pre-TLS…', [genericReset, preTls]],
+  ])('postJsonIdempotent 在「%s」下总尝试恒为 3', async (_label, seq) => {
+    const posts = await attemptsFor(
+      seq,
+      client => client.postJsonIdempotent('/developers/v1/robot/switch/cli_x', { clientId: 'cli_x', enable: true }),
+    );
+    expect(posts).toBe(3);
+  });
+
+  it('普通 postJson 不因此变宽：pre-TLS 仍 3 次，普通 reset 仍 1 次', async () => {
+    expect(await attemptsFor([preTls], c => c.postJson('/developers/v1/app_version/create/cli_x', {}))).toBe(3);
+    expect(await attemptsFor([genericReset], c => c.postJson('/developers/v1/app_version/create/cli_x', {}))).toBe(1);
   });
 });
 
