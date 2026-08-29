@@ -166,7 +166,11 @@ export function loopbackFetch(
   // bracketed form through was rejected as `remote_host_forbidden`, i.e. a legal
   // IPv6 loopback URL could never be dialled (measured against a `::1` server).
   const host = normaliseLoopbackHost(target.hostname) as LiteralLoopbackHost;
-  const port = Number(target.port);
+  // `URL` normalises away a scheme's DEFAULT port, so both `http://127.0.0.1/x` and
+  // an explicit `http://127.0.0.1:80/x` yield `port === ''` — `Number('')` is 0 and
+  // was rejected as `invalid_port` (measured against a local server on :80, which the
+  // native fetch reaches fine). Fill in the scheme default.
+  const port = target.port ? Number(target.port) : 80;
   const method = (init.method ?? 'GET').toUpperCase();
   const headers = headerEntries(init.headers);
   const body = bodyToBuffer(init.body);
@@ -307,9 +311,24 @@ export function isLoopbackUrl(url: string): boolean {
   }
 }
 
-/** Strip the brackets `URL.hostname` keeps around IPv6 literals. */
+/**
+ * Canonicalise a hostname for the loopback allow-list.
+ *
+ *  · Strips the brackets `URL.hostname` keeps around IPv6 literals.
+ *  · Maps `localhost` to `127.0.0.1`.
+ *
+ * ⚠️ `localhost` USED to be rejected here, on the reasoning that "a DNS name is
+ * not a loopback guarantee". That was backwards: refusing it did not avoid a
+ * lookup, it pushed the request onto the GLOBAL fetch, which then proxied it —
+ * measured with a self-hosted TTS endpoint, the `Authorization: Bearer …` header
+ * arrived at the stand-in proxy. `localhost` is reserved for loopback by RFC 6761,
+ * and mapping it here means we dial the literal address and never resolve DNS at
+ * all, which is strictly safer than the alternative. Every OTHER hostname stays
+ * rejected — that is where the rebinding concern actually applies.
+ */
 function normaliseLoopbackHost(hostname: string): string {
-  return hostname.startsWith('[') && hostname.endsWith(']')
+  const bare = hostname.startsWith('[') && hostname.endsWith(']')
     ? hostname.slice(1, -1)
     : hostname;
+  return bare === 'localhost' ? '127.0.0.1' : bare;
 }

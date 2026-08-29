@@ -242,6 +242,32 @@ describe('loopbackFetch — hosts and statuses that used to be mis-handled', () 
       .rejects.toThrow(/only http:/);
   });
 
+  it('derives port 80 when the URL omits it (URL drops the scheme default)', async () => {
+    // `new URL('http://127.0.0.1:80/x').port` is '' — for the implicit AND the
+    // explicit form. `Number('')` is 0, which the loopback guard rejected as
+    // `invalid_port`, so a service on the standard port was unreachable while the
+    // native fetch handled it fine.
+    expect(new URL('http://127.0.0.1:80/x').port).toBe('');   // the trap, pinned
+    // Whatever happens next (connect, refuse, whatever is on :80 here), it must not
+    // be a rejection about the port itself.
+    for (const url of ['http://127.0.0.1/x', 'http://127.0.0.1:80/x']) {
+      const outcome = await loopbackFetch(url).then(() => 'resolved', (e: Error) => e.message);
+      expect(outcome).not.toMatch(/invalid_port/);
+    }
+  }, 15_000);
+
+  it('accepts localhost by mapping it to the literal address', async () => {
+    // Rejecting `localhost` did not avoid a DNS lookup — it pushed the caller onto
+    // the global fetch, which then proxied the request (measured: a Bearer token
+    // reached the stand-in proxy). Mapping it here means we dial 127.0.0.1 directly
+    // and never resolve anything.
+    const port = await listen((_q, r) => { r.writeHead(200); r.end('via-localhost'); });
+    const res = await loopbackFetch(`http://localhost:${port}/x`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('via-localhost');
+    expect(isLoopbackUrl(`http://localhost:${port}/x`)).toBe(true);
+  }, 15_000);
+
   it('gives a HEAD response a null body', async () => {
     const port = await listen((_q, r) => { r.writeHead(200, { 'content-length': '5' }); r.end(); });
     const res = await loopbackFetch(`http://127.0.0.1:${port}/x`, { method: 'HEAD' });
@@ -255,7 +281,9 @@ describe('isLoopbackUrl', () => {
     expect(isLoopbackUrl('http://127.0.0.1:7891/x')).toBe(true);
     expect(isLoopbackUrl('http://[::1]:7891/x')).toBe(true);
     // A DNS name is not a loopback guarantee even if it resolves there today.
-    expect(isLoopbackUrl('http://localhost:7891/x')).toBe(false);
+    // localhost is reserved for loopback (RFC 6761) and we dial the literal address,
+    // so accepting it is strictly safer than pushing the caller onto a proxied fetch.
+    expect(isLoopbackUrl('http://localhost:7891/x')).toBe(true);
     expect(isLoopbackUrl('https://dash.example.com/x')).toBe(false);
     expect(isLoopbackUrl('not a url')).toBe(false);
   });
