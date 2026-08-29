@@ -853,7 +853,19 @@ export function BotDefaultsPage() {
               }))}
               onChange={sourceAppId => {
                 setOnboardingBusy(true);
-                void openBotOnboarding(sourceAppId).finally(() => setOnboardingBusy(false));
+                // 把源 Bot 的 CLI / 目录 / model 一并带进弹窗预填：克隆时后端会用
+                // 源 Bot 覆盖这几项，表单必须显示真正会生效的值，否则用户白填。
+                const source = bots.find(bot => bot.larkAppId === sourceAppId);
+                const sourceDefaults = source
+                  ? {
+                      ...(source.cliId ? { cliId: source.cliId } : {}),
+                      ...(source.defaultWorkingDir
+                        ? { workingDir: source.defaultWorkingDir, dirMode: 'fixed' as const }
+                        : {}),
+                      ...(source.model ? { model: source.model } : {}),
+                    }
+                  : undefined;
+                void openBotOnboarding(sourceAppId, sourceDefaults).finally(() => setOnboardingBusy(false));
               }}
             />
           ) : null}

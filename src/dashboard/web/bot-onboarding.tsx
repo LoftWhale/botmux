@@ -7,7 +7,17 @@ import { confirm } from './confirm-modal.js';
 import { t } from './ui.js';
 
 export const OPEN_BOT_ONBOARDING_EVENT = 'botmux:open-bot-onboarding';
+
+/** 克隆源 Bot 里会被 cloneBotConfig 带过去、且表单里也有对应项的字段。 */
+export type CloneSourceDefaults = {
+  cliId?: string;
+  workingDir?: string;
+  dirMode?: 'card' | 'fixed';
+  model?: string;
+};
+
 let cloneSourceAppId: string | undefined;
+let cloneSourceDefaults: CloneSourceDefaults | undefined;
 
 type OnboardingStatus =
   | 'starting'
@@ -249,8 +259,35 @@ function normalizeFormForOptions(form: OnboardingFormState, cliState: CliOptions
   }, cliId, cliState);
 }
 
-export async function openBotOnboarding(sourceAppId?: string): Promise<void> {
+/**
+ * 把克隆源的配置铺进表单初值。只覆盖源上确实有值的项，其余保持普通新建的默认，
+ * 这样表单展示的就是克隆真正会用的配置（cloneBotConfig 之后仍以源为准）。
+ */
+function applyCloneDefaults(
+  form: OnboardingFormState,
+  defaults: CloneSourceDefaults | undefined,
+): OnboardingFormState {
+  if (!defaults) return form;
+  return {
+    ...form,
+    ...(defaults.cliId ? { cliId: defaults.cliId } : {}),
+    ...(defaults.workingDir ? { workingDir: defaults.workingDir } : {}),
+    ...(defaults.dirMode ? { dirMode: defaults.dirMode } : {}),
+    ...(defaults.model ? { model: defaults.model } : {}),
+  };
+}
+
+/**
+ * 克隆时用源 Bot 的配置预填表单：后端 cloneBotConfig 会用源 Bot 的
+ * cliId / 目录 / model 覆盖表单值，所以表单必须显示**真正会被使用的**那份，
+ * 否则用户填了却被静默丢弃（看到 claude-code，建出来却是源 Bot 的 codex）。
+ */
+export async function openBotOnboarding(
+  sourceAppId?: string,
+  sourceDefaults?: CloneSourceDefaults,
+): Promise<void> {
   cloneSourceAppId = sourceAppId;
+  cloneSourceDefaults = sourceAppId ? sourceDefaults : undefined;
   window.dispatchEvent(new Event(OPEN_BOT_ONBOARDING_EVENT));
 }
 
@@ -664,6 +701,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   const close = useCallback(() => {
     stopPolling();
     cloneSourceAppId = undefined;
+    cloneSourceDefaults = undefined;
     props.onClose();
   }, [props, stopPolling]);
 
@@ -700,7 +738,9 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
     loadSeqRef.current = seq;
     const initialCliState = defaultCliOptionsState();
     setCliState(initialCliState);
-    setForm(defaultFormState());
+    // 克隆模式下用源 Bot 的值开局，让表单显示真正会生效的配置（后端克隆会用
+    // 源 Bot 覆盖这几项）；普通新建仍是原来的默认值。
+    setForm(applyCloneDefaults(defaultFormState(), cloneSourceDefaults));
     setSessionMode('checking');
     setView({ kind: 'form' });
     setSubmitting(false);
