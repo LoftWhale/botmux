@@ -366,6 +366,50 @@ describe('recovering a session store poisoned by a crashed SQLite import', () =>
     });
   });
 
+  it('rescues rows from the LEGACY snapshot without pulling in another bot rows', () => {
+    withDirs((dataDir, home) => {
+      poison(dataDir, home);
+      // Damage the orphan so only a snapshot can rescue, and provide ONLY the
+      // legacy flat `sessions.json` (no per-bot file). Recovery must resolve it
+      // the same way the import does — filtered by larkAppId, so a sibling
+      // bot's rows can never leak into this store.
+      truncateSync(join(dataDir, 'session-stores', 'appA', 'sessions.db.tmp-wal'), 20_000);
+      const legacy: Record<string, unknown> = {};
+      for (const [id, row] of Object.entries(frozenJsonRows())) {
+        legacy[id] = { ...(row as Record<string, unknown>), larkAppId: 'appA' };
+      }
+      legacy.OTHERBOT = {
+        sessionId: 'OTHERBOT', larkAppId: 'appZ', chatId: 'oc_other', rootMessageId: 'om_other',
+        title: 'someone else', status: 'active', createdAt: '2026-01-01T00:00:00.000Z', scope: 'topic',
+      };
+      writeFileSync(join(dataDir, 'sessions.json'), JSON.stringify(legacy));
+
+      const after = load(dataDir, home);
+      expect(after.visible).toBe(SESSION_ROWS);
+      expect(after.strict).toBe(SESSION_ROWS);
+      expect(after.ids).not.toContain('OTHERBOT');
+    });
+  });
+
+  it('re-runs an idempotent merge when a previous cleanup left a stray sidecar', () => {
+    withDirs((dataDir, home) => {
+      poison(dataDir, home);
+      writeFileSync(join(dataDir, 'sessions-appA.json'), JSON.stringify(frozenJsonRows()));
+      expect(load(dataDir, home).strict).toBe(SESSION_ROWS);
+
+      // A crash between the two unlinkSync calls leaves one orphan behind. The
+      // next start must re-detect it and converge WITHOUT losing the rows the
+      // first pass already merged (the merge is idempotent) — and must not
+      // strand the store as permanently unhealthy either.
+      writeFileSync(join(dataDir, 'session-stores', 'appA', 'sessions.db.tmp-shm'), Buffer.alloc(32_768));
+
+      const after = load(dataDir, home);
+      expect(after.visible).toBe(SESSION_ROWS);
+      expect(after.strict).toBe(SESSION_ROWS);
+      expect(readdirSync(join(dataDir, 'session-stores', 'appA')).filter(n => n.includes('.tmp'))).toEqual([]);
+    });
+  });
+
   it('fails closed when a damaged orphan leaves the contents unattested', () => {
     withDirs((dataDir, home) => {
       poison(dataDir, home);
