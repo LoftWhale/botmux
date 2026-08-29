@@ -268,6 +268,28 @@ describe('loopbackFetch — hosts and statuses that used to be mis-handled', () 
     expect(isLoopbackUrl(`http://localhost:${port}/x`)).toBe(true);
   }, 15_000);
 
+  it('rejects a 101 immediately instead of hanging forever', async () => {
+    // node:http delivers a 101 as an `upgrade` event, never to the response callback.
+    // Without an `upgrade` listener the promise never settles — measured: the call
+    // only ended when an external AbortSignal fired at 800ms, and requestDashboardAt
+    // passes no signal, so it would hang indefinitely if the recorded port happened
+    // to be a WebSocket service. The native fetch rejects in ~1ms; so must we.
+    const { createServer } = await import('node:http');
+    const server = createServer();
+    servers.push(server);
+    server.on('request', (_q, r) => {
+      r.socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n');
+    });
+    await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as { port: number }).port;
+
+    const started = Date.now();
+    await expect(loopbackFetch(`http://127.0.0.1:${port}/x`)).rejects.toThrow(/switched protocols/);
+    // Assert on TIME, not just on rejecting: a test that only checks "it rejects"
+    // would also pass if the rejection came from vitest's own timeout.
+    expect(Date.now() - started).toBeLessThan(2_000);
+  }, 15_000);
+
   it('gives a HEAD response a null body', async () => {
     const port = await listen((_q, r) => { r.writeHead(200, { 'content-length': '5' }); r.end(); });
     const res = await loopbackFetch(`http://127.0.0.1:${port}/x`, { method: 'HEAD' });

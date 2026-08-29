@@ -206,12 +206,14 @@ export function loopbackFetch(
         },
         res => {
           const status = res.statusCode ?? 0;
-          // Fetch's null-body statuses are 101/204/205/304, and a HEAD response
-          // never carries one either. `new Response(stream, {status:205})` THROWS,
+          // Fetch's null-body statuses that can actually ARRIVE HERE are 204/205/304,
+          // plus any HEAD response. 101 is deliberately absent: node:http never calls
+          // this callback for it (it emits `upgrade` instead — handled below), so a
+          // `status === 101` branch here would be dead code that reads as covered. `new Response(stream, {status:205})` THROWS,
           // and it throws inside this async callback — on Node that escaped as an
           // uncaught exception and killed the process, while Bun happens to tolerate
           // 205, which is exactly why it went unnoticed.
-          const bodyless = status === 101 || status === 204 || status === 205
+          const bodyless = status === 204 || status === 205
             || status === 304 || method === 'HEAD';
           const stream = bodyless ? null : new ReadableStream<Uint8Array>({
             start(controller) {
@@ -263,6 +265,21 @@ export function loopbackFetch(
       finish(() => reject(err));
       return;
     }
+
+    // ⚠️ A 101 arrives as `upgrade`, NOT as a response. Without this listener the
+    // promise never settles: measured against a server answering 101, the call only
+    // ended when an external AbortSignal fired at 800ms (and `requestDashboardAt`
+    // passes no signal at all, so it would hang forever if the recorded port happened
+    // to be a WebSocket service). The native fetch rejects such a response in ~1ms;
+    // do the same, since a fetch-shaped client cannot express a protocol switch.
+    req.on('upgrade', (_res, socket) => {
+      socket.destroy();
+      req.destroy();
+      detachAbort();
+      finish(() => reject(new TypeError(
+        'loopbackFetch: server switched protocols (101); this client does not support upgrades',
+      )));
+    });
 
     // Only a failure BEFORE the response headers can reject the promise; once the
     // Response exists, later socket errors surface through the stream instead.

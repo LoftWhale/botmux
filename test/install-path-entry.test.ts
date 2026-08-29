@@ -55,14 +55,14 @@ describe('detectShell', () => {
 
 describe('pathEntryTargets', () => {
   it('zsh gets .zshenv — the only file read by -c, -i AND -li alike', () => {
-    const t = pathEntryTargets('zsh', installDir, home);
+    const t = pathEntryTargets('zsh', installDir, home, {});
     expect(t.map(x => rel(x.file))).toEqual(['/.zshenv']);
     // NOT .profile: that is the exact bug being fixed.
     expect(t.map(x => rel(x.file))).not.toContain('/.profile');
   });
 
   it('bash gets BOTH .bashrc and a login file (login vs interactive are disjoint)', () => {
-    const t = pathEntryTargets('bash', installDir, home);
+    const t = pathEntryTargets('bash', installDir, home, {});
     expect(t.map(x => rel(x.file))).toContain('/.bashrc');
     expect(t).toHaveLength(2);
   });
@@ -76,7 +76,7 @@ describe('pathEntryTargets', () => {
    */
   describe('bash login file is chosen without shadowing', () => {
     const loginTarget = () =>
-      pathEntryTargets('bash', installDir, home).map(x => rel(x.file)).find(f => f !== '/.bashrc');
+      pathEntryTargets('bash', installDir, home, {}).map(x => rel(x.file)).find(f => f !== '/.bashrc');
 
     it('appends to .profile when that is the only login file present', () => {
       writeFileSync(join(home, '.profile'), 'export SENTINEL=yes\n');
@@ -100,13 +100,15 @@ describe('pathEntryTargets', () => {
 
     it('never writes the same file twice', () => {
       writeFileSync(join(home, '.profile'), '');
-      const files = pathEntryTargets('bash', installDir, home).map(x => x.file);
+      const files = pathEntryTargets('bash', installDir, home, {}).map(x => x.file);
       expect(new Set(files).size).toBe(files.length);
     });
   });
 
   it('fish gets conf.d/botmux.fish with NATIVE fish syntax, not POSIX export', () => {
-    const t = pathEntryTargets('fish', installDir, home);
+    // Explicit env: the HOST may have XDG_CONFIG_HOME set (CI does), which would
+    // legitimately relocate the file and make a hardcoded ~/.config path wrong.
+    const t = pathEntryTargets('fish', installDir, home, {});
     expect(rel(t[0].file)).toBe('/.config/fish/conf.d/botmux.fish');
     expect(t[0].line).toContain('set -gx PATH');
     expect(t[0].line).not.toContain('export ');
@@ -114,13 +116,13 @@ describe('pathEntryTargets', () => {
 
   it('unknown/other shells fall back to .profile', () => {
     for (const s of ['other', 'unknown']) {
-      expect(rel(pathEntryTargets(s, installDir, home)[0].file)).toBe('/.profile');
+      expect(rel(pathEntryTargets(s, installDir, home, {})[0].file)).toBe('/.profile');
     }
   });
 
   it('every generated line carries the installer marker and the install dir', () => {
     for (const s of ['zsh', 'bash', 'fish', 'other']) {
-      for (const { line } of pathEntryTargets(s, installDir, home)) {
+      for (const { line } of pathEntryTargets(s, installDir, home, {})) {
         expect(line).toContain(PATH_ENTRY_MARKER);
         expect(line).toContain(installDir);
       }
@@ -130,12 +132,12 @@ describe('pathEntryTargets', () => {
 
 describe('ensurePathEntry', () => {
   it('creates the file when absent, and is idempotent on a second run', () => {
-    const first = ensurePathEntry({ installDir, home, shell: 'zsh' });
+    const first = ensurePathEntry({ installDir, home, shell: 'zsh', env: {} });
     expect(first.written.map(rel)).toEqual(['/.zshenv']);
     const body = readFileSync(join(home, '.zshenv'), 'utf8');
     expect(body).toContain(installDir);
 
-    const second = ensurePathEntry({ installDir, home, shell: 'zsh' });
+    const second = ensurePathEntry({ installDir, home, shell: 'zsh', env: {} });
     expect(second.written).toEqual([]);
     expect(second.skipped.map(rel)).toEqual(['/.zshenv']);
     // The file must not have grown a duplicate line.
@@ -145,7 +147,7 @@ describe('ensurePathEntry', () => {
   it('appends without destroying existing content, and never glues onto an unterminated line', () => {
     // Deliberately NO trailing newline — the case that corrupts a naive append.
     writeFileSync(join(home, '.zshenv'), 'alias ll="ls -la"');
-    ensurePathEntry({ installDir, home, shell: 'zsh' });
+    ensurePathEntry({ installDir, home, shell: 'zsh', env: {} });
     const lines = readFileSync(join(home, '.zshenv'), 'utf8').split('\n');
     expect(lines[0]).toBe('alias ll="ls -la"');
     expect(lines[1]).toContain(installDir);
@@ -153,7 +155,7 @@ describe('ensurePathEntry', () => {
 
   it("respects a PATH line the user already wrote in their own style", () => {
     writeFileSync(join(home, '.zshenv'), `path+=(${installDir})\n`);
-    const r = ensurePathEntry({ installDir, home, shell: 'zsh' });
+    const r = ensurePathEntry({ installDir, home, shell: 'zsh', env: {} });
     expect(r.written).toEqual([]);
     expect(r.skipped.map(rel)).toEqual(['/.zshenv']);
   });
@@ -161,13 +163,13 @@ describe('ensurePathEntry', () => {
   it('a mention of the dir that is NOT a PATH line does not count as handled', () => {
     writeFileSync(join(home, '.zshenv'), `# I once installed things into ${installDir}\n`);
     expect(fileAlreadyHasEntry(join(home, '.zshenv'), installDir)).toBe(false);
-    expect(ensurePathEntry({ installDir, home, shell: 'zsh' }).written.map(rel)).toEqual(['/.zshenv']);
+    expect(ensurePathEntry({ installDir, home, shell: 'zsh', env: {} }).written.map(rel)).toEqual(['/.zshenv']);
   });
 
   it('reports a failure instead of throwing when the target cannot be written', () => {
     // A file where the parent dir must be — mkdir/append both fail, install must not.
     writeFileSync(join(home, '.config'), 'not a directory');
-    const r = ensurePathEntry({ installDir, home, shell: 'fish' });
+    const r = ensurePathEntry({ installDir, home, shell: 'fish', env: {} });
     expect(r.written).toEqual([]);
     expect(r.failed).toHaveLength(1);
     expect(r.failed[0].file).toContain('botmux.fish');
@@ -191,8 +193,12 @@ describe('the written file actually puts botmux on PATH (real shells)', () => {
   }
   /** Run `botmux` through a shell, with HOME pointed at the fixture. */
   function runIn(shell: string, args: string[]): string {
+    // ⚠️ Do NOT spread process.env: the host's XDG_CONFIG_HOME / ZDOTDIR would come
+    // along and send the shell looking somewhere other than where we wrote (CI sets
+    // XDG_CONFIG_HOME, so this passed locally and failed there). Pass only what the
+    // fixture defines.
     return execFileSync(shell, args, {
-      env: { ...process.env, HOME: home, ZDOTDIR: home, PATH: '/usr/bin:/bin' },
+      env: { HOME: home, ZDOTDIR: home, PATH: '/usr/bin:/bin' },
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000,
     });
   }
@@ -200,7 +206,7 @@ describe('the written file actually puts botmux on PATH (real shells)', () => {
   it('zsh finds it in non-interactive mode (scripts and ssh commands)', () => {
     if (!have('zsh')) return;
     fakeLauncher();
-    ensurePathEntry({ installDir, home, shell: 'zsh' });
+    ensurePathEntry({ installDir, home, shell: 'zsh', env: {} });
     expect(runIn('zsh', ['-c', 'botmux'])).toContain('BOTMUX_OK');
   });
 
@@ -217,7 +223,7 @@ describe('the written file actually puts botmux on PATH (real shells)', () => {
   it('fish finds it (native syntax really evaluates)', () => {
     if (!have('fish')) return;
     fakeLauncher();
-    ensurePathEntry({ installDir, home, shell: 'fish' });
+    ensurePathEntry({ installDir, home, shell: 'fish', env: {} });
     expect(runIn('fish', ['-c', 'botmux'])).toContain('BOTMUX_OK');
   });
 
