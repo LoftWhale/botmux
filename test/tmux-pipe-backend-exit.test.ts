@@ -24,7 +24,8 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawn } from 'node:child_process';
+import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const FIXTURE = resolve(__dirname, 'fixtures/tmux-pipe-exit-fixture.ts');
 // Generous vs. the ~250ms the fixture needs: on a loaded box a slow start must
@@ -33,17 +34,30 @@ const FIXTURE = resolve(__dirname, 'fixtures/tmux-pipe-exit-fixture.ts');
 const EXIT_TIMEOUT_MS = 20_000;
 
 let fakeBinDir: string;
+let failingBinDir: string;
 
 /** Run the fixture; resolve with how it ended. `timedOut` means it wedged. */
-async function runFixture(mode: 'real' | 'nowake' | 'paneexit' | 'full'): Promise<{
+type FixtureMode = 'real' | 'nowake' | 'paneexit' | 'full' | 'spawnfail' | 'unlinked' | 'emfile' | 'directexit';
+
+async function runFixture(mode: FixtureMode): Promise<{
   timedOut: boolean;
   code: number | null;
   stdout: string;
 }> {
-  const child = spawnTsScript(FIXTURE, [mode], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, PATH: `${fakeBinDir}:${process.env.PATH ?? ''}` },
-  });
+  const bin = mode === 'spawnfail' ? failingBinDir : fakeBinDir;
+  // The emfile case needs a small fd table to exhaust. `sh -c 'ulimit -n …'`
+  // is the portable way to lower RLIMIT_NOFILE for a child; 128 leaves room
+  // for the runtime's own startup while still being quick to fill.
+  const child = mode === 'emfile'
+    ? spawn(
+      '/bin/sh',
+      ['-c', `ulimit -n 128; exec "$0" "$@"`, tsRunnerPrefix().command, ...tsRunnerPrefix().prefixArgs, FIXTURE, mode],
+      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` } },
+    )
+    : spawnTsScript(FIXTURE, [mode], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+    });
   let stdout = '';
   child.stdout?.on('data', (b) => { stdout += String(b); });
   child.stderr?.on('data', (b) => { stdout += String(b); });
@@ -66,10 +80,27 @@ beforeAll(() => {
   // `pipe-pane` must succeed (exit 0) or spawn() throws before a fifo exists.
   writeFileSync(fake, '#!/bin/sh\nexit 0\n');
   chmodSync(fake, 0o755);
+
+  // A tmux whose pipe-pane fails NON-retryably, so spawn() gives up at once
+  // instead of sleeping through the retry ladder: a numeric exit status plus
+  // stderr that is not a server-level error reads as "the server answered and
+  // deterministically rejected" (isRetryableStartupTmuxFailure).
+  failingBinDir = mkdtempSync(join(tmpdir(), 'botmux-failing-tmux-'));
+  const failing = join(failingBinDir, 'tmux');
+  writeFileSync(
+    failing,
+    '#!/bin/sh\n'
+    + 'case "$1" in\n'
+    + "  pipe-pane) echo \"can't find pane: bmx-exit-fixture\" >&2; exit 1 ;;\n"
+    + '  *) exit 0 ;;\n'
+    + 'esac\n',
+  );
+  chmodSync(failing, 0o755);
 });
 
 afterAll(() => {
   rmSync(fakeBinDir, { recursive: true, force: true });
+  rmSync(failingBinDir, { recursive: true, force: true });
 });
 
 describe('TmuxPipeBackend fifo teardown', () => {
@@ -81,6 +112,7 @@ describe('TmuxPipeBackend fifo teardown', () => {
     expect(r.stdout).toContain('TEARDOWN');
     expect(r.stdout).not.toContain('FIXTURE_NO_FIFO');
     expect(r.stdout).toContain('EXITING');
+    expect(r.stdout).toContain('LEAKED_READERS=0 FIFO_LEFT=false');
     expect(r.timedOut).toBe(false);
     expect(r.code).toBe(0);
   }, EXIT_TIMEOUT_MS + 15_000);
@@ -94,6 +126,7 @@ describe('TmuxPipeBackend fifo teardown', () => {
     expect(r.stdout).toContain('TEARDOWN');
     expect(r.stdout).not.toContain('FIXTURE_NO_FIFO');
     expect(r.stdout).toContain('EXITING');
+    expect(r.stdout).toContain('LEAKED_READERS=0 FIFO_LEFT=false');
     expect(r.timedOut).toBe(false);
     expect(r.code).toBe(0);
   }, EXIT_TIMEOUT_MS + 15_000);
@@ -106,6 +139,57 @@ describe('TmuxPipeBackend fifo teardown', () => {
 
     expect(r.stdout).toContain('TEARDOWN');
     expect(r.stdout).not.toContain('FIXTURE_NO_FIFO');
+    expect(r.timedOut).toBe(false);
+    expect(r.code).toBe(0);
+  }, EXIT_TIMEOUT_MS + 15_000);
+
+  // A THIRD wedge path, distinct from the two teardown sites: spawn() opens the
+  // fifo (step 2) before attaching pipe-pane (step 3). If step 3 fails
+  // terminally, spawn() throws — and the caller never got a backend handle, so
+  // nobody can call kill(). spawn() has to clean up after itself or the parked
+  // read outlives the failed spawn and wedges exit.
+  it('lets the process exit when spawn() fails after opening the fifo', async () => {
+    const r = await runFixture('spawnfail');
+
+    expect(r.stdout).toContain('SPAWN_THREW');
+    // Exit alone cannot judge this any more — the exit hook would rescue a
+    // leaked reader too. Assert the cleanup itself: nothing left registered,
+    // no fifo left on disk.
+    expect(r.stdout).toContain('LEAKED_READERS=0 FIFO_LEFT=false');
+    expect(r.timedOut).toBe(false);
+    expect(r.code).toBe(0);
+  }, EXIT_TIMEOUT_MS + 15_000);
+
+  // Blocker found in review: several production exit paths never call kill() —
+  // sendFatalWorkerErrorAndExit(), the uncaughtException / unhandledRejection
+  // handlers, and the existing-App-Server parent-exit branch all exit directly.
+  // Fixing only the teardown sites would leave the original wedge reachable, so
+  // the module installs a process-exit hook. This is its regression.
+  it('lets the process exit with a LIVE backend and no teardown call at all', async () => {
+    const r = await runFixture('directexit');
+
+    expect(r.stdout).toContain('DIRECT_EXIT');
+    expect(r.stdout).not.toContain('FIXTURE_NO_FIFO');
+    expect(r.timedOut).toBe(false);
+    expect(r.code).toBe(0);
+  }, EXIT_TIMEOUT_MS + 15_000);
+
+  // Blocker found in review: acquiring the wake fd lazily AT teardown fails in
+  // exactly the states teardown has to survive. Both of these were verified to
+  // re-wedge the process while the error was silently swallowed, which is why
+  // the fd is opened up front in spawn().
+  it('still exits when the fifo was unlinked before teardown', async () => {
+    const r = await runFixture('unlinked');
+
+    expect(r.stdout).toContain('TEARDOWN');
+    expect(r.timedOut).toBe(false);
+    expect(r.code).toBe(0);
+  }, EXIT_TIMEOUT_MS + 15_000);
+
+  it('still exits when the fd table is exhausted at teardown (EMFILE)', async () => {
+    const r = await runFixture('emfile');
+
+    expect(r.stdout).toContain('TEARDOWN');
     expect(r.timedOut).toBe(false);
     expect(r.code).toBe(0);
   }, EXIT_TIMEOUT_MS + 15_000);

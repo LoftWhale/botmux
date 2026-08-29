@@ -192,6 +192,41 @@ export function tmuxLifecycleInitialDelayMs(target: string): number {
   return 1000 + ((hash >>> 0) % 750);
 }
 
+/**
+ * Every backend with a live fifo reader, so process exit can unblock them all.
+ *
+ * A parked fifo read wedges `process.exit()` forever in uv__threadpool_cleanup
+ * (see teardownFifoReader for the full mechanism), and several production exit
+ * paths never call kill(): sendFatalWorkerErrorAndExit(), the
+ * uncaughtException / unhandledRejection handlers, and the
+ * existing-App-Server parent-exit branch all exit directly. Making the fix
+ * depend on every caller remembering to tear down first would leave the
+ * original wedge reachable, so the backend registers itself here and the
+ * process-exit hook below is the backstop. Entries are removed on teardown, so
+ * a normally-closed backend leaves nothing behind.
+ */
+const liveFifoReaders = new Set<TmuxPipeBackend>();
+let fifoExitHookInstalled = false;
+
+function installFifoExitHook(): void {
+  if (fifoExitHookInstalled) return;
+  fifoExitHookInstalled = true;
+  // 'exit' only admits synchronous work — which is exactly what this is: one
+  // write() plus close() per reader. Cannot be an async cleanup.
+  process.on('exit', () => {
+    for (const backend of liveFifoReaders) {
+      try { backend.wakeFifoReaderForExit(); } catch { /* best-effort */ }
+    }
+  });
+}
+
+/** Live fifo readers awaiting the exit-hook wake. Test-only: lets a regression
+ *  assert that a failed spawn deregistered itself, which "the process exited"
+ *  cannot show once the exit hook is in place. */
+export function __testOnly_liveFifoReaderCount(): number {
+  return liveFifoReaders.size;
+}
+
 export class TmuxPipeBackend implements SessionBackend {
   readonly supportsRawCommandPasteLine = true;
   /** Real tmux pane address (e.g. "0:2.0") or botmux session name (bmx-*). */
@@ -201,6 +236,18 @@ export class TmuxPipeBackend implements SessionBackend {
   /** Read end of the fifo, kept so teardown can close it explicitly.
    *  `createReadStream(..., { autoClose: false })` never closes it for us. */
   private fifoFd: number | null = null;
+  /** Set once teardownFifoReader() has run, so the reader's own EBADF-on-close
+   *  (see the 'error' handler) is recognised as expected teardown noise. Not
+   *  `exited`: the spawn-failure path tears the reader down without ever
+   *  marking the backend exited. */
+  private fifoTornDown = false;
+  /** Write end, opened at spawn() and held for the lifetime of the reader.
+   *  Teardown writes one byte here to unblock the parked read (see
+   *  teardownFifoReader). Acquired UP FRONT on purpose: opening it at teardown
+   *  instead would need the pathname to still exist and a spare fd at the worst
+   *  possible moment — both verified to fail and re-wedge the process (fifo
+   *  already unlinked → ENOENT; fd table exhausted → EMFILE). */
+  private fifoWakeFd: number | null = null;
   /** Streaming UTF-8 decoder. The fifo read emits raw Buffer chunks at libuv's
    *  64KB highWaterMark boundary, which can fall in the middle of a multi-byte
    *  character (CJK = 3 bytes, box-drawing = 3 bytes, emoji = 4 bytes). Decoding
@@ -325,7 +372,22 @@ export class TmuxPipeBackend implements SessionBackend {
     // strace showed worker only read its IPC fd, never the fifo.)
     const fd = fs.openSync(this.fifoPath, fs.constants.O_RDWR);
     this.fifoFd = fd;
+    // Acquire the wake-up write end NOW, while the pathname exists and the fd
+    // table has room. Teardown must never need to allocate anything.
+    // O_NONBLOCK so a full pipe fails with EAGAIN instead of parking here.
+    try {
+      this.fifoWakeFd = fs.openSync(this.fifoPath, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+    } catch {
+      // Extremely unlikely (we hold the read end, so no ENXIO). Losing the wake
+      // fd only costs the unblock path, so keep the session working rather than
+      // failing the spawn; teardown degrades to best-effort.
+      this.fifoWakeFd = null;
+    }
     this.readStream = fs.createReadStream('', { fd, autoClose: false, highWaterMark: 64 * 1024 });
+    // From here on a parked read can wedge process exit, so make this reader
+    // reachable from the exit hook even if nothing ever calls kill().
+    installFifoExitHook();
+    liveFifoReaders.add(this);
 
     this.readStream.on('data', (chunk) => {
       // StringDecoder reassembles multi-byte chars split across chunk
@@ -341,6 +403,12 @@ export class TmuxPipeBackend implements SessionBackend {
       }
     });
     this.readStream.on('error', (err: any) => {
+      // Teardown noise, not a fault: destroy() closes the read fd itself when
+      // no read is in flight (despite autoClose:false), so our own backstop
+      // close races it and the stream reports EBADF on a reader we are
+      // deliberately dismantling. Logging it would put a scary line in every
+      // worker's stderr on every normal close.
+      if (this.fifoTornDown && err?.code === 'EBADF') return;
       // Errors are best-effort logged via the worker's stderr (we can't
       // pull a logger in a backend without circular imports). Don't fire
       // exit — the user's CLI is still alive, we just lost realtime view.
@@ -367,6 +435,12 @@ export class TmuxPipeBackend implements SessionBackend {
         break;
       } catch (err: any) {
         if (!isRetryableStartupTmuxFailure(err) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) {
+          // The fifo reader is already live (step 2) with a blocking read parked
+          // on it. Throwing out of spawn() without this leaves that read alive
+          // forever and wedges the process at exit exactly like the bug
+          // teardownFifoReader() exists to prevent — the caller only sees a
+          // failed spawn and has no handle to clean up.
+          this.teardownFifoReader();
           this.fireExit(1, null);
           throw err;
         }
@@ -862,27 +936,56 @@ export class TmuxPipeBackend implements SessionBackend {
    * as "Worker 未能接收这条消息" (worker.input_delivery_failed) forever.
    *
    * The wake-up byte is what unblocks that read. It goes through a SEPARATE
-   * O_WRONLY|O_NONBLOCK fd rather than our own O_RDWR one on purpose: at
-   * teardown nobody is draining the pipe any more, so if tmux left it full a
-   * blocking write would hang exactly like the bug we are fixing (verified —
-   * a blocking write here reproduces the wedge, the non-blocking one returns
-   * EAGAIN and we simply move on; the reader is being torn down regardless).
-   * The byte is never observed by callers: the stream is destroyed first, so
-   * it is read by nobody and dies with the fifo on the unlink below.
+   * write fd (never our own O_RDWR one) opened back in spawn(): at teardown
+   * nobody is draining the pipe any more, so if tmux left it full a blocking
+   * write would hang exactly like the bug we are fixing (verified). That fd is
+   * acquired UP FRONT rather than here because teardown is precisely when
+   * acquiring one can fail — the fifo may already be unlinked (ENOENT) or the
+   * fd table exhausted (EMFILE), and both were verified to re-wedge the
+   * process while the old code silently swallowed the error. The byte is never
+   * observed by callers: the stream is destroyed first, so nothing reads it and
+   * it dies with the fifo on the unlink below.
    */
+  /**
+   * Last-resort unblock for the process-exit hook.
+   *
+   * Only writes the wake-up byte — no unlink, no stream teardown, nothing that
+   * could throw or block. The single job is to let the parked threadpool read
+   * return so uv__threadpool_cleanup can join it; the process is already on its
+   * way out, so the fifo file itself is the OS's problem. Safe to call after a
+   * real teardown (fifoWakeFd is null by then) and safe to call twice.
+   */
+  wakeFifoReaderForExit(): void {
+    if (this.fifoWakeFd === null) return;
+    try { fs.writeSync(this.fifoWakeFd, '\0'); } catch { /* already unblocked */ }
+  }
+
   private teardownFifoReader(): void {
+    liveFifoReaders.delete(this);
+    this.fifoTornDown = true;
     if (this.readStream) {
       try { this.readStream.destroy(); } catch { /* already closed */ }
       this.readStream = null;
     }
-    try {
-      const wakeFd = fs.openSync(this.fifoPath, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
-      try { fs.writeSync(wakeFd, '\0'); } catch { /* EAGAIN when full — the read is already unblocked */ }
-      fs.closeSync(wakeFd);
-    } catch { /* fifo already unlinked/gone — nothing parked on it */ }
+    if (this.fifoWakeFd !== null) {
+      // EAGAIN (pipe full) is fine: a full pipe means the read already has data
+      // to return, so it is not parked. Any other error is equally non-fatal —
+      // we are tearing down regardless.
+      try { fs.writeSync(this.fifoWakeFd, '\0'); } catch { /* already unblocked */ }
+      try { fs.closeSync(this.fifoWakeFd); } catch { /* already closed */ }
+      this.fifoWakeFd = null;
+    }
     if (this.fifoFd !== null) {
-      try { fs.closeSync(this.fifoFd); } catch { /* already closed */ }
+      // Closing the read fd is nominally ours (autoClose:false), but destroy()
+      // DOES close it itself when no read is in flight — verified: after a
+      // synchronous destroy() the fd is already EBADF. So this close is a
+      // best-effort backstop for the in-flight case, and EBADF here is the
+      // normal, expected outcome rather than a fault. Clear the field first so
+      // a late 'error' handler re-entering teardown cannot close it twice (by
+      // then the number could name a freshly-opened unrelated file).
+      const fd = this.fifoFd;
       this.fifoFd = null;
+      try { fs.closeSync(fd); } catch { /* stream already closed it */ }
     }
     try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
   }
