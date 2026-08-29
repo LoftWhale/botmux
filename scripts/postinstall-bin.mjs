@@ -219,11 +219,47 @@ try {
   );
 }
 
-// ── PATH hint ─────────────────────────────────────────────────────────────────
-// Mirrors install.sh. Without ~/.botmux/bin on PATH the launcher we just wrote is
-// never the `botmux` the user's shell resolves.
-const pathEntries = (process.env.PATH ?? '').split(':');
-if (!pathEntries.includes(binDir)) {
-  console.log(`[botmux] add ${binDir} to your PATH so this launcher is the \`botmux\` your shell finds:`);
-  console.log(`[botmux]   echo 'export PATH="${binDir}:$PATH"' >> ~/.profile && . ~/.profile`);
+// ── PATH: write it, don't just suggest it ─────────────────────────────────────
+// This used to only PRINT `echo 'export PATH=…' >> ~/.profile`. Two problems:
+// the user had to act on it, and for zsh users the suggested file is WRONG —
+// zsh never reads ~/.profile (measured), so following the hint verbatim left
+// `botmux` still not found. There is no `bin` field any more, so PATH is the
+// only way this launcher becomes a command; we now write the right startup file
+// for the user's actual shell (bash/zsh/fish/other) and tell them what we did.
+//
+// ⚠️ FAIL-SOFT, and never `fail()`: the launcher is already installed and working
+// at this point, so a PATH edit that cannot happen must degrade to the printed
+// hint — not abort a successful install. That includes the sibling module simply
+// not being there: it ships via package.json `files`, and if a future edit drops
+// it (or a mirror repacks the tarball without it) the import throws. Guarding it
+// keeps `npm i -g botmux` succeeding either way.
+if (!(process.env.PATH ?? '').split(':').includes(binDir)) {
+  let ensurePathEntry = null;
+  try {
+    ({ ensurePathEntry } = await import('./install-path-entry.mjs'));
+  } catch (err) {
+    console.error(`[botmux] PATH helper unavailable (${err && err.message ? err.message : String(err)})`);
+  }
+  let written = [], skipped = [];
+  if (ensurePathEntry) {
+    try {
+      const r = ensurePathEntry({ installDir: binDir });
+      ({ written, skipped } = r);
+      for (const f of written) console.log(`[botmux] added ${binDir} to PATH in ${f} (${r.shell})`);
+      for (const f of skipped) console.log(`[botmux] ${f} already puts ${binDir} on PATH`);
+      for (const { file, error } of r.failed) console.error(`[botmux] could not update ${file}: ${error}`);
+    } catch (err) {
+      console.error(`[botmux] could not update your shell startup file: ${err && err.message ? err.message : String(err)}`);
+    }
+  }
+  if (written.length > 0) {
+    console.log('[botmux] open a new terminal (or re-source that file) and `botmux` will be on PATH');
+  } else if (skipped.length === 0) {
+    // Nothing written and nothing already present — fall back to telling them.
+    // Deliberately not naming a specific file here: the correct one depends on
+    // the shell, and naming the wrong one is what caused the original bug.
+    console.log(`[botmux] add ${binDir} to your PATH so this launcher is the \`botmux\` your shell finds`);
+  }
 }
+
+

@@ -7,6 +7,7 @@
   "files": [
     "dist/",
     "scripts/postinstall-bin.mjs",
+    "scripts/install-path-entry.mjs",
     "ecosystem.config.cjs",
     "README.md",
     "README.en.md",

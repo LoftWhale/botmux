@@ -305,3 +305,113 @@ describe('discovery credential binding (anti-forward)', () => {
 
 // Guard against `existsSync` import being tree-shaken in refactors.
 void existsSync;
+
+
+/**
+ * The loopback client must not honour `$http_proxy` — regression guard for
+ * `Dashboard lookup failed: 403 <html>… 403 Forbidden …`.
+ *
+ * ⚠️⚠️ WHY NOT JUST "call callDashboard with proxy env set and assert it worked":
+ * measured — that test is BORN TOOTHLESS. Vitest executes test bodies under
+ * **Node even when launched via `bun x vitest`** (probed: `runtime=node v22.21.1`,
+ * `execPath=…/node`), and Node's `fetch` ignores proxy env anyway. So reverting
+ * the production default back to the global `fetch` keeps such a test green:
+ * verified, 25/25 passed under BOTH `npx vitest` and `bun x vitest` with the fix
+ * reverted. The defect only exists in Bun's `fetch`, which no in-process vitest
+ * assertion can reach.
+ *
+ * Hence two guards that CAN bite:
+ *  1. A shape guard on the source — no runtime needed, so it holds in CI.
+ *  2. A real Bun child process (skipped when no bun binary is around), which is
+ *     the only way to observe the actual proxying behaviour.
+ */
+describe('loopback client ignores $http_proxy (403 nginx regression)', () => {
+  const ENDPOINT_SRC = join(__dirname, '..', 'src', 'cli', 'dashboard-endpoint.ts');
+
+  it('never falls back to the global fetch for the default client (shape guard)', () => {
+    const src = readFileSync(ENDPOINT_SRC, 'utf8');
+    // Both defaulting sites (requestDashboardAt + callDashboard) must resolve to
+    // the node:http client. `?? fetch` is exactly the regression: on Bun that
+    // routes a 127.0.0.1 request through $http_proxy when no_proxy is a CIDR.
+    const globalFetchFallbacks = src.match(/fetchImpl\s*\?\?\s*fetch\b/g) ?? [];
+    expect(globalFetchFallbacks).toEqual([]);
+    const loopbackDefaults = src.match(/fetchImpl\s*\?\?\s*\(loopbackFetch\b/g) ?? [];
+    expect(loopbackDefaults).toHaveLength(2);
+    // And the client itself must be built on node:http, not fetch.
+    expect(src).toMatch(/await import\(['"]node:http['"]\)/);
+  });
+
+  it('a real Bun process reaches the dashboard directly with a CIDR no_proxy', async () => {
+    const bun = [
+      process.env.BUN_PATH,
+      join(process.env.HOME ?? '/root', '.bun', 'bin', 'bun'),
+      '/root/.bun/bin/bun',
+    ].find(p => p && existsSync(p));
+    if (!bun) { expect(true).toBe(true); return; }   // no bun available; shape guard still covers CI
+
+    const { createServer } = await import('node:http');
+    const servers: import('node:http').Server[] = [];
+    const listen = async (h: import('node:http').RequestListener) => {
+      const s = createServer(h); servers.push(s);
+      await new Promise<void>(r => s.listen(0, '127.0.0.1', () => r()));
+      return (s.address() as { port: number }).port;
+    };
+    try {
+      let proxyHits = 0, directHits = 0;
+      const proxyPort = await listen((_q, s) => {
+        proxyHits++;
+        s.writeHead(403, { 'content-type': 'text/html' });
+        s.end('<html><head><title>403 Forbidden</title></head></html>');
+      });
+      const dashPort = await listen((_q, s) => {
+        directHits++;
+        s.writeHead(200, { 'content-type': 'application/json' });
+        s.end(JSON.stringify({ url: 'http://dash.local/?t=direct' }));
+      });
+      setPort(dashPort);
+
+      const snippet = `
+        const { callDashboard } = await import(${JSON.stringify(join(__dirname, '..', 'src', 'cli', 'dashboard-endpoint.ts'))});
+        const r = await callDashboard({ configDir: ${JSON.stringify(dir)}, defaultPort: ${dashPort}, path: '/__cli/current', probeSpan: 0 });
+        process.stdout.write(JSON.stringify({ runtime: typeof Bun !== 'undefined' ? 'bun' : 'node', r }));
+      `;
+      // ⚠️ MUST be async spawn, not spawnSync: spawnSync blocks this process's
+      // event loop, so the two servers above would never accept the child's
+      // connection — the child then times out and the test fails for a reason
+      // that has nothing to do with proxying. (Measured: spawnSync → 30s
+      // timeout, empty stdout.)
+      const { spawn } = await import('node:child_process');
+      const proxyUrl = `http://127.0.0.1:${proxyPort}`;
+      const stdout = await new Promise<string>((resolve, reject) => {
+        const child = spawn(bun, ['-e', snippet], {
+          env: {
+            ...process.env,
+            http_proxy: proxyUrl, HTTP_PROXY: proxyUrl,
+            https_proxy: proxyUrl, HTTPS_PROXY: proxyUrl,
+            // The CIDR form real shell rc files use — the one Bun's fetch ignores.
+            no_proxy: '127.0.0.0/8', NO_PROXY: '127.0.0.0/8',
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let out = '', err = '';
+        child.stdout.on('data', d => { out += String(d); });
+        child.stderr.on('data', d => { err += String(d); });
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('bun child timed out')); }, 25_000);
+        child.on('error', e => { clearTimeout(timer); reject(e); });
+        child.on('close', code => {
+          clearTimeout(timer);
+          if (code !== 0) reject(new Error(`bun child exited ${code}: ${err.slice(0, 500)}`));
+          else resolve(out);
+        });
+      });
+      const parsed = JSON.parse(stdout || '{}');
+      // Prove the child really was Bun; otherwise this assertion means nothing.
+      expect(parsed.runtime).toBe('bun');
+      expect(proxyHits).toBe(0);
+      expect(directHits).toBe(1);
+      expect(parsed.r).toEqual({ ok: true, url: 'http://dash.local/?t=direct' });
+    } finally {
+      await Promise.all(servers.splice(0).map(s => new Promise<void>(r => s.close(() => r()))));
+    }
+  }, 40_000);
+});

@@ -106,12 +106,70 @@ chmod +x "$tmp/$asset"
 mv "$tmp/$asset" "$INSTALL_DIR/botmux"
 printf '%s\n' "✅ installed botmux → $INSTALL_DIR/botmux"
 
-# ── PATH hint ─────────────────────────────────────────────────────────────────
+# ── PATH: write it, don't just suggest it ─────────────────────────────────────
+# This used to only print `echo 'export PATH=…' >> ~/.profile`, which is WRONG for
+# zsh users: zsh never reads ~/.profile (measured), so following the hint verbatim
+# left `botmux` still not found. Mirrors scripts/install-path-entry.mjs — keep the
+# two in step. Startup files per shell, all measured:
+#   zsh  → .zshenv                     (only file read by -c, -i and -li alike)
+#   bash → .bashrc AND .bash_profile   (interactive vs login are disjoint)
+#   fish → ~/.config/fish/conf.d/botmux.fish   (and fish is NOT POSIX: `set -gx`)
+#   else → .profile                    (sh/ksh/dash read it at login)
+MARKER='# added by botmux installer'
+
+path_line_present() {  # $1=file — already handled, by us or by the user's own line?
+  [ -f "$1" ] || return 1
+  # Must be a PATH *assignment* mentioning our dir, not merely a line containing
+  # the word "path" (an install dir can itself contain "path"). Mirrors the regex
+  # in scripts/install-path-entry.mjs.
+  grep -q "$INSTALL_DIR" "$1" 2>/dev/null \
+    && grep -Eqi "export[[:space:]]+PATH[[:space:]]*=|^[[:space:]]*PATH[[:space:]]*=|set[[:space:]]+(-[[:alnum:]]+[[:space:]]+)*PATH|fish_add_path|path\+=|path=\(" "$1" 2>/dev/null
+}
+
+append_path_line() {  # $1=file  $2=line
+  mkdir -p "$(dirname "$1")" 2>/dev/null || return 1
+  # Leading newline only when the file exists and lacks a trailing one, so we
+  # never glue onto an unterminated last line.
+  if [ -f "$1" ] && [ -n "$(tail -c 1 "$1" 2>/dev/null)" ]; then
+    printf '\n%s\n' "$2" >> "$1" || return 1
+  else
+    printf '%s\n' "$2" >> "$1" || return 1
+  fi
+  printf '%s\n' "✓ added $INSTALL_DIR to PATH in $1"
+}
+
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) : ;;  # already on PATH
   *)
-    printf '\n%s\n' "Add $INSTALL_DIR to your PATH, e.g.:"
-    printf '  %s\n' "echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.profile && . ~/.profile"
+    posix_line="export PATH=\"$INSTALL_DIR:\$PATH\"  $MARKER"
+    wrote=0
+    case "$(basename "${SHELL:-}")" in
+      *zsh*)
+        f="$HOME/.zshenv"
+        if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
+        ;;
+      *fish*)
+        f="$HOME/.config/fish/conf.d/botmux.fish"
+        if path_line_present "$f"; then wrote=1
+        else append_path_line "$f" "set -gx PATH \"$INSTALL_DIR\" \$PATH  $MARKER" && wrote=1; fi
+        ;;
+      *bash*)
+        for f in "$HOME/.bashrc" "$HOME/.bash_profile"; do
+          if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
+        done
+        ;;
+      *)
+        f="$HOME/.profile"
+        if path_line_present "$f"; then wrote=1; else append_path_line "$f" "$posix_line" && wrote=1; fi
+        ;;
+    esac
+    if [ "$wrote" = 1 ]; then
+      printf '%s\n' "  open a new terminal (or re-source that file) and \`botmux\` will be on PATH"
+    else
+      printf '\n%s\n' "Add $INSTALL_DIR to your PATH, e.g.:"
+      printf '  %s\n' "echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> ~/.profile && . ~/.profile"
+    fi
     ;;
 esac
+
 printf '\n%s\n' "Next: botmux setup"
