@@ -2474,6 +2474,44 @@ const TRANSIENT_NETWORK_ERROR_CODES = new Set([
 
 const TRANSIENT_FETCH_RETRY_DELAYS_MS = [300, 900];
 
+/**
+ * 「TLS 握手完成之前连接就断了」——Node 内置 `_tls_wrap.js` 的 `onConnectEnd`
+ * 唯一产出这句话（`ConnResetException`，code=ECONNRESET）。它的关键性质是
+ * **可证明零副作用**，因此连非幂等写请求都能安全重放：
+ *
+ *   • 结构上：该监听器在建 socket 时 `prependListener('end', onConnectEnd)` 挂上，
+ *     并在 `onConnectSecure` 里 `removeListener('end', onConnectEnd)` 摘掉 ——
+ *     所以它只可能在 `secureConnect` 之前触发。握手没完成 ⟹ 没有任何加密通道，
+ *     HTTP 请求行 / 头 / body 一个字节都没能发出去。
+ *   • 实测（本机 TCP 抓包型探针）：服务端只收到 1583 字节且首字节 0x16
+ *     （TLS handshake record），文本里 **不含** 请求方法、路径与 body 字段；
+ *     对照组「握手完成后才断」收到 248 字节应用数据，且错误换成
+ *     `UND_ERR_SOCKET / other side closed` —— 两类错误可靠可分。
+ *
+ * ⚠️ 仅此一句话享受该待遇。`ECONNRESET` 本身**不够**：连接建成、请求已送达后
+ * 被 RST 同样是 ECONNRESET，那种情况服务端可能已处理，重放会重复提交。
+ */
+const PRE_TLS_DISCONNECT_MESSAGE =
+  'Client network socket disconnected before secure TLS connection was established';
+
+/**
+ * 传输层失败是否**可证明「请求未送达」**，即重放绝不会产生重复副作用。
+ * 只认上面那一句 pre-TLS 断连（外层可能被 undici 包成
+ * `TypeError('fetch failed', { cause })`，也可能藏在 happy-eyeballs 的
+ * AggregateError 里，故顺 cause 链找）。
+ */
+function isProvablyUnsentTransportError(err: unknown, depth = 0): boolean {
+  if (depth > 4 || !(err instanceof Error)) return false;
+  if (err.name === 'AbortError' || err.name === 'TimeoutError') return false;
+  if ((err as { code?: unknown }).code === 'ECONNRESET' && err.message === PRE_TLS_DISCONNECT_MESSAGE) {
+    return true;
+  }
+  if (err instanceof AggregateError && err.errors.some(item => isProvablyUnsentTransportError(item, depth + 1))) {
+    return true;
+  }
+  return isProvablyUnsentTransportError((err as { cause?: unknown }).cause, depth + 1);
+}
+
 function isLikelyTransientNetworkError(err: unknown, depth = 0): boolean {
   if (depth > 4 || !(err instanceof Error)) return false;
   // 调用方主动 abort / 超时不算网络抖动，重试会违背调用方意图。
@@ -2539,8 +2577,12 @@ class MutableCookieJar {
   async fetchRaw(fetcher: typeof fetch, url: string, init: RequestInit = {}, maxHops = 10): Promise<Response> {
     let current = url;
     let referer: string | undefined;
-    // 只有幂等的 GET/HEAD 允许瞬态网络错误重试：POST 全是 console 写操作或登录
-    // 流程，传输错误时服务端可能已 commit（结果未知），重试等于重复提交。
+    // 幂等的 GET/HEAD：任意瞬态网络错误都可小步退避重试。
+    // POST 全是 console 写操作或登录流程，传输错误时服务端可能已 commit（结果
+    // 未知），重试等于重复提交 —— 唯一例外是「TLS 握手完成前就断连」，那类错误
+    // 可证明请求一个字节都没发出去（见 isProvablyUnsentTransportError），重放
+    // 不可能产生重复副作用；不放过它的代价是一次网络毛刺就让用户的改名/改头像
+    // 整轮失败。
     const method = (init.method ?? 'GET').toUpperCase();
     const retryable = method === 'GET' || method === 'HEAD';
     for (let hop = 0; hop <= maxHops; hop += 1) {
@@ -2556,7 +2598,12 @@ class MutableCookieJar {
           response = await fetcher(current, { ...init, headers, redirect: 'manual' });
           break;
         } catch (err) {
-          if (!retryable || attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isLikelyTransientNetworkError(err)) {
+          // 可重试 = 幂等方法遇任意瞬态错误，或任意方法遇「可证明未送达」的
+          // pre-TLS 断连。后者对写操作也安全（零字节送达 ⟹ 无副作用）。
+          const mayRetry = retryable
+            ? isLikelyTransientNetworkError(err)
+            : isProvablyUnsentTransportError(err);
+          if (attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !mayRetry) {
             throw err;
           }
           await sleep(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt]);

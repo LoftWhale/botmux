@@ -3201,6 +3201,149 @@ describe('console 页面读取的瞬态网络错误重试', () => {
   });
 });
 
+// 「TLS 握手完成之前就断连」是唯一可证明「请求一个字节都没发出去」的传输错误：
+// Node 内置 `_tls_wrap.js` 的 `onConnectEnd` 在建 socket 时挂上、在
+// `onConnectSecure` 里摘掉，所以它只会在握手完成前触发 ⟹ 没有加密通道 ⟹ 请求行/
+// 头/body 都没送出。因此连非幂等的 console 写操作也能安全重放；不重放的代价是
+// 用户的改名/改头像被一次网络毛刺整轮打挂（线上实测：改头像失败并把这句话原样
+// 抛给用户）。以下用例守住「该重试的重试、不该重试的绝不重试」两侧。
+describe('pre-TLS 断连：可证明未送达，写操作也重试', () => {
+  /** 与线上实测逐字一致的错误形态（外层 undici 包装 + cause 带 code）。 */
+  const preTlsDisconnect = () =>
+    new TypeError('fetch failed', {
+      cause: Object.assign(
+        new Error('Client network socket disconnected before secure TLS connection was established'),
+        { code: 'ECONNRESET' },
+      ),
+    });
+  /** 对照：握手已完成、请求已送达后才断 —— 服务端可能已处理，绝不能重放。 */
+  const afterRequestSent = () =>
+    new TypeError('fetch failed', {
+      cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }),
+    });
+
+  async function postWith(errFactory: () => Error, failTimes: number) {
+    let postAttempts = 0;
+    let failed = 0;
+    const bodies: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') {
+        postAttempts += 1;
+        bodies.push(String(init?.body ?? ''));
+        if (failed < failTimes) { failed += 1; throw errFactory(); }
+        return new Response(JSON.stringify({ code: 0, data: { ok: true } }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const clientResult = await createOpenPlatformApiClient([cookie()], { fetchImpl });
+    expect(clientResult.ok).toBe(true);
+    if (!clientResult.ok) throw new Error('client construction failed');
+    return { client: clientResult.client, attempts: () => postAttempts, bodies };
+  }
+
+  it('POST 写操作遇 pre-TLS 断连会重试，并把 body 原样重发', async () => {
+    const h = await postWith(preTlsDisconnect, 1);
+    await expect(h.client.postJson('/developers/v1/base_info/cli_x', { clientId: 'cli_x', name: '小助手' }))
+      .resolves.toMatchObject({ code: 0 });
+    expect(h.attempts()).toBe(2);
+    // 重发的必须是同一份 payload——否则会写出半截数据。
+    expect(h.bodies).toHaveLength(2);
+    expect(h.bodies[0]).toBe(h.bodies[1]);
+    expect(h.bodies[0]).toContain('"name":"小助手"');
+  });
+
+  it('POST 的 multipart 上传（改头像图片）同样重试且 FormData 可原样重发', async () => {
+    let postAttempts = 0;
+    const sizes: Array<number | string> = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') {
+        postAttempts += 1;
+        const body = init?.body as FormData;
+        sizes.push(body instanceof FormData ? ((body.get('file') as Blob | null)?.size ?? 'MISSING') : 'NOT_FORM');
+        if (postAttempts === 1) throw preTlsDisconnect();
+        return new Response(JSON.stringify({ code: 0, data: { url: 'https://cdn/a.png' } }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage(), { status: 200 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const clientResult = await createOpenPlatformApiClient([cookie()], { fetchImpl });
+    expect(clientResult.ok).toBe(true);
+    if (!clientResult.ok) return;
+    const form = new FormData();
+    form.append('file', new Blob([new Uint8Array(64).fill(7)], { type: 'image/png' }), 'avatar.png');
+    await expect(clientResult.client.postForm('/developers/v1/app/upload/image', form))
+      .resolves.toMatchObject({ code: 0 });
+    expect(postAttempts).toBe(2);
+    // 两次都带着完整的 64 字节图片——重发不能退化成空 body。
+    expect(sizes).toEqual([64, 64]);
+  });
+
+  it('重试耗尽后仍失败，并把这句 pre-TLS 断连原样透出给用户', async () => {
+    const h = await postWith(preTlsDisconnect, Number.POSITIVE_INFINITY);
+    await expect(h.client.postJson('/developers/v1/base_info/cli_x', {}))
+      .rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(3); // 首次 + 2 次退避重试
+  });
+
+  it('对照：握手后断连（UND_ERR_SOCKET）的写操作绝不重试——结果未知不可重放', async () => {
+    const h = await postWith(afterRequestSent, 1);
+    await expect(h.client.postJson('/developers/v1/app_version/create/cli_x', {}))
+      .rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(1);
+  });
+
+  it('对照：普通 ECONNRESET（非 pre-TLS 文案）的写操作也不重试——仅靠 code 判定不安全', async () => {
+    const genericReset = () => new TypeError('fetch failed', {
+      cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+    });
+    const h = await postWith(genericReset, 1);
+    await expect(h.client.postJson('/developers/v1/publish/commit/cli_x/v1', {}))
+      .rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(1);
+  });
+
+  // 判据必须是**整句精确匹配**，不能放宽成关键词包含。Node 内置的
+  // `ConnResetException` 有多条文案共用 code=ECONNRESET，其中 `socket hang up`
+  // （`_http_client.js`）是在请求**已发出之后**才抛的 —— 一旦用
+  // `includes('disconnected')` 之类的松匹配，或把别的 ConnResetException 文案
+  // 也算进来，写操作就会在「服务端可能已处理」的情况下被重放。
+  it.each([
+    ['socket hang up', 'ECONNRESET'],                                   // 请求已送达后
+    ['aborted', 'ECONNRESET'],                                          // 响应中途断
+    ['Client network socket disconnected', 'ECONNRESET'],               // 截断的近似文案
+    ['socket disconnected before secure TLS handshake', 'ECONNRESET'],  // 改写过的近似文案
+  ])('对照：ConnResetException 的其它文案 %j 不得被当成可重放', async (message, code) => {
+    const near = () => new TypeError('fetch failed', {
+      cause: Object.assign(new Error(message), { code }),
+    });
+    const h = await postWith(near, 1);
+    await expect(h.client.postJson('/developers/v1/app_version/create/cli_x', {}))
+      .rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(1);
+  });
+
+  it('调用方主动 abort 即使裹在 pre-TLS 文案里也不重试（不违背调用方意图）', async () => {
+    const aborted = () => {
+      const e = new Error('Client network socket disconnected before secure TLS connection was established');
+      e.name = 'AbortError';
+      (e as any).code = 'ECONNRESET';
+      return new TypeError('fetch failed', { cause: e });
+    };
+    const h = await postWith(aborted, 1);
+    await expect(h.client.postJson('/developers/v1/base_info/cli_x', {})).rejects.toThrow('fetch failed');
+    expect(h.attempts()).toBe(1);
+  });
+});
+
 describe('safeErrorMessage', () => {
   it('展开 undici fetch failed 的 cause 链，露出真实网络错误', () => {
     const err = new TypeError('fetch failed', {
