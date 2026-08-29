@@ -131,7 +131,13 @@ setTimeout(() => {
   }
   if (mode === 'emfile') {
     // Exhaust the fd table so an on-demand wake fd open would get EMFILE.
-    // The parent lowers RLIMIT_NOFILE so this stays cheap and bounded.
+    //
+    // Just open until the OS refuses. No `ulimit` shell wrapper (threading
+    // interpreter paths through a shell string is what CodeQL flags) and no
+    // setrlimit (neither Node nor Bun exposes one — verified, and an optional
+    // call would have silently no-op'd). Cost is bounded by RLIMIT_NOFILE and
+    // measured at ~2-4s even with this box's 1M soft limit; every fd points at
+    // /dev/null and the process exits moments later.
     for (;;) {
       try { fs.openSync('/dev/null', 'r'); } catch { break; }
     }

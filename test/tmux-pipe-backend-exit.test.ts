@@ -24,8 +24,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawn } from 'node:child_process';
-import { spawnTsScript, tsRunnerPrefix, isBunRuntime } from './helpers/ts-runner.js';
+import { spawnTsScript, isBunRuntime } from './helpers/ts-runner.js';
 
 const FIXTURE = resolve(__dirname, 'fixtures/tmux-pipe-exit-fixture.ts');
 // Generous vs. the ~250ms the fixture needs: on a loaded box a slow start must
@@ -46,19 +45,14 @@ async function runFixture(mode: FixtureMode): Promise<{
 }> {
   const bin = mode === 'spawnfail' ? failingBinDir : fakeBinDir;
   const extraEnv = mode === 'wakefail' ? { BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL: '1' } : {};
-  // The emfile case needs a small fd table to exhaust. `sh -c 'ulimit -n …'`
-  // is the portable way to lower RLIMIT_NOFILE for a child; 128 leaves room
-  // for the runtime's own startup while still being quick to fill.
-  const child = mode === 'emfile'
-    ? spawn(
-      '/bin/sh',
-      ['-c', `ulimit -n 128; exec "$0" "$@"`, tsRunnerPrefix().command, ...tsRunnerPrefix().prefixArgs, FIXTURE, mode],
-      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...extraEnv, PATH: `${bin}:${process.env.PATH ?? ''}` } },
-    )
-    : spawnTsScript(FIXTURE, [mode], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, ...extraEnv, PATH: `${bin}:${process.env.PATH ?? ''}` },
-    });
+  // No `sh -c 'ulimit -n …'` wrapper: threading interpreter paths through a
+  // shell string is what CodeQL flags as a command built from environment
+  // values, and it buys nothing here — the emfile fixture just opens fds until
+  // the OS refuses, which exhausts whatever limit the process happens to have.
+  const child = spawnTsScript(FIXTURE, [mode], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, ...extraEnv, PATH: `${bin}:${process.env.PATH ?? ''}` },
+  });
   let stdout = '';
   child.stdout?.on('data', (b) => { stdout += String(b); });
   child.stderr?.on('data', (b) => { stdout += String(b); });

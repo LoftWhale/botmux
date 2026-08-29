@@ -212,7 +212,7 @@ function installFifoExitHook(): void {
   if (fifoExitHookInstalled) return;
   fifoExitHookInstalled = true;
   // 'exit' only admits synchronous work — which is exactly what this is: one
-  // write() plus close() per reader. Cannot be an async cleanup.
+  // write() plus one unlink() per reader. Cannot be an async cleanup.
   process.on('exit', () => {
     for (const backend of liveFifoReaders) {
       try { backend.wakeFifoReaderForExit(); } catch { /* best-effort */ }
@@ -387,7 +387,9 @@ export class TmuxPipeBackend implements SessionBackend {
     try {
       // Test seam: the fail-closed path below is only reachable when this open
       // fails, and EMFILE/ENOENT cannot be provoked from a test without
-      // destabilising the whole process. Env-gated, so production never reads it.
+      // destabilising the whole process. The env var is read on every spawn but
+      // is only ever set by this repo's own test, so production behaviour is
+      // unchanged.
       if (process.env.BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL === '1') {
         const injected: NodeJS.ErrnoException = new Error('EMFILE: injected by test');
         injected.code = 'EMFILE';
