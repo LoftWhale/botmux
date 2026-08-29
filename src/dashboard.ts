@@ -4058,14 +4058,20 @@ const server = createServer(async (req, res) => {
     // `authed` guards on the two mutations are defense-in-depth for host actions.
     if (req.method === 'GET' && url.pathname === '/api/update/status') {
       const current = currentInstalledVersion();
-      const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
-      const installManager = detectGlobalInstallManager(packageRoot);
-      // A compiled binary has no package.json, so `packageRoot` is "/" and the
+      // Display/classification only — deliberately NOT a plan root. It feeds
+      // `currentUpdateStrategy` (which handles the compiled binary's "/" correctly)
+      // and the manager label shown when nothing else resolves. Named distinctly from
+      // the `packageRoot` variables that DO reach resolveGlobalInstallPlan, so the two
+      // uses cannot be confused (and so the source guard in
+      // test/binary-self-update.test.ts can tell them apart).
+      const classifyRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
+      const installManager = detectGlobalInstallManager(classifyRoot);
+      // A compiled binary has no package.json, so `classifyRoot` is "/" and the
       // plan resolution always fails — which used to grey out the update button
       // and tell an npm user their install method is unsupported. Resolve the
       // strategy by BINARY LOCATION first; only fall back to the package-root
       // classification for the Node path (unchanged there).
-      const updateStrategy = currentUpdateStrategy(packageRoot);
+      const updateStrategy = currentUpdateStrategy(classifyRoot);
       const installPlan = updateStrategy.kind === 'package-manager'
         ? tryResolveGlobalInstallPlan(updateStrategy.packageRoot)
         : null;
@@ -4340,9 +4346,22 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'not_rollback_target' });
       }
 
+      // Rollback only knows how to drive a package manager. Resolve the strategy
+      // first so a compiled binary uses its MAPPED root: on a fresh process there
+      // is no `lastSuccessfulUpdatePlan` yet and `botmuxInstallRoot()` is "/", which
+      // made the very first rollback throw `unsupported_install_method` even though
+      // /api/update/status had just reported `rollbackSupported: true`.
+      const rollbackStrategy = currentUpdateStrategy(botmuxInstallRoot());
+      if (rollbackStrategy.kind !== 'package-manager') {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'unsupported_install_method',
+          manager: rollbackStrategy.kind === 'self-replace' ? 'binary' : 'unknown',
+        });
+      }
       let installPlan: GlobalInstallPlan;
       try {
-        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? botmuxInstallRoot();
+        const packageRoot = lastSuccessfulUpdatePlan?.activePackageRoot ?? rollbackStrategy.packageRoot;
         installPlan = withGlobalInstallRegistry(
           resolveGlobalInstallPlan(packageRoot, process.platform, `botmux@${targetVersion}`),
         );

@@ -357,6 +357,90 @@ describe('auto-update support is ONE predicate for UI and save-time validation',
   it('unsupported stays unsupported', () => {
     expect(resolveAutoUpdateSupport({ kind: 'unsupported', reason: 'unknown-binary-location' }).supported).toBe(false);
   });
+
+  it('NO ASYMMETRY: whatever status claims supportable, rollback can resolve too', () => {
+    /**
+     * The bug this pins: `/api/update/status` reported `rollbackSupported: true`
+     * for an npm-installed compiled binary (it resolves the MAPPED package root),
+     * while `/api/update/rollback` still resolved from `botmuxInstallRoot()` — on a
+     * FRESH process there is no `lastSuccessfulUpdatePlan` yet, so that is "/" and
+     * the plan resolution throws. Net effect: the UI offers a rollback button whose
+     * first click always fails.
+     *
+     * Both endpoints must therefore start from the same strategy. Assert the two
+     * roots agree for every shape that claims support.
+     */
+    const npmBinary = resolveUpdateStrategy(
+      true, '/usr/lib/node_modules/botmux-linux-x64/botmux', '/', {}, '/home/u',
+    );
+    expect(npmBinary.kind).toBe('package-manager');
+    const support = resolveAutoUpdateSupport(npmBinary);
+    expect(support.supported).toBe(true);
+
+    // What rollback must use — the strategy's root, NOT the "/" install root.
+    const rollbackRoot = npmBinary.kind === 'package-manager' ? npmBinary.packageRoot : '';
+    expect(tryResolveGlobalInstallPlan(rollbackRoot, 'linux')).not.toBeNull();
+    // ...and the pre-fix root, to show the two really differ (the defect).
+    expect(tryResolveGlobalInstallPlan('/', 'linux')).toBeNull();
+
+    // A self-replacing binary is the reverse case: update supported, rollback NOT,
+    // which is why rollbackSupported is reported separately rather than derived.
+    const curl = resolveUpdateStrategy(true, '/home/u/.botmux/bin/botmux', '/', {}, '/home/u');
+    expect(resolveAutoUpdateSupport(curl).supported).toBe(true);
+    expect(resolveAutoUpdateSupport(curl).plan).toBeNull(); // ⟹ rollbackSupported false
+  });
+
+  it('SOURCE GUARD: no update/rollback endpoint feeds resolveGlobalInstallPlan the "/" install root', () => {
+    /**
+     * ⚠️ WHY A SOURCE ASSERTION AND NOT A BEHAVIOURAL ONE. The pure-function test
+     * above proves the two ROOTS differ, but it cannot see which one dashboard.ts
+     * actually passes — verified by mutating the rollback line back to
+     * `botmuxInstallRoot()` and watching every behavioural test stay green. Standing
+     * up the whole dashboard here (auth, sockets, a real package tree) to exercise
+     * one argument is not worth it, so pin the call sites instead.
+     *
+     * THE RULE IS NARROW ON PURPOSE: what must never happen is a root reaching
+     * `resolveGlobalInstallPlan`, because that is the call that throws on "/". Merely
+     * *computing* `botmuxInstallRoot()` is fine and still happens in
+     * /api/update/status, where it feeds `currentUpdateStrategy` (which handles "/"
+     * correctly) plus a display-only manager label. An earlier, broader version of
+     * this guard flagged that benign line and failed on clean master — a guard that
+     * fires on correct code gets deleted, so it is scoped to the plan calls.
+     */
+    const src = readFileSync(resolve('src/dashboard.ts'), 'utf-8');
+    // Every `resolveGlobalInstallPlan(<root>…)` call and the identifier it is given.
+    const roots = [...src.matchAll(/resolveGlobalInstallPlan\(\s*([A-Za-z_$][\w$]*)/g)].map(m => m[1]);
+    expect(roots.length, 'expected to find the plan call sites — did they get renamed?')
+      .toBeGreaterThanOrEqual(2);
+    for (const ident of roots) expect(ident).toBe('packageRoot');
+
+    /**
+     * Every plan call takes a `packageRoot`, and every `packageRoot` assignment must
+     * let the resolved strategy decide. The display-only root in /api/update/status
+     * is named `classifyRoot` precisely so it is outside this rule — it feeds
+     * `currentUpdateStrategy` (which handles "/" correctly) and a label, never a plan.
+     *
+     * A *guarded* `runStrategy.kind === 'package-manager' ? runStrategy.packageRoot :
+     * botmuxInstallRoot()` is correct: that ternary is the Node path, where the install
+     * root IS right. So the rule is "a strategy decides this root", not "the identifier
+     * is absent" — an earlier version asserted the latter and failed on clean code.
+     */
+    const assignments = [...src.matchAll(/const packageRoot =([\s\S]{0,220}?);/g)].map(m => m[1]);
+    expect(assignments.length, 'expected the plan-root assignments — were they renamed?')
+      .toBeGreaterThanOrEqual(2);
+    const offenders = assignments.filter(a => !/(runStrategy|rollbackStrategy)\.packageRoot/.test(a));
+    expect(
+      offenders.map(a => a.replace(/\s+/g, ' ').trim()),
+      'a plan root is chosen without consulting the resolved strategy — botmuxInstallRoot() '
+        + 'is "/" for every compiled binary and resolveGlobalInstallPlan throws on it.',
+    ).toEqual([]);
+    // Positive controls: the strategy-based fallbacks ARE present, so this guard is
+    // asserting against real code rather than passing on an empty search.
+    expect(src).toMatch(/runStrategy\.kind === 'package-manager' \? runStrategy\.packageRoot/);
+    expect(src).toMatch(/\?\?\s*rollbackStrategy\.packageRoot/);
+    // And rollback must refuse anything that is not package-manager driveable.
+    expect(src).toMatch(/rollbackStrategy\.kind !== 'package-manager'/);
+  });
 });
 
 describe('resolveStandaloneRestartExecutable — restart the NEW binary, not the old path', () => {
