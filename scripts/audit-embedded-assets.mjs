@@ -57,6 +57,19 @@ const EMBED_MECHANISMS = [
     covers: (rel) => rel.startsWith('dashboard-web/'),
     proof: 'scripts/generate-dashboard-embed.mjs walks dist/dashboard-web and emits a type:"file" import per file',
   },
+  {
+    id: 'static-json-import',
+    // src/cli.ts and src/setup/open-platform-automation.ts both do
+    // `import … from './…/lark-scopes.json' with { type: 'json' }`, so --compile
+    // traces it into the module graph. The copy under dist/ remains for the Node
+    // path; the binary no longer reads it off disk at all.
+    //
+    // VERIFIED on a real compiled binary via the `__selfcheck` hidden command
+    // that shipped with the fix: `{"ok":true,"tenant":171,"user":130}` — before
+    // it, `botmux setup` threw `找不到 botmux lark-scopes.json`.
+    covers: (rel) => rel === 'setup/lark-scopes.json',
+    proof: 'imported with { type: "json" } by cli.ts and setup/open-platform-automation.ts; `<binary> __selfcheck` proves it resolves',
+  },
 ];
 
 /**
@@ -72,27 +85,6 @@ const NOT_NEEDED_IN_BINARY = [
   },
 ];
 
-/**
- * KNOWN-BROKEN, fix already in flight elsewhere.
- *
- * These ARE unreachable from the compiled binary — the gate is right about them —
- * but the fix belongs to an open PR, so failing the build here would block
- * everyone for a defect someone else is already resolving. Listed separately from
- * NOT_NEEDED_IN_BINARY so the two never blur: that list means "absence is fine",
- * this one means "absence is a bug we have not landed yet".
- *
- * Remove an entry when its PR merges. If the gate then passes, the asset became
- * reachable; if it fails, the fix regressed.
- */
-const KNOWN_UNREACHABLE = [
-  {
-    rel: 'setup/lark-scopes.json',
-    // MEASURED on a compiled binary: readDefaultScopeManifest() probes three
-    // `join(here, …)` candidates, all resolving under /$bunfs/root, all missing,
-    // so `botmux setup` throws `找不到 botmux lark-scopes.json`.
-    owner: 'PR #1065 (fix/compiled-lark-scope-manifest) — static JSON import',
-  },
-];
 
 function walk(dir) {
   const out = [];
@@ -114,18 +106,15 @@ const assets = walk(DIST)
   .sort();
 
 const unaccounted = [];
-const knownBroken = [];
 for (const rel of assets) {
   if (EMBED_MECHANISMS.some((m) => m.covers(rel))) continue;
   if (NOT_NEEDED_IN_BINARY.some((e) => e.rel === rel)) continue;
-  const known = KNOWN_UNREACHABLE.find((e) => e.rel === rel);
-  if (known) { knownBroken.push(known); continue; }
   unaccounted.push(rel);
 }
 
 // Stale-entry check: an exemption that no longer matches any asset is worse than
 // no exemption, because it silently stops protecting anything.
-const stale = [...NOT_NEEDED_IN_BINARY, ...KNOWN_UNREACHABLE].filter((e) => !assets.includes(e.rel));
+const stale = NOT_NEEDED_IN_BINARY.filter((e) => !assets.includes(e.rel));
 if (stale.length > 0) {
   console.error(
     `[audit-embed] ${stale.length} exemption(s) no longer match any dist asset — delete them:\n`
@@ -152,7 +141,4 @@ if (unaccounted.length > 0) {
   process.exit(1);
 }
 
-for (const k of knownBroken) {
-  console.warn(`[audit-embed] ⚠️  ${k.rel} is NOT reachable from the compiled binary — ${k.owner}`);
-}
 console.log(`[audit-embed] ${assets.length} dist asset(s) accounted for (compiled-binary reachability decided)`);
