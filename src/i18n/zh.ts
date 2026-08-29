@@ -936,7 +936,7 @@ export const messages: Record<string, string> = {
   'start.daemon_started_suffix': ' ({count} 个机器人, 每个独立进程)',
   'start.logs_hint': '   日志: botmux logs',
   'start.status_hint': '   状态: botmux status',
-  'start.autostart_synced': '   autostart unit 已同步到当前 Node/cli.js 路径',
+  'start.autostart_synced': '   autostart unit 已同步到当前启动路径',
 
   // ─── Daemon runtime notices ──────────────────────────────────────────────
   'daemon.auto_start_join_title': '主动开工（入群）',

@@ -42,6 +42,66 @@ export function formatDashboardSuccessLines(result: Extract<DashboardResult, { o
   return lines;
 }
 
+/**
+ * How long `start`/`restart` should keep waiting for the dashboard to answer, and
+ * what to tell an operator who asks for the link while it is still coming up.
+ *
+ * SIZED FROM A REAL FLEET, not from how long a boot "should" take. The budget was
+ * 6s; MEASURED on a 13-member fleet the dashboard needed ~45s from supervisor
+ * start to answering (supervisor up at 14:23:04, `.dashboard-port` written at
+ * 14:23:49). So every `restart` there ended in the "still booting" fallback, and
+ * the operator's natural next step — `botmux dashboard` — printed
+ * "not reachable ... `botmux restart` will start it": advice that would restart a
+ * daemon which was in fact coming up fine, throwing away the boot about to
+ * succeed.
+ */
+export const DASHBOARD_READY_WAIT_MS = 90_000;
+
+/** Failure reasons that no amount of waiting can change: a file-backed
+ *  secret/token will not appear mid-poll, and `wrong-service` means the port file
+ *  points at a non-dashboard server that discovery already failed to resolve. */
+export function dashboardFailureIsTerminal(failure: Extract<DashboardResult, { ok: false }>): boolean {
+  return failure.reason === 'no-secret'
+    || failure.reason === 'no-active-token'
+    || failure.reason === 'wrong-service';
+}
+
+/**
+ * Should the readiness poll take another turn?
+ *
+ * Two independent bounds, and BOTH matter. The clock alone would spend the (now
+ * much larger) budget in full on a fleet that has no dashboard member at all, or
+ * whose dashboard already died — so liveness gates it: keep waiting only while
+ * the supervisor still reports a live dashboard process. Liveness alone would
+ * spin forever on a member that is up but never binds its port.
+ */
+export function shouldKeepWaitingForDashboard(input: {
+  elapsedMs: number;
+  budgetMs?: number;
+  failure: Extract<DashboardResult, { ok: false }>;
+  dashboardMemberLive: boolean;
+}): boolean {
+  if (input.elapsedMs >= (input.budgetMs ?? DASHBOARD_READY_WAIT_MS)) return false;
+  if (dashboardFailureIsTerminal(input.failure)) return false;
+  return input.dashboardMemberLive;
+}
+
+/**
+ * The message for an `unreachable` result — the one an operator sees from
+ * `botmux dashboard`.
+ *
+ * "Run restart" is right ONLY when nothing is coming up. With a live dashboard
+ * member, nothing is broken and a restart would be actively counterproductive, so
+ * say "wait" instead. See DASHBOARD_READY_WAIT_MS for the measurement.
+ */
+export function formatDashboardUnreachable(port: string | number, dashboardMemberLive: boolean): string {
+  if (dashboardMemberLive) {
+    return `dashboard 正在启动中，还没开始在 127.0.0.1:${port} 上应答（大 fleet 可能要几十秒）。`
+      + '稍等几秒后重新运行 `botmux dashboard` 即可，不需要 restart。';
+  }
+  return `dashboard process not reachable on 127.0.0.1:${port} — \`botmux restart\` will start it`;
+}
+
 export function formatDashboardFallbackFailure(
   action: 'current' | 'rotate',
   failure: Extract<DashboardResult, { ok: false }>,

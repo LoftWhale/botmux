@@ -411,6 +411,96 @@ function parseJlist(stdout: string): Array<{ name?: unknown }> {
   return [];
 }
 
+/**
+ * Is this God plausibly the pre-migration botmux fleet — i.e. worth acting on?
+ *
+ * `~/.botmux/pm2` IS NOT EXCLUSIVELY THE LEGACY FLEET'S, which is the premise the
+ * rest of this module was written on. `PLUGIN_PM2_HOME` (core/plugins/pm2.ts) is
+ * the SAME directory, so a plugin service's God lives at the path treated here as
+ * "ours, safe to kill". Two things went wrong as a result, both MEASURED on a
+ * devbox running the compiled binary:
+ *
+ *  • The CLI-less path found a live plugin God next to the legacy fleet's
+ *    long-dead `pids/` records (12 files naming processes dead for three weeks)
+ *    and reported "a legacy fleet I cannot confirm is stopped" on EVERY
+ *    `botmux restart`, with no way to clear it — while telling the operator to
+ *    hunt for `index-daemon` processes that do not exist.
+ *  • The pm2-CLI path killed that God unconditionally once the home was
+ *    "exclusive", taking the plugin's services down with it.
+ *
+ * So decide from what the God actually supervises, not from the directory name:
+ *
+ *  1. Live, identity-verified legacy daemons in `pids/` → yes, a real fleet.
+ *  2. Otherwise look at the God's direct children — a pm2 God's apps ARE its
+ *     direct children (verified: an app started under a throwaway PM2_HOME had
+ *     the God as its ppid). A child counts as fleet evidence only if its cmdline
+ *     identifies it as a legacy botmux daemon, the same test `pids/` entries must
+ *     pass. No children, or only children that are not legacy daemons (a plugin
+ *     service) → no fleet.
+ *
+ * WHY THE CMDLINE AND NOT THE pm2 APP NAME: the name (`botmux-3` vs
+ * `botmux-plugin-agent-chrome`) is what cleanly separates the two, but it is NOT
+ * in the process's command line — MEASURED by starting both kinds under one God:
+ * each child's cmdline was just `node <script>`, with the name only in its
+ * `environ` as `name=`. The script path, however, does distinguish them
+ * (`dist/index-daemon.js` vs the plugin's own entry), which is exactly what
+ * `looksLikeLegacyBotmuxDaemon` already tests — so reuse it rather than parse
+ * another process's environment.
+ *
+ * Step 2 reads `/proc/<pid>/task/<tid>/children`, the kernel's own child list: no
+ * subprocess, and identical under glibc and musl (the reason nothing here uses
+ * `ps` — see `cmdlineOf`). Verified readable with a positive control on the same
+ * box: the user's systemd reported 102 children while the God reported none.
+ *
+ * `children` IS PER-TASK, so every task is scanned, not just the main thread. pm2's
+ * God does fork from its main thread (MEASURED: its app appeared in the main task's
+ * list), but a main-task-only read would report "no fleet" for anything spawned off
+ * a worker thread — a false negative that skips reaping a live fleet, the one
+ * direction that must never happen here.
+ *
+ * FAILS CLOSED everywhere it cannot measure (socket-only God with no pid, no
+ * /proc, or an unreadable task dir — `children` also needs CONFIG_PROC_CHILDREN):
+ * "yes". A wrong yes costs only the stale warning this exists to remove; a wrong
+ * no would skip reaping a live fleet and leave two fleets on the same Feishu
+ * events. A child whose cmdline is unreadable is NOT fleet evidence, matching how
+ * `legacyProcsFromPidsDir` refuses to act on anything it cannot identify.
+ */
+function godLooksLikeLegacyFleet(god: Pm2God): boolean {
+  if (legacyProcsFromPidsDir(god.home).length > 0) return true;
+  if (god.pid <= 0) return true;                   // socket-only → cannot tell
+  if (process.platform !== 'linux') return true;   // no /proc → cannot tell
+  let tasks: string[];
+  try { tasks = readdirSync(`/proc/${god.pid}/task`); }
+  catch { return true; }                           // unreadable → cannot tell
+  const children: number[] = [];
+  let readAny = false;
+  for (const tid of tasks) {
+    let raw: string;
+    try { raw = readFileSync(`/proc/${god.pid}/task/${tid}/children`, 'utf-8'); }
+    catch { continue; }                            // task exited mid-scan, or no CONFIG_PROC_CHILDREN
+    readAny = true;
+    for (const tok of raw.trim().split(/\s+/)) {
+      const pid = parseInt(tok, 10);
+      if (Number.isSafeInteger(pid) && pid > 1) children.push(pid);
+    }
+  }
+  if (!readAny) return true;                       // could not read ANY task → cannot tell
+  return children.some((pid) => looksLikeLegacyBotmuxDaemon(pid));
+}
+
+/**
+ * Is a legacy botmux fleet live under `home`? The single predicate behind both
+ * the reaper's decision and the operator-facing warning in `status`/`logs`, so
+ * the two cannot disagree — they already drifted once (see `liveGodAt`), and the
+ * plugin-home collision above is exactly the kind of premise change that would
+ * drift them again.
+ */
+export function legacyFleetAt(home: string): Pm2God | null {
+  const god = liveGodAt(home);
+  if (!god) return null;
+  return godLooksLikeLegacyFleet(god) ? god : null;
+}
+
 export interface LegacyPm2ReapResult {
   /** True if a live legacy God was found and we attempted to reap it. */
   found: boolean;
@@ -456,7 +546,11 @@ export function reapLegacyPm2(configDir: string, pkgRoot: string, log: (m: strin
   const pm2 = resolvePm2Bin(pkgRoot);
 
   for (const { home, exclusive } of homes) {
-    const god = liveGodAt(home);
+    // For the EXCLUSIVE home, "a God is live" is not enough to act on: the plugin
+    // subsystem shares this directory, so require evidence of an actual legacy
+    // fleet (see legacyFleetAt). The shared home is decided by its botmux rows
+    // further down, as before.
+    const god = exclusive ? legacyFleetAt(home) : liveGodAt(home);
     if (!god) continue;
 
     // ── No usable pm2 CLI: reap from the God's own pid files ─────────────────
@@ -473,7 +567,9 @@ export function reapLegacyPm2(configDir: string, pkgRoot: string, log: (m: strin
       if (procs.length === 0) {
         // A live God we cannot prove anything about. Say so plainly rather than
         // reporting success — the caller must be able to tell the old fleet may
-        // still be consuming the same Feishu events.
+        // still be consuming the same Feishu events. (A God supervising NOTHING
+        // never reaches here: `legacyFleetAt` filtered it out above, because on
+        // this shared home that is a plugin service's God, not a legacy fleet.)
         result.unresolved = true;
         result.note = `no pm2 CLI available and no reapable botmux pids under ${home}; `
           + 'legacy pm2 God may still be running';

@@ -935,7 +935,7 @@ export const messages: Record<string, string> = {
   'start.daemon_started_suffix': ' ({count} bots, each in its own process)',
   'start.logs_hint': '   Logs: botmux logs',
   'start.status_hint': '   Status: botmux status',
-  'start.autostart_synced': '   autostart unit synced to current Node/cli.js paths',
+  'start.autostart_synced': '   autostart unit synced to current launch path',
 
   // ─── Daemon runtime notices ──────────────────────────────────────────────
   'daemon.auto_start_join_title': 'Proactive start (joined chat)',

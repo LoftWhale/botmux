@@ -101,7 +101,7 @@ import {
 import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
-import { reapLegacyPm2, liveGodAt } from './core/legacy-pm2-reaper.js';
+import { reapLegacyPm2, liveGodAt, legacyFleetAt } from './core/legacy-pm2-reaper.js';
 import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/file-lock.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
@@ -142,9 +142,12 @@ import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/bi
 import { isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
+  dashboardFailureIsTerminal,
   executeDashboardCommand,
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
+  formatDashboardUnreachable,
+  shouldKeepWaitingForDashboard,
 } from './cli/dashboard-command.js';
 import { globalInstallUpdateLockTarget, globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
 import {
@@ -2411,7 +2414,7 @@ async function startConfiguredFleet(
   // expected in-flight state and make every systemd start fail.
   if (!options.systemdServiceStart
       && refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
-    console.log(`   autostart 主 unit 已同步到当前 Node/cli.js 路径`);
+    console.log(`   autostart 主 unit 已同步到当前启动路径`);
   }
   await printDashboardHintWithRetry();
 }
@@ -2593,7 +2596,7 @@ async function cmdRestart(): Promise<void> {
 
     await reconcilePluginServicesForCli(undefined, { autoOnly: true });
     if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
-      console.log(`autostart 主 unit 已同步到当前 Node/cli.js 路径`);
+      console.log(`autostart 主 unit 已同步到当前启动路径`);
     }
     console.log('✅ daemon 已重启');
     await printDashboardHintWithRetry();
@@ -2863,11 +2866,16 @@ async function ensureSystemDependencies(): Promise<void> {
  * `existsSync(rpc.sock)` (which outlives `pm2 kill`), so the warning survived a
  * SUCCESSFUL migration and no amount of re-running `restart` could clear it.
  *
- *  • The botmux-dedicated home (~/.botmux/pm2) is exclusively ours, so ANY live
- *    God there is a migration leftover. `liveGodAt` detects it by pm2.pid OR a
- *    held rpc.sock: a real God was observed supervising 50 daemons with NO
- *    pm2.pid at all, and a pid-file-only probe stayed silent through exactly the
- *    situation this warning exists for.
+ *  • The botmux-dedicated home (~/.botmux/pm2) is NOT exclusively ours after all:
+ *    `PLUGIN_PM2_HOME` is the same directory, so a plugin service's God lives
+ *    there too. Asking only "is a God live here?" therefore warned about a
+ *    migration that was already done — MEASURED on a devbox running the compiled
+ *    binary, on every `botmux restart`, with no way to clear it. `legacyFleetAt`
+ *    adds the missing half: a God is a legacy fleet only if it actually
+ *    supervises legacy daemons. It still detects a God by pm2.pid OR a held
+ *    rpc.sock — a real God was observed supervising 50 daemons with NO pm2.pid at
+ *    all, and a pid-file-only probe stayed silent through exactly the situation
+ *    this warning exists for.
  *
  *  • The shared default (~/.pm2) may be the user's own pm2 running unrelated
  *    apps. A live God there means nothing by itself — MEASURED on this box: the
@@ -2878,7 +2886,7 @@ async function ensureSystemDependencies(): Promise<void> {
  */
 function legacyBotmuxGodAlive(): boolean {
   const dedicated = join(CONFIG_DIR, 'pm2');
-  if (liveGodAt(dedicated) !== null) return true;
+  if (legacyFleetAt(dedicated) !== null) return true;
   const shared = join(homedir(), '.pm2');
   return liveGodAt(shared) !== null && sharedHomeHasBotmuxRows(shared);
 }
@@ -3191,21 +3199,60 @@ async function ensureDevboxDashboardExportForCurrentPort(): Promise<void> {
 }
 
 /**
+ * Is the supervisor currently running a dashboard member? Answers "is it worth
+ * waiting for the dashboard to start answering", so it is deliberately about the
+ * PROCESS, not about whether the HTTP port is up yet.
+ *
+ * Reads the supervisor's own fleet state and verifies the recorded pid is really
+ * alive, because a `launching`/`online` row can outlive the process it names (a
+ * crash between writes, or a state file left by a previous boot). Anything it
+ * cannot determine — no state file, no dashboard row, unreadable — is reported as
+ * NOT live: this only shortens a wait, and the caller still prints its soft
+ * fallback, so a false negative costs one skipped poll loop while a false
+ * positive would hang `start`/`restart` for the whole budget.
+ *
+ * `fleet-runtime` is imported dynamically to match every other use of it in this
+ * file — it pulls in the supervisor machinery, which the CLI deliberately keeps
+ * off its startup path.
+ */
+async function dashboardMemberLive(): Promise<boolean> {
+  try {
+    const { fleetStatePath, DASHBOARD_PROCESS_NAME } = await import('./core/fleet-runtime.js');
+    const { readFleetState } = await import('./core/fleet-state-store.js');
+    const state = readFleetState(fleetStatePath());
+    const proc = state?.procs?.find((p) => p.name === DASHBOARD_PROCESS_NAME);
+    if (!proc || proc.status === 'stopped' || proc.status === 'errored') return false;
+    if (!Number.isSafeInteger(proc.pid) || proc.pid <= 1) return false;
+    try { process.kill(proc.pid, 0); return true; } catch { return false; }
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Best-effort dashboard hint printed after start/restart. Reads the LIVE link
  * via /__cli/current (non-rotating) so an already-shared URL is preserved.
- * Retries for a few seconds since the dashboard process boots after the daemon;
- * if it still isn't ready, prints a soft fallback so the user isn't blocked.
+ * Retries since the dashboard process boots after the daemon; if it still isn't
+ * ready, prints a soft fallback so the user isn't blocked.
+ *
+ * BUDGET AND STOP CONDITIONS live in `cli/dashboard-command.ts`
+ * (`DASHBOARD_READY_WAIT_MS`, `shouldKeepWaitingForDashboard`) so they are unit
+ * testable and shared with the `botmux dashboard` message below — the two used to
+ * disagree, which is how an operator got told to restart a healthy, still-booting
+ * dashboard. The wait is bounded by LIVENESS as well as by the clock, so a fleet
+ * with the dashboard disabled or already crashed falls through in one tick instead
+ * of hanging for the whole budget. A fast boot is unaffected — the loop returns the
+ * moment the dashboard answers.
  */
 async function printDashboardHintWithRetry(): Promise<void> {
-  const maxWaitMs = 6000;
   const stepMs = 500;
   const started = Date.now();
   let last: Awaited<ReturnType<typeof callDashboardEndpoint>> | null = null;
   // 只在轮询之前做一次：导出结果与「dashboard 起没起来」无关，放在循环体里每轮都会
   // 重新 spawn 一次 merlin-cli，而失败路径最坏每轮付满 5s 超时——本函数自己的预算
-  // 才 6s，实测会把 start/restart 的这段拖到近两倍。
+  // 撑不住，实测会把 start/restart 的这段拖到近两倍。
   await ensureDevboxDashboardExportForCurrentPort();
-  while (Date.now() - started < maxWaitMs) {
+  for (;;) {
     last = await callDashboardEndpoint('/__cli/current');
     if (last.ok) {
       console.log(`   面板: botmux dashboard (${last.url})`);
@@ -3213,11 +3260,14 @@ async function printDashboardHintWithRetry(): Promise<void> {
       if (last.localUrl) console.log(`   本地直连(平台异常时可用): ${last.localUrl}`);
       return;
     }
-    // Terminal states — file-backed secret/token won't appear mid-poll, unlike
-    // a not-yet-listening port. `wrong-service` means the port file points at a
-    // non-dashboard server and discovery already failed to find it, so retrying
-    // won't help either. Don't spin on any of them.
-    if (last.reason === 'no-secret' || last.reason === 'no-active-token' || last.reason === 'wrong-service') break;
+    const keepWaiting = shouldKeepWaitingForDashboard({
+      elapsedMs: Date.now() - started,
+      failure: last,
+      // Only asked when a retry is otherwise possible, so a fast boot never pays
+      // for reading the fleet state.
+      dashboardMemberLive: dashboardFailureIsTerminal(last) ? false : await dashboardMemberLive(),
+    });
+    if (!keepWaiting) break;
     await new Promise(r => setTimeout(r, stepMs));
   }
   // Soft fallback
@@ -3267,9 +3317,10 @@ async function cmdDashboard(args: string[]): Promise<void> {
   if (r.reason === 'no-secret') {
     console.error('Dashboard not initialised. Run `botmux restart` first.');
   } else if (r.reason === 'unreachable') {
-    console.error(
-      `dashboard process not reachable on 127.0.0.1:${recordedPort} — \`botmux restart\` will start it`,
-    );
+    // "Run restart" is only right when nothing is coming up; with a live
+    // dashboard member it would throw away a boot that is about to succeed.
+    // See formatDashboardUnreachable / DASHBOARD_READY_WAIT_MS.
+    console.error(formatDashboardUnreachable(recordedPort, await dashboardMemberLive()));
   } else if (r.reason === 'wrong-service') {
     // 127.0.0.1:<port> answered, but it isn't the dashboard (typically the
     // daemon IPC server holding a port the stale .dashboard-port points at),

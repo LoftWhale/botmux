@@ -90,10 +90,72 @@ function fakePm2(pkgRoot: string, opts: { jlist: string }): string {
   return logFile;
 }
 
-/** Create a live pm2 God pidfile pointing at our own (alive) pid. */
+/** Create a live pm2 God pidfile pointing at our own (alive) pid.
+ *
+ *  NOTE: our own process supervises nothing, so this alone is a God with NO
+ *  legacy daemons under it — which the reaper deliberately leaves alone now that
+ *  `~/.botmux/pm2` is shared with plugin services. Tests that need the reaper to
+ *  ACT must also give it something to find: `writePm2AppPid` with a live
+ *  daemon-shaped pid, or `liveGodSupervising`. */
 function liveGodPidfile(home: string): void {
   mkdirSync(home, { recursive: true });
   writeFileSync(join(home, 'pm2.pid'), String(process.pid));
+}
+
+/**
+ * A live God that genuinely SUPERVISES a legacy botmux daemon: a real process
+ * whose own child has a `dist/index-daemon.js` cmdline, with `pm2.pid` naming the
+ * parent. This is the shape the reaper must act on.
+ *
+ * Needed because a God is now identified by WHAT IT SUPERVISES, not by the
+ * directory it lives in — `PLUGIN_PM2_HOME` is the same `~/.botmux/pm2`, so a God
+ * with no legacy daemons under it is a plugin service's God and must survive.
+ * Using our own pid as the "God" (as `liveGodPidfile` does) models a God
+ * supervising nothing, which is exactly the case that must NOT be reaped.
+ *
+ * Returns the God pid and its daemon child's pid.
+ */
+function liveGodSupervising(home: string): { god: number; child: number } {
+  return liveGodSupervisingTagged(home, '/fake/dist/index-daemon.js');
+}
+
+/**
+ * {@link liveGodSupervising} with control over the CHILD's cmdline, so a test can
+ * model a God supervising a plugin service (`/opt/<plugin>/server.js`) instead of
+ * a legacy daemon. That distinction is the whole point of the guard: the pm2 app
+ * NAME (`botmux-3` vs `botmux-plugin-agent-chrome`) is what separates them
+ * conceptually, but it is NOT in the process cmdline — MEASURED by starting both
+ * kinds under one real pm2 God: each child's cmdline was just `node <script>`,
+ * with the name only in its `environ`. The script path is what distinguishes them.
+ */
+function liveGodSupervisingTagged(home: string, childTag: string): { god: number; child: number } {
+  mkdirSync(home, { recursive: true });
+  // A parent that spawns one child with the given cmdline and then idles.
+  // Detached so teardown can signal the whole group (the child is not in
+  // `spawned`).
+  const parent = spawn(process.execPath, ['-e',
+    `const {spawn}=require('child_process');`
+    + `const c=spawn(process.execPath,['-e','setTimeout(()=>{},60000)',process.argv[1]],{stdio:'ignore'});`
+    + `process.stdout.write(String(c.pid));setTimeout(()=>{},60000);`, childTag],
+    { stdio: ['ignore', 'pipe', 'ignore'], detached: true });
+  spawned.push(parent);
+  groupLeaders.push(parent.pid!);
+  let out = '';
+  parent.stdout!.on('data', (d) => { out += String(d); });
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline && !out) spinMs(25);
+  // The child must be visible in /proc as the God's child before we assert on it.
+  const childPid = Number(out.trim());
+  const seen = Date.now() + 5_000;
+  while (Date.now() < seen) {
+    try {
+      const kids = readFileSync(`/proc/${parent.pid}/task/${parent.pid}/children`, 'utf-8');
+      if (kids.split(/\s+/).filter(Boolean).includes(String(childPid))) break;
+    } catch { /* keep waiting */ }
+    spinMs(25);
+  }
+  writeFileSync(join(home, 'pm2.pid'), String(parent.pid));
+  return { god: parent.pid!, child: childPid };
 }
 
 /** A live God that has NO pm2.pid — only its RPC socket, WITH a real listener.
@@ -243,7 +305,10 @@ describe('reapLegacyPm2', () => {
       { name: 'some-other-app' },  // unrelated → skip
     ]);
     const logFile = fakePm2(pkgRoot, { jlist });
-    liveGodPidfile(join(configDir, 'pm2'));
+    // A God that actually supervises a legacy daemon: the reaper now requires
+    // evidence of a real fleet before it touches this home (it is shared with
+    // plugin services), so a God supervising nothing would be left alone.
+    liveGodSupervising(join(configDir, 'pm2'));
 
     const r = reapLegacyPm2(configDir, pkgRoot);
     expect(r.found).toBe(true);
@@ -394,7 +459,10 @@ describe('reapLegacyPm2', () => {
     const pkgRoot = tmp();
     const home = join(configDir, 'pm2');
     fakePm2(pkgRoot, { jlist: JSON.stringify([{ name: 'botmux-0' }]) });
-    liveGodPidfile(home);      // pm2.pid → our own pid, which stays alive
+    // pm2.pid → a live God that really supervises a legacy daemon (so the reaper
+    // acts on this home at all), and that stays alive across the reap because the
+    // fake pm2 only logs its calls.
+    liveGodSupervising(home);
     orphanGodSocket(home);     // ...but nothing holds the socket
 
     const r = reapLegacyPm2(configDir, pkgRoot, () => {});
@@ -426,7 +494,7 @@ describe('reapLegacyPm2', () => {
     const pkgRoot = tmp();
     fakePm2(pkgRoot, { jlist: JSON.stringify([{ name: 'botmux' }]) });
     const home = join(configDir, 'pm2');
-    liveGodPidfile(home);
+    liveGodSupervising(home);
     liveGodSocketOnly(home); // both signals present
     const r = reapLegacyPm2(configDir, pkgRoot);
     expect(r.found).toBe(true);
@@ -470,7 +538,7 @@ describe('reapLegacyPm2', () => {
     const bin = join(binDir, 'pm2');
     writeFileSync(bin, '#!/usr/bin/env node\nprocess.exit(3);\n', { mode: 0o755 });
     chmodSync(bin, 0o755);
-    liveGodPidfile(join(configDir, 'pm2'));
+    liveGodSupervising(join(configDir, 'pm2'));
 
     // Must not throw; found:true (God was live) but nothing deleted/killed.
     const r = reapLegacyPm2(configDir, pkgRoot);
@@ -490,7 +558,7 @@ describe('reapLegacyPm2', () => {
     const configDir = tmp();
     const pkgRoot = tmp();
     const logFile = fakePm2(pkgRoot, { jlist: JSON.stringify([{ name: 'botmux' }, { name: 'botmux-0' }]) });
-    liveGodPidfile(join(configDir, 'pm2'));
+    liveGodSupervising(join(configDir, 'pm2'));
 
     const r = reapLegacyPm2(configDir, pkgRoot);
     expect(r.deleted.sort()).toEqual(['botmux', 'botmux-0']);
@@ -595,10 +663,11 @@ describe('reapLegacyPm2', () => {
   it('does not report success when the God survives (no CLI, no reapable pids)', () => {
     // The dangerous direction: if we cannot prove the old fleet is down, the
     // caller must be able to tell — silently returning "handled" is what let a
-    // double-run start. God is live, but there are no pids/ to work with.
+    // double-run start. God is live and supervising a legacy daemon, but there
+    // are no pids/ records to work with, so nothing can be signalled.
     const configDir = tmp();
     const pkgRoot = tmp(); // no bundled pm2
-    liveGodPidfile(join(configDir, 'pm2'));
+    liveGodSupervising(join(configDir, 'pm2'));
 
     const r = reapLegacyPm2(configDir, pkgRoot, () => {});
 
@@ -606,6 +675,72 @@ describe('reapLegacyPm2', () => {
     expect(r.killed).toBe(false);
     expect(r.unresolved).toBe(true); // caller must warn: old fleet may be live
     expect(r.note).toMatch(/pm2 (CLI|not)/i);
+  });
+
+  // ── The plugin-home collision ───────────────────────────────────────────────
+  // `PLUGIN_PM2_HOME` (core/plugins/pm2.ts) IS `~/.botmux/pm2` — the very home
+  // this module was written to treat as "exclusively the legacy fleet's, safe to
+  // pm2 kill". The two cases below are the production shapes MEASURED on a devbox
+  // running the compiled binary.
+  it('does not warn about a plugin God that supervises no legacy daemon (stale pids/ only)', () => {
+    // THE devbox-2 SHAPE: a live plugin-service God, next to `pids/` records the
+    // dead legacy fleet left behind three weeks earlier. The CLI-less path found
+    // "a live God + nothing reapable" and reported `unresolved` on EVERY
+    // `botmux restart` — an alarm no re-run could clear, telling the operator to
+    // hunt for `index-daemon` processes that no longer existed.
+    const configDir = tmp();
+    const pkgRoot = tmp();            // no bundled pm2 → CLI-less path
+    const home = join(configDir, 'pm2');
+    // A God supervising ONE plugin service (not a legacy daemon).
+    const { god } = liveGodSupervisingTagged(home, '/opt/agent-chrome/server.js');
+    // ...plus stale legacy pid records whose processes are long dead.
+    writePm2AppPid(home, 'botmux-0', 999_000_001);
+    writePm2AppPid(home, 'botmux-dashboard-12', 999_000_002);
+
+    const r = reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    expect(r.unresolved).toBe(false);   // ← the permanent false alarm
+    expect(r.found).toBe(false);
+    expect(alive(god)).toBe(true);      // and the plugin God is left running
+  });
+
+  it('does not `pm2 kill` a plugin God on the CLI path either', () => {
+    // Same collision, other branch: with a pm2 CLI available the exclusive-home
+    // arm ran `pm2 kill` unconditionally, taking the plugin's services down with
+    // it (MEASURED on that box as the God count dropping 4 → 3 on each restart).
+    const configDir = tmp();
+    const pkgRoot = tmp();
+    const home = join(configDir, 'pm2');
+    // jlist reports ONLY a plugin row — `botmux-plugin-*` is not botmux core.
+    const logFile = fakePm2(pkgRoot, { jlist: JSON.stringify([{ name: 'botmux-plugin-agent-chrome' }]) });
+    const { god } = liveGodSupervisingTagged(home, '/opt/agent-chrome/server.js');
+
+    const r = reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    expect(r.killed).toBe(false);
+    expect(r.deleted).toEqual([]);
+    expect(alive(god)).toBe(true);
+    // The guard runs BEFORE any pm2 invocation, so pm2 is never spawned at all —
+    // the fake's log file is not even created. Assert that directly rather than
+    // reading a file whose absence is itself the pass condition.
+    expect(existsSync(logFile)).toBe(false);
+  });
+
+  it('STILL reaps when a legacy daemon runs under the SAME God as a plugin service', () => {
+    // The guard must not become a blanket exemption: a machine mid-migration can
+    // have both under one God, and the legacy half is still a double-run hazard.
+    const configDir = tmp();
+    const pkgRoot = tmp();                    // CLI-less path
+    const home = join(configDir, 'pm2');
+    liveGodSupervisingTagged(home, '/opt/agent-chrome/server.js');
+    const [daemon] = spawnSleepers(1);        // a real, identifiable legacy daemon
+    writePm2AppPid(home, 'botmux-0', daemon);
+
+    const r = reapLegacyPm2(configDir, pkgRoot, () => {});
+
+    expect(r.found).toBe(true);
+    expect(r.deleted).toEqual(['botmux-0']);
+    expect(alive(daemon)).toBe(false);
   });
 
   it('does NOT mark the shared-home outcome unresolved (its God is spared by design)', () => {
