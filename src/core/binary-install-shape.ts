@@ -60,8 +60,13 @@ export function classifyBinaryInstall(
   }
 
   // The standalone install location. `BOTMUX_INSTALL_DIR` is what install.sh
-  // honours, so an install that used it must still be recognised — otherwise a
-  // custom-dir user silently loses self-update.
+  // honours, so an install that used it is recognised WHEN THAT VARIABLE IS STILL
+  // EXPORTED at runtime. ⚠️ It usually is not: `BOTMUX_INSTALL_DIR=/opt/bm sh
+  // install.sh` sets it for the installer only, so a later `botmux update` sees a
+  // bare environment and this falls through to `unknown` — fail-closed, so nothing
+  // is damaged, but self-update is unavailable for that install. Do not describe
+  // custom dirs as unconditionally covered; making them work without the variable
+  // would need a persisted install record, which is out of scope here.
   for (const raw of [env.BOTMUX_INSTALL_DIR, defaultInstallDir(home)]) {
     if (!raw) continue;
     const dir = raw.replace(/\\/g, '/').replace(/\/+$/, '');

@@ -16,7 +16,7 @@ import { botmuxInstallRoot } from './install-info.js';
 // whole self-update module: binary-self-update.ts pulls in restart-report →
 // install-info, and importing that side of it from here would close an import
 // cycle through this very module.
-import { currentBinaryInstallShape } from '../core/binary-install-shape.js';
+import { currentUpdateStrategy, type UpdateStrategy } from '../core/binary-install-shape.js';
 
 export type GlobalInstallManager = 'npm' | 'pnpm' | 'bun';
 export type DetectedInstallManager = GlobalInstallManager | 'yarn' | 'unknown';
@@ -259,15 +259,31 @@ export function tryResolveGlobalInstallPlan(
   }
 }
 
+/**
+ * Can this install auto-update, and by which route?
+ *
+ * ONE predicate for the whole surface: the Settings projection (what the UI shows),
+ * the save-time validation, and anything else that has to agree with them. They
+ * used to answer this question separately and drifted — the backend accepted the
+ * toggle while the frontend rendered it disabled.
+ *
+ * A compiled binary is not owned by a package manager, so `tryResolveGlobalInstallPlan`
+ * cannot classify it (its package root is "/"). Resolve by binary LOCATION first,
+ * then — for a package-manager-owned binary — still require a resolvable plan, so
+ * layouts we knowingly cannot drive (Yarn, and a pnpm v11 store whose probe fails)
+ * report false instead of promising an update that would throw.
+ */
+export function resolveAutoUpdateSupport(
+  strategy: UpdateStrategy,
+): { supported: boolean; plan: GlobalInstallPlan | null } {
+  if (strategy.kind === 'self-replace') return { supported: true, plan: null };
+  if (strategy.kind === 'unsupported') return { supported: false, plan: null };
+  const plan = tryResolveGlobalInstallPlan(strategy.packageRoot);
+  return { supported: plan !== null, plan };
+}
+
 export function isAutoUpdateSupportedInstall(): boolean {
-  // A compiled binary is not owned by a package manager, so the plan resolution
-  // below cannot classify it (its package root is "/"). It CAN still auto-update
-  // — either by handing back to npm (subpackage shape) or by replacing itself
-  // (install.sh shape) — so ask the binary-shape resolver too. Without this the
-  // Settings toggle refuses to save with `unsupported_install_no_autoupdate` on
-  // every binary install, which is now the default way botmux ships.
-  if (currentBinaryInstallShape() !== 'unknown') return true;
-  return tryResolveGlobalInstallPlan() !== null;
+  return resolveAutoUpdateSupport(currentUpdateStrategy(botmuxInstallRoot())).supported;
 }
 
 /** Pin an install plan to one registry. Callers opt in explicitly (rollback only). */

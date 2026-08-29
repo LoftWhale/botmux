@@ -37,6 +37,7 @@ import {
   botmuxVersion,
   botmuxInstallRoot,
   botmuxVersionAt,
+  diskVersionAt,
   botmuxCliEntry,
   botmuxCliEntryAt,
 } from '../utils/install-info.js';
@@ -51,9 +52,12 @@ import { scrubWorkflowWorkerEnv, stripDashboardH5Env } from '../utils/child-env.
 import { isStandaloneBinary } from './self-spawn.js';
 import {
   currentUpdateStrategy,
+  currentBinaryInstallShape,
   replaceStandaloneBinary,
+  type BinaryInstallShape,
   type UpdateStrategy,
 } from './binary-self-update.js';
+import { globalWrapperPath } from '../utils/local-dev-update.js';
 
 export interface MaintenanceState {
   /** Local date the auto-update run was last handled (fired or skipped). */
@@ -76,18 +80,25 @@ export interface MaintenanceDeps {
   /**
    * What `runUpdate` actually installed, or '' when it could not be determined.
    *
-   * ⚠️ WHY THIS EXISTS — `currentVersion()` CANNOT SEE A SELF-REPLACE. For a
-   * package-manager update the new version lands in the install's package.json,
-   * so re-reading it afterwards observes the change. A compiled binary has no
-   * package.json: its version is BAKED IN at compile time and read from this
-   * process's own env, so after swapping the file on disk `currentVersion()`
-   * still returns the OLD version (measured). The tick's `after !== before` gate
-   * would then be false, it would log "already on the latest version", and it
-   * would never restart onto the binary it just installed.
+   * ⚠️ WHY THIS EXISTS — THE BAKED VERSION SHADOWS A COMPLETED UPDATE, ON BOTH
+   * STRATEGIES. A compiled binary's version is baked in at compile time, and
+   * `botmuxVersionAt` returns that value for ANY directory you ask about. So
+   * `currentVersion()` after an update still reports this process's OLD version:
    *
-   * So the self-replace path reports the version it installed explicitly, and the
-   * tick treats that as authoritative. Returns '' for the package-manager path,
-   * which keeps using the re-read comparison exactly as before.
+   *   · self-replace     — the file on disk was swapped; nothing on disk is read.
+   *   · package-manager  — npm rewrote the install's package.json, but the baked
+   *                        value takes priority over reading it (measured:
+   *                        package.json says 3.19.0, the call returns 3.18.4).
+   *
+   * Either way `after === before`, so the tick logs "already on the latest
+   * version" and NEVER restarts onto what it just installed. Both branches
+   * therefore report the installed version explicitly — the self-replace path from
+   * what it downloaded, the package-manager path via `diskVersionAt` (which
+   * deliberately ignores the baked value).
+   *
+   * Returns '' when undeterminable, and the tick falls back to the re-read
+   * comparison. Under Node the baked value is absent, so all of this is a no-op
+   * and behaviour is byte-identical to before.
    */
   installedVersion?: () => string;
   writeIntent: (intent: RestartIntent) => void;
@@ -135,8 +146,8 @@ export function runMaintenanceTick(deps: MaintenanceDeps): void {
     deps.withUpdateLock(() => {
       before = deps.currentVersion();
       deps.runUpdate();
-      // The self-replace path reports what it installed, because re-reading the
-      // version cannot observe a swapped binary (see MaintenanceDeps.installedVersion).
+      // Both strategies report what they installed: a compiled binary's baked
+      // version shadows the disk on BOTH paths (see MaintenanceDeps.installedVersion).
       const reported = deps.installedVersion?.() ?? '';
       after = reported || deps.currentVersion();
       if (after !== before && cfg.autoRestart?.enabled) {
@@ -367,6 +378,41 @@ function setsidAvailable(): boolean {
 }
 
 /**
+ * Resolve the executable a detached restart should launch.
+ *
+ * ⚠️ WHY `process.execPath` IS NOT ALWAYS RIGHT FOR A COMPILED BINARY. For the
+ * self-replacing (install.sh) shape it is exactly right: the path is stable and we
+ * just swapped the bytes underneath it. But for a PACKAGE-MANAGER-owned binary the
+ * running path can be VERSIONED — pnpm's virtual store yields
+ * `…/.pnpm/botmux-linux-x64@<old version>/node_modules/botmux-linux-x64/botmux`.
+ * After the update, npm/pnpm's postinstall has re-pointed the stable launcher at
+ * the NEW subpackage, while this process's `execPath` still names the OLD one. So
+ * restarting from `execPath` either fails with ENOENT (the old store entry was
+ * pruned) or silently starts the OLD binary — an update that reports success and
+ * does not take effect.
+ *
+ * The stable launcher (`~/.botmux/bin/botmux`) is what both installers maintain and
+ * re-point, so it is the correct target after a package-manager update. Fall back
+ * to `execPath` when it is missing (nothing else to go on) — that is the
+ * pre-existing behaviour.
+ *
+ * Pure over its inputs so every branch is testable without a compiled binary.
+ */
+export function resolveStandaloneRestartExecutable(
+  standalone: boolean,
+  execPath: string,
+  shape: BinaryInstallShape,
+  launcherPath: string,
+  launcherExists: boolean,
+): string {
+  if (!standalone) return execPath;
+  // We own this exact path and just replaced its contents — re-exec it.
+  if (shape === 'curl-binary') return execPath;
+  if (shape === 'npm-binary' && launcherExists) return launcherPath;
+  return execPath;
+}
+
+/**
  * Spawn a detached `botmux restart`, immune to this process's own teardown
  * (setsid → a new session reparented to init, so PM2 killing the current
  * process doesn't interrupt the restart driver). Output is appended to the
@@ -395,7 +441,17 @@ export function spawnDetachedRestart(
   // still compute it for the Node path, which is unchanged.
   const standalone = isStandaloneBinary();
   const cliEntry = activePackageRoot ? botmuxCliEntryAt(activePackageRoot) : botmuxCliEntry();
-  const { cmd, args } = buildRestartLauncher(process.execPath, cliEntry, setsidAvailable(), standalone);
+  // A package-manager-owned binary's own path can be versioned (pnpm store); after
+  // the update the stable launcher points at the new one while execPath does not.
+  const launcher = globalWrapperPath();
+  const executable = resolveStandaloneRestartExecutable(
+    standalone,
+    process.execPath,
+    standalone ? currentBinaryInstallShape() : 'unknown',
+    launcher,
+    existsSync(launcher),
+  );
+  const { cmd, args } = buildRestartLauncher(executable, cliEntry, setsidAvailable(), standalone);
   const child = spawn(cmd, args, {
     detached: true,
     stdio: fd !== undefined ? ['ignore', fd, fd] : 'ignore',
@@ -458,8 +514,8 @@ function productionDeps(): MaintenanceDeps {
   // use the stable global node_modules/botmux symlink, not the removed
   // .pnpm/botmux@old runtime realpath.
   let installPlan: GlobalInstallPlan | undefined;
-  // Set by the self-replace path only (see MaintenanceDeps.installedVersion).
-  let selfReplacedTo = '';
+  // What runUpdate installed, for both strategies (see MaintenanceDeps.installedVersion).
+  let installedTo = '';
   return {
     now: () => Date.now(),
     readConfig: () => readGlobalConfig().maintenance,
@@ -475,7 +531,7 @@ function productionDeps(): MaintenanceDeps {
       ? botmuxVersionAt(installPlan.activePackageRoot)
       : botmuxVersion(),
     runUpdate: () => {
-      selfReplacedTo = '';
+      installedTo = '';
       const strategy = currentUpdateStrategy(botmuxInstallRoot());
       if (strategy.kind === 'unsupported') {
         throw new UnsupportedGlobalInstallError('unknown', process.execPath);
@@ -487,13 +543,20 @@ function productionDeps(): MaintenanceDeps {
         // `runSelfReplaceBlocking` re-execs this binary with a hidden subcommand
         // that performs the swap, which keeps the lock semantics identical to the
         // package-manager branch (one child, awaited, non-zero exit ⇒ throw).
-        selfReplacedTo = runSelfReplaceBlocking();
+        installedTo = runSelfReplaceBlocking();
         return;
       }
       installPlan ??= resolveGlobalInstallPlan(strategy.packageRoot);
       installLatestBotmuxSync(installPlan);
+      // Report what landed on DISK. For a compiled binary installed by a package
+      // manager, `currentVersion()` (→ botmuxVersionAt) returns this process's
+      // BAKED version and so cannot see the update npm just performed — measured,
+      // and it would make the tick log "already on the latest version" and skip the
+      // restart. diskVersionAt deliberately ignores the baked value. Under Node the
+      // two agree, so this is a no-op there.
+      installedTo = diskVersionAt(installPlan.activePackageRoot);
     },
-    installedVersion: () => selfReplacedTo,
+    installedVersion: () => installedTo,
     writeIntent: (intent) => writeRestartIntent(intent),
     triggerRestart: () => {
       const leaseId = claimRestartLease();

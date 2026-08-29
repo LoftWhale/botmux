@@ -84,6 +84,28 @@ export function botmuxVersionAt(rootDir: string): string {
   // The compiled binary has no package.json to read (see bakedBinaryVersion).
   const baked = bakedBinaryVersion();
   if (baked) return baked;
+  return diskVersionAt(rootDir);
+}
+
+/**
+ * The version recorded in `rootDir`'s package.json, IGNORING the baked value.
+ *
+ * ⚠️ WHY THIS EXISTS — THE BAKED VERSION SHADOWS A COMPLETED UPDATE. `baked` is
+ * compiled into the running executable, so `botmuxVersionAt` returns it no matter
+ * which directory you ask about. That is right for "what am I running", and WRONG
+ * for "what is now installed on disk": after a package-manager update replaces the
+ * install tree, a compiled binary asking `botmuxVersionAt(root)` still gets its OWN
+ * old version (measured: package.json says 3.19.0, the call returns 3.18.4).
+ *
+ * The maintenance tick gates its restart on `after !== before`, so that shadowing
+ * makes a successful update look like "already on the latest version" — it never
+ * restarts onto what it just installed. Post-update reads must therefore use this
+ * function, not `botmuxVersionAt`.
+ *
+ * (Under Node `bakedBinaryVersion()` is undefined, so the two are identical there
+ * — which is why this defect only surfaces for the compiled binary.)
+ */
+export function diskVersionAt(rootDir: string): string {
   try {
     const pkg = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf-8'));
     return typeof pkg.version === 'string' ? pkg.version : '0.0.0';

@@ -37,8 +37,9 @@ import {
   resolveUpdateStrategy,
 } from '../src/core/binary-install-shape.js';
 import { isMuslHost, releaseAssetName, releaseAssetBaseUrl, replaceStandaloneBinary } from '../src/core/binary-self-update.js';
-import { buildRestartLauncher } from '../src/core/maintenance.js';
-import { tryResolveGlobalInstallPlan, formatGlobalInstallCommand } from '../src/utils/global-install.js';
+import { buildRestartLauncher, resolveStandaloneRestartExecutable } from '../src/core/maintenance.js';
+import { tryResolveGlobalInstallPlan, formatGlobalInstallCommand, resolveAutoUpdateSupport } from '../src/utils/global-install.js';
+import { botmuxVersionAt, diskVersionAt } from '../src/utils/install-info.js';
 
 const dirs: string[] = [];
 function tmp(): string {
@@ -64,11 +65,22 @@ describe('classifyBinaryInstall — where the binary lives decides who updates i
 
   it('install.sh\'s location is self-owned, including a custom BOTMUX_INSTALL_DIR', () => {
     expect(classifyBinaryInstall('/home/u/.botmux/bin/botmux', {}, '/home/u')).toBe('curl-binary');
-    // install.sh honours BOTMUX_INSTALL_DIR; an install that used it must still be
-    // recognised or that user silently loses self-update.
+    // install.sh honours BOTMUX_INSTALL_DIR, and it is recognised WHEN STILL
+    // EXPORTED at runtime. It usually is not (the installer is normally invoked as
+    // `BOTMUX_INSTALL_DIR=… sh install.sh`, which does not persist it) — see the
+    // fail-closed case asserted below.
     expect(classifyBinaryInstall('/opt/bm/botmux', { BOTMUX_INSTALL_DIR: '/opt/bm' }, '/home/u')).toBe('curl-binary');
     // A trailing slash names the same directory.
     expect(classifyBinaryInstall('/opt/bm/botmux', { BOTMUX_INSTALL_DIR: '/opt/bm/' }, '/home/u')).toBe('curl-binary');
+  });
+
+  it('a custom-dir install without the env var at runtime fails CLOSED, not wrong', () => {
+    // The honest limitation: nothing is damaged (we never write), but self-update is
+    // unavailable for that install. Asserted so the behaviour is deliberate rather
+    // than an accident, and so the docs cannot drift into claiming full coverage.
+    expect(classifyBinaryInstall('/opt/bm/botmux', {}, '/home/u')).toBe('unknown');
+    expect(resolveUpdateStrategy(true, '/opt/bm/botmux', '/', {}, '/home/u'))
+      .toEqual({ kind: 'unsupported', reason: 'unknown-binary-location' });
   });
 
   it('FAIL CLOSED: anything else is unknown, so no caller writes where it should not', () => {
@@ -269,6 +281,110 @@ describe('buildRestartLauncher — the compiled binary dispatches its own subcom
     for (const shape of [direct, viaSetsid]) {
       expect(shape.args.some(a => a.endsWith('cli.js'))).toBe(false);
     }
+  });
+});
+
+describe('the baked version must not shadow a completed update (BOTH strategies)', () => {
+  /**
+   * `botmuxVersionAt` returns the compile-time baked version for ANY directory,
+   * which is right for "what am I running" and WRONG for "what is now installed".
+   * After a package-manager update rewrites the install's package.json, a compiled
+   * binary asking `botmuxVersionAt(root)` still gets its OWN old version — so the
+   * maintenance tick's `after !== before` gate stays false and it never restarts
+   * onto what it just installed, and the dashboard reports `changed: false`.
+   *
+   * `diskVersionAt` exists to bypass the baked value for exactly those post-update
+   * reads. MUTATION CHECK: making `diskVersionAt` delegate to `botmuxVersionAt`
+   * turns the first assertion red.
+   */
+  it('diskVersionAt reads package.json even when a baked version is present', () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '3.19.0' }));
+    const prev = process.env.BOTMUX_BAKED_VERSION;
+    process.env.BOTMUX_BAKED_VERSION = '3.18.4'; // as a compiled binary carries
+    try {
+      // The shadowing itself — this is the behaviour that caused the bug.
+      expect(botmuxVersionAt(dir)).toBe('3.18.4');
+      // ...and the bypass used by every post-update read.
+      expect(diskVersionAt(dir)).toBe('3.19.0');
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_BAKED_VERSION;
+      else process.env.BOTMUX_BAKED_VERSION = prev;
+    }
+  });
+
+  it('under Node (no baked version) the two agree — so nothing changes there', () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '3.19.0' }));
+    const prev = process.env.BOTMUX_BAKED_VERSION;
+    delete process.env.BOTMUX_BAKED_VERSION;
+    try {
+      expect(diskVersionAt(dir)).toBe(botmuxVersionAt(dir));
+      expect(diskVersionAt(dir)).toBe('3.19.0');
+    } finally {
+      if (prev !== undefined) process.env.BOTMUX_BAKED_VERSION = prev;
+    }
+  });
+
+  it('an unreadable root degrades to 0.0.0, matching botmuxVersionAt', () => {
+    expect(diskVersionAt(join(tmp(), 'nope'))).toBe('0.0.0');
+  });
+});
+
+describe('auto-update support is ONE predicate for UI and save-time validation', () => {
+  // These used to be answered separately: the projection ran
+  // `tryResolveGlobalInstallPlan()` (false for every compiled binary, root "/")
+  // while the save path used the shape resolver — so the backend accepted a toggle
+  // the frontend rendered as disabled.
+  it('self-replace is supported without any package-manager plan', () => {
+    const r = resolveAutoUpdateSupport({ kind: 'self-replace', target: '/home/u/.botmux/bin/botmux' });
+    expect(r.supported).toBe(true);
+    expect(r.plan).toBeNull();
+  });
+
+  it('a package-manager binary is supported only when its plan resolves', () => {
+    expect(resolveAutoUpdateSupport({ kind: 'package-manager', packageRoot: '/usr/lib/node_modules/botmux' }).supported)
+      .toBe(true);
+    // Yarn is knowingly not driveable — promising support would offer an update
+    // that throws. (This is the case my first implementation got wrong by
+    // returning true for ANY npm-binary shape.)
+    expect(resolveAutoUpdateSupport({ kind: 'package-manager', packageRoot: '/root/.config/yarn/global/node_modules/botmux' }).supported)
+      .toBe(false);
+    // And the pre-fix compiled-binary root.
+    expect(resolveAutoUpdateSupport({ kind: 'package-manager', packageRoot: '/' }).supported).toBe(false);
+  });
+
+  it('unsupported stays unsupported', () => {
+    expect(resolveAutoUpdateSupport({ kind: 'unsupported', reason: 'unknown-binary-location' }).supported).toBe(false);
+  });
+});
+
+describe('resolveStandaloneRestartExecutable — restart the NEW binary, not the old path', () => {
+  const LAUNCHER = '/root/.botmux/bin/botmux';
+  // pnpm's virtual store puts the VERSION in the running path.
+  const PNPM_OLD = '/root/.local/share/pnpm/global/5/.pnpm/botmux-linux-x64@3.18.4/node_modules/botmux-linux-x64/botmux';
+
+  it('a package-manager binary restarts via the stable launcher', () => {
+    // After the update, postinstall re-pointed the launcher at the NEW subpackage
+    // while this process's execPath still names the OLD versioned one. Restarting
+    // from execPath would ENOENT (store entry pruned) or silently run the old
+    // binary — an update that reports success and does not take effect.
+    expect(resolveStandaloneRestartExecutable(true, PNPM_OLD, 'npm-binary', LAUNCHER, true)).toBe(LAUNCHER);
+  });
+
+  it('falls back to execPath when no launcher exists (pre-existing behaviour)', () => {
+    expect(resolveStandaloneRestartExecutable(true, PNPM_OLD, 'npm-binary', LAUNCHER, false)).toBe(PNPM_OLD);
+  });
+
+  it('a self-replaced binary keeps its own path — we swapped the bytes there', () => {
+    expect(resolveStandaloneRestartExecutable(true, LAUNCHER, 'curl-binary', LAUNCHER, true)).toBe(LAUNCHER);
+    // Even a curl install at a custom dir restarts itself, not the default launcher.
+    expect(resolveStandaloneRestartExecutable(true, '/opt/bm/botmux', 'curl-binary', LAUNCHER, true))
+      .toBe('/opt/bm/botmux');
+  });
+
+  it('NODE PATH UNCHANGED: never redirected away from execPath', () => {
+    expect(resolveStandaloneRestartExecutable(false, '/usr/bin/node', 'unknown', LAUNCHER, true)).toBe('/usr/bin/node');
   });
 });
 
