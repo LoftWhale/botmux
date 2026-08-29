@@ -500,11 +500,16 @@ describe('inbound webhook idempotency', () => {
         method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: raw,
       }).then(async r => ({ status: r.status, body: await r.json() as any }));
 
-    it('folds a VERBATIM signed retry instead of answering 409 replay', async () => {
-      // A gateway retrying at-least-once normally resends the identical signed
-      // request — same timestamp, nonce, signature, body and key. Claiming the nonce
-      // before the idempotency verdict answered 409, which the sender reads as "not
-      // delivered", so it kept retrying and the fold never happened.
+    it('answers 409 for a VERBATIM signed retry (documented HMAC limitation)', async () => {
+      // Scope decision, not an oversight: the nonce is claimed before the
+      // idempotency gate, so an identical signed replay is a nonce replay. Folding
+      // it would require deferring the claim, which only works when the first
+      // delivery SUCCEEDS — on failure the nonce is spent and the retry that should
+      // take over is refused (see the next test). Doing it properly needs a second
+      // reserve/settle machine for nonces, CAS-bound to a full dispatch-affecting
+      // fingerprint, because the signature covers only `timestamp.rawBody` and not
+      // the idempotency key / query / routing headers. Out of scope here; HMAC
+      // senders must re-sign with a fresh nonce per retry (documented).
       await seedHmac();
       const raw = JSON.stringify(MR_EVENT);
       const ts = String(Math.floor(Date.now() / 1000));
@@ -516,6 +521,25 @@ describe('inbound webhook idempotency', () => {
       };
       const first = await sendSigned(headers, raw);
       const retry = await sendSigned(headers, raw);
+      expect(first.body.action).toBe('queued');
+      expect([retry.status, retry.body.errorCode]).toEqual([409, 'replay']);
+      expect(proxyToDaemon).toHaveBeenCalledTimes(1);
+    });
+
+    it('folds a retry that mints a fresh nonce and re-signs (the supported shape)', async () => {
+      // What the documentation asks HMAC senders to do — and it collapses properly.
+      await seedHmac();
+      const raw = JSON.stringify(MR_EVENT);
+      const key = 'rec_hmac_2';
+      const send = (nonce: string) => {
+        const ts = String(Math.floor(Date.now() / 1000));
+        return sendSigned({
+          'x-botmux-timestamp': ts, 'x-botmux-nonce': nonce,
+          'x-botmux-signature': sign(ts, raw), 'x-idempotency-key': key,
+        }, raw);
+      };
+      const first = await send('nonce-1');
+      const retry = await send('nonce-2');
       expect(first.body.action).toBe('queued');
       expect([retry.status, retry.body.action]).toEqual([200, 'ignored']);
       expect(proxyToDaemon).toHaveBeenCalledTimes(1);

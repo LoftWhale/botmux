@@ -93,9 +93,17 @@ three headers are tried in the order listed; the first non-empty value wins.
 - A `wait`-mode **timeout (504) does not release the key**: that turn was already
   dispatched and is probably still running, so a retry is folded rather than run
   a second time.
-- In HMAC mode a gateway that **replays the identical signed request** (same
-  timestamp, nonce, signature and body) is folded to `200 ignored` as well — the
-  nonce replay guard no longer answers 409 ahead of the idempotency check.
+- ⚠️ **HMAC limitation**: the nonce replay guard runs before the idempotency
+  check, so replaying the **identical signed request** (same nonce) returns
+  `409 replay` and is NOT folded. With HMAC, mint a **fresh nonce and re-sign for
+  each retry** — same key + new nonce folds normally.
+  > Why not support verbatim replays: the signature covers only
+  > `timestamp.raw-body`, **not** the idempotency key, the query string, or the
+  > `x-botmux-chat-id` / `-session-id` / `-root-message-id` routing headers. If a
+  > nonce could be released after a failure, someone holding a captured signature
+  > could replay it with altered routing. Doing it correctly needs a second
+  > reserve/settle machine for nonces bound to a full request fingerprint — a bigger
+  > security change than this feature's scope.
 
 ### Limits (important)
 

@@ -484,9 +484,6 @@ async function handleWebhookRouteImpl(
   const startedAtMs = Date.now();
   const connectorId = decodeURIComponent(m[1]);
   let requestId: string | undefined;
-  /** HMAC mode only: the caller's nonce, claimed AFTER the idempotency verdict so a
-   *  verbatim signed retry can be folded rather than answered 409 replay. */
-  let hmacNonce: string | undefined;
   let auditRequest = webhookAuditRequest(req, url);
   let auditTarget: TriggerLogTarget | undefined;
   const auditMeta = () => ({ createdAt, startedAtMs, requestId, request: auditRequest, target: auditTarget });
@@ -614,23 +611,34 @@ async function handleWebhookRouteImpl(
       fail(401, 'replay', 'timestamp outside tolerance window');
       return true;
     }
-    // Signature BEFORE the nonce claim. Two reasons, both found in review:
-    //  * An unauthenticated caller must not be able to write into `replayNonces`
-    //    (uncapped, TTL-only) by sending a bogus signature with a fresh nonce.
-    //  * The nonce claim is deferred until after the idempotency verdict, so a
-    //    gateway that replays the SAME signed request verbatim — same timestamp,
-    //    nonce, signature, body and key, which is what an at-least-once retry
-    //    normally looks like — is folded as a duplicate instead of being answered
-    //    409 replay, which the sender reads as "not delivered" and retries again.
+    // Signature BEFORE the nonce claim: an unauthenticated caller must not be able
+    // to write into `replayNonces` (uncapped, TTL-only) with a bogus signature, nor
+    // poison a nonce the real sender is about to use.
     const secret = getWebhookSecret(verify.secretRef);
     if (!secret || !verifyWebhookSignature(secret, ts, rawBody, sig)) {
       fail(401, 'invalid_signature', 'signature verification failed');
       return true;
     }
-    // Deferred: claimed below, only once we know this delivery is not a duplicate
-    // we are about to collapse. Replaying an authenticated request has no side
-    // effect of its own — the idempotency gate is what makes that safe.
-    hmacNonce = nonce;
+    // The nonce is claimed HERE, before the idempotency gate. Consequence, and it
+    // is a deliberate scope decision: a gateway that replays the IDENTICAL signed
+    // request (same timestamp/nonce/signature) is answered 409 replay rather than
+    // folded as a duplicate. HMAC senders must mint a fresh nonce and re-sign for
+    // each retry — documented in the webhook guide.
+    //
+    // Deferring the claim past the gate (so verbatim retries could fold) only works
+    // for a first delivery that SUCCEEDS: if it fails, the nonce is already spent
+    // and the retry that should take over is refused 409 instead (verified by
+    // probe). Making it correct needs a second reserve/settle state machine for
+    // nonces, CAS-bound to a full dispatch-affecting fingerprint — because the HMAC
+    // covers only `timestamp.rawBody`, NOT the idempotency key, query string, or the
+    // `x-botmux-chat-id` / `-session-id` / `-root-message-id` routing headers, so a
+    // releasable nonce would otherwise let a captured signature be replayed with
+    // altered routing. That is a bigger, security-sensitive change than the problem
+    // this PR set out to fix (token-mode fixed group), so it stays out.
+    if (!claimNonce(connector.id, nonce, verify.toleranceSeconds)) {
+      fail(409, 'replay', 'nonce replay detected');
+      return true;
+    }
     requestId = nonce;
   }
 
@@ -724,17 +732,6 @@ async function handleWebhookRouteImpl(
       const reserved = idempotency;
       guard.release = () => settleWebhookIdempotency(connector.id, reserved.key, reserved.token, undefined);
     }
-  }
-
-  // Nonce replay guard, claimed now that this delivery is NOT a duplicate we are
-  // collapsing. A duplicate short-circuited above without touching the nonce map,
-  // so a verbatim at-least-once retry folds to 200 ignored; anything reaching here
-  // is a distinct delivery, and a repeated nonce on a distinct delivery is a real
-  // replay. (Signature was verified above, so this map can only be written by an
-  // authenticated caller.)
-  if (hmacNonce && !claimNonce(connector.id, hmacNonce, connector.verify.toleranceSeconds)) {
-    fail(409, 'replay', 'nonce replay detected');
-    return true;
   }
 
   // The limiter runs only for deliveries we are actually going to act on, so a
