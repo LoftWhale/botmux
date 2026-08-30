@@ -166,7 +166,14 @@ console.log(
 const liveChildren = new Map();
 
 /**
- * Signal a child's whole process TREE, not just the Bun parent it points at.
+ * Signal a child's process GROUP — deliberately not called a "tree".
+ *
+ * A grandchild that calls `setsid()` or spawns with `detached: true` leaves this
+ * group and survives (measured: a fixture server with PID == PGID == SID outlived
+ * its group leader). Killing the group covers the common case — a test's spawned
+ * server or pty — and is what makes normal-close and cancellation sweeps work; it
+ * is not a guarantee against a descendant that deliberately detaches. Those are
+ * the test's own responsibility to clean up.
  *
  * POSIX: `detached: true` gave the child its own process group, and a negative pid
  * signals that whole group. Windows has no process groups in this sense and
@@ -278,6 +285,14 @@ function runOne(file) {
     child.on('close', (code, signal) => {
       clearTimeout(wall);
       liveChildren.delete(child);
+      // Sweep whatever is LEFT in the child's process group. A test that spawns a
+      // grandchild and only kills the intermediate process leaves the grandchild
+      // running when the Bun parent exits — measured with
+      // test/session-preview-ownership.test.ts, whose `LISTEN_SCRIPT` server
+      // survived a NORMAL file close as a PPID=1 process holding a port. Deleting
+      // the scratch dir without this made a directory-based check look clean while
+      // the process was still alive, so sweep BEFORE removing the evidence.
+      killTree(child, 'SIGKILL');
       rmSync(scratch, { recursive: true, force: true });
       // A signal death (wall-clock kill, OOM) leaves code null — never let that
       // coerce into a pass.
