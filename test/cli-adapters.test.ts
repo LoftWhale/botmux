@@ -7,7 +7,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { codexHome } from '../src/services/codex-paths.js';
 
 // ---------------------------------------------------------------------------
@@ -42,7 +42,7 @@ import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
-import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createPiAdapter, buildPiArgs, piTurnBoundaryExtensionPath } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
 import { assertEbsdPerBotEnv, createEbsdAdapter, ebsdBotmuxSessionDir } from '../src/adapters/cli/ebsd.js';
@@ -1215,6 +1215,24 @@ describe('pi buildArgs', () => {
     // Absolute: Pi resolves a relative --extension against ITS cwd, which is
     // the user's workspace, not ours.
     expect(isAbsolute(args[flagIdx + 1])).toBe(true);
+    // …and the path must really be there. Pi treats an unloadable extension as
+    // FATAL (exit 1), so a path we cannot back with a file would kill every Pi
+    // session instead of merely losing the marker.
+    expect(existsSync(args[flagIdx + 1])).toBe(true);
+  });
+
+  it('omits --extension rather than handing Pi a path that does not exist', () => {
+    // The compiled binary is the real case: its module graph lives in the
+    // virtual `/$bunfs/` root, so both `__dirname`-derived candidates resolve
+    // to paths that exist only inside that process. Measured directly against
+    // Pi 0.84.4: a missing `--extension` target aborts startup with
+    // `Failed to load extension … Extension path does not exist` and exit 1.
+    // Losing the boundary marker costs the reader's timeout backstop; a dead
+    // Pi costs the whole session — so this must fail OPEN.
+    expect(piTurnBoundaryExtensionPath()).toBeTruthy();
+    const args = buildPiArgs({ sessionId: 'sess-pi', turnBoundaryExtension: undefined });
+    expect(args).not.toContain('--extension');
+    expect(args).toEqual(['--session-id', 'sess-pi']);
   });
 
   it('pins the configured model instead of inheriting Pi defaults', () => {
