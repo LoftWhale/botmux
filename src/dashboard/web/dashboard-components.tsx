@@ -414,6 +414,12 @@ export function dropdownPlacement(input: {
   /** Unconstrained popup height (scrollHeight), i.e. what the content wants. */
   naturalHeight: number;
   viewportHeight: number;
+  /**
+   * Size for this direction instead of deciding one. Used when a per-page rule
+   * pins the direction with higher specificity than the `.is-drop-up` class, so
+   * the budget must match what actually rendered rather than what we asked for.
+   */
+  forceDropUp?: boolean;
 }): { dropUp: boolean; maxHeight: number } {
   const margin = 12;
   const gap = 8;
@@ -421,7 +427,7 @@ export function dropdownPlacement(input: {
   const roomAbove = input.triggerTop - gap - margin;
   // Flip up only when below genuinely cannot fit AND above is roomier;
   // otherwise stay below (predictable) and just cap the height.
-  const dropUp = input.naturalHeight > roomBelow && roomAbove > roomBelow;
+  const dropUp = input.forceDropUp ?? (input.naturalHeight > roomBelow && roomAbove > roomBelow);
   // Floor: in a viewport too short for either side, a tiny sliver would be
   // worse than a popup that slightly overhangs but is still scrollable.
   const maxHeight = Math.max(140, Math.floor(dropUp ? roomAbove : roomBelow));
@@ -464,8 +470,28 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
         naturalHeight: pop.scrollHeight,
         viewportHeight: window.innerHeight,
       });
-      pop.style.setProperty('--dropdown-popover-space', `${maxHeight}px`);
       details.classList.toggle('is-drop-up', dropUp);
+      // A per-page rule may pin the direction regardless of the class — e.g.
+      // `.connector-create-modal #cn-verify .sect-sort-pop` sets `bottom` with
+      // ID specificity, so that popup always opens upward. Budgeting for the
+      // side we merely *asked* for would then clip it off the opposite edge, so
+      // detect where it actually landed and size for that side.
+      //
+      // Measure geometry, not `getComputedStyle().top`: for a positioned box the
+      // computed value resolves `auto` to a used pixel value, never the string
+      // 'auto', so a style probe reports "not flipped" for every popup.
+      const popBox = pop.getBoundingClientRect();
+      const renderedUp = popBox.height > 0 && popBox.bottom <= trigger.top + 1;
+      const effective = renderedUp === dropUp
+        ? maxHeight
+        : dropdownPlacement({
+          triggerTop: trigger.top,
+          triggerBottom: trigger.bottom,
+          naturalHeight: pop.scrollHeight,
+          viewportHeight: window.innerHeight,
+          forceDropUp: renderedUp,
+        }).maxHeight;
+      pop.style.setProperty('--dropdown-popover-space', `${effective}px`);
     };
     const frame = window.requestAnimationFrame(place);
     window.addEventListener('resize', place);

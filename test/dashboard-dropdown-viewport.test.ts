@@ -98,6 +98,37 @@ describe('dropdown popup stays inside the viewport', () => {
     }
   });
 
+  it('sizes for the direction that actually rendered, not the one it asked for', () => {
+    // `.connector-create-modal #cn-verify .sect-sort-pop` pins `bottom` with ID
+    // specificity, so that popup opens upward even when the class says other-
+    // wise. Budgeting for "below" would then clip it off the TOP of the screen.
+    const geometry = {
+      triggerTop: 120,
+      triggerBottom: 160,
+      naturalHeight: 600,
+      viewportHeight: 720,
+    };
+    const asked = dropdownPlacement(geometry);
+    expect(asked.dropUp).toBe(false);
+    expect(asked.maxHeight).toBe(540); // room BELOW — wrong side for this popup
+
+    const rendered = dropdownPlacement({ ...geometry, forceDropUp: true });
+    expect(rendered.dropUp).toBe(true);
+    // Room ABOVE is only 120 - 8 - 12 = 100, so the floor applies; either way
+    // it must be far smaller than the below-budget that would overflow upward.
+    expect(rendered.maxHeight).toBeLessThan(asked.maxHeight);
+    expect(rendered.maxHeight).toBeLessThanOrEqual(140);
+  });
+
+  it('detects the applied direction from geometry, not computed style', () => {
+    const source = readFileSync(new URL('../src/dashboard/web/dashboard-components.tsx', import.meta.url), 'utf8');
+    // getComputedStyle().top resolves `auto` to a used pixel value on a
+    // positioned box, so a style probe reports "not flipped" for every popup.
+    expect(source).not.toMatch(/getComputedStyle\(pop\)\.top === 'auto'/);
+    expect(source).toMatch(/popBox\.bottom <= trigger\.top \+ 1/);
+    expect(source).toMatch(/forceDropUp: renderedUp/);
+  });
+
   it('has a drop-up rule for the flipped state', () => {
     expect(style()).toMatch(/\.sect-sort-menu\.is-drop-up\s*>\s*\.sect-sort-pop\s*\{[^}]*bottom:\s*calc\(100% \+ 8px\)/);
   });
