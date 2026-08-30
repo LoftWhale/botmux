@@ -6,7 +6,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { codexHome } from '../src/services/codex-paths.js';
 
@@ -1200,16 +1200,37 @@ describe('pi buildArgs', () => {
     expect(adapter.altScreen).toBe(true);
   });
 
+  it('loads the turn-boundary extension on every spawn so mid-turn retries are not read as failures', () => {
+    // Pi's `stopReason:"error"` is per-REQUEST and its loop retries inside the
+    // same turn, so the transcript alone cannot say when a turn ended. The
+    // reader depends on the boundary marker this extension appends — if the
+    // flag stops being passed, `pi-transcript` silently falls back to its
+    // timeout backstop and every transient blip becomes a late failure card.
+    // Asserted here (not only in the reader's own tests) because the policy
+    // being right is worthless if the wiring that feeds it is missing.
+    const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: false });
+    const flagIdx = args.indexOf('--extension');
+    expect(flagIdx).toBeGreaterThanOrEqual(0);
+    expect(args[flagIdx + 1]).toMatch(/pi-turn-boundary-extension\.(?:js|ts)$/);
+    // Absolute: Pi resolves a relative --extension against ITS cwd, which is
+    // the user's workspace, not ours.
+    expect(isAbsolute(args[flagIdx + 1])).toBe(true);
+  });
+
   it('pins the configured model instead of inheriting Pi defaults', () => {
     const args = adapter.buildArgs({
       sessionId: 'sess-pi',
       resume: false,
       model: 'custom/long-context-model',
     });
-    expect(args).toEqual([
+    // Exact argv, minus the extension pair asserted by its own case above:
+    // keeps this case about the model flag while still proving nothing else
+    // crept into the launch line.
+    expect(args.slice(2)).toEqual([
       '--session-id', 'sess-pi',
       '--model', 'custom/long-context-model',
     ]);
+    expect(args[0]).toBe('--extension');
   });
 });
 

@@ -1,9 +1,25 @@
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+
+/** Absolute path to the turn-boundary extension handed to Pi via `--extension`.
+ *  Mirrors `pi-initial-prompt.ts`'s resolver: prefer the compiled sibling, fall
+ *  back to the TypeScript source (Pi loads .ts directly, and that is the shape
+ *  a source-tree checkout ships). Resolved lazily at spawn time, not at module
+ *  load, so constructing the adapter never touches the filesystem. */
+export function piTurnBoundaryExtensionPath(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const compiled = resolve(here, 'pi-turn-boundary-extension.js');
+  if (existsSync(compiled)) return compiled;
+  return resolve(here, 'pi-turn-boundary-extension.ts');
+}
 
 /** Adapter for Pi coding-agent's native TUI (`pi`).
  *
@@ -83,6 +99,13 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, initialPrompt, model }) {
       const args = [
+        // Pi's `stopReason:"error"` is a PER-REQUEST failure that its agent loop
+        // retries inside the same turn, so the transcript alone cannot say when
+        // a turn really ended. This extension appends Pi's own `agent_settled`
+        // boundary into the session JSONL the bridge already reads. Loaded on
+        // every Botmux-spawned Pi (a hand-started `pi` is unaffected, since the
+        // flag lives only in the argv we build). See pi-turn-boundary-extension.ts.
+        '--extension', piTurnBoundaryExtensionPath(),
         '--session-id', sessionId,
       ];
       if (model?.trim()) args.push('--model', model.trim());
