@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import osDefault from 'node:os';
-import { realpathSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fenceHomeRootedEnv } from './helpers/fence-home-env.js';
 import { homedir, userInfo } from 'node:os';
 
 /**
@@ -282,7 +284,13 @@ describe.sequential('sequential parity', () => {
 // than "points somewhere safe" — matches the chosen contract: `resolveBotConfigPath`
 // fails closed on a set-but-missing path, so redirecting would change behaviour for
 // every test that never set the variable.
-describe('exact-path env overrides are cleared by both fences', () => {
+//
+// ⚠️ The test SEEDS the variables itself and calls the shared helper directly.
+// Merely asserting they are unset after setup is a zero-input guard: in CI (and any
+// clean shell) most of these are unset anyway, so deleting every `delete` from the
+// helper still passed — measured: fence fully disabled + clean env = 21/21 green.
+// Seeding is what gives the guard teeth on the machines that actually run it.
+describe('exact-path env overrides are cleared by the shared fence', () => {
   const cleared = [
     'BOTS_CONFIG',
     'PM2_HOME',
@@ -295,7 +303,32 @@ describe('exact-path env overrides are cleared by both fences', () => {
     'MIRAMCP_PID_FILE',
   ] as const;
 
-  it('none of them is set inside a fenced run', () => {
+  it('deletes every one of them even when the caller had them set', () => {
+    const saved = new Map<string, string | undefined>();
+    for (const name of cleared) {
+      saved.set(name, process.env[name]);
+      // A sentinel that looks like the live path these normally point at.
+      process.env[name] = `/root/.botmux/sentinel-${name}`;
+    }
+    try {
+      // Exercise the helper the two setup files share, on a throwaway home.
+      const fencedHome = mkdtempSync(join(tmpdir(), 'fence-env-parity-'));
+      try {
+        fenceHomeRootedEnv(fencedHome);
+        const stillSet = cleared.filter(name => process.env[name] !== undefined);
+        expect(stillSet).toEqual([]);
+      } finally {
+        rmSync(fencedHome, { recursive: true, force: true });
+      }
+    } finally {
+      for (const [name, original] of saved) {
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
+  it('and none of them is set inside the fenced run itself', () => {
     const stillSet = cleared.filter(name => process.env[name] !== undefined);
     expect(stillSet).toEqual([]);
   });
