@@ -42,6 +42,7 @@ import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
   compactGroupsMatrix,
+  groupsNamesMatrix,
   createGroupsMatrixSnapshot,
   enrichSessionsWithGroupNames,
   roleWriteShouldInvalidate,
@@ -4910,7 +4911,27 @@ const server = createServer(async (req, res) => {
     // 含 aiden×claude / aiden×codex 网关项——前端打开"添加机器人"表单时拉取填充下拉.
     // id 既可能是普通 cliId, 也可能是 'aiden-x-claude' 这类选择键, 由 resolveCliSelection 解析.
     if (req.method === 'GET' && url.pathname === '/api/cli-options') {
-      const webSession = await botOnboarding.sessionStatus();
+      // `webSession` 是「开放平台登录态」实时探测: sessionStatus() 一路走到
+      // inspectCachedFeishuOpenPlatformSession(), 对飞书做一次真实网络往返
+      // (MEASURED: 1004 / 1091 / 2530ms; 端点 p50 1282ms / max 4402ms)。而同一
+      // 个 handler 里真正要算的东西只要 13ms (39 个 CLI 的 checkCliAvailability
+      // 12ms + staticModelChoices 1ms)——99% 的时间花在那一次外网调用上。
+      //
+      // 只有「添加机器人」弹窗消费它 (bot-onboarding.tsx 用来决定 reuse/qr 登录
+      // 模式并展示"将使用 …"账号)。Bot 配置页的 CliOptionsState (bot-defaults.ts)
+      // 类型里根本没有这个字段——付了 1-4s 的钱, 拿到就丢, 首屏白等。
+      //
+      // ⚠️ 兼容性决定了这里为什么是 opt-OUT 而不是 opt-IN:
+      // 路由 chunk 带 `immutable` 长缓存, 而 stale-chunk 自愈只在**动态 import
+      // 失败**时触发 —— dashboard 重启后, 已经加载好的旧 Bot 配置 chunk 会继续
+      // 活着并请求**裸** `/api/cli-options`。若裸端点默认不再探测, 旧 chunk 会在
+      // `body?.webSession?.status === 'ready'` 处把「字段缺席」判成 scan_required,
+      // 把登录态明明正常的用户**推去扫码**。新增 `not_probed` 状态也救不了它
+      // (旧代码不认识新状态)。
+      // 所以: 裸端点**保留旧语义**(照旧探测), 新的 Bot 配置页显式带
+      // `?probe=none` 走快路径。旧配置页最坏只是慢一次, 没有功能退化。
+      const probe = url.searchParams.get('probe');
+      const webSession = probe === 'none' ? undefined : await botOnboarding.sessionStatus();
       return jsonRes(res, 200, {
         options: CLI_SELECT_OPTIONS.map((o) => {
           // Keep the all-options scan shell-free so opening the form remains
@@ -4946,7 +4967,10 @@ const server = createServer(async (req, res) => {
         ttadkModelDefault: TTADK_DEFAULT_MODEL,
         ttadkModelSuggestions: TTADK_MODEL_SUGGESTIONS,
         suggestedAppName: botOnboarding.suggestedAppName(),
-        webSession,
+        // 未探测时整个字段缺席 (而不是 webSession: undefined)——JSON 里两者都不
+        // 出现, 但显式写清意图: 调用方拿不到就该自己带 ?probe=session 再要一次,
+        // 不会把「没探测」误读成「探测结果是未登录」而把用户推去扫码。
+        ...(webSession ? { webSession } : {}),
       });
     }
 
@@ -5539,6 +5563,21 @@ const server = createServer(async (req, res) => {
       });
       if (url.searchParams.get('view') === 'compact') {
         return jsonRes(res, 200, compactGroupsMatrix(matrix));
+      }
+      // `?view=names` — 名称/头像专用轻量视图。完整矩阵实测 12.59MB，其中
+      // chats[].memberBots 独占 12341KB；而 loadNameMaps()（web/ui.ts）只用
+      // bots 的名称/头像 + chats 的 chatId/name/avatar。摘掉 memberBots 后
+      // 372KB 级别，同时省掉主线程 38-70ms 的 JSON.parse。
+      //
+      // 不复用 `?view=compact`：那个投影没有 `bots`，名称/头像会全丢（见
+      // GroupsNamesSnapshot 的注释）。
+      //
+      // 公开只读边界：本投影的 chats 只有 chatId/name/avatar，比
+      // redactGroupsForPublic 的输出更窄（它还会保留 chatMode/memberBots），
+      // 且 `bots` 在下面的默认分支对未认证访客也是原样下发的——所以这里
+      // 无需按 authed 分叉，不存在新增暴露面。
+      if (url.searchParams.get('view') === 'names') {
+        return jsonRes(res, 200, groupsNamesMatrix(matrix));
       }
       return jsonRes(res, 200, {
         chats: authed ? matrix.chats : redactGroupsForPublic(matrix.chats),

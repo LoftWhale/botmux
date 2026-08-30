@@ -5,6 +5,7 @@ import {
   agentSelectionKey,
   cliIdOf,
   createRefreshGate,
+  createOncePerKeyGate,
   displayCliId,
   fallbackCliOptionsState,
   fetchBotDefaults,
@@ -1066,7 +1067,7 @@ function BotDefaultsCard(props: {
         >
           <BdTabGrid>
             <section className="bd-tile bd-tile-wide"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
-            <section className="bd-tile bd-tile-wide"><FeedbackSettingsSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile bd-tile-wide"><FeedbackSettingsSection bot={bot} patchBot={patchBot} active={props.activeTab === 'cards'} /></section>
             <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -1106,7 +1107,7 @@ function BotDefaultsCard(props: {
   );
 }
 
-function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; active: boolean }) {
   const enabled = props.bot.feedback?.enabled === true;
   const [on, setOn] = useState(enabled);
   const [json, setJson] = useState(JSON.stringify(props.bot.feedback ?? { enabled: true }, null, 2));
@@ -1115,15 +1116,38 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
   const [chatId, setChatId] = useState('');
   const [chats, setChats] = useState<GroupChat[]>([]);
   const [preview, setPreview] = useState<any>(null);
+  // 「本 bot 的群列表已拉过（或正在拉）」闸门。见下面 effect 的注释：把 active
+  // 加进依赖会让每次切回 Cards tab 都重跑 effect，靠它收敛成「每 bot 一次」。
+  const chatsGateRef = useRef(createOncePerKeyGate());
   useEffect(() => {
     setOn(props.bot.feedback?.enabled === true);
     setJson(JSON.stringify(props.bot.feedback ?? { enabled: true }, null, 2));
   }, [props.bot.feedback]);
   useEffect(() => {
+    // 这个区块要的是 memberBots（筛「本 bot 已在群」的群列表），只有完整矩阵
+    // 有 —— 那是 12.7MB。而各 tab 是用 `hidden` 隐藏而非条件卸载，所以本区块
+    // 在任何 tab 下都会 mount：无条件拉取等于每次进 Bot 配置页都后台补一发
+    // 12.7MB，把首屏的优化又吃回去。
+    //
+    // 所以按 `active` 延迟到 Cards tab 真正激活才拉。刻意**不用条件卸载**
+    // （`{active && <Section/>}`）：那会在切走 tab 时丢掉用户正在编辑的 JSON
+    // 草稿与开关状态。组件照常挂着，只是不发请求。
+    if (!props.active) return;
+    // ⚠️ 但把 `active` 加进依赖数组，副作用是**每次切回 Cards tab 都会重跑**
+    // （cards → common → 隔几秒回 cards，groups-api 的 3s 缓存已过期 ⟹ 又下载
+    // 12.7MB）。原语义是「每次 mount / 每个 botId 只拉一次」，延迟加载不该把它
+    // 放宽成「每次回 tab 都拉」。闸门把它收敛回每 bot 一次。
+    if (!chatsGateRef.current.claim(props.bot.larkAppId)) return;
+    const appId = props.bot.larkAppId;
     void fetchGroupsSnapshot().then(snapshot => {
-      setChats(snapshot.chats.filter(chat => chat.memberBots.some(member => member.larkAppId === props.bot.larkAppId && member.inChat)));
-    }).catch(() => setChats([]));
-  }, [props.bot.larkAppId]);
+      setChats(snapshot.chats.filter(chat => chat.memberBots.some(member => member.larkAppId === appId && member.inChat)));
+    }).catch(() => {
+      setChats([]);
+      // 失败释放认领：下次激活允许重试，否则一次网络抖动会让这个群列表在本 bot
+      // 上永久空着。
+      chatsGateRef.current.release(appId);
+    });
+  }, [props.bot.larkAppId, props.active]);
   async function save(nextOn = on): Promise<void> {
     setBusy(true); setStatus(null);
     try {
