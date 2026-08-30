@@ -161,6 +161,33 @@ console.log(
   + `(${skipped.length} deferred to vitest — module-registry APIs)`,
 );
 
+// Every child currently running, so a cancelled run can take them with it.
+const liveChildren = new Set();
+
+/** Signal a child's whole process group, falling back to the pid alone. */
+function killTree(child, signal) {
+  if (child.pid === undefined) return;
+  try {
+    // Negative pid targets the process group created by `detached: true`.
+    process.kill(-child.pid, signal);
+  } catch {
+    try { child.kill(signal); } catch { /* already gone */ }
+  }
+}
+
+// Without this, killing the runner (Ctrl-C, an outer timeout, a supervisor) leaves
+// its `bun test` children orphaned to PID 1 — they keep holding ports and CPU and
+// corrupt whatever runs next. Reap the tree, then exit with the conventional code.
+let shuttingDown = false;
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    for (const child of liveChildren) killTree(child, 'SIGKILL');
+    process.exit(sig === 'SIGINT' ? 130 : 143);
+  });
+}
+
 function runOne(file) {
   return new Promise(resolve => {
     const args = ['test', ...(hasOwnTimeout ? [] : [`--timeout=${TEST_TIMEOUT_MS}`]), ...extraArgs, file];
@@ -200,19 +227,31 @@ function runOne(file) {
     delete childEnv.PM2_HOME;
     delete childEnv.PLUGIN_PM2_HOME;
 
-    const child = spawn('bun', args, { stdio: ['ignore', 'pipe', 'pipe'], env: childEnv });
+    // `detached: true` puts the child in its OWN process group, so a kill can take
+    // the whole tree — `child.kill()` alone signals only the Bun parent and leaves
+    // servers/ptys it spawned running (measured: cancelling a run left `bun test`
+    // children with PPID=1 alive for minutes, competing for ports and load with the
+    // next run and silently poisoning its results).
+    const child = spawn('bun', args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: childEnv,
+      detached: process.platform !== 'win32',
+    });
+    liveChildren.add(child);
     let out = '';
     const cap = chunk => { if (out.length < 200_000) out += chunk; };
     child.stdout.on('data', cap);
     child.stderr.on('data', cap);
-    const wall = setTimeout(() => child.kill('SIGKILL'), FILE_WALL_MS);
+    const wall = setTimeout(() => killTree(child, 'SIGKILL'), FILE_WALL_MS);
     child.on('error', err => {
       clearTimeout(wall);
+      liveChildren.delete(child);
       rmSync(scratch, { recursive: true, force: true });
       resolve({ file, ok: false, out: `failed to launch bun: ${err.message}` });
     });
     child.on('close', (code, signal) => {
       clearTimeout(wall);
+      liveChildren.delete(child);
       rmSync(scratch, { recursive: true, force: true });
       // A signal death (wall-clock kill, OOM) leaves code null — never let that
       // coerce into a pass.
