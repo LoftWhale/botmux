@@ -370,23 +370,28 @@ async function worker() {
 const settled = await Promise.allSettled(Array.from({ length: concurrency }, worker));
 const workerErrors = settled.filter(r => r.status === 'rejected').map(r => r.reason);
 
-console.log(`\nbun test: ${runnable.length - failures.length}/${runnable.length} files green, ${failures.length} failing`);
 if (failures.length > 0) {
-  console.log('Failing files:');
+  console.log('\nFailing files:');
   for (const f of failures) console.log(`  ${f.file}`);
 }
 
-if (workerErrors.length > 0) {
-  console.error(`\n${workerErrors.length} worker(s) crashed — results are INCOMPLETE (${done}/${runnable.length} files ran):`);
-  for (const err of workerErrors) console.error(`  ${err?.stack ?? err}`);
+// Completeness FIRST, then the summary. Printing "N/N files green" before checking
+// these would count files that never ran: a worker crash after 2 of 9 files still
+// showed a prominent `9/9 files green` with the INCOMPLETE notice below it — the
+// exit code was right but the headline contradicted it, and a human or a log
+// excerpt reads the headline.
+const incomplete = workerErrors.length > 0 || done !== runnable.length;
+if (incomplete) {
+  console.error(
+    `\nbun test: INCOMPLETE — ${done}/${runnable.length} files ran`
+    + `, ${done - failures.length} of those green, ${failures.length} failing`,
+  );
+  for (const err of workerErrors) console.error(`  worker crashed: ${err?.stack ?? err}`);
+  if (workerErrors.length === 0) {
+    console.error('  no worker crashed, yet files are missing — results cannot be trusted');
+  }
   process.exit(1);
 }
 
-// Invariant: every runnable file must have produced a verdict. A count short of the
-// population means files were silently dropped, which must never read as success.
-if (done !== runnable.length) {
-  console.error(`\nRefusing to report success: only ${done} of ${runnable.length} files produced a verdict.`);
-  process.exit(1);
-}
-
+console.log(`\nbun test: ${runnable.length - failures.length}/${runnable.length} files green, ${failures.length} failing`);
 if (failures.length > 0) process.exit(1);
