@@ -28,20 +28,16 @@ import { describe, expect, it } from 'vitest';
 
 const src = readFileSync(new URL('../src/im/lark/event-dispatcher.ts', import.meta.url), 'utf-8');
 
-function fnRegion(signature: string, span = 3200): string {
-  const start = src.indexOf(signature);
-  expect(start, `${signature} not found in event-dispatcher.ts`).toBeGreaterThanOrEqual(0);
-  return src.slice(start, start + span);
-}
-
 /**
  * 从 `signature` 截到 `endMarker` 为止（含）。
  *
- * ⭐ 比固定字符宽度的 {@link fnRegion} 稳：那种写法把「代码语义」和「代码在文件里的
- * 字节位置」绑在一起，于是**任何无害的说明性改动都能让断言变红**，而红的信息完全指
- * 向错误的方向（看起来像功能没了）。这个函数在本次改动里连踩三次：目标文本偏移分别
- * 到过 1463 / 5243 / 7933，而窗口卡在 1400 / 5200 / 7600。用真实的结构边界收尾就不
- * 会再随注释漂移。
+ * ⭐ **本文件不再提供「固定字符宽度」的截法**（原 `fnRegion(sig, span)` 已删）：那种写法
+ * 把「代码语义」和「代码在文件里的字节位置」绑在一起，于是**任何无害的说明性改动都能
+ * 让断言变红**，而红的信息完全指向错误的方向（看起来像功能没了）。本轮它咬了四次：
+ * 目标文本偏移到过 1463 / 5243 / 7933，窗口卡在 1400 / 5200 / 7600；第四处
+ * (`ensureVcMeetingEventsSubscribed`) 是被复审者发现的——我一度以为「三个 region 全转
+ * 完了」，而恰好同一轮改动给那个函数加了 ~10 行，最紧的断言距窗口尾只剩 633 字符。
+ * 故意不留下 `fnRegion`：留着它下一个人还会用，陷阱就会回来。
  */
 function fnRegionUntil(signature: string, endMarker: string): string {
   const start = src.indexOf(signature);
@@ -219,7 +215,12 @@ describe('checkRequiredScopes — 99991672 chicken-and-egg scope request set', (
 });
 
 describe('ensureVcMeetingEventsSubscribed — startup VC-event check-then-configure', () => {
-  const region = fnRegion('export async function ensureVcMeetingEventsSubscribed(', 3200);
+  // 截到该函数体真正的结尾（DM 的 contextTag），不用固定字符宽度 —— 本轮 C 修复给这个
+  // 函数加了 ~10 行，最紧的断言距 3200 尾只剩 633 字符，下一次改动就会咬到。
+  const region = fnRegionUntil(
+    'export async function ensureVcMeetingEventsSubscribed(',
+    "'vc event auto-subscribe deferred (under review)'",
+  );
 
   it('skips non-feishu, apiOnly, and VC-inactive bots (active-config gate)', () => {
     expect(region).toContain("if (brand !== 'feishu') return;");
@@ -250,6 +251,22 @@ describe('ensureVcMeetingEventsSubscribed — startup VC-event check-then-config
     expect(probeFailIdx).toBeGreaterThanOrEqual(0);
     expect(probeFailIdx).toBeLessThan(automationIdx);
     expect(region).toContain('botmux setup');
+  });
+
+  /**
+   * 审核中（`app_under_review`）时的建议必须是「等审批通过」，**不能**是「刷新登录态」：
+   * 审核期间开放平台锁定配置写入，刷 session 一点用没有（不是 session 问题）。给做不到
+   * 的建议比不给更糟 —— 用户会反复 `botmux setup` 却始终不见好。
+   */
+  it('审核中不给「刷新登录态」这种做不到的建议（改为等审批通过）', () => {
+    expect(region).toContain("result.reason === 'app_under_review'");
+    // 审核中走 info 而不是 warn：等待即自愈的状态不该反复报错刷屏
+    expect(region).toContain('VC event auto-subscribe deferred (app under review)');
+    // DM 文案二选一：审核中说「等审批」、其余仍说「刷新登录态」
+    expect(region).toContain('审批通过后执行');
+    expect(region).toContain('刷新飞书开放平台登录态');
+    // 审核中那句必须明确否掉刷登录态这条路，否则用户照旧去试
+    expect(region).toMatch(/审核期间飞书锁定了配置写入，刷新登录态也改不了/);
   });
 
   it('DMs the admin only when the auto-subscribe actually fails', () => {
