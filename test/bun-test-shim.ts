@@ -1,4 +1,4 @@
-import { afterEach, expect, jest, mock, setSystemTime } from 'bun:test';
+import { expect, jest, mock, setSystemTime } from 'bun:test';
 import { vi } from 'vitest';
 
 /**
@@ -97,9 +97,11 @@ fill('mocked', <T>(item: T): T => item);
 
 // `vi.importActual` bypasses the mock registry. Bun has no mock-aware resolver
 // to bypass: an un-mocked path imports the real module, and a path this process
-// HAS mocked cannot be un-mocked per-call. Only safe because it is used in
-// files that do not also mock the same specifier — a file that does will get
-// the mocked copy and fail loudly on the assertion rather than silently pass.
+// HAS mocked cannot be un-mocked per-call. Kept only for the direct-call form
+// used by files that do not also mock the same specifier. The `vi.mock('x',
+// async (importActual) => …)` CALLBACK form is a different thing — that
+// parameter is supplied by the runner, not read off `vi`, so no fill can provide
+// it; scripts/run-bun-tests.mjs excludes those files instead.
 fill('importActual', (specifier: string) => import(specifier));
 
 fill('setSystemTime', (time?: string | number | Date) => {
@@ -175,13 +177,14 @@ fill('waitFor', async <T>(
   }
 });
 
-// Keep stubs from bleeding across tests within a file. vitest scopes them the
-// same way when `unstubEnvs`/`unstubGlobals` are configured; doing it here means
-// a file that stubs without restoring cannot poison its neighbours.
-afterEach(() => {
-  (anyVi.unstubAllEnvs as () => void)();
-  (anyVi.unstubAllGlobals as () => void)();
-});
+// NOTE: no automatic per-test unstub here, deliberately. vitest only clears
+// stubs between tests when `unstubEnvs`/`unstubGlobals` are enabled in config,
+// and this repo's vitest.config.ts sets neither — so stubs persist across tests
+// within a file, and at least one file relies on that by stubbing in
+// `beforeAll` (test/fs-policy-bwrap.e2e.test.ts). Adding an `afterEach` reset
+// here would make the shim STRICTER than the runner it emulates and break those
+// files. Cross-file leakage is not a concern: `bun test` gives each file its own
+// process, and test/bun-test-fence.ts fences the home directory per process.
 
 // `expect(...).toMatchObject` etc. already exist in Bun; assert the pieces this
 // shim depends on are really present so a Bun upgrade that moves them fails

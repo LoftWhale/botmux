@@ -26,7 +26,13 @@ const TEST_DIR = 'test';
 // Matches the APIs whose absence is a module-system gap rather than a missing
 // helper. Keep in sync with the "DELIBERATELY NOT SHIMMED" list in
 // test/bun-test-shim.ts.
-const UNSUPPORTED = /\bvi\s*\.\s*(doMock|doUnmock|resetModules)\b|\bimportOriginal\b/;
+//
+// `importOriginal` / `importActual` also appear as the CALLBACK PARAMETER of a
+// `vi.mock` factory (`vi.mock('x', async (importActual) => …)`), which is the
+// same module-registry feature under a different spelling — matching the bare
+// identifier catches both that and any `vi.importActual(…)` call site. Anchoring
+// only on `vi.<name>` would miss the callback form entirely (measured: 2 files).
+const UNSUPPORTED = /\bvi\s*\.\s*(doMock|doUnmock|resetModules)\b|\bimportOriginal\b|\bimportActual\b/;
 
 const all = readdirSync(TEST_DIR)
   .filter(f => f.endsWith('.test.ts'))
