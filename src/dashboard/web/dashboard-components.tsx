@@ -442,6 +442,12 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
   const [open, setOpen] = useState(false);
   const choose = (next: T) => {
     detailsRef.current?.removeAttribute('open');
+    // Belt-and-braces: `onToggle` normally syncs this, but WebKit before Safari
+    // 15.4 did not fire toggle for programmatic open changes, which would leave
+    // `open` stuck true and the placement effect skipped on the next open (stale
+    // budget / drop-up class). Setting it here closes that loop; on browsers that
+    // do fire toggle React bails out of the identical-state update, so it is free.
+    setOpen(false);
     // Re-selecting the already-active value is a no-op: close the menu but skip
     // onChange, so auto-saving dropdowns don't fire a redundant write + "saved" flash.
     if (next === props.value) return;
@@ -508,6 +514,8 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
     if (typeof document === 'undefined') return undefined;
     const close = () => {
       if (detailsRef.current?.open) detailsRef.current.open = false;
+      // Same reason as in choose(): don't rely solely on toggle firing.
+      setOpen(false);
     };
     const onPointerDown = (event: PointerEvent) => {
       const details = detailsRef.current;
@@ -527,7 +535,10 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
     };
   }, []);
   useEffect(() => {
-    if (props.disabled && detailsRef.current?.open) detailsRef.current.open = false;
+    if (!props.disabled) return;
+    if (detailsRef.current?.open) detailsRef.current.open = false;
+    // Third programmatic close path — keep it in sync too (see choose()).
+    setOpen(false);
   }, [props.disabled]);
 
   const className = ['sect-sort-menu', props.disabled ? 'is-disabled' : '', props.className].filter(Boolean).join(' ');

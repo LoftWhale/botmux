@@ -46,8 +46,8 @@
   --dropdown-trigger-width: 118px;
   --dropdown-popover-min-width: 156px;
   /* 下拉弹层的限高：超过就在弹层内部滚动，而不是把选项顶出视口。
-     祖先链（main / .chrome-body / .app-shell）多为 overflow:hidden，
-     溢出的选项会被直接裁掉、鼠标事件也落不到弹层上。 */
+     滚动容器是 main（overflow-y:auto），其上的 .chrome-body / .app-shell 是
+     overflow:hidden——溢出视口的选项会被裁掉、鼠标事件也落不到弹层上。 */
   --dropdown-popover-max-height: min(320px, 52vh);
   --page-title-row-height: 48px;
   --page-title-divider-gap: 14px;
