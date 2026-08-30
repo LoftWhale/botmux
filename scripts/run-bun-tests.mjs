@@ -49,8 +49,21 @@ if (runnable.length === 0) {
 
 // Pass an explicit file list rather than letting bun glob, so the deferred files
 // cannot sneak in via a future default-glob change.
+//
+// --timeout: Bun's per-test default is 5s, but the unit project runs at
+// vitest's 30s and individual files raise it further via `vi.setConfig({
+// testTimeout })` — up to 180s for the mojo suites. `bun test` has no runtime
+// equivalent for that per-file call (the shim accepts it as a no-op), so the
+// ceiling has to come from the CLI. Use the highest value any file asks for;
+// a generous timeout cannot turn a failing test green, it only stops a slow one
+// from being cut short. An explicit --timeout in argv wins over this default.
+const HIGHEST_FILE_TIMEOUT_MS = 180_000;
 const extraArgs = process.argv.slice(2);
-const res = spawnSync('bun', ['test', ...extraArgs, ...runnable], { stdio: 'inherit' });
+const timeoutArgs = extraArgs.some(a => a === '--timeout' || a.startsWith('--timeout='))
+  ? []
+  : [`--timeout=${HIGHEST_FILE_TIMEOUT_MS}`];
+
+const res = spawnSync('bun', ['test', ...timeoutArgs, ...extraArgs, ...runnable], { stdio: 'inherit' });
 
 if (res.error) {
   console.error(`Failed to launch bun test: ${res.error.message}`);

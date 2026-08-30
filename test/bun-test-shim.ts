@@ -115,6 +115,40 @@ fill('advanceTimersByTimeAsync', async (ms: number) => {
   return vi;
 });
 
+// Same sync-to-async relationship as advanceTimersByTimeAsync. Bun has the sync
+// `runAllTimers`; the async variants additionally drain the microtask queue so a
+// timer callback that awaits can finish before the assertion runs.
+fill('runAllTimersAsync', async () => {
+  jest.runAllTimers();
+  await Promise.resolve();
+  return vi;
+});
+
+fill('runOnlyPendingTimersAsync', async () => {
+  jest.runOnlyPendingTimers();
+  await Promise.resolve();
+  return vi;
+});
+
+fill('advanceTimersToNextTimerAsync', async () => {
+  jest.advanceTimersToNextTimer();
+  await Promise.resolve();
+  return vi;
+});
+
+// vitest drains the microtask queue; there is no timer involvement.
+fill('runAllTicks', async () => {
+  await Promise.resolve();
+  return vi;
+});
+
+// Per-file config (only `testTimeout` is used here). `bun test` takes the
+// timeout as a CLI flag, so there is no runtime knob to forward this to —
+// accepting it as a no-op is safe for a TIMEOUT (a too-generous default cannot
+// turn a red into a green; it can only let a slow test finish). scripts/
+// run-bun-tests.mjs passes a matching --timeout so these files are not cut short.
+fill('setConfig', () => vi);
+
 // ---------------------------------------------------------------------------
 // vi.waitFor — poll until the callback stops throwing (or its promise rejects).
 // Mirrors vitest's default 1000ms timeout / 50ms interval and its behaviour of
