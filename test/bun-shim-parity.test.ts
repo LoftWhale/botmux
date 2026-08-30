@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import osDefault from 'node:os';
+import { realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { homedir, userInfo } from 'node:os';
 
 /**
@@ -200,14 +202,36 @@ describe('vi shim parity (vitest reference / bun shim)', () => {
 // shape of the bun fence pointed `default` at the UNFENCED module. Assert the
 // cross-product so neither route can regress silently on either runner.
 describe('home fence parity (both override targets, both import forms)', () => {
-  it('homedir() and userInfo().homedir agree and are not the real home', () => {
-    expect(homedir()).not.toBe('/root');
-    expect(userInfo().homedir).toBe(homedir());
+  // Assert equality with the CURRENT fenced env, not inequality with one
+  // machine's home path. `not.toBe('/root')` would pass on a GitHub runner
+  // (`/home/runner`) or macOS (`/Users/...`) even if the fence were leaking
+  // entirely — a false green wherever this repo's CI actually runs.
+  const expectedHome = () => (process.platform === 'win32'
+    ? process.env.USERPROFILE
+    : process.env.HOME);
+
+  it('homedir() and userInfo().homedir both equal the fenced HOME', () => {
+    expect(expectedHome()).toBeTruthy();
+    expect(homedir()).toBe(expectedHome());
+    expect(userInfo().homedir).toBe(expectedHome());
+  });
+
+  // The assertion above only proves CONSISTENCY: both fences set `process.env.HOME`
+  // AND redirect `homedir()`, so comparing the two to each other still passes if
+  // the fence is removed entirely (measured — that mutation stayed green). Anchor
+  // containment on something the fence cannot move: the OS temp root. Both fences
+  // mint their disposable home under `tmpdir()`, and a leak to a real home
+  // (`/root`, `/home/runner`, `/Users/...`) is not under it — on any platform,
+  // which `not.toBe('/root')` could not claim.
+  it('the fenced home lives under the OS temp root, not a real user home', () => {
+    const home = homedir();
+    const tmpRoot = realpathSync(tmpdir());
+    expect(realpathSync(home).startsWith(tmpRoot)).toBe(true);
   });
 
   it('the default import sees the same fenced values as the named import', () => {
-    expect(osDefault.homedir()).toBe(homedir());
-    expect(osDefault.userInfo().homedir).toBe(homedir());
+    expect(osDefault.homedir()).toBe(expectedHome());
+    expect(osDefault.userInfo().homedir).toBe(expectedHome());
   });
 
   it('non-home fields of userInfo are left real', () => {
@@ -223,14 +247,14 @@ describe('home fence parity (both override targets, both import forms)', () => {
 describe.sequential('sequential parity', () => {
   const order: string[] = [];
 
-  it('first test yields, then finishes', async () => {
+  it.sequential('first test yields, then finishes', async () => {
     order.push('first-start');
     await new Promise(resolve => setTimeout(resolve, 30));
     order.push('first-end');
     expect(order).toEqual(['first-start', 'first-end']);
   });
 
-  it('second test starts only after the first fully finished', () => {
+  it.sequential('second test starts only after the first fully finished', () => {
     order.push('second');
     // Interleaving would give ['first-start', 'second', …] instead.
     expect(order).toEqual(['first-start', 'first-end', 'second']);
