@@ -5,21 +5,38 @@
 // startup-frozen `os.homedir()`, `Bun.file`, compiled-binary paths) is invisible
 // to `bun run test` and can only regress silently there.
 //
+// ONE FILE PER PROCESS, deliberately. `bun test a.ts b.ts …` runs every file in
+// a SINGLE process (measured: two files report the same `process.pid`), unlike
+// vitest which forks a worker per file. Handing it the whole suite produces
+// cascading cross-file interference rather than real failures — measured on this
+// repo: 1010 files batched → 933 failures; the same files one-per-process → ~2%
+// red; and individual victims (`fleet-supervisor.integration`,
+// `ask-custom-reply-candidate`, `dashboard-ipc`) go 23/23, 8/8 and 170/171 green
+// in isolation while failing in the batch. A `vi.mock` of a shared module (e.g.
+// `utils/logger`) installed by one file stays installed for later files, so a
+// deliberately partial mock in file A becomes a `logger.isDebug is not a
+// function` crash in file Z. Per-process execution restores the isolation
+// boundary vitest gives for free.
+//
+// The cost is process startup per file (~21 min wall clock for this suite versus
+// a few minutes batched). That is the price of trustworthy results; a leg whose
+// failures are mostly artefacts is worse than no leg at all.
+//
 // A subset of files cannot run here yet: `vi.doMock` / `vi.doUnmock` /
-// `vi.resetModules` and the `importOriginal` callback are module-registry
-// semantics, not missing functions. `test/bun-test-shim.ts` deliberately does
-// NOT fake them — a fake would report success while silently not mocking, which
-// is worse than the current red. Those files keep running under vitest until
-// they are rewritten to use dependency injection.
+// `vi.resetModules` and the `importOriginal` / `importActual` mock-factory
+// callbacks are module-registry semantics, not missing functions.
+// `test/bun-test-shim.ts` deliberately does NOT fake them — a fake would report
+// success while silently not mocking, which is worse than the current red. Those
+// files keep running under vitest until they are rewritten to use dependency
+// injection.
 //
 // The exclusion list is COMPUTED, never hardcoded: a stale literal list would
 // quietly start skipping files (or fail on files that have since been fixed).
-// Adding a `vi.doMock` to any file automatically moves it out of this leg, and
-// removing one moves it back in.
 
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { availableParallelism } from 'node:os';
 
 const TEST_DIR = 'test';
 
@@ -34,6 +51,17 @@ const TEST_DIR = 'test';
 // only on `vi.<name>` would miss the callback form entirely (measured: 2 files).
 const UNSUPPORTED = /\bvi\s*\.\s*(doMock|doUnmock|resetModules)\b|\bimportOriginal\b|\bimportActual\b/;
 
+// Bun's per-test default is 5s, but the unit project runs at vitest's 30s and
+// individual files raise it further via `vi.setConfig({ testTimeout })` — up to
+// 180s for the mojo suites. `bun test` has no runtime equivalent for that
+// per-file call (the shim accepts it as a no-op), so the ceiling comes from the
+// CLI. A generous timeout cannot turn a failing test green; it only stops a slow
+// one from being cut short.
+const TEST_TIMEOUT_MS = 180_000;
+// Hard wall per file, above the per-test ceiling: a file that wedges (waiting on
+// a pty, a lock, a socket) must not hold the whole leg open.
+const FILE_WALL_MS = 240_000;
+
 const all = readdirSync(TEST_DIR)
   .filter(f => f.endsWith('.test.ts'))
   .map(f => join(TEST_DIR, f))
@@ -46,39 +74,73 @@ for (const file of all) {
   else runnable.push(file);
 }
 
-console.log(`bun test: ${runnable.length} files (${skipped.length} deferred to vitest — module-registry APIs)`);
-
 if (runnable.length === 0) {
   console.error('Refusing to report success: no runnable files were found. Is the test/ directory present?');
   process.exit(1);
 }
 
-// Pass an explicit file list rather than letting bun glob, so the deferred files
-// cannot sneak in via a future default-glob change.
-//
-// --timeout: Bun's per-test default is 5s, but the unit project runs at
-// vitest's 30s and individual files raise it further via `vi.setConfig({
-// testTimeout })` — up to 180s for the mojo suites. `bun test` has no runtime
-// equivalent for that per-file call (the shim accepts it as a no-op), so the
-// ceiling has to come from the CLI. Use the highest value any file asks for;
-// a generous timeout cannot turn a failing test green, it only stops a slow one
-// from being cut short. An explicit --timeout in argv wins over this default.
-const HIGHEST_FILE_TIMEOUT_MS = 180_000;
 const extraArgs = process.argv.slice(2);
-const timeoutArgs = extraArgs.some(a => a === '--timeout' || a.startsWith('--timeout='))
-  ? []
-  : [`--timeout=${HIGHEST_FILE_TIMEOUT_MS}`];
+const hasOwnTimeout = extraArgs.some(a => a === '--timeout' || a.startsWith('--timeout='));
+// Keep concurrency well under the core count: many of these files spawn real
+// daemons, ptys and bwrap sandboxes, and oversubscribing turns their internal
+// timeouts into spurious reds (measured on a busy host).
+const envConcurrency = Number.parseInt(process.env.BOTMUX_BUN_TEST_CONCURRENCY ?? '', 10);
+const concurrency = Number.isFinite(envConcurrency) && envConcurrency > 0
+  ? envConcurrency
+  : Math.max(2, Math.min(8, Math.floor(availableParallelism() / 8)));
 
-const res = spawnSync('bun', ['test', ...timeoutArgs, ...extraArgs, ...runnable], { stdio: 'inherit' });
+console.log(
+  `bun test: ${runnable.length} files, one process each, ${concurrency} at a time `
+  + `(${skipped.length} deferred to vitest — module-registry APIs)`,
+);
 
-if (res.error) {
-  console.error(`Failed to launch bun test: ${res.error.message}`);
+function runOne(file) {
+  return new Promise(resolve => {
+    const args = ['test', ...(hasOwnTimeout ? [] : [`--timeout=${TEST_TIMEOUT_MS}`]), ...extraArgs, file];
+    const child = spawn('bun', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    const cap = chunk => { if (out.length < 200_000) out += chunk; };
+    child.stdout.on('data', cap);
+    child.stderr.on('data', cap);
+    const wall = setTimeout(() => child.kill('SIGKILL'), FILE_WALL_MS);
+    child.on('error', err => {
+      clearTimeout(wall);
+      resolve({ file, ok: false, out: `failed to launch bun: ${err.message}` });
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(wall);
+      // A signal death (wall-clock kill, OOM) leaves code null — never let that
+      // coerce into a pass.
+      resolve({ file, ok: code === 0, out, signal: signal ?? undefined });
+    });
+  });
+}
+
+const queue = [...runnable];
+const failures = [];
+let done = 0;
+
+async function worker() {
+  for (;;) {
+    const file = queue.shift();
+    if (!file) return;
+    const res = await runOne(file);
+    done += 1;
+    if (!res.ok) {
+      failures.push(res);
+      process.stdout.write(`\nFAIL ${res.file}${res.signal ? ` (killed: ${res.signal})` : ''}\n${res.out}\n`);
+    }
+    if (done % 50 === 0 || done === runnable.length) {
+      process.stdout.write(`… ${done}/${runnable.length} files, ${failures.length} failing\n`);
+    }
+  }
+}
+
+await Promise.all(Array.from({ length: concurrency }, worker));
+
+console.log(`\nbun test: ${runnable.length - failures.length}/${runnable.length} files green, ${failures.length} failing`);
+if (failures.length > 0) {
+  console.log('Failing files:');
+  for (const f of failures) console.log(`  ${f.file}`);
   process.exit(1);
 }
-// A signal death (OOM, timeout kill) leaves status null — treat it as failure
-// rather than letting `undefined` coerce to a passing 0.
-if (res.status === null) {
-  console.error(`bun test terminated by signal ${res.signal ?? 'unknown'}`);
-  process.exit(1);
-}
-process.exit(res.status);
