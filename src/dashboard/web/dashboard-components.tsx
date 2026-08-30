@@ -2,6 +2,7 @@ import type React from 'react';
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ButtonHTMLAttributes,
@@ -394,10 +395,45 @@ type DropdownMenuProps<T extends string> = {
   searchEmptyLabel?: ReactNode;
 };
 
+/**
+ * Where a dropdown popup should go, and how tall it may be.
+ *
+ * A dropdown's ancestors are mostly `overflow: hidden` (main / .chrome-body /
+ * .app-shell), so a popup hanging past the viewport edge is clipped away: those
+ * options cannot be seen, and pointer/wheel events never reach them either
+ * (the popup is not under the cursor down there). Plain CSS cannot know how
+ * much room is left below the trigger, so the component measures it and hands
+ * the budget to style.css as a custom property.
+ *
+ * Pure function of the geometry so it can be unit-tested without a DOM.
+ */
+export function dropdownPlacement(input: {
+  /** Trigger box, viewport-relative (getBoundingClientRect). */
+  triggerTop: number;
+  triggerBottom: number;
+  /** Unconstrained popup height (scrollHeight), i.e. what the content wants. */
+  naturalHeight: number;
+  viewportHeight: number;
+}): { dropUp: boolean; maxHeight: number } {
+  const margin = 12;
+  const gap = 8;
+  const roomBelow = input.viewportHeight - input.triggerBottom - gap - margin;
+  const roomAbove = input.triggerTop - gap - margin;
+  // Flip up only when below genuinely cannot fit AND above is roomier;
+  // otherwise stay below (predictable) and just cap the height.
+  const dropUp = input.naturalHeight > roomBelow && roomAbove > roomBelow;
+  // Floor: in a viewport too short for either side, a tiny sliver would be
+  // worse than a popup that slightly overhangs but is still scrollable.
+  const maxHeight = Math.max(140, Math.floor(dropUp ? roomAbove : roomBelow));
+  return { dropUp, maxHeight };
+}
+
 export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): React.JSX.Element {
   const detailsRef = useRef<HTMLDetailsElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const popRef = useRef<HTMLDivElement | null>(null);
   const [query, setQuery] = useState('');
+  const [open, setOpen] = useState(false);
   const choose = (next: T) => {
     detailsRef.current?.removeAttribute('open');
     // Re-selecting the already-active value is a no-op: close the menu but skip
@@ -413,6 +449,34 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
       option.value.toLowerCase().includes(queryNorm)
       || (typeof option.label === 'string' && option.label.toLowerCase().includes(queryNorm)))
     : props.options;
+
+  // Keep the popup inside the viewport; see dropdownPlacement above.
+  useLayoutEffect(() => {
+    if (!open) return undefined;
+    const place = () => {
+      const details = detailsRef.current;
+      const pop = popRef.current;
+      if (!details || !pop) return;
+      const trigger = details.getBoundingClientRect();
+      const { dropUp, maxHeight } = dropdownPlacement({
+        triggerTop: trigger.top,
+        triggerBottom: trigger.bottom,
+        naturalHeight: pop.scrollHeight,
+        viewportHeight: window.innerHeight,
+      });
+      pop.style.setProperty('--dropdown-popover-space', `${maxHeight}px`);
+      details.classList.toggle('is-drop-up', dropUp);
+    };
+    const frame = window.requestAnimationFrame(place);
+    window.addEventListener('resize', place);
+    // Capture phase: the scroller is an ancestor (main), not window.
+    window.addEventListener('scroll', place, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener('resize', place);
+      window.removeEventListener('scroll', place, true);
+    };
+  }, [open, visibleOptions.length]);
 
   useEffect(() => {
     if (typeof document === 'undefined') return undefined;
@@ -450,7 +514,11 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
       hidden={props.hidden}
       style={props.style}
       onToggle={event => {
-        if (!props.searchable || !event.currentTarget.open) return;
+        // <details> fires toggle for programmatic `.open = false` too, so this is
+        // the single place that keeps the placement effect in sync with reality.
+        const isOpen = event.currentTarget.open;
+        setOpen(isOpen);
+        if (!props.searchable || !isOpen) return;
         setQuery('');
         searchRef.current?.focus();
       }}
@@ -468,7 +536,7 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
       >
         <span className="sect-sort-value">{props.label}</span>
       </summary>
-      <div className="sect-sort-pop">
+      <div className="sect-sort-pop" ref={popRef}>
         {props.searchable ? (
           <input
             ref={searchRef}
