@@ -1565,7 +1565,14 @@ function wantsUnlimitedMessages(pageSize: number): boolean {
   return pageSize <= 0 || !Number.isFinite(pageSize);
 }
 
-/** List thread messages using container_id_type="thread" (fast path). */
+/** List thread-container messages, most-recent first but returned chronologically
+ *  (oldest → newest, capped at `pageSize`). Fast path for `botmux history` in a
+ *  topic session — same contract as `listChatMessages` below, and for the same
+ *  reason: the caller asked for `pageSize` messages of *context*, which is the
+ *  tail of the thread, not its head. A thread that has outgrown `pageSize` used
+ *  to come back as its oldest N here while the chat-scope sibling returned its
+ *  newest N — and the two ends are indistinguishable downstream, because both
+ *  are N real messages in chronological order. */
 async function listByThread(c: any, threadId: string, pageSize: number): Promise<any[]> {
   const allMessages: any[] = [];
   let pageToken: string | undefined;
@@ -1576,7 +1583,8 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
       container_id_type: 'thread',
       container_id: threadId,
       page_size: unlimited ? LARK_MESSAGE_LIST_MAX_PAGE : Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
-      sort_type: 'ByCreateTimeAsc',
+      // Page in Desc order so a long thread yields its TAIL; reversed below.
+      sort_type: 'ByCreateTimeDesc',
       with_sender_name: 'true',
       ...(pageToken ? { page_token: pageToken } : {}),
     });
@@ -1593,7 +1601,8 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
     if (!unlimited && allMessages.length >= pageSize) break;
   } while (pageToken);
 
-  return unlimited ? allMessages : allMessages.slice(0, pageSize);
+  // Cap to pageSize newest, then reverse to chronological for the caller.
+  return (unlimited ? allMessages : allMessages.slice(0, pageSize)).reverse();
 }
 
 /** List chat-container messages, most-recent first but returned chronologically
