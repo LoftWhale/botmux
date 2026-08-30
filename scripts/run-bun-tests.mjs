@@ -86,7 +86,19 @@ function collectTestFiles(dir) {
 // paper over it: `mock.module('vitest', … inject: … )` still fails, because the
 // static import is validated against `bun:test`'s real export list before any
 // mock applies (measured). Runner-config plumbing, not a missing helper.
-const UNSUPPORTED = /\bvi\s*\.\s*(doMock|doUnmock|resetModules|hoisted)\b|\bimportOriginal\b|\bimportActual\b|\binject\b/;
+const UNSUPPORTED = /\bvi\s*\.\s*(doMock|doUnmock|resetModules|hoisted)\b|\bimportOriginal\b|\bimportActual\b/;
+
+// `inject` needs its OWN, anchored pattern. Adding a bare `\binject\b` to the
+// list above looks equivalent but silently deferred 20 innocent files — measured:
+// of the 21 files it newly excluded, exactly ONE actually imports `inject`; the
+// rest merely contain the English word in a test title ("does not inject …"), a
+// script name (`inject-optional-binaries.mjs`), a callback parameter, or a domain
+// term (`inject-queue-policy`). Same failure shape as the comment-matching bug
+// this file already guards against — and the population count looks perfectly
+// healthy while it happens. So match the thing that actually breaks: a NAMED
+// IMPORT of `inject` from `vitest` (the specifier list may span lines and carry
+// other names alongside it).
+const IMPORTS_INJECT = /import\s*\{[^}]*\binject\b[^}]*\}\s*from\s*['"]vitest['"]/s;
 
 // Comments must not decide whether a file runs. Matching raw source means a file
 // that merely MENTIONS one of these names in prose gets silently skipped, and the
@@ -121,7 +133,8 @@ const all = collectTestFiles(TEST_DIR).sort();
 const runnable = [];
 const skipped = [];
 for (const file of all) {
-  if (UNSUPPORTED.test(stripComments(readFileSync(file, 'utf8')))) skipped.push(file);
+  const source = stripComments(readFileSync(file, 'utf8'));
+  if (UNSUPPORTED.test(source) || IMPORTS_INJECT.test(source)) skipped.push(file);
   else runnable.push(file);
 }
 

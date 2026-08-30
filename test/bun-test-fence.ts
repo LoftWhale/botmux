@@ -66,11 +66,16 @@ fenceHomeRootedEnv(fileHome);
 const actualUserInfo = realOs.userInfo;
 const actualHomedir = realOs.homedir;
 
-mock.module('node:os', () => ({
+// Build the fenced surface ONCE, then hand the SAME object out as both the
+// namespace and the default export. Pointing `default` at the unfenced `realOs`
+// (an earlier shape here) contradicted the intent: a `import os from 'node:os'`
+// caller would read the real implementation. Measured on Bun 1.4.0 the default
+// import happens to resolve to the namespace anyway, so nothing in `src/` was
+// actually escaping — but relying on that is relying on a resolution detail, and
+// the code said one thing while meaning another. Now both routes are the fenced
+// object by construction.
+const fencedOs = {
   ...realOs,
-  // Bun resolves `import os from 'node:os'` through the default export, so a
-  // spread alone would leave default-import callers on the real implementation.
-  default: realOs,
   homedir: () => (process.platform === 'win32'
     ? process.env.USERPROFILE || actualHomedir()
     : process.env.HOME || actualHomedir()),
@@ -85,7 +90,9 @@ mock.module('node:os', () => ({
     const fenced = process.platform === 'win32' ? process.env.USERPROFILE : process.env.HOME;
     return fenced ? { ...info, homedir: fenced } : info;
   }) as typeof realOs.userInfo,
-}));
+};
+
+mock.module('node:os', () => ({ ...fencedOs, default: fencedOs }));
 
 // Mirrors the vitest fence: mojo mints per-session workspaces under the real
 // `~/.botmux/mojo-workspaces` unless redirected (observed live before the vitest

@@ -31,7 +31,7 @@ vi.mock('node:os', async (importOriginal) => {
   const fencedHome = () => (process.platform === 'win32'
     ? process.env.USERPROFILE || actual.homedir()
     : process.env.HOME || actual.homedir());
-  return {
+  const fenced = {
     ...actual,
     homedir: fencedHome,
     // `userInfo().homedir` is a SECOND route to the home directory that does NOT
@@ -46,6 +46,13 @@ vi.mock('node:os', async (importOriginal) => {
       return { ...info, homedir: fencedHome() };
     }) as typeof actual.userInfo,
   };
+  // Hand the SAME fenced object out as the default export. Under vitest the
+  // default binding is separate from the namespace, and spreading `actual` alone
+  // carried the REAL module through as `default` — measured: with only the
+  // namespace fenced, `import os from 'node:os'; os.homedir()` returned `/root`
+  // while the named `homedir()` returned the temp home. Every `import os from
+  // 'node:os'` caller would have escaped the fence.
+  return { ...fenced, default: fenced };
 });
 
 // Same fencing for mojo's per-session isolated workspaces: without this, any

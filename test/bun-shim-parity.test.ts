@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import osDefault from 'node:os';
+import { homedir, userInfo } from 'node:os';
 
 /**
  * Guards the `vi.*` / `it.*` helpers that `test/bun-test-shim.ts` fills in under
@@ -189,6 +191,50 @@ describe('vi shim parity (vitest reference / bun shim)', () => {
   // THIS file from the very leg it is meant to guard. It is unsupported under
   // bun, not shimmed — see the "DELIBERATELY NOT SHIMMED" list in
   // test/bun-test-shim.ts.
+});
+
+// The home fence has TWO override targets and TWO import forms; all four
+// combinations must land inside the fenced home. `userInfo().homedir` does not go
+// through `homedir()` (it leaked to the real `/root` before it was overridden),
+// and the default export is a separate binding from the namespace — an earlier
+// shape of the bun fence pointed `default` at the UNFENCED module. Assert the
+// cross-product so neither route can regress silently on either runner.
+describe('home fence parity (both override targets, both import forms)', () => {
+  it('homedir() and userInfo().homedir agree and are not the real home', () => {
+    expect(homedir()).not.toBe('/root');
+    expect(userInfo().homedir).toBe(homedir());
+  });
+
+  it('the default import sees the same fenced values as the named import', () => {
+    expect(osDefault.homedir()).toBe(homedir());
+    expect(osDefault.userInfo().homedir).toBe(homedir());
+  });
+
+  it('non-home fields of userInfo are left real', () => {
+    expect(typeof userInfo().uid).toBe('number');
+    expect(typeof userInfo().username).toBe('string');
+  });
+});
+
+// `.sequential` is shimmed under bun as an IDENTITY, which is only correct because
+// `bun test` runs tests sequentially by default. Assert that default directly, so
+// a future Bun release that makes concurrency the default turns this red instead
+// of letting the identity silently stop meaning what the caller asked for.
+describe.sequential('sequential parity', () => {
+  const order: string[] = [];
+
+  it('first test yields, then finishes', async () => {
+    order.push('first-start');
+    await new Promise(resolve => setTimeout(resolve, 30));
+    order.push('first-end');
+    expect(order).toEqual(['first-start', 'first-end']);
+  });
+
+  it('second test starts only after the first fully finished', () => {
+    order.push('second');
+    // Interleaving would give ['first-start', 'second', …] instead.
+    expect(order).toEqual(['first-start', 'first-end', 'second']);
+  });
 });
 
 // `it.runIf(cond)` must behave exactly like `skipIf(!cond)`: Bun ships skipIf but
