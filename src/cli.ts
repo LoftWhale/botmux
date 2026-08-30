@@ -109,7 +109,7 @@ import { reapLegacyPm2, liveGodAt } from './core/legacy-pm2-reaper.js';
 import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/file-lock.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
-import { firstPositional, hasFlagOrEq } from './cli/arg-utils.js';
+import { firstPositional, hasFlagOrEq, unknownFlags } from './cli/arg-utils.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
 import {
   computeSessionPickerLayout,
@@ -6910,6 +6910,21 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
 }
 
 async function cmdHistory(rest: string[]): Promise<void> {
+  // Reject unrecognized flags BEFORE anything else. Every flag below is pulled
+  // out of argv by name; a flag that is not pulled is simply not there, so a
+  // typo or an invented flag used to be answered with the default behaviour and
+  // no diagnostic at all. `--thread` (there is no such flag; the spelling is
+  // `--scope thread`) came back as session scope, which for a thread-scope
+  // session is the same window — so the mistake was invisible in the output too.
+  const unknown = unknownFlags(rest, {
+    valueFlags: ['--limit', '--scope', '--session-id'],
+    boolFlags: ['--with-card-json'],
+  });
+  if (unknown.length > 0) {
+    console.error(`未知参数: ${unknown.join(' ')}`);
+    console.error('  botmux history [--limit <n>] [--scope session|thread|chat|ambient] [--session-id <id>] [--with-card-json]');
+    process.exit(2);
+  }
   // No-transport turn has no Feishu chat history to read — central hard gate.
   assertTurnTransportOrExit('history');
   // Read isolation: register this bot from its cred file so the Lark client is
@@ -12327,12 +12342,26 @@ if (command === '__self-update') {
 
 
 const ROOT_FLEET_MUTATION_COMMANDS = new Set(['start', 'stop', 'restart', 'upgrade', 'update']);
-if (
-  ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')
-  && process.argv.slice(3).some(arg => arg === '--help' || arg === '-h')
-) {
-  showHelp();
-  process.exit(0);
+if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
+  const fleetArgs = process.argv.slice(3);
+  if (fleetArgs.some(arg => arg === '--help' || arg === '-h')) {
+    showHelp();
+    process.exit(0);
+  }
+  // Fail closed on anything else. `cmdStart` / `cmdStop` / `cmdRestart` /
+  // `cmdUpgrade` are all declared with zero parameters, so every one of these
+  // commands accepts exactly one flag: --help. Without this branch an
+  // unrecognized flag falls through and the command runs at FULL effect —
+  // `botmux update --check` and `botmux update --dry-run` read like probes and
+  // upgrade the whole fleet. The failure is silent and one-directional: the
+  // user who typed a guess gets the most destructive interpretation of it,
+  // and the flags most likely to be guessed are exactly the read-only ones.
+  if (fleetArgs.length > 0) {
+    console.error(`未知参数: ${fleetArgs.join(' ')}`);
+    console.error(`  \`botmux ${command}\` 不接受任何参数（只有 --help）。`);
+    console.error('  为避免把一个看起来像「只检查」的参数当成「执行」，这里直接中止，不做任何改动。');
+    process.exit(2);
+  }
 }
 
 // Workflow safety gate (Slice C0): a CLI invoked inside a workflow
