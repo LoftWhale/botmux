@@ -234,6 +234,20 @@ describe('home fence parity (both override targets, both import forms)', () => {
     expect(osDefault.userInfo().homedir).toBe(expectedHome());
   });
 
+  // The fence substitutes `homedir`, and must keep that field's ORIGINAL type:
+  // `userInfo({ encoding: 'buffer' })` returns Buffers under Node (Bun 1.4 returns
+  // strings for both overloads), so a hardcoded string produced a mixed
+  // `username: Buffer, homedir: string` object no runtime ever returns. Compare the
+  // two fields rather than asserting one concrete type, so this passes on either
+  // runtime and still fails if the substitution changes the shape.
+  it('userInfo({encoding:"buffer"}) keeps homedir the same type as username', () => {
+    const info = userInfo({ encoding: 'buffer' }) as unknown as { homedir: unknown; username: unknown };
+    expect(Buffer.isBuffer(info.homedir)).toBe(Buffer.isBuffer(info.username));
+    // …and whatever the type, it still points at the fenced home.
+    const asString = Buffer.isBuffer(info.homedir) ? info.homedir.toString() : String(info.homedir);
+    expect(asString).toBe(expectedHome());
+  });
+
   it('non-home fields of userInfo are left real', () => {
     expect(typeof userInfo().uid).toBe('number');
     expect(typeof userInfo().username).toBe('string');

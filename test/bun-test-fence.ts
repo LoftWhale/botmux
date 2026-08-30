@@ -85,10 +85,20 @@ const fencedOs = {
   // sites read it (src/cli.ts, src/worker.ts ×3), so leaving it unfenced would
   // let those paths write outside the fence. Keep the real uid/username/shell
   // fields intact and redirect only the home field.
+  // Preserve the field's ORIGINAL type. `userInfo({ encoding: 'buffer' })` returns
+  // Buffers for username/homedir/shell (Node does; Bun 1.4 returns strings for
+  // both overloads), so replacing `homedir` with a plain string produced a mixed
+  // `username: Buffer, homedir: string` object — a shape neither runtime ever
+  // returns, hidden by the `as typeof userInfo` cast. Mirror whatever the real call
+  // gave back.
   userInfo: ((options?: { encoding?: string }) => {
     const info = (actualUserInfo as (o?: unknown) => ReturnType<typeof realOs.userInfo>)(options);
     const fenced = process.platform === 'win32' ? process.env.USERPROFILE : process.env.HOME;
-    return fenced ? { ...info, homedir: fenced } : info;
+    if (!fenced) return info;
+    const homedir = Buffer.isBuffer((info as { homedir: unknown }).homedir)
+      ? Buffer.from(fenced)
+      : fenced;
+    return { ...info, homedir };
   }) as typeof realOs.userInfo,
 };
 

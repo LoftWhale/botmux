@@ -41,9 +41,16 @@ vi.mock('node:os', async (importOriginal) => {
     // without this the fence leaks on exactly the paths that motivated it. Keep
     // the real uid/username/shell fields (those call sites use them too) and
     // redirect only the home field.
+    // Preserve the field's ORIGINAL type: `userInfo({ encoding: 'buffer' })`
+    // returns Buffers under Node, so substituting a plain string produced a mixed
+    // `username: Buffer, homedir: string` object that no runtime ever returns —
+    // and the `as typeof userInfo` cast hid the mismatch.
     userInfo: ((options?: { encoding?: string }) => {
       const info = (actual.userInfo as (o?: unknown) => ReturnType<typeof actual.userInfo>)(options);
-      return { ...info, homedir: fencedHome() };
+      const homedir = Buffer.isBuffer((info as { homedir: unknown }).homedir)
+        ? Buffer.from(fencedHome())
+        : fencedHome();
+      return { ...info, homedir };
     }) as typeof actual.userInfo,
   };
   // Hand the SAME fenced object out as the default export. Under vitest the
