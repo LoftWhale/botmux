@@ -40,6 +40,28 @@ import { availableParallelism } from 'node:os';
 
 const TEST_DIR = 'test';
 
+// Mirror vitest's unit include/exclude exactly: `test/**/*.{test,spec}.ts`,
+// minus `test/e2e-browser/**` and `*.e2e.ts`. A non-recursive `readdirSync`
+// looked right but silently skipped every nested file (measured: 19 files under
+// test/desktop/), and the count line would have looked perfectly healthy — the
+// worst shape of a miss. Recurse so a newly added subdirectory joins this leg
+// automatically instead of quietly sitting out.
+const EXCLUDED_DIRS = new Set(['e2e-browser', 'node_modules', 'helpers', 'fixtures', '__snapshots__']);
+
+function collectTestFiles(dir) {
+  const found = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (EXCLUDED_DIRS.has(entry.name)) continue;
+      found.push(...collectTestFiles(full));
+    } else if (/\.(test|spec)\.ts$/.test(entry.name) && !entry.name.endsWith('.e2e.ts')) {
+      found.push(full);
+    }
+  }
+  return found;
+}
+
 // Matches the APIs whose absence is a module-system gap rather than a missing
 // helper. Keep in sync with the "DELIBERATELY NOT SHIMMED" list in
 // test/bun-test-shim.ts.
@@ -62,10 +84,7 @@ const TEST_TIMEOUT_MS = 180_000;
 // a pty, a lock, a socket) must not hold the whole leg open.
 const FILE_WALL_MS = 240_000;
 
-const all = readdirSync(TEST_DIR)
-  .filter(f => f.endsWith('.test.ts'))
-  .map(f => join(TEST_DIR, f))
-  .sort();
+const all = collectTestFiles(TEST_DIR).sort();
 
 const runnable = [];
 const skipped = [];
@@ -114,7 +133,24 @@ function runOne(file) {
       clearTimeout(wall);
       // A signal death (wall-clock kill, OOM) leaves code null — never let that
       // coerce into a pass.
-      resolve({ file, ok: code === 0, out, signal: signal ?? undefined });
+      if (code !== 0) {
+        resolve({ file, ok: false, out, signal: signal ?? undefined });
+        return;
+      }
+      // `bun test` exits 0 for a file that collected ZERO tests (measured — both
+      // an empty file and an all-`.skip` file exit 0). A file that silently ran
+      // nothing is indistinguishable from a passing one by exit code alone, so
+      // parse the count and fail closed. `Ran N tests` is bun's own summary line.
+      const ran = /^Ran (\d+) tests?/m.exec(out);
+      if (!ran) {
+        resolve({ file, ok: false, out: `${out}\n[runner] no "Ran N tests" summary — cannot confirm this file executed` });
+        return;
+      }
+      if (Number(ran[1]) === 0) {
+        resolve({ file, ok: false, out: `${out}\n[runner] collected 0 tests — a file that runs nothing must not report success` });
+        return;
+      }
+      resolve({ file, ok: true, out });
     });
   });
 }
