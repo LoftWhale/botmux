@@ -39,4 +39,3 @@ registry = "https://registry.npmjs.org/"
 # cannot follow the daemon or CLI into production.
 [test]
 preload = ["./test/bun-test-fence.ts", "./test/bun-test-shim.ts"]
-
