@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, beforeEach, inject, vi } from 'vitest';
+import { fenceHomeRootedEnv } from './helpers/fence-home-env.js';
 
 const inheritedDataDir = process.env.SESSION_DATA_DIR;
 const fileRoot = mkdtempSync(join(inject('unitSessionDataRoot'), 'file-'));
@@ -20,13 +21,30 @@ mkdirSync(fileHome);
 process.env.HOME = fileHome;
 process.env.USERPROFILE = fileHome;
 
+// Same reasoning as the bun fence: BOTS_CONFIG / PM2_HOME are explicit pointers
+// at a live home that never go through `homedir()`, and a normal Botmux shell has
+// them set to the real fleet.
+fenceHomeRootedEnv(fileHome);
+
 vi.mock('node:os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:os')>();
+  const fencedHome = () => (process.platform === 'win32'
+    ? process.env.USERPROFILE || actual.homedir()
+    : process.env.HOME || actual.homedir());
   return {
     ...actual,
-    homedir: () => process.platform === 'win32'
-      ? process.env.USERPROFILE || actual.homedir()
-      : process.env.HOME || actual.homedir(),
+    homedir: fencedHome,
+    // `userInfo().homedir` is a SECOND route to the home directory that does NOT
+    // go through `homedir()` — measured under this very fence: `homedir()`
+    // returned the temp home while `userInfo().homedir` still returned `/root`.
+    // Four production call sites read it (src/cli.ts, src/worker.ts ×3), so
+    // without this the fence leaks on exactly the paths that motivated it. Keep
+    // the real uid/username/shell fields (those call sites use them too) and
+    // redirect only the home field.
+    userInfo: ((options?: { encoding?: string }) => {
+      const info = (actual.userInfo as (o?: unknown) => ReturnType<typeof actual.userInfo>)(options);
+      return { ...info, homedir: fencedHome() };
+    }) as typeof actual.userInfo,
   };
 });
 

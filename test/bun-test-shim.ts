@@ -23,6 +23,12 @@ import { vi } from 'vitest';
  *   `importOriginal` / `importActual` — the `vi.mock` factory's callback arg that
  *                                  yields the real module (runner-supplied, so
  *                                  no fill can provide it)
+ *   `vi.hoisted`                 — vitest's transform physically LIFTS the
+ *                                  callback above the static imports. A runtime
+ *                                  fill can only run it when the module body gets
+ *                                  there, i.e. after the imports, so a fixture
+ *                                  reading a global at import time sees nothing
+ *                                  (measured). Order, not a missing function.
  * Files using them stay red under `bun test` and keep running under vitest until
  * they are rewritten to use dependency injection. See `package.json:test:bun`.
  */
@@ -88,23 +94,8 @@ fill('unstubAllGlobals', () => {
 // Pass-throughs to a real Bun/jest implementation under a different name.
 // ---------------------------------------------------------------------------
 
-// `vi.hoisted` in vitest runs its factory before the module body. Bun's own
-// `mock.module` factories are already evaluated lazily at import time, so
-// running the factory eagerly here matches what callers depend on: the returned
-// value is available to a later `vi.mock` factory in the same file.
-fill('hoisted', <T>(factory: () => T): T => factory());
-
 // Type-only helper in vitest — the runtime value is the argument itself.
 fill('mocked', <T>(item: T): T => item);
-
-// `vi.importActual` bypasses the mock registry. Bun has no mock-aware resolver
-// to bypass: an un-mocked path imports the real module, and a path this process
-// HAS mocked cannot be un-mocked per-call. Kept only for the direct-call form
-// used by files that do not also mock the same specifier. The `vi.mock('x',
-// async (importActual) => …)` CALLBACK form is a different thing — that
-// parameter is supplied by the runner, not read off `vi`, so no fill can provide
-// it; scripts/run-bun-tests.mjs excludes those files instead.
-fill('importActual', (specifier: string) => import(specifier));
 
 fill('setSystemTime', (time?: string | number | Date) => {
   setSystemTime(time === undefined ? undefined : new Date(time));
@@ -128,30 +119,28 @@ fill('runAllTimersAsync', async () => {
   return vi;
 });
 
-fill('runOnlyPendingTimersAsync', async () => {
-  jest.runOnlyPendingTimers();
-  await Promise.resolve();
+// Per-file config. `bun test` takes the timeout as a CLI flag, so there is no
+// runtime knob to forward this to — and scripts/run-bun-tests.mjs already passes
+// a `--timeout` at least as large as anything a file asks for, so accepting
+// `testTimeout` as a no-op cannot turn a red into a green (a generous timeout only
+// lets a slow test finish).
+//
+// A blanket no-op would NOT be safe though: any OTHER option silently would not
+// apply, and the file would still go green. Accept exactly the key we have
+// verified is harmless and throw on anything else, so a future `vi.setConfig({
+// retry: 3 })` fails loudly here instead of quietly doing nothing.
+fill('setConfig', (config?: Record<string, unknown>) => {
+  for (const key of Object.keys(config ?? {})) {
+    if (key !== 'testTimeout') {
+      throw new Error(
+        `[bun-test-shim] vi.setConfig({ ${key} }) is not supported under bun test. `
+        + 'Only testTimeout is accepted (the runner passes a matching --timeout). '
+        + 'Add explicit support in test/bun-test-shim.ts rather than letting it no-op.',
+      );
+    }
+  }
   return vi;
 });
-
-fill('advanceTimersToNextTimerAsync', async () => {
-  jest.advanceTimersToNextTimer();
-  await Promise.resolve();
-  return vi;
-});
-
-// vitest drains the microtask queue; there is no timer involvement.
-fill('runAllTicks', async () => {
-  await Promise.resolve();
-  return vi;
-});
-
-// Per-file config (only `testTimeout` is used here). `bun test` takes the
-// timeout as a CLI flag, so there is no runtime knob to forward this to —
-// accepting it as a no-op is safe for a TIMEOUT (a too-generous default cannot
-// turn a red into a green; it can only let a slow test finish). scripts/
-// run-bun-tests.mjs passes a matching --timeout so these files are not cut short.
-fill('setConfig', () => vi);
 
 // ---------------------------------------------------------------------------
 // `it.runIf` / `describe.runIf` — Bun ships `skipIf` but not `runIf` (measured:
@@ -179,25 +168,110 @@ addRunIf(bunDescribe);
 
 // Mirrors vitest's default 1000ms timeout / 50ms interval and its behaviour of
 // surfacing the LAST failure, not a generic timeout message.
+//
+// ⚠️ FAKE TIMERS: vitest's waitFor ADVANCES fake timers by `interval` on each
+// poll. A naive `await new Promise(r => setTimeout(r, interval))` deadlocks
+// instead — once timers are faked nothing moves the clock, so the sleep never
+// resolves and the test dies on its own timeout (measured: vitest passes the same
+// probe while the naive shim hung to the 20s cap).
+//
+// There is no reliable way to ASK Bun whether timers are currently faked —
+// measured: `jest.now()` returns a number either way, and `setTimeout` keeps its
+// name and carries no `.mock` marker. So don't ask: TRY to advance, and treat the
+// "Fake timers are not active" throw as the signal to fall back to a real sleep.
+// The poll-count bound matters because a faked `Date.now()` need not advance, so
+// a wall-clock deadline alone could never expire.
 // ---------------------------------------------------------------------------
+
+/**
+ * Advance a faked clock. Returns false when timers are real (nothing to pump).
+ *
+ * Only "fake timers are not active" is treated as the real-timers signal; any
+ * other error is rethrown rather than silently reinterpreted as "timers are real"
+ * (which would send the caller down the wrong branch).
+ *
+ * ⚠️ KNOWN DIVERGENCE, not fixable from here: if a fired timer CALLBACK throws,
+ * vitest surfaces that error out of `waitFor`, but Bun's
+ * `jest.advanceTimersByTime` does not propagate it at all — measured directly:
+ * with a `setTimeout(() => { throw … })` pending, the advance call returns
+ * normally ("no-throw") and Bun reports the callback error through its own
+ * uncaught-error channel instead. So `waitFor` here rejects with the CONDITION's
+ * last error while vitest rejects with the timer's. A shim cannot invent an
+ * exception the runtime never delivers; the fix belongs in Bun. Documented rather
+ * than papered over, since the failure mode is a confusing diagnostic (wrong
+ * error text), not a silent pass.
+ */
+function tryAdvanceFakeTimers(ms: number): boolean {
+  try {
+    jest.advanceTimersByTime(ms);
+    return true;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/fake timers are not active/i.test(message)) return false;
+    throw err;
+  }
+}
+
 fill('waitFor', async <T>(
   callback: () => T | Promise<T>,
   options?: number | { timeout?: number; interval?: number },
 ): Promise<T> => {
   const timeout = typeof options === 'number' ? options : options?.timeout ?? 1000;
   const interval = typeof options === 'number' ? 50 : options?.interval ?? 50;
+  const step = Math.max(1, interval);
   const deadline = Date.now() + timeout;
+  // Track how far the FAKE clock has been pumped. A faked `Date.now()` need not
+  // advance, so this is the only honest elapsed measure on that path — and it has
+  // to be a hard bound, not a generous one: with slack, a condition that only
+  // becomes true AFTER the timeout still got accepted on a later poll, so a
+  // caller expecting a rejection saw a resolve instead (measured against vitest).
+  let fakeElapsed = 0;
   let lastError: unknown;
+
   for (;;) {
     try {
       return await callback();
     } catch (err) {
       lastError = err;
     }
-    if (Date.now() >= deadline) {
-      throw lastError ?? new Error(`vi.waitFor timed out after ${timeout}ms`);
+    // Advancing returns false when timers are real (nothing to pump).
+    const faked = tryAdvanceFakeTimers(step);
+    if (faked) {
+      fakeElapsed += step;
+      // Stop as soon as the pumped time reaches the timeout. The probe above
+      // already ran for this tick, so the condition still gets its observation at
+      // exactly `timeout` — but never beyond it.
+      if (fakeElapsed >= timeout) {
+        try {
+          return await callback();
+        } catch (err) {
+          throw err ?? lastError;
+        }
+      }
+      // Let the just-fired timers' continuations settle before probing again.
+      await Promise.resolve();
+    } else {
+      // Real timers: the caller's timeout is wall-clock, so clamp the sleep to
+      // what is LEFT rather than always sleeping a full interval. Oversleeping
+      // past the deadline and then probing again accepted conditions that only
+      // became true after the timeout — measured: with interval 50 / timeout 30,
+      // a condition arriving at 40ms resolved here while vitest rejected at ~33ms.
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw lastError ?? new Error(`vi.waitFor timed out after ${timeout}ms`);
+      }
+      await new Promise(resolve => setTimeout(resolve, Math.min(step, remaining)));
+      // The sleep above ends at or before the deadline; one final probe at the
+      // boundary matches vitest's inclusive last observation, and anything later
+      // must not be observed at all.
+      if (Date.now() >= deadline) {
+        try {
+          return await callback();
+        } catch (err) {
+          throw err ?? lastError;
+        }
+      }
     }
-    await new Promise(resolve => setTimeout(resolve, interval));
   }
 });
 

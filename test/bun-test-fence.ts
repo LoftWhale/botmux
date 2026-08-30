@@ -2,6 +2,7 @@ import { afterAll, beforeEach, mock } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import * as realOs from 'node:os';
+import { fenceHomeRootedEnv } from './helpers/fence-home-env.js';
 
 /**
  * `bun test` counterpart of `test/unit-setup.ts`.
@@ -52,6 +53,11 @@ const fileHome = join(fileRoot, 'home');
 mkdirSync(fileHome);
 process.env.HOME = fileHome;
 process.env.USERPROFILE = fileHome;
+
+// HOME alone is not enough: BOTS_CONFIG / PM2_HOME and friends point straight at
+// a live home and bypass `homedir()` entirely (bot-registry treats BOTS_CONFIG as
+// the top of its chain). Redirect them into the fenced tree.
+fenceHomeRootedEnv(fileHome);
 
 // Bind the real implementations BEFORE installing the override. Reading them off
 // the namespace object inside the factory resolves back through the mocked

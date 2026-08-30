@@ -75,6 +75,87 @@ describe('vi shim parity (vitest reference / bun shim)', () => {
     ).rejects.toThrow('distinctive-shim-parity-failure');
   });
 
+  // Real timers have their own deadline boundary, and it broke independently of
+  // the fake one: the sleep must be clamped to the REMAINING timeout, or the loop
+  // oversleeps and then accepts a condition that only became true afterwards
+  // (measured: interval 50 / timeout 30, condition at 40ms — vitest rejected at
+  // ~33ms while an unclamped shim resolved).
+  it('waitFor under real timers REJECTS a condition that arrives after the timeout', async () => {
+    let ready = false;
+    const timer = setTimeout(() => { ready = true; }, 40);
+    try {
+      await expect(
+        vi.waitFor(
+          () => { if (!ready) throw new Error('real-late-marker'); return 'too-late'; },
+          { interval: 50, timeout: 30 },
+        ),
+      ).rejects.toThrow('real-late-marker');
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  // Fake timers are a separate code path in the shim: vitest's waitFor pumps the
+  // faked clock itself, so a naive real `setTimeout` sleep deadlocks there. These
+  // four pin the boundary behaviour in both directions — the shim must neither
+  // hang nor accept a condition that only becomes true after the deadline.
+  it('waitFor under fake timers resolves when the condition arrives in time', async () => {
+    vi.useFakeTimers();
+    try {
+      let ready = false;
+      setTimeout(() => { ready = true; }, 50);
+      const got = await vi.waitFor(
+        () => { if (!ready) throw new Error('not yet'); return 'arrived'; },
+        { interval: 10, timeout: 500 },
+      );
+      expect(got).toBe('arrived');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waitFor under fake timers REJECTS a condition that only arrives after the timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      let ready = false;
+      setTimeout(() => { ready = true; }, 120);
+      await expect(
+        vi.waitFor(
+          () => { if (!ready) throw new Error('late-arrival-marker'); return 'too-late'; },
+          { interval: 10, timeout: 100 },
+        ),
+      ).rejects.toThrow('late-arrival-marker');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waitFor under fake timers still observes a condition arriving exactly at the timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      let ready = false;
+      setTimeout(() => { ready = true; }, 100);
+      const got = await vi.waitFor(
+        () => { if (!ready) throw new Error('not yet'); return 'boundary'; },
+        { interval: 10, timeout: 100 },
+      );
+      expect(got).toBe('boundary');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waitFor under fake timers surfaces the last failure when never ready', async () => {
+    vi.useFakeTimers();
+    try {
+      await expect(
+        vi.waitFor(() => { throw new Error('fake-never-ready-marker'); }, { interval: 10, timeout: 60 }),
+      ).rejects.toThrow('fake-never-ready-marker');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('runAllTimersAsync settles a timer callback that awaits', async () => {
     vi.useFakeTimers();
     try {
@@ -99,11 +180,15 @@ describe('vi shim parity (vitest reference / bun shim)', () => {
     }
   });
 
-  // NOTE: `vi.hoisted` is intentionally NOT asserted here. vitest's transform
-  // physically hoists any `vi.hoisted(…)` call to the top of the module, above
-  // the imports — so merely mentioning it inside a test body makes the file
-  // unparseable under vitest ("Expected a semicolon … after a statement").
-  // Its shim is exercised implicitly by the 111 files that already use it.
+  // NOTE: the hoisting helper is intentionally NOT asserted here, for two
+  // reasons. (1) vitest's transform physically lifts that call to the top of the
+  // module, above the imports — so merely writing it inside a test body makes the
+  // file unparseable under vitest ("Expected a semicolon … after a statement").
+  // (2) scripts/run-bun-tests.mjs matches the bare identifier to decide which
+  // files the bun leg must skip, so even naming it in prose here would exclude
+  // THIS file from the very leg it is meant to guard. It is unsupported under
+  // bun, not shimmed — see the "DELIBERATELY NOT SHIMMED" list in
+  // test/bun-test-shim.ts.
 });
 
 // `it.runIf(cond)` must behave exactly like `skipIf(!cond)`: Bun ships skipIf but

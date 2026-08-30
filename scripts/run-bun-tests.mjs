@@ -23,20 +23,20 @@
 // failures are mostly artefacts is worse than no leg at all.
 //
 // A subset of files cannot run here yet: `vi.doMock` / `vi.doUnmock` /
-// `vi.resetModules` and the `importOriginal` / `importActual` mock-factory
-// callbacks are module-registry semantics, not missing functions.
-// `test/bun-test-shim.ts` deliberately does NOT fake them — a fake would report
-// success while silently not mocking, which is worse than the current red. Those
-// files keep running under vitest until they are rewritten to use dependency
-// injection.
+// `vi.resetModules`, the `importOriginal` / `importActual` mock-factory callbacks,
+// and `vi.hoisted` are module-registry or transform semantics, not missing
+// functions. `test/bun-test-shim.ts` deliberately does NOT fake them — a fake
+// would report success while silently not mocking (or, for `hoisted`, run the
+// factory too late), which is worse than the current red. Those files keep running
+// under vitest until they are rewritten to use dependency injection.
 //
 // The exclusion list is COMPUTED, never hardcoded: a stale literal list would
 // quietly start skipping files (or fail on files that have since been fixed).
 
-import { readdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { availableParallelism } from 'node:os';
+import { availableParallelism, tmpdir as realTmpdir } from 'node:os';
 
 const TEST_DIR = 'test';
 
@@ -71,7 +71,32 @@ function collectTestFiles(dir) {
 // same module-registry feature under a different spelling — matching the bare
 // identifier catches both that and any `vi.importActual(…)` call site. Anchoring
 // only on `vi.<name>` would miss the callback form entirely (measured: 2 files).
-const UNSUPPORTED = /\bvi\s*\.\s*(doMock|doUnmock|resetModules)\b|\bimportOriginal\b|\bimportActual\b/;
+//
+// `vi.hoisted` belongs here for the same class of reason: vitest's TRANSFORM
+// physically moves the callback above the static imports, so a fixture that reads
+// a global at import time sees what the callback set. A runtime shim can only run
+// the factory when the module body reaches it — i.e. AFTER the imports — so the
+// fixture sees nothing (measured: vitest passes that probe while an eager-factory
+// shim reports `missing`). That is module-evaluation ORDER, not a missing
+// function, so it is unsupported rather than faked.
+const UNSUPPORTED = /\bvi\s*\.\s*(doMock|doUnmock|resetModules|hoisted)\b|\bimportOriginal\b|\bimportActual\b/;
+
+// Comments must not decide whether a file runs. Matching raw source means a file
+// that merely MENTIONS one of these names in prose gets silently skipped, and the
+// count line still looks healthy — the same shape of miss as the non-recursive
+// scan above. This is not hypothetical: the parity guard in
+// test/bun-shim-parity.test.ts excluded ITSELF that way while explaining why the
+// hoisting helper is unsupported. Strip comments before testing.
+//
+// Deliberately simple: this is a skip-list heuristic over first-party test files,
+// not a parser. `//` inside a string literal would over-strip, which fails
+// CLOSED — the file stays in the leg and any real unsupported call there fails
+// loudly rather than being quietly dropped.
+function stripComments(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+}
 
 // Bun's per-test default is 5s, but the unit project runs at vitest's 30s and
 // individual files raise it further via `vi.setConfig({ testTimeout })` — up to
@@ -89,7 +114,7 @@ const all = collectTestFiles(TEST_DIR).sort();
 const runnable = [];
 const skipped = [];
 for (const file of all) {
-  if (UNSUPPORTED.test(readFileSync(file, 'utf8'))) skipped.push(file);
+  if (UNSUPPORTED.test(stripComments(readFileSync(file, 'utf8')))) skipped.push(file);
   else runnable.push(file);
 }
 
@@ -119,7 +144,43 @@ console.log(
 function runOne(file) {
   return new Promise(resolve => {
     const args = ['test', ...(hasOwnTimeout ? [] : [`--timeout=${TEST_TIMEOUT_MS}`]), ...extraArgs, file];
-    const child = spawn('bun', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    // Per-child scratch root, used for BOTH tmp and home.
+    //
+    // TMPDIR: most `tmpdir()` uses in `src/` go through `mkdtemp`, but a few derive
+    // a FIXED name — `botmux-codex-app-control-<uid>` (src/worker.ts) and
+    // `bmcp-<uid>-<sessionKey>` (core/plugins/mcp/host.ts) — which collide across
+    // concurrently running files under the same user. Not a home escape, just a
+    // concurrency flake surface.
+    //
+    // HOME: the preload fence cannot cover Bun's OWN startup. Bun boots, resolves
+    // and loads the preload's static imports, and touches its user-level caches
+    // BEFORE any of our JS runs — measured: `.bun/install/cache` appears in the
+    // INHERITED home even on a fenced run. Setting HOME here means the fence
+    // exists from process birth; the preload then narrows it further and installs
+    // the in-process `node:os` override. Child processes inherit this too.
+    const scratch = mkdtempSync(join(realTmpdir(), 'botmux-bun-child-'));
+    const childTmp = join(scratch, 'tmp');
+    const childHome = join(scratch, 'home');
+    mkdirSync(childTmp);
+    mkdirSync(childHome);
+
+    const childEnv = {
+      ...process.env,
+      TMPDIR: childTmp,
+      TMP: childTmp,
+      TEMP: childTmp,
+      HOME: childHome,
+      USERPROFILE: childHome,
+    };
+    // Exact-path pointers at a live Botmux home never go through `homedir()`, so
+    // they have to be dropped in the spawn env too — not just in the preload.
+    // Mirrors test/helpers/fence-home-env.ts; kept here as well because that file
+    // only runs after Bun has started.
+    delete childEnv.BOTS_CONFIG;
+    delete childEnv.PM2_HOME;
+    delete childEnv.PLUGIN_PM2_HOME;
+
+    const child = spawn('bun', args, { stdio: ['ignore', 'pipe', 'pipe'], env: childEnv });
     let out = '';
     const cap = chunk => { if (out.length < 200_000) out += chunk; };
     child.stdout.on('data', cap);
@@ -127,10 +188,12 @@ function runOne(file) {
     const wall = setTimeout(() => child.kill('SIGKILL'), FILE_WALL_MS);
     child.on('error', err => {
       clearTimeout(wall);
+      rmSync(scratch, { recursive: true, force: true });
       resolve({ file, ok: false, out: `failed to launch bun: ${err.message}` });
     });
     child.on('close', (code, signal) => {
       clearTimeout(wall);
+      rmSync(scratch, { recursive: true, force: true });
       // A signal death (wall-clock kill, OOM) leaves code null — never let that
       // coerce into a pass.
       if (code !== 0) {
