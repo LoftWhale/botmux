@@ -53,14 +53,32 @@ mkdirSync(fileHome);
 process.env.HOME = fileHome;
 process.env.USERPROFILE = fileHome;
 
+// Bind the real implementations BEFORE installing the override. Reading them off
+// the namespace object inside the factory resolves back through the mocked
+// module, so `realOs.userInfo` would call the replacement and recurse forever
+// (measured: "Maximum call stack size exceeded").
+const actualUserInfo = realOs.userInfo;
+const actualHomedir = realOs.homedir;
+
 mock.module('node:os', () => ({
   ...realOs,
   // Bun resolves `import os from 'node:os'` through the default export, so a
   // spread alone would leave default-import callers on the real implementation.
   default: realOs,
   homedir: () => (process.platform === 'win32'
-    ? process.env.USERPROFILE || realOs.homedir()
-    : process.env.HOME || realOs.homedir()),
+    ? process.env.USERPROFILE || actualHomedir()
+    : process.env.HOME || actualHomedir()),
+  // `userInfo().homedir` is a SECOND route to the home directory and it does not
+  // go through `homedir()` — measured: with only `homedir` overridden,
+  // `userInfo().homedir` still returned the real `/root`. Four production call
+  // sites read it (src/cli.ts, src/worker.ts ×3), so leaving it unfenced would
+  // let those paths write outside the fence. Keep the real uid/username/shell
+  // fields intact and redirect only the home field.
+  userInfo: ((options?: { encoding?: string }) => {
+    const info = (actualUserInfo as (o?: unknown) => ReturnType<typeof realOs.userInfo>)(options);
+    const fenced = process.platform === 'win32' ? process.env.USERPROFILE : process.env.HOME;
+    return fenced ? { ...info, homedir: fenced } : info;
+  }) as typeof realOs.userInfo,
 }));
 
 // Mirrors the vitest fence: mojo mints per-session workspaces under the real
