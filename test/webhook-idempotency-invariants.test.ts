@@ -1,7 +1,7 @@
 /**
  * Regression net for the inbound-webhook idempotency invariants that PR #1086's
  * own suite leaves uncovered. Each case here was written against a specific
- * mutation of the shipped code and verified to go red under it — the four areas
+ * mutation of the shipped code and verified to go red under it — the five areas
  * are the ones a re-review flagged as highest risk:
  *
  *  1. singleflight join: `aborted` must NOT fall through to re-inspect
@@ -9,10 +9,23 @@
  *  2. two-stage rate limiter: no double-charge, no unauthenticated bypass.
  *  3. `dispatchDidRun` classification: only a provably-forked turn keeps the key.
  *  4. HMAC ordering: verify-then-claim, so a bogus signature cannot burn a nonce.
+ *  5. takeover race: when a failed owner releases the slot and N parked waiters
+ *     wake together, exactly ONE may become the new owner (probe 5). Dropping the
+ *     re-inspect loop makes all N dispatch — an Nx duplicate delivery.
+ *
+ * Of these, only #1 and #5 are NOT already caught by #1086's own suite; the rest
+ * add an integration-level view of behaviour that suite checks at unit level.
  *
  * Why these live in their own file: they are invariant guards rather than feature
  * tests, and keeping the mutation each one answers next to it is what stops them
  * from being "simplified" into something that passes on broken code.
+ *
+ * NO PROBE HERE MAY DEPEND ON A TIMER FOR ORDERING. Two failure modes were found
+ * in review and both are guarded above: a participant that never reaches the
+ * server makes a concurrency probe pass VACUOUSLY, and a cancellation that lands
+ * after the owner's settle makes it FALSE-RED on correct code. Use
+ * `waitForRequests` for happens-before and a deferred owner failure for causal
+ * order; never a sleep long enough to "probably" win.
  */
 import { createHmac } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
@@ -27,6 +40,22 @@ let dataDir = '';
 let prevDataDir: string | undefined;
 let proxyToDaemon: any;
 let dispatchCount = 0;
+/** Requests that actually REACHED the server this test. Concurrency probes below
+ *  assert on this: a participant that never lands makes them pass vacuously. */
+let requestsSeen = 0;
+
+/** Yield n macrotask turns, so a queued 'close' / abort callback is delivered. */
+const tick = async (n: number): Promise<void> => {
+  for (let i = 0; i < n; i++) await new Promise(resolve => setImmediate(resolve));
+};
+
+/** Wait until `n` requests have reached the server, then let the handler park on
+ *  its reservation. Replaces sleeping for a guessed number of milliseconds: the
+ *  probes need a HAPPENED-BEFORE, and a timer only gives a hoped-for one. */
+async function waitForRequests(n: number): Promise<void> {
+  while (requestsSeen < n) await new Promise(resolve => setTimeout(resolve, 1));
+  await tick(3);
+}
 
 async function startWebhookServer(): Promise<void> {
   vi.resetModules();
@@ -34,6 +63,7 @@ async function startWebhookServer(): Promise<void> {
   const { __testOnly_resetWebhookIdempotency } = await import('../src/services/webhook-idempotency.js');
   __testOnly_resetWebhookIdempotency();
   dispatchCount = 0;
+  requestsSeen = 0;
   proxyToDaemon = vi.fn(async () => ({
     status: 200,
     text: async () => JSON.stringify({
@@ -42,6 +72,7 @@ async function startWebhookServer(): Promise<void> {
     }),
   }));
   server = createServer(async (req, res) => {
+    requestsSeen += 1;
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
     if (await handleWebhookRoute(req, res, url, { proxyToDaemon })) return;
     res.writeHead(404).end(JSON.stringify({ error: 'not_found' }));
@@ -96,20 +127,36 @@ afterEach(async () => {
 
 describe('probe 1: join aborted vs released (integration)', () => {
   it('a WAITER whose client aborts does NOT dispatch; the later retry dispatches fresh', async () => {
-    // Owner A will FAIL (daemon_offline) after 300ms. Waiter B joins at 80ms and
-    // its client hangs up. B must stop (aborted), not re-inspect and take over.
-    // The upstream's retry C must then become the new owner and dispatch.
+    // Owner A will FAIL (daemon_offline). Waiter B joins, then its client hangs up.
+    // B must stop (aborted), not re-inspect and take over. The upstream's retry C
+    // must then become the new owner and dispatch.
     // Mutation that should REDDEN this probe: drop the `aborted` early-return in
     // webhook-routes.ts so an aborted waiter falls through to re-inspect — B would
     // then take over after A fails and settle, so C would fold (ignored) instead
     // of dispatching.
+    //
+    // ORDERING IS THE WHOLE TEST, so none of it is left to a timer. The failure
+    // this probe must not have is a FALSE RED on correct code, which happens iff
+    // A's settle fires while B is still parked (its abort not yet DELIVERED):
+    // A's release then wakes B, B takes over, and C folds. A `setTimeout` before
+    // A's failure loses that race under CPU contention — verified: with A on a
+    // 300ms timer, blocking the event loop ~250ms makes this test fail against
+    // CORRECT code. A test that fires on correct code gets deleted, taking the
+    // only invariant this file adds with it.
+    //
+    // So A's failure is a DEFERRED promise released by the test, causally after
+    // the abort has been observed. Note the fix is the causal order, NOT a bigger
+    // timeout: no delay value makes a race safe, and tuning one hides the bug.
     await seedConnector();
+    let failOwner: () => void = () => {};
+    const ownerMayFail = new Promise<void>(resolve => { failOwner = resolve; });
     let attempt = 0;
     proxyToDaemon.mockImplementation(async () => {
       attempt += 1;
       if (attempt === 1) {
-        // A: the owner, fails after 300ms so its reservation is released.
-        await new Promise(r => setTimeout(r, 300));
+        // A: the owner. Fails only once the test releases it, so its settle can
+        // never overtake B's abort.
+        await ownerMayFail;
         return { status: 502, text: async () => JSON.stringify({ ok: false, errorCode: 'daemon_offline', error: 'down' }) };
       }
       // C (and anything else): a healthy daemon.
@@ -117,21 +164,81 @@ describe('probe 1: join aborted vs released (integration)', () => {
     });
     const key = { 'x-idempotency-key': 'evt_abort_waiter' };
     const first = post('conn_idem', EVT, key);          // A: owner, will fail
-    await new Promise(r => setTimeout(r, 80));
+    await waitForRequests(1);
     const ac = new AbortController();
     const waiter = fetch(`${baseUrl}/webhook/conn_idem/tok_secret_value`, {
       method: 'POST', headers: { 'content-type': 'application/json', ...key },
       body: JSON.stringify(EVT), signal: ac.signal,
     }).catch(() => null);                              // B: waiter, aborts
-    setTimeout(() => ac.abort(), 60);
-    await waiter;
+    // B must be PARKED on the reservation before we cancel it — otherwise the
+    // probe passes vacuously (verified: with B never reaching the server, the
+    // mutation above stays green).
+    await waitForRequests(2);
+    ac.abort();
+    await waiter;                                      // abort delivered to the server
+    await tick(2);                                     // ...and drained by the join
+    failOwner();
     const a = await first;
     expect(a.body.ok).toBe(false);                     // A failed
-    await new Promise(r => setTimeout(r, 50));
     // C: upstream retry. A's failure released the slot; B (aborted) never took it.
     const c = await post('conn_idem', EVT, key);
     expect(c.body.action).toBe('queued');              // C dispatched, NOT folded
+    // Landing count, not just call count: 3 requests reached the server (A, B, C).
+    // The call-count assertion below cannot tell the two worlds apart on its own —
+    // correct is A+C = 2, broken is A+B = 2, the SAME number — so it only means
+    // anything once B is known to have taken part.
+    expect(requestsSeen).toBe(3);
     // A's failed attempt + C's dispatch = 2 daemon calls; B contributed none.
+    expect(proxyToDaemon).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('probe 5: concurrent waiters racing to take over a released reservation', () => {
+  it('exactly ONE waiter takes over when the owner fails; the rest fold', async () => {
+    // The re-inspect loop in webhook-routes.ts is load-bearing, and says so:
+    // "several waiters can wake together and only one may take over as `first`".
+    // Nothing tested it. Mutation that should REDDEN this probe: on a 'released'
+    // outcome, break out of the loop and dispatch instead of re-inspecting (the
+    // exact "simplification" that comment warns against). Measured under it: all
+    // 8 waiters dispatch (9 daemon calls) — an 8x duplicate delivery, which is
+    // strictly worse than the single duplicate the rest of this file guards, and
+    // the whole 85-test suite stays GREEN.
+    //
+    // Why `released` (not `ran`) is the interesting case: a successful owner is
+    // already covered by the fold path. It is FAILURE that reopens the slot and
+    // wakes every parked waiter at once, so "who takes over" is decided exactly
+    // here — and `inspect` must hand `first` to one of them and only one.
+    await seedConnector();
+    const WAITERS = 8;
+    let failOwner: () => void = () => {};
+    const ownerMayFail = new Promise<void>(resolve => { failOwner = resolve; });
+    let attempt = 0;
+    proxyToDaemon.mockImplementation(async () => {
+      attempt += 1;
+      if (attempt === 1) {
+        // The owner. Released by the test only once every waiter is parked, so
+        // the wake-up is genuinely simultaneous (a timer here would let waiters
+        // arrive after the release and serialise instead of racing).
+        await ownerMayFail;
+        return { status: 502, text: async () => JSON.stringify({ ok: false, errorCode: 'daemon_offline', error: 'down' }) };
+      }
+      return { status: 200, text: async () => JSON.stringify({ ok: true, triggerId: `trg_${++dispatchCount}`, action: 'queued' }) };
+    });
+    const key = { 'x-idempotency-key': 'evt_takeover_race' };
+    const owner = post('conn_idem', EVT, key);
+    await waitForRequests(1);
+    const waiters = Array.from({ length: WAITERS }, () => post('conn_idem', EVT, key));
+    await waitForRequests(1 + WAITERS);   // all parked before the slot reopens
+    failOwner();
+    const ownerResult = await owner;
+    const settled = await Promise.all(waiters);
+    expect(ownerResult.body.ok).toBe(false);                       // owner failed
+    const queued = settled.filter(r => r.body.action === 'queued').length;
+    const folded = settled.filter(r => r.body.action === 'ignored').length;
+    expect(queued).toBe(1);                                        // exactly one took over
+    expect(folded).toBe(WAITERS - 1);                              // the rest folded onto it
+    // Owner's failed attempt + exactly one takeover. Unlike probe 1's call count,
+    // this number IS discriminating: the mutation above makes it 1 + WAITERS.
     expect(proxyToDaemon).toHaveBeenCalledTimes(2);
   });
 });
