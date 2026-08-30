@@ -1,4 +1,4 @@
-import { expect, jest, mock, setSystemTime } from 'bun:test';
+import { describe as bunDescribe, expect, it as bunIt, jest, mock, setSystemTime } from 'bun:test';
 import { vi } from 'vitest';
 
 /**
@@ -20,7 +20,9 @@ import { vi } from 'vitest';
  * functions, and any fake would silently not-mock while reporting success:
  *   `vi.doMock` / `vi.doUnmock`  — re-point a module mid-file
  *   `vi.resetModules`            — clear the module registry
- *   `importOriginal`             — the callback arg that yields the real module
+ *   `importOriginal` / `importActual` — the `vi.mock` factory's callback arg that
+ *                                  yields the real module (runner-supplied, so
+ *                                  no fill can provide it)
  * Files using them stay red under `bun test` and keep running under vitest until
  * they are rewritten to use dependency injection. See `package.json:test:bun`.
  */
@@ -152,7 +154,29 @@ fill('runAllTicks', async () => {
 fill('setConfig', () => vi);
 
 // ---------------------------------------------------------------------------
-// vi.waitFor — poll until the callback stops throwing (or its promise rejects).
+// `it.runIf` / `describe.runIf` — Bun ships `skipIf` but not `runIf` (measured:
+// `skipIf` and `each` are present, `runIf` is not). `runIf(cond)` is exactly
+// `skipIf(!cond)`, so this is a mechanical inversion with no semantic guesswork —
+// unlike the module-registry APIs above, there is nothing here to get subtly
+// wrong. Without it, 16 `it.runIf` + 5 `describe.runIf` files fail at collection
+// time with `it.runIf is not a function` (the whole mojo-* cluster).
+// ---------------------------------------------------------------------------
+function addRunIf(target: unknown): void {
+  const fn = target as { runIf?: unknown; skipIf?: (cond: boolean) => unknown };
+  if (typeof fn?.skipIf !== 'function') return;
+  let missing = false;
+  try { missing = typeof fn.runIf !== 'function'; } catch { missing = true; }
+  if (!missing) return;
+  Object.defineProperty(fn, 'runIf', {
+    configurable: true,
+    writable: true,
+    value: (condition: boolean) => fn.skipIf!(!condition),
+  });
+}
+
+addRunIf(bunIt);
+addRunIf(bunDescribe);
+
 // Mirrors vitest's default 1000ms timeout / 50ms interval and its behaviour of
 // surfacing the LAST failure, not a generic timeout message.
 // ---------------------------------------------------------------------------
