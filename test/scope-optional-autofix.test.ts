@@ -34,13 +34,32 @@ function fnRegion(signature: string, span = 3200): string {
   return src.slice(start, start + span);
 }
 
+/**
+ * 从 `signature` 截到 `endMarker` 为止（含）。
+ *
+ * ⭐ 比固定字符宽度的 {@link fnRegion} 稳：那种写法把「代码语义」和「代码在文件里的
+ * 字节位置」绑在一起，于是**任何无害的说明性改动都能让断言变红**，而红的信息完全指
+ * 向错误的方向（看起来像功能没了）。这个函数在本次改动里连踩三次：目标文本偏移分别
+ * 到过 1463 / 5243 / 7933，而窗口卡在 1400 / 5200 / 7600。用真实的结构边界收尾就不
+ * 会再随注释漂移。
+ */
+function fnRegionUntil(signature: string, endMarker: string): string {
+  const start = src.indexOf(signature);
+  expect(start, `${signature} not found in event-dispatcher.ts`).toBeGreaterThanOrEqual(0);
+  const end = src.indexOf(endMarker, start);
+  expect(end, `${endMarker} not found after ${signature}`).toBeGreaterThan(start);
+  return src.slice(start, end + endMarker.length);
+}
+
 describe('checkRequiredScopes — opt-in optional-scope auto-top-up', () => {
   // The all-critical-granted branch, up to (and including) its early return.
+  // ⚠️ 窗口宽度要够：这个分支里加过注释/新分支（如「应用审核中就静默跳过」），
+  // 卡太紧会让断言因为**文本被推出窗口**而红，看起来像行为回归，实际什么都没改。
   const region = (() => {
     const anchor = 'if (missingCritical.length === 0) {';
     const start = src.indexOf(anchor);
     expect(start, 'missingCritical.length === 0 branch not found').toBeGreaterThanOrEqual(0);
-    return src.slice(start, start + 1400);
+    return src.slice(start, start + 2200);
   })();
 
   it('gates the top-up on a missing optional scope', () => {
@@ -63,7 +82,9 @@ describe('checkRequiredScopes — opt-in optional-scope auto-top-up', () => {
 
   it('returns on a successful top-up (before the all-critical-granted log)', () => {
     const topUpIdx = region.indexOf('const toppedUp = await tryAutoFixScopes');
-    const returnIdx = region.indexOf('return;', topUpIdx);
+    // 成功判据必须是**真的补上了**（'fixed'），不能是「调用没抛」：应用审核中时
+    // 开放平台连 scope/update 都拒（code=10046），一项都没写进去，报 topped-up 是谎报。
+    const returnIdx = region.indexOf("if (toppedUp === 'fixed') {", topUpIdx);
     const allGrantedLogIdx = region.indexOf('all critical scopes granted');
     expect(topUpIdx).toBeGreaterThanOrEqual(0);
     expect(returnIdx).toBeGreaterThan(topUpIdx);
@@ -78,10 +99,24 @@ describe('checkRequiredScopes — opt-in optional-scope auto-top-up', () => {
 });
 
 describe('tryAutoFixScopes — silent / disableQrLogin plumbing', () => {
-  // ⚠️ 固定字符数窗口：函数体一变长，末尾的断言（DM 抬头文案）就会滑出窗口而
-  // 失败——**不是**行为回归。加了「权限数据范围」那几行日志后实测需要 4448 字符，
-  // 这里留到 5200 给后续小改动一点余量。真正变动这段逻辑时看的是断言本身。
-  const region = fnRegion('async function tryAutoFixScopes(', 5200);
+  // 截到函数体真正的结尾（catch 里那句 auto-fix error 日志），不用会随注释漂移的固定
+  // 字符宽度 —— 这段历史上因窗口太窄假红过三次（详见 fnRegionUntil 的注释）。
+  const region = fnRegionUntil('async function tryAutoFixScopes(', "logger.warn(`[${larkAppId}] auto-fix error:");
+
+  /**
+   * 🔴 最高风险的一条护栏：**撤回审核中版本不可逆**（审批队列位置会丢，线上见过已排
+   * 3 天的、且不属于本机 owner）。只有「确实缺 critical 权限」才允许撤——那种情况下
+   * 审核期间 `scope/update` 被 `code=10046` 拒、权限永远补不上，撤回是唯一出路。
+   * 纯 opt-in 权限补齐（silent 路径，missingCritical 为空）绝不能撤。
+   *
+   * 断言 `missingCritical.length > 0` 这个**具体条件**，而不是「传了这个参数」：
+   * 写成 `withdrawPendingReview: true` 同样能通过「参数存在」类断言，却把护栏拆没了。
+   */
+  it('只在缺 critical 权限时才允许撤回审核中版本（不可逆操作的护栏）', () => {
+    expect(region).toContain('withdrawPendingReview: missingCritical.length > 0,');
+    // 反面：绝不能是无条件 true
+    expect(region).not.toContain('withdrawPendingReview: true');
+  });
 
   it('accepts the disableQrLogin + silent opts', () => {
     expect(region).toContain('opts?: { disableQrLogin?: boolean; silent?: boolean; grantedScopeNames?: { tenant: string[]; user: string[] } }');
@@ -106,7 +141,7 @@ describe('tryAutoFixScopes — silent / disableQrLogin plumbing', () => {
 
   it('skips the admin success DM when silent', () => {
     // the silent early-return must sit before getAdminOpenId is read for the DM
-    const silentIdx = region.indexOf('if (opts?.silent) return true;');
+    const silentIdx = region.indexOf("if (opts?.silent) return 'fixed';");
     const adminIdx = region.indexOf('const adminOpenId = getAdminOpenId(bot);');
     expect(silentIdx).toBeGreaterThanOrEqual(0);
     expect(adminIdx).toBeGreaterThan(silentIdx);
@@ -134,7 +169,10 @@ describe('tryAutoFixScopes — silent / disableQrLogin plumbing', () => {
     // needs a human.
     expect(region).toContain('logger.warn(summary)');
     expect(region).toMatch(/autoFixEffective\s*$|autoFixEffective\s*\?/m);
-    expect(region).toContain('没能申请成功');
+    // 「没能全部落地」覆盖两种失败：权限一项都没申请上，以及权限进了清单但版本没提交
+    // 发布（后者权限同样不生效，见 versionWarning）。原文案只说「没能申请成功」，
+    // 对第二种是错的。
+    expect(region).toContain('没能全部落地');
   });
 });
 
@@ -167,7 +205,9 @@ describe('checkRequiredScopes — 99991672 chicken-and-egg scope request set', (
 
   it('still only runs on feishu and falls through to the manual deep-link DM', () => {
     expect(region).toContain("if (brand === 'feishu') {");
-    expect(region).toContain('if (fixed) return;');
+    // 自愈成功**或**「应用正在审核中」都直接返回：审核期间开放平台锁写，把 self_manage
+    // 深链推给管理员是错误建议（点了也开不了），等审批通过下次重启自检即可。
+    expect(region).toContain("if (fixed !== 'failed') return;");
     expect(region).toContain('buildScopeDeepLink(bot.config.larkAppId, SELF_MANAGE_SCOPE, brand)');
   });
 });

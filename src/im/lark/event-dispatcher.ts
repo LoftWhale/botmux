@@ -248,6 +248,13 @@ async function dmAdmin(larkAppId: string, adminOpenId: string, content: string, 
  *   path so a bot that never asked for the feature isn't pinged; the log line is
  *   enough). Failures are always silent here regardless.
  */
+/**
+ * 返回 `'fixed'` = 已处理完（调用方停止）；`'under_review'` = 应用正在飞书审核中，
+ * 配置写锁、等审批通过即自愈（调用方**不该**再让管理员去点权限链接——那些链接现在
+ * 点了也写不进去）；`'failed'` = 落回人工深链 DM。
+ */
+type AutoFixOutcome = 'fixed' | 'under_review' | 'failed';
+
 async function tryAutoFixScopes(
   larkAppId: string,
   bot: BotState,
@@ -255,8 +262,8 @@ async function tryAutoFixScopes(
   missingCritical: { name: string; desc: string }[],
   missingOptional: { name: string; desc: string }[],
   opts?: { disableQrLogin?: boolean; silent?: boolean; grantedScopeNames?: { tenant: string[]; user: string[] } },
-): Promise<boolean> {
-  if (brand !== 'feishu') return false;
+): Promise<AutoFixOutcome> {
+  if (brand !== 'feishu') return 'failed';
 
   try {
     const totalMissing = missingCritical.length + missingOptional.length;
@@ -280,6 +287,14 @@ async function tryAutoFixScopes(
       // 超集，故本路径上二次差集恒为空操作；它真正兜住的是「裁剪后为空」那一轮。
       // 拿不到 granted（self_manage 冷启动）时不传，退回保守近似。
       grantedScopeNames: opts?.grantedScopeNames,
+      // 🔴 护栏：只有「确实缺 critical 权限」才允许撤回正在审核中的版本。
+      // 审核期间开放平台把配置整体写锁（`code=10046`），`scope/update` 也被拒 ⟹ 缺的
+      // 必需权限**永远补不上**，等审批过了那一版照样不含它们，bot 一直不可用；这种情况
+      // 撤回是唯一出路。
+      // 反过来，纯 opt-in 权限补齐（`im:feed_group_v1:*` 这类，走 silent 路径、
+      // missingCritical 为空）**绝不撤**：撤回不可逆、会丢审批队列位置（线上见过排 3 天
+      // 的），为一个没人在用的可选特性掀掉别人的审批，代价完全不对等。
+      withdrawPendingReview: missingCritical.length > 0,
       onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
       onQrCode: (info) => {
         logger.warn(
@@ -318,21 +333,42 @@ async function tryAutoFixScopes(
         : result.privilegeRangeWarning
           ? `, 权限数据范围未能自动配置（${result.privilegeRangeWarning}）`
           : '';
-      // 「无变更→有意跳过发版」≠「发了版但没解析到 versionId」：后者要提示去开放平台
-      // 确认，前者根本没建版本，报 `version n/a published` 会误导（#1044）。
+      // 三种结局互斥，判定顺序不能反（#1044 的 publishSkipped 必须最先判）：
+      //   ① publishSkipped —— 无变更、**根本没建版本**，报 `version n/a published` 会误导
+      //   ② versionWarning —— 建/提交了但回读仍是草稿。「version X published」曾是**谎报**：
+      //      `publish/commit` 回 code=0 而版本仍停在未提交草稿态，日志照样写 published，
+      //      于是那个草稿一路卡死后续每一次自愈（`app_version/create` 撞 code=10043）。
+      //   ③ 正常发布
       const versionDetail = result.publishSkipped
         ? '无变更，已跳过发版'
-        : `version ${result.versionId ?? 'n/a'} published`;
+        : result.versionWarning
+          ? `version ${result.versionId ?? 'n/a'} NOT published（${result.versionWarning}）`
+          : `version ${result.versionId ?? 'n/a'} ${result.versionReused ? '(复用既有草稿) ' : ''}published`;
+      // 「秒过」与「要人审」是两种截然不同的结局，日志必须分开——否则运维看到
+      // published 会以为权限已经生效，而实际上可能还在等某个人点同意。
+      const approvalDetail = result.approvalAutoPassed === true
+        ? '（审批流自动通过，已即时生效）'
+        : result.approvalHumanApprovers?.length
+          ? `（需人工审批：${result.approvalHumanApprovers.join('、')}）`
+          : '';
+      // 撤回过别人排队中的审批是**不可逆**的，必须在日志里留痕：出问题时要能回答
+      // 「谁撤的、为什么撤」。撤了但没走完重新提交，比不撤更糟，所以这两个信号
+      // （withdrew + versionWarning）一起决定下面的成败判定。
+      const withdrawDetail = result.withdrewPendingReview
+        ? ', 已撤回原审核中版本以解开配置写锁并重新提交'
+        : result.withdrawWarning
+          ? `, 撤回审核中版本未成功（${result.withdrawWarning}）`
+          : '';
       const summary =
         `[${larkAppId}] auto-fix ${autoFixEffective ? 'succeeded' : 'could NOT apply the missing scopes'}: ${scopeDetail}${privilegeRangeDetail}, ` +
-        `${versionDetail}, ` +
+        `${versionDetail}${approvalDetail}${withdrawDetail}, ` +
         `${result.subscribedEventCount} events subscribed`;
-      if (autoFixEffective) logger.info(summary);
+      if (autoFixEffective && !result.versionWarning) logger.info(summary);
       else logger.warn(summary);
       // opt-in / optional-only path: succeeded silently, no admin DM (a bot that
       // never enabled the feature must not be pinged just because a non-critical
       // scope was topped up in the background). The log line above is the record.
-      if (opts?.silent) return true;
+      if (opts?.silent) return 'fixed';
       // Notify admin that auto-fix worked — even if im:message was missing before,
       // the newly published version should now have it.
       const adminOpenId = getAdminOpenId(bot);
@@ -341,19 +377,45 @@ async function tryAutoFixScopes(
         const missingList = fixedList.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n');
         // 标题跟着实际结果走：一项都没落地时说「已自动修复」是谎报，管理员会以为
         // 不用管，而这条路径的下游（缺 critical scope）恰恰是最需要人工介入的。
+        // 同理「新版本已发布」也不能写死：scope 写进了清单但版本没提交，权限就**不会
+        // 生效**，而管理员读到「已发布」只会干等。versionWarning 有值时直接给出
+        // 手动收尾的动作。
+        //
+        // 三种结局要分清，因为「用户接下来该做什么」完全不同：
+        //   ① 秒过（审批流全自动通过）→ 已经生效了，什么都不用做
+        //   ② 要人审 → 已提交，但在等具体某个人；告诉他等谁，免得重复点或干等
+        //   ③ 判不出来 → 保持中性措辞，不猜
+        const versionLine = result.versionWarning
+          ? `⚠️ 但新版本**没有成功提交发布**（${result.versionWarning}）。权限要等版本发布后才生效。`
+          : result.approvalAutoPassed === true
+            ? '新版本已提交，审批流**自动通过**，权限已即时生效。'
+            : result.approvalHumanApprovers?.length
+              ? `新版本已提交，但需要**人工审批**（审批人：${result.approvalHumanApprovers.join('、')}），`
+                + '通过后权限才生效——不用重复提交，等审批即可。'
+              : '新版本已发布。';
+        // 撤回过审批必须**如实告知 owner**：他的应用曾短暂离开审批队列、现在是新提交的
+        // 一版在排。瞒着不说 = 他看到「审批进度重置」时无从解释。
+        const withdrawLine = result.withdrewPendingReview
+          ? '\n\nℹ️ 说明：这个应用原有一个**正在审核中**的版本，而审核期间飞书锁定配置写入、'
+            + '缺失的权限根本补不上（等审批通过那一版也不含这些权限）。botmux 已撤回原版本、'
+            + '补齐权限后重新提交审核——**审批需要重新排队**。'
+          : result.withdrawWarning
+            ? `\n\n⚠️ 这个应用有一个审核中的版本，botmux 尝试撤回以解开配置写锁但没成功（${result.withdrawWarning}）。`
+              + '你可以到开放平台「版本管理」→ 点进该版本详情 → **Withdraw** 手动撤回，然后 `botmux restart`。'
+            : '';
         await dmAdmin(
           larkAppId,
           adminOpenId,
-          (autoFixEffective
+          (autoFixEffective && !result.versionWarning
             ? `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n`
-            : `⚠️ botmux 尝试自动为机器人 "${bot.botName ?? larkAppId}" 补齐以下权限，但没能申请成功，需要你手动开通：\n\n`) +
+            : `⚠️ botmux 尝试自动为机器人 "${bot.botName ?? larkAppId}" 补齐以下权限，但没能全部落地，需要你手动收尾：\n\n`) +
           `${missingList}\n\n` +
-          `${scopeDetail}，新版本已发布。\n` +
+          `${scopeDetail}，${versionLine}${withdrawLine}\n` +
           `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。`,
           autoFixEffective ? `auto-fixed ${fixedList.length} scopes` : `auto-fix could not apply ${fixedList.length} scopes`,
         );
       }
-      return true;
+      return 'fixed';
     }
 
     // Auto-fix failed — log reason. Critical path falls through to a manual
@@ -370,16 +432,35 @@ async function tryAutoFixScopes(
       missing_csrf: '开放平台页面未返回 CSRF token',
       scope_mapping_failed: '权限映射失败',
       api_error: '开放平台 API 错误',
+      app_under_review: '应用正在飞书审核中（配置被开放平台写锁，审批通过后自动恢复）',
     };
+    // ⚠️ 泛化标签和具体消息**两个都要打**。这里曾写成
+    // `reasons[result.reason] ?? result.message`——`api_error` 在表里有值,`??`
+    // 永远短路,于是 `result.message` 一次都进不了日志。线上真实后果:一天 5 次自愈
+    // 失败只留下 5 行「开放平台 API 错误」,而被吞掉的那句正是唯一有用的诊断
+    // (`code=10043 版本已创建,请刷新`),排查只能靠重放整条链路才拿到。
+    // 泛化标签帮人快速归类,具体消息才说得清到底哪儿坏——别再让前者盖掉后者。
+    const reasonLabel = reasons[result.reason] ?? result.reason;
+    // 审核中不是「修不了」，是「现在不能改、审批通过就好」。日志级别降为 info 并显式
+    // 说明不会落回深链 DM——把权限链接推给管理员是**错误的建议**：审核期间开放平台
+    // 连 scope/update 都拒（实测 code=10046），点了也写不进去。
+    if (result.reason === 'app_under_review') {
+      logger.info(
+        `[${larkAppId}] auto-fix deferred: ${reasonLabel}` +
+        `${result.message ? ` — ${result.message}` : ''}`,
+      );
+      return 'under_review';
+    }
     logger.warn(
-      `[${larkAppId}] auto-fix not possible (${result.reason}: ${reasons[result.reason] ?? result.message}). ` +
+      `[${larkAppId}] auto-fix not possible (${result.reason}: ${reasonLabel}` +
+      `${result.message ? ` — ${result.message}` : ''}). ` +
       (opts?.silent ? 'Leaving opt-in scope ungranted (no DM).' : 'Falling back to manual deep-link DM.'),
     );
-    return false;
+    return 'failed';
   } catch (err: any) {
     logger.warn(`[${larkAppId}] auto-fix error: ${err?.message ?? err}` +
       (opts?.silent ? ' — leaving opt-in scope ungranted (no DM)' : ' — falling back to manual DM'));
-    return false;
+    return 'failed';
   }
 }
 
@@ -417,7 +498,9 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       if (brand === 'feishu') {
         const requiredNow = BOTMUX_REQUIRED_SCOPES.map(s => ({ name: s.name, desc: s.desc }));
         const fixed = await tryAutoFixScopes(larkAppId, bot, brand, requiredNow, []);
-        if (fixed) return;
+        // 审核中同样直接返回：这条路径下游是让管理员去点 self_manage 深链，而审核期间
+        // 写锁生效，点了也开不了——等审批通过下次重启自检即可。
+        if (fixed !== 'failed') return;
       }
       const selfManageAuthUrl = buildScopeDeepLink(bot.config.larkAppId, SELF_MANAGE_SCOPE, brand);
       const targetAuthUrl = buildScopeDeepLink(bot.config.larkAppId, REQUIRED_BOT_AT_SCOPE, brand);
@@ -584,10 +667,13 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       if (missingOptional.length > 0 && brand === 'feishu') {
         const toppedUp = await tryAutoFixScopes(larkAppId, bot, brand, [], missingOptional,
           { disableQrLogin: true, silent: true, grantedScopeNames: grantedScopeBuckets });
-        if (toppedUp) {
+        // 只有真的补上了才说「auto-topped-up」：审核中什么都没写进去（开放平台
+        // 连 scope/update 都拒），说补上了就是谎报。审核中静默跳过，等审批通过。
+        if (toppedUp === 'fixed') {
           logger.info(`[${larkAppId}] auto-topped-up ${missingOptional.length} optional scope(s): ${missingOptional.map(s => s.name).join('、')}`);
           return;
         }
+        if (toppedUp === 'under_review') return;
         logger.debug(`[${larkAppId}] optional scope(s) missing (${missingOptional.map(s => s.name).join('、')}); no cached web session to auto-apply — leaving to opt-in feature owner`);
       }
       logger.info(`[${larkAppId}] all critical scopes granted (${BOTMUX_REQUIRED_SCOPES.filter(s => s.critical).length} checked)`);
@@ -600,7 +686,36 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // Falls through to manual DM warning if session is missing/expired.
     const autoFixed = await tryAutoFixScopes(larkAppId, bot, brand, missingCritical, missingOptional,
       { grantedScopeNames: grantedScopeBuckets });
-    if (autoFixed) return;
+    if (autoFixed === 'fixed') return;
+    // 审核中：告诉管理员「在等审批」，而**不是**推一串权限深链让他去点。审核期间开放
+    // 平台把配置写入整体锁了（实测连 scope/update 都回 code=10046），那些链接点了也
+    // 开不了权限，只会让人白折腾并误以为是自己没配对。审批通过后下次重启自动补齐。
+    if (autoFixed === 'under_review') {
+      const summary = missingCritical.map(s => `${s.name} (${s.desc})`).join('、');
+      logger.warn(
+        `[${larkAppId}] 缺少 ${missingCritical.length} 项必需权限（${summary}），` +
+        '但应用正在飞书审核中、配置暂时不可写；审批通过后 botmux 下次启动会自动补齐。',
+      );
+      const reviewAdmin = getAdminOpenId(bot);
+      if (reviewAdmin) {
+        await dmAdmin(
+          larkAppId,
+          reviewAdmin,
+          `⏳ 机器人 "${bot.botName ?? larkAppId}" 还缺 ${missingCritical.length} 项必需权限，`
+          + `但它当前**正在飞书审核中**，开放平台锁定了配置写入，botmux 暂时补不了：\n\n`
+          + `${missingCritical.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n')}\n\n`
+          // 缺 critical 权限时 botmux 会自动撤回待审版本（见 withdrawPendingReview），
+          // 走到这条 DM 说明**撤回也没成功**——这时说「不需要你做任何事」是错的，
+          // 权限补不上、bot 一直不可用，必须给出手动撤回的路径。
+          + `botmux 已尝试撤回该待审版本以解开写锁，但没有成功。请手动处理：\n`
+          + `开放平台 →「版本管理与发布」→ 点进审核中那一版的**版本详情** → 点 **Withdraw** 撤回，`
+          + '然后执行 `botmux restart`，botmux 会自动补齐权限并重新提交审核。\n\n'
+          + '（说明：审核期间飞书连「申请权限」都拒绝，所以直接去权限管理页点开通也是无效的。）',
+          `app under review, ${missingCritical.length} scopes deferred`,
+        );
+      }
+      return;
+    }
 
     // Log + DM consolidated message listing all missing critical scopes.
     const summaryLine = missingCritical.map(s => `${s.name} (${s.desc})`).join('、');
