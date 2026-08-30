@@ -33,10 +33,15 @@ import * as realOs from 'node:os';
 
 const inheritedDataDir = process.env.SESSION_DATA_DIR;
 
-// One disposable root per test process. `bun test` has no globalSetup hook to
-// hand a shared parent down (vitest uses `unit-global-setup.ts` for that), so
-// each process mints its own under the real tmpdir — captured from the unmocked
-// module before the override is installed.
+// One disposable root per test PROCESS — note that `bun test` runs every file
+// it was given in a single process (measured: two files report the same
+// `process.pid`), unlike vitest which forks a worker per file. So this root is
+// shared by the whole invocation rather than per-file. That is fine for the
+// purpose here (keeping writes out of the real home) but it means `afterAll`
+// below fires once at the end, not between files. `bun test` also has no
+// globalSetup hook to hand a shared parent down (vitest uses
+// `unit-global-setup.ts` for that), so the root is minted here, under the real
+// tmpdir — captured from the unmocked module before the override is installed.
 const fileRoot = mkdtempSync(join(realOs.tmpdir(), 'botmux-bun-unit-'));
 
 const dataDir = join(fileRoot, 'data');

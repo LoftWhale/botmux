@@ -182,9 +182,19 @@ fill('waitFor', async <T>(
 // and this repo's vitest.config.ts sets neither — so stubs persist across tests
 // within a file, and at least one file relies on that by stubbing in
 // `beforeAll` (test/fs-policy-bwrap.e2e.test.ts). Adding an `afterEach` reset
-// here would make the shim STRICTER than the runner it emulates and break those
-// files. Cross-file leakage is not a concern: `bun test` gives each file its own
-// process, and test/bun-test-fence.ts fences the home directory per process.
+// here would make the shim STRICTER than the runner it emulates and turn those
+// files red.
+//
+// ⚠️ The tradeoff is real and differs from vitest: `bun test` runs every file in
+// ONE process (measured — two files report the same `process.pid` and share one
+// fence dir), whereas vitest forks a worker per file. So a file that stubs an env
+// var and never restores it CAN leak into a later file in the same `bun test`
+// invocation, where under vitest it could not. Files are still fenced as a group
+// (test/bun-test-fence.ts redirects HOME for the whole process, so nothing
+// reaches the real home either way); what leaks is only test-visible state
+// between files. Matching vitest's per-file isolation would need a reset keyed to
+// file boundaries, which bun:test does not currently expose. Prefer fixing a
+// leaky file over adding a blanket reset that breaks the `beforeAll` pattern.
 
 // `expect(...).toMatchObject` etc. already exist in Bun; assert the pieces this
 // shim depends on are really present so a Bun upgrade that moves them fails
