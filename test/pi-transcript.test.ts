@@ -296,6 +296,43 @@ describe('drainPiTranscript: turn terminal contract', () => {
     expect(late.events).toHaveLength(0);
   });
 
+  // ── /adopt: a user-started Pi never receives --extension ──────────────────
+  //
+  // Those sessions produce NO boundary marker at all, so this is the shape the
+  // change degrades to when it gets no help from Pi. It must degrade to "late
+  // but correct", never to "wrong" or "silent".
+
+  it('without any boundary marker (adopt), a recovered turn still suppresses its mid-turn error', () => {
+    // Suppression here rides on the real terminal, not the marker — so adopt
+    // sessions get the false-alarm fix for free.
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('say PROBE_OK'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+      assistantFinal('stop', 'PROBE_OK', '2026-08-03T05:14:03.000Z'),
+    ]);
+    const t0 = 3_000_000;
+    const first = drainPiTranscript(path, 0, t0);
+    const late = drainPiTranscript(path, first.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS * 3);
+    const all = [...first.events, ...late.events];
+    expect(all.filter((e) => e.terminalStatus === 'failed')).toHaveLength(0);
+    expect(all.some((e) => e.text === 'PROBE_OK')).toBe(true);
+  });
+
+  it('without any boundary marker (adopt), a genuinely failed turn is still reported via the timeout', () => {
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('say PROBE_OK'),
+      assistantFinal('error', '', '2026-08-03T05:14:01.000Z', 'upstream stream error: service unavailable'),
+    ]);
+    const t0 = 4_000_000;
+    const first = drainPiTranscript(path, 0, t0);
+    const late = drainPiTranscript(path, first.newOffset, t0 + PI_TURN_BOUNDARY_TIMEOUT_MS);
+    const fails = [...first.events, ...late.events].filter((e) => e.terminalStatus === 'failed');
+    expect(fails).toHaveLength(1);
+    expect(fails[0].terminalErrorCode).toBe('codex_upstream_error');
+  });
+
   it('emits assistant_final on stopReason:length as a completed (truncated) answer', () => {
     const path = writeTranscript([
       sessionHeader(),
