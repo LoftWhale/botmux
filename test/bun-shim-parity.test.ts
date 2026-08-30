@@ -275,6 +275,32 @@ describe.sequential('sequential parity', () => {
   });
 });
 
+// Exact-path env overrides that bypass `homedir()`/`userInfo()` and lead to real
+// writes (usage ledger, dashboard control audit, miramcp config + pidfile, the
+// core-only state dir). A value inherited from the caller's shell would have the
+// suite mutate live state, so both fences DELETE them. Asserting absence — rather
+// than "points somewhere safe" — matches the chosen contract: `resolveBotConfigPath`
+// fails closed on a set-but-missing path, so redirecting would change behaviour for
+// every test that never set the variable.
+describe('exact-path env overrides are cleared by both fences', () => {
+  const cleared = [
+    'BOTS_CONFIG',
+    'PM2_HOME',
+    'PLUGIN_PM2_HOME',
+    'BOTMUX_USAGE_DIR',
+    'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
+    'BOTMUX_CORE_STATE_DIR',
+    'MIRAMCP_CONFIG_PATH',
+    'MIRA_CONFIG_PATH',
+    'MIRAMCP_PID_FILE',
+  ] as const;
+
+  it('none of them is set inside a fenced run', () => {
+    const stillSet = cleared.filter(name => process.env[name] !== undefined);
+    expect(stillSet).toEqual([]);
+  });
+});
+
 // `it.runIf(cond)` must behave exactly like `skipIf(!cond)`: Bun ships skipIf but
 // not runIf, and the shim inverts it. Asserting the ran/skipped split (rather
 // than just "did not crash") is what makes the equivalence testable.

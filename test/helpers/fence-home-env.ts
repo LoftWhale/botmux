@@ -30,9 +30,27 @@ import { join } from 'node:path';
 export function fenceHomeRootedEnv(fencedHome: string): void {
   // Exact-path pointers into a Botmux home. Nothing here has a safe fenced
   // default worth inventing, so drop them and let home-derived resolution win.
-  delete process.env.BOTS_CONFIG;
-  delete process.env.PM2_HOME;
-  delete process.env.PLUGIN_PM2_HOME;
+  //
+  // Every one of these is an exact FILE or DIRECTORY override that bypasses
+  // `homedir()`/`userInfo()` entirely, and every one leads to real writes — so a
+  // value inherited from the caller's shell would have the test mutate live state.
+  // Verified write paths behind each: usage-ledger mkdir/write/rename/append,
+  // control-audit mkdir+append (a key the daemon genuinely persists),
+  // mir-local-runtime read-modify-write+rename of the miramcp config and
+  // create/delete of its pidfile (and it can start a bridge process),
+  // index-core-only mkdir at module load which then becomes SESSION_DATA_DIR.
+  const exactPathOverrides = [
+    'BOTS_CONFIG',
+    'PM2_HOME',
+    'PLUGIN_PM2_HOME',
+    'BOTMUX_USAGE_DIR',
+    'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
+    'BOTMUX_CORE_STATE_DIR',
+    'MIRAMCP_CONFIG_PATH',
+    'MIRA_CONFIG_PATH',
+    'MIRAMCP_PID_FILE',
+  ];
+  for (const name of exactPathOverrides) delete process.env[name];
 
   // Per-CLI config homes that production reads directly (verified present in
   // `src/`: codex, claude, grok, traex, hermes, relay, lark-cli). Each bypasses
