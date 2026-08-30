@@ -166,6 +166,29 @@ console.log(
 const liveChildren = new Map();
 
 /**
+ * Remove a scratch tree without ever taking the run down with it.
+ *
+ * `rmSync({ recursive: true, force: true })` still THROWS `ENOTEMPTY` when
+ * something creates a file mid-delete — `force` only suppresses "already gone".
+ * A process we just SIGKILLed has not necessarily reaped yet, so the sweep above
+ * races it, and an uncaught throw in a `close` handler killed a 994-file run at
+ * file 950 (measured). Retry briefly, then give up: a leftover temp dir is a
+ * nuisance, losing the whole run's results is not.
+ */
+function removeScratch(scratch) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      rmSync(scratch, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      return;
+    } catch (err) {
+      if (attempt === 4) {
+        process.stderr.write(`[runner] could not remove ${scratch}: ${err?.code ?? err}\n`);
+      }
+    }
+  }
+}
+
+/**
  * Signal a child's process GROUP — deliberately not called a "tree".
  *
  * A grandchild that calls `setsid()` or spawns with `detached: true` leaves this
@@ -203,6 +226,16 @@ function killTree(child, signal) {
   try { child.kill(signal); } catch { /* already gone */ }
 }
 
+// Last-resort net: a throw inside an async close handler is an unhandled rejection
+// / uncaught exception that would take the whole run down and discard every result
+// gathered so far. Report it and keep going — the per-file verdicts are the point.
+process.on('uncaughtException', err => {
+  process.stderr.write(`[runner] ignoring uncaught error during bookkeeping: ${err?.stack ?? err}\n`);
+});
+process.on('unhandledRejection', err => {
+  process.stderr.write(`[runner] ignoring unhandled rejection during bookkeeping: ${err?.stack ?? err}\n`);
+});
+
 // Without this, killing the runner (Ctrl-C, an outer timeout, a supervisor) leaves
 // its `bun test` children orphaned to PID 1 — they keep holding ports and CPU and
 // corrupt whatever runs next. Reap the tree, then exit with the conventional code.
@@ -215,7 +248,7 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
       killTree(child, 'SIGKILL');
       // Cancellation is exactly when these would otherwise accumulate: the close
       // handler that normally removes them never runs.
-      try { rmSync(scratch, { recursive: true, force: true }); } catch { /* best effort */ }
+      removeScratch(scratch);
     }
     process.exit(sig === 'SIGINT' ? 130 : 143);
   });
@@ -279,7 +312,7 @@ function runOne(file) {
     child.on('error', err => {
       clearTimeout(wall);
       liveChildren.delete(child);
-      rmSync(scratch, { recursive: true, force: true });
+      removeScratch(scratch);
       resolve({ file, ok: false, out: `failed to launch bun: ${err.message}` });
     });
     child.on('close', (code, signal) => {
@@ -293,7 +326,7 @@ function runOne(file) {
       // the scratch dir without this made a directory-based check look clean while
       // the process was still alive, so sweep BEFORE removing the evidence.
       killTree(child, 'SIGKILL');
-      rmSync(scratch, { recursive: true, force: true });
+      removeScratch(scratch);
       // A signal death (wall-clock kill, OOM) leaves code null — never let that
       // coerce into a pass.
       if (code !== 0) {
