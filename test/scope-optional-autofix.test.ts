@@ -55,12 +55,9 @@ describe('checkRequiredScopes — opt-in optional-scope auto-top-up', () => {
   // The all-critical-granted branch, up to (and including) its early return.
   // ⚠️ 窗口宽度要够：这个分支里加过注释/新分支（如「应用审核中就静默跳过」），
   // 卡太紧会让断言因为**文本被推出窗口**而红，看起来像行为回归，实际什么都没改。
-  const region = (() => {
-    const anchor = 'if (missingCritical.length === 0) {';
-    const start = src.indexOf(anchor);
-    expect(start, 'missingCritical.length === 0 branch not found').toBeGreaterThanOrEqual(0);
-    return src.slice(start, start + 2200);
-  })();
+  // 截到该分支真正的结尾（终局那句 all-critical-granted 日志之后的 return），不用会随
+  // 注释漂移的固定字符宽度 —— 同款窗口在本次改动里已假红三次，见 fnRegionUntil。
+  const region = fnRegionUntil('if (missingCritical.length === 0) {', 'all critical scopes granted');
 
   it('gates the top-up on a missing optional scope', () => {
     expect(region).toContain('if (missingOptional.length > 0 && brand === \'feishu\') {');
@@ -113,13 +110,15 @@ describe('tryAutoFixScopes — silent / disableQrLogin plumbing', () => {
    * 写成 `withdrawPendingReview: true` 同样能通过「参数存在」类断言，却把护栏拆没了。
    */
   it('只在缺 critical 权限时才允许撤回审核中版本（不可逆操作的护栏）', () => {
-    expect(region).toContain('withdrawPendingReview: missingCritical.length > 0,');
+    // 两个条件都要在：`allowWithdraw !== false` 是给 99991672 那条「判据不可靠」的
+    // 路径留的一刀闸；`missingCritical.length > 0` 是「确实缺才撤」的本体。
+    expect(region).toContain("withdrawPendingReview: opts?.allowWithdraw !== false && missingCritical.length > 0,");
     // 反面：绝不能是无条件 true
     expect(region).not.toContain('withdrawPendingReview: true');
   });
 
   it('accepts the disableQrLogin + silent opts', () => {
-    expect(region).toContain('opts?: { disableQrLogin?: boolean; silent?: boolean; grantedScopeNames?: { tenant: string[]; user: string[] } }');
+    expect(region).toContain('opts?: { disableQrLogin?: boolean; silent?: boolean; allowWithdraw?: boolean; grantedScopeNames?: { tenant: string[]; user: string[] } }');
   });
 
   it('threads grantedScopeNames into the Open Platform automation', () => {
@@ -187,12 +186,19 @@ describe('tryAutoFixScopes — silent / disableQrLogin plumbing', () => {
  * behaviorally in test/setup-open-platform-automation.test.ts.
  */
 describe('checkRequiredScopes — 99991672 chicken-and-egg scope request set', () => {
-  const region = (() => {
-    const anchor = 'if (infoData.code === 99991672) {';
-    const start = src.indexOf(anchor);
-    expect(start, '99991672 branch not found').toBeGreaterThanOrEqual(0);
-    return src.slice(start, start + 1200);
-  })();
+  // 截到该分支真正的结尾（发完 self_manage 提示 DM 的那一句），同样不用固定字符宽度。
+  const region = fnRegionUntil('if (infoData.code === 99991672) {', "'self_manage scope (auto-approved) missing'");
+
+  /**
+   * 🔴 99991672 路径**禁止自动撤回**：这里传给 tryAutoFixScopes 的 missingCritical 是
+   * 完整 BOTMUX_REQUIRED_SCOPES —— 不是「确认缺这些」，而是「连自己的 scope 列表都读
+   * 不到」（缺 self_manage）。护栏谓词 `missingCritical.length > 0` 在这条路径上恒真、
+   * 已知不可靠，而撤回不可逆：万一那个待审版本本就含全部权限，撤回纯粹白丢队列位置
+   * （线上见过排 18/23 天、且不属于本机 owner 的审批）。判据不可靠时宁可不动。
+   */
+  it('🔴 99991672 路径显式关掉撤回（谓词不可靠 + 动作不可逆）', () => {
+    expect(region).toContain('{ allowWithdraw: false }');
+  });
 
   it('asks for every botmux-required scope, not just self_manage', () => {
     // Passing only self_manage used to be cosmetic: the param never reached the
@@ -200,7 +206,7 @@ describe('checkRequiredScopes — 99991672 chicken-and-egg scope request set', (
     // log/DM text. Now that the manifest IS derived from these names, the list
     // has to be the real one or the next restart still finds scopes missing.
     expect(region).toMatch(/const requiredNow = BOTMUX_REQUIRED_SCOPES\.map\(s => \(\{ name: s\.name, desc: s\.desc \}\)\)/);
-    expect(region).toContain('tryAutoFixScopes(larkAppId, bot, brand, requiredNow, [])');
+    expect(region).toContain('tryAutoFixScopes(larkAppId, bot, brand, requiredNow, [], { allowWithdraw: false })');
   });
 
   it('still only runs on feishu and falls through to the manual deep-link DM', () => {

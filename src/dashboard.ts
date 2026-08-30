@@ -1384,9 +1384,15 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
         logger.warn(`[vc-agent] open-platform automation failed for ${targetAppId}: ${reason}: ${result.message}`);
         const scopeCheck = await validateVcMeetingScopesForBot(bot);
         if (!scopeCheck.ok) {
+          // 「应用正在审核中」时**手动也开不了**：审核期间开放平台锁定配置写入，连
+          // scope/update 都拒（实测 code=10046）。给「请手动开通」这种做不到的建议
+          // 比不给更糟，所以这条单独措辞成「等审批通过」。
+          const advice = reason === 'app_under_review'
+            ? '该应用正在飞书审核中，审核期间开放平台锁定配置写入（手动开通同样会被拒）；请等审批通过后重试。'
+            : '请手动开通后重试。';
           return {
             ok: false,
-            error: `vcMeetingBot_preflight_missing_scopes: ${scopeCheck.error}。自动化配置失败(${reason})且权限未满足，请手动开通后重试。`,
+            error: `vcMeetingBot_preflight_missing_scopes: ${scopeCheck.error}。自动化配置失败(${reason})且权限未满足，${advice}`,
           };
         }
         const eventGateError = vcListenerEventGateError(result);

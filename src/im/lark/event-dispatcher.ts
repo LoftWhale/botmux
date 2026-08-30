@@ -261,7 +261,7 @@ async function tryAutoFixScopes(
   brand: Brand,
   missingCritical: { name: string; desc: string }[],
   missingOptional: { name: string; desc: string }[],
-  opts?: { disableQrLogin?: boolean; silent?: boolean; grantedScopeNames?: { tenant: string[]; user: string[] } },
+  opts?: { disableQrLogin?: boolean; silent?: boolean; allowWithdraw?: boolean; grantedScopeNames?: { tenant: string[]; user: string[] } },
 ): Promise<AutoFixOutcome> {
   if (brand !== 'feishu') return 'failed';
 
@@ -294,7 +294,10 @@ async function tryAutoFixScopes(
       // 反过来，纯 opt-in 权限补齐（`im:feed_group_v1:*` 这类，走 silent 路径、
       // missingCritical 为空）**绝不撤**：撤回不可逆、会丢审批队列位置（线上见过排 3 天
       // 的），为一个没人在用的可选特性掀掉别人的审批，代价完全不对等。
-      withdrawPendingReview: missingCritical.length > 0,
+      // `opts.allowWithdraw === false` 时**一律不撤**（99991672 鸡生蛋路径专用：那里
+      // missingCritical 是「读不到 scope 列表」的占位，不是「确认缺」——判据不可靠就不动
+      // 不可逆的东西）。默认不传 = 允许，仍要满足「确实缺 critical」。
+      withdrawPendingReview: opts?.allowWithdraw !== false && missingCritical.length > 0,
       onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
       onQrCode: (info) => {
         logger.warn(
@@ -497,7 +500,14 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       // all present, without over-applying the whole 300+ scope manifest.
       if (brand === 'feishu') {
         const requiredNow = BOTMUX_REQUIRED_SCOPES.map(s => ({ name: s.name, desc: s.desc }));
-        const fixed = await tryAutoFixScopes(larkAppId, bot, brand, requiredNow, []);
+        // 🔴 这条路径**禁止自动撤回待审版本**（`allowWithdraw: false`）。
+        // 别处的护栏判据是 `missingCritical.length > 0`，靠的是「这些 scope 确实缺」；
+        // 但这里传的是**完整** BOTMUX_REQUIRED_SCOPES —— 不是因为确认缺，而是因为应用
+        // 连自己的 scope 列表都读不到（缺 self_manage，API 回 99991672）。谓词在这条路径
+        // 上**已知不可靠**，而撤回是不可逆动作：万一那个待审版本本就含全部所需权限，
+        // 撤回纯粹是白丢队列位置（线上见过排 18/23 天的、且不属于本机 owner）。
+        // 判据不可靠时宁可不动，落回下面的手动提示。
+        const fixed = await tryAutoFixScopes(larkAppId, bot, brand, requiredNow, [], { allowWithdraw: false });
         // 审核中同样直接返回：这条路径下游是让管理员去点 self_manage 深链，而审核期间
         // 写锁生效，点了也开不了——等审批通过下次重启自检即可。
         if (fixed !== 'failed') return;
@@ -798,15 +808,26 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
     }
     // Automation failed (session expired mid-run / api error). Log; DM the admin
     // once so a bot that genuinely lacks the subscription gets a human nudge.
-    logger.warn(`[${larkAppId}] VC event auto-subscribe failed (${result.reason}): ${result.message}`);
+    //
+    // 「应用正在审核中」要单独说：审核期间开放平台锁配置写入，刷新登录态**没有用**
+    // （不是 session 问题），等审批通过重启即可。给错的操作建议比不给更糟——用户会
+    // 反复 `botmux setup` 却始终不见好。
+    const underReview = !result.ok && result.reason === 'app_under_review';
+    if (underReview) {
+      logger.info(`[${larkAppId}] VC event auto-subscribe deferred (app under review): ${result.message}`);
+    } else {
+      logger.warn(`[${larkAppId}] VC event auto-subscribe failed (${result.reason}): ${result.message}`);
+    }
     const adminOpenId = getAdminOpenId(bot);
     if (adminOpenId) {
       await dmAdmin(
         larkAppId,
         adminOpenId,
         `⚠️ botmux 想在启动时自动为机器人 "${bot.botName ?? larkAppId}" 订阅视频会议事件（vc.bot.meeting_*），以便它被拉进会时能自动进会，但自动配置失败：${result.message}\n\n` +
-        `请运行 \`botmux setup\` 刷新飞书开放平台登录态后重启 daemon，botmux 会自动重试。`,
-        'vc event auto-subscribe failed',
+        (underReview
+          ? '**现在不用做什么**：审核期间飞书锁定了配置写入，刷新登录态也改不了。审批通过后执行 `botmux restart`，botmux 会自动重试。'
+          : '请运行 `botmux setup` 刷新飞书开放平台登录态后重启 daemon，botmux 会自动重试。'),
+        underReview ? 'vc event auto-subscribe deferred (under review)' : 'vc event auto-subscribe failed',
       );
     }
   } catch (err: any) {

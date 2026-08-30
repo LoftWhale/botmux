@@ -1550,8 +1550,11 @@ export async function automateOpenPlatformSetup(
     // 应用配置写锁了（scope/update / robot/switch / safe_setting/update / base_info 全
     // 拒，读接口照常），审批通过后自然恢复。给它一个独立 reason，让上层能说人话、
     // 并且不要每次重启都把整条链路重跑一遍（线上两台 bot 各已空转 8 次）。
-    // 注意：这一步也是本函数里第一个会撞上 10046 的**写**操作，所以判定放在这里；
-    // 上游的 redirect 白名单写入同样会被拒，但它是非致命的，只记 redirectWarning。
+    // 注意：这一步**不是本函数第一个写操作**（redirect 白名单、scope/update、
+    // privilege/update 都在它前面，也都会被 10046 拒），而是第一个**不吞错**的写 ——
+    // 前三个各自 try/catch 成 warning 继续走，只有这里会把错误抛到这个 catch。所以
+    // 归因放在这里是可行的（它无条件执行），但别据此以为前面没有写操作：真要提前
+    // 识别 10046，得去看那几个 warning 而不是指望这里最先命中。
     if (openPlatformUnderReview(err)) {
       // 走到这里说明写锁还在。三种成因要说清，否则管理员不知道该等还是该动手：
       //   ① 压根没允许撤回（opt-in 未开）——比如只是补可选权限，本来就不该掀别人的审批
