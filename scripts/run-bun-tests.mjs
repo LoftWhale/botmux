@@ -79,7 +79,14 @@ function collectTestFiles(dir) {
 // fixture sees nothing (measured: vitest passes that probe while an eager-factory
 // shim reports `missing`). That is module-evaluation ORDER, not a missing
 // function, so it is unsupported rather than faked.
-const UNSUPPORTED = /\bvi\s*\.\s*(doMock|doUnmock|resetModules|hoisted)\b|\bimportOriginal\b|\bimportActual\b/;
+// `inject` is vitest's globalSetup→test value channel (`project.provide` /
+// `inject`). It is a NAMED EXPORT of the `vitest` module, and `bun test` resolves
+// `vitest` to its own `bun:test` — which has no such export, so the file dies at
+// import with `SyntaxError: Export named 'inject' not found`. A preload cannot
+// paper over it: `mock.module('vitest', … inject: … )` still fails, because the
+// static import is validated against `bun:test`'s real export list before any
+// mock applies (measured). Runner-config plumbing, not a missing helper.
+const UNSUPPORTED = /\bvi\s*\.\s*(doMock|doUnmock|resetModules|hoisted)\b|\bimportOriginal\b|\bimportActual\b|\binject\b/;
 
 // Comments must not decide whether a file runs. Matching raw source means a file
 // that merely MENTIONS one of these names in prose gets silently skipped, and the

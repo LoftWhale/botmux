@@ -23,6 +23,10 @@ import { vi } from 'vitest';
  *   `importOriginal` / `importActual` — the `vi.mock` factory's callback arg that
  *                                  yields the real module (runner-supplied, so
  *                                  no fill can provide it)
+ *   `inject`                     — vitest's globalSetup→test value channel. A
+ *                                  NAMED EXPORT of the `vitest` module that
+ *                                  `bun:test` does not have, so the static import
+ *                                  fails before any mock can apply (measured).
  *   `vi.hoisted`                 — vitest's transform physically LIFTS the
  *                                  callback above the static imports. A runtime
  *                                  fill can only run it when the module body gets
@@ -150,6 +154,28 @@ fill('setConfig', (config?: Record<string, unknown>) => {
 // wrong. Without it, 16 `it.runIf` + 5 `describe.runIf` files fail at collection
 // time with `it.runIf is not a function` (the whole mojo-* cluster).
 // ---------------------------------------------------------------------------
+/**
+ * `it.sequential` / `describe.sequential` — vitest's opt-out of concurrent
+ * execution. `bun test` already runs tests sequentially by default (measured: an
+ * async test fully finishes before the next one starts, `ORDER=a-start,a-end,b`),
+ * so requesting sequential execution is a no-op there and the modifier can be an
+ * identity pass-through. Note this is only safe BECAUSE of that default: Bun does
+ * expose a working `.concurrent`, and if a future release made concurrency the
+ * default this identity would silently stop meaning what the caller asked for.
+ */
+function addSequential(target: unknown): void {
+  const fn = target as Record<string, unknown>;
+  if (typeof fn !== 'function' && typeof fn !== 'object') return;
+  let missing = false;
+  try { missing = typeof fn.sequential !== 'function'; } catch { missing = true; }
+  if (!missing) return;
+  Object.defineProperty(fn, 'sequential', {
+    configurable: true,
+    writable: true,
+    value: fn,
+  });
+}
+
 function addRunIf(target: unknown): void {
   const fn = target as { runIf?: unknown; skipIf?: (cond: boolean) => unknown };
   if (typeof fn?.skipIf !== 'function') return;
@@ -165,6 +191,8 @@ function addRunIf(target: unknown): void {
 
 addRunIf(bunIt);
 addRunIf(bunDescribe);
+addSequential(bunIt);
+addSequential(bunDescribe);
 
 // Mirrors vitest's default 1000ms timeout / 50ms interval and its behaviour of
 // surfacing the LAST failure, not a generic timeout message.
