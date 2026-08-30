@@ -226,16 +226,6 @@ function killTree(child, signal) {
   try { child.kill(signal); } catch { /* already gone */ }
 }
 
-// Last-resort net: a throw inside an async close handler is an unhandled rejection
-// / uncaught exception that would take the whole run down and discard every result
-// gathered so far. Report it and keep going — the per-file verdicts are the point.
-process.on('uncaughtException', err => {
-  process.stderr.write(`[runner] ignoring uncaught error during bookkeeping: ${err?.stack ?? err}\n`);
-});
-process.on('unhandledRejection', err => {
-  process.stderr.write(`[runner] ignoring unhandled rejection during bookkeeping: ${err?.stack ?? err}\n`);
-});
-
 // Without this, killing the runner (Ctrl-C, an outer timeout, a supervisor) leaves
 // its `bun test` children orphaned to PID 1 — they keep holding ports and CPU and
 // corrupt whatever runs next. Reap the tree, then exit with the conventional code.
@@ -371,11 +361,32 @@ async function worker() {
   }
 }
 
-await Promise.all(Array.from({ length: concurrency }, worker));
+// `allSettled`, so one worker blowing up does not discard the verdicts the others
+// already collected — but a rejected worker still FAILS the run. There is deliberately
+// NO global `uncaughtException` net: it could not distinguish a scratch-cleanup hiccup
+// from a bookkeeping bug, and swallowing the latter could let the process exit 0 with
+// an incomplete result set — trading a loud crash for a silent false green. Scratch
+// removal degrades locally (see removeScratch); everything else fails closed.
+const settled = await Promise.allSettled(Array.from({ length: concurrency }, worker));
+const workerErrors = settled.filter(r => r.status === 'rejected').map(r => r.reason);
 
 console.log(`\nbun test: ${runnable.length - failures.length}/${runnable.length} files green, ${failures.length} failing`);
 if (failures.length > 0) {
   console.log('Failing files:');
   for (const f of failures) console.log(`  ${f.file}`);
+}
+
+if (workerErrors.length > 0) {
+  console.error(`\n${workerErrors.length} worker(s) crashed — results are INCOMPLETE (${done}/${runnable.length} files ran):`);
+  for (const err of workerErrors) console.error(`  ${err?.stack ?? err}`);
   process.exit(1);
 }
+
+// Invariant: every runnable file must have produced a verdict. A count short of the
+// population means files were silently dropped, which must never read as success.
+if (done !== runnable.length) {
+  console.error(`\nRefusing to report success: only ${done} of ${runnable.length} files produced a verdict.`);
+  process.exit(1);
+}
+
+if (failures.length > 0) process.exit(1);
