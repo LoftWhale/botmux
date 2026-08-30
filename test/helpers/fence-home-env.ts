@@ -27,7 +27,15 @@ import { join } from 'node:path';
  * the `userInfo` gap existed precisely because one side was patched and the other
  * was not.
  */
-export function fenceHomeRootedEnv(fencedHome: string): void {
+/**
+ * @param env The environment to mutate. Defaults to the real `process.env`, which
+ *   is what both setup files want. Tests pass a throwaway object so they can
+ *   exercise the key list without touching (or having to restore) the live
+ *   environment — the helper rewrites CLI homes and `XDG_*` too, not just the
+ *   exact-path list, so a caller that snapshots only part of it leaves later tests
+ *   pointing at a deleted directory.
+ */
+export function fenceHomeRootedEnv(fencedHome: string, env: NodeJS.ProcessEnv = process.env): void {
   // Exact-path pointers into a Botmux home. Nothing here has a safe fenced
   // default worth inventing, so drop them and let home-derived resolution win.
   //
@@ -50,7 +58,7 @@ export function fenceHomeRootedEnv(fencedHome: string): void {
     'MIRA_CONFIG_PATH',
     'MIRAMCP_PID_FILE',
   ];
-  for (const name of exactPathOverrides) delete process.env[name];
+  for (const name of exactPathOverrides) delete env[name];
 
   // Per-CLI config homes that production reads directly (verified present in
   // `src/`: codex, claude, grok, traex, hermes, relay, lark-cli). Each bypasses
@@ -69,7 +77,7 @@ export function fenceHomeRootedEnv(fencedHome: string): void {
     ['LARKSUITE_CLI_DATA_DIR', join('.local', 'share', 'lark-cli')],
   ];
   for (const [name, relative] of cliHomes) {
-    if (process.env[name]) process.env[name] = join(fencedHome, relative);
+    if (env[name]) env[name] = join(fencedHome, relative);
   }
 
   // XDG + Windows profile dirs — defensive. Nothing in `src/` currently resolves a
@@ -84,6 +92,6 @@ export function fenceHomeRootedEnv(fencedHome: string): void {
     ['LOCALAPPDATA', join('AppData', 'Local')],
   ];
   for (const [name, relative] of xdg) {
-    if (process.env[name]) process.env[name] = join(fencedHome, relative);
+    if (env[name]) env[name] = join(fencedHome, relative);
   }
 }

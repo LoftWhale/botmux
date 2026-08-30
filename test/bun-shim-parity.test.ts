@@ -304,27 +304,29 @@ describe('exact-path env overrides are cleared by the shared fence', () => {
   ] as const;
 
   it('deletes every one of them even when the caller had them set', () => {
-    const saved = new Map<string, string | undefined>();
-    for (const name of cleared) {
-      saved.set(name, process.env[name]);
-      // A sentinel that looks like the live path these normally point at.
-      process.env[name] = `/root/.botmux/sentinel-${name}`;
-    }
+    // Drive the helper against a THROWAWAY env object, not `process.env`. The
+    // helper also rewrites the CLI homes (`CODEX_HOME`, `GROK_HOME`, …) and the
+    // `XDG_*`/Windows profile dirs, so snapshotting only the nine keys asserted
+    // here would leave any of those the caller had set pointing at the temp dir
+    // this test then deletes — a dangling path for every later test in the
+    // process. An isolated object sidesteps the whole restore problem.
+    const env: NodeJS.ProcessEnv = {};
+    for (const name of cleared) env[name] = `/root/.botmux/sentinel-${name}`;
+    // A CLI home too, to prove the isolation covers the keys this test does not
+    // assert on: it must be rewritten inside `env` and never touch process.env.
+    env.CODEX_HOME = '/root/.codex';
+    const before = process.env.CODEX_HOME;
+
+    const fencedHome = mkdtempSync(join(tmpdir(), 'fence-env-parity-'));
     try {
-      // Exercise the helper the two setup files share, on a throwaway home.
-      const fencedHome = mkdtempSync(join(tmpdir(), 'fence-env-parity-'));
-      try {
-        fenceHomeRootedEnv(fencedHome);
-        const stillSet = cleared.filter(name => process.env[name] !== undefined);
-        expect(stillSet).toEqual([]);
-      } finally {
-        rmSync(fencedHome, { recursive: true, force: true });
-      }
+      fenceHomeRootedEnv(fencedHome, env);
+      expect(cleared.filter(name => env[name] !== undefined)).toEqual([]);
+      // Redirected, not deleted — and inside the fence.
+      expect(env.CODEX_HOME).toBe(join(fencedHome, '.codex'));
+      // The live environment was not touched at all.
+      expect(process.env.CODEX_HOME).toBe(before);
     } finally {
-      for (const [name, original] of saved) {
-        if (original === undefined) delete process.env[name];
-        else process.env[name] = original;
-      }
+      rmSync(fencedHome, { recursive: true, force: true });
     }
   });
 
