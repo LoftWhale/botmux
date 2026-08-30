@@ -70,9 +70,14 @@ jobs:
   # population has not yet had a full green baseline established across a CI
   # runner's environment. Flip `continue-on-error` off once it holds green — a
   # gate that is red for environmental reasons trains people to ignore it.
+  #
+  # The generous timeout is inherent to the design: the runner spawns ONE bun
+  # process PER FILE, because `bun test` otherwise runs every file in a single
+  # process and cross-file interference cascades (measured: 933 failures batched
+  # vs ~2% one-per-process). Startup cost therefore dominates the wall clock.
   bun-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     continue-on-error: true
 
     steps:

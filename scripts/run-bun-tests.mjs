@@ -81,13 +81,16 @@ if (runnable.length === 0) {
 
 const extraArgs = process.argv.slice(2);
 const hasOwnTimeout = extraArgs.some(a => a === '--timeout' || a.startsWith('--timeout='));
-// Keep concurrency well under the core count: many of these files spawn real
-// daemons, ptys and bwrap sandboxes, and oversubscribing turns their internal
-// timeouts into spurious reds (measured on a busy host).
+// Keep concurrency moderate: many of these files spawn real daemons, ptys and
+// bwrap sandboxes, and oversubscribing turns their internal timeouts into
+// spurious reds (measured on a busy host). But do not starve a small runner
+// either — one process per file means startup cost dominates, and a 4-core CI
+// box running 2 at a time cannot finish 1000+ files inside a sane job timeout.
+// Hence: at least 4, at most 8, scaled off the core count in between.
 const envConcurrency = Number.parseInt(process.env.BOTMUX_BUN_TEST_CONCURRENCY ?? '', 10);
 const concurrency = Number.isFinite(envConcurrency) && envConcurrency > 0
   ? envConcurrency
-  : Math.max(2, Math.min(8, Math.floor(availableParallelism() / 8)));
+  : Math.max(4, Math.min(8, Math.floor(availableParallelism() / 4)));
 
 console.log(
   `bun test: ${runnable.length} files, one process each, ${concurrency} at a time `
