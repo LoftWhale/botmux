@@ -35,7 +35,7 @@
 
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { availableParallelism, tmpdir as realTmpdir } from 'node:os';
 
 const TEST_DIR = 'test';
@@ -161,18 +161,39 @@ console.log(
   + `(${skipped.length} deferred to vitest — module-registry APIs)`,
 );
 
-// Every child currently running, so a cancelled run can take them with it.
-const liveChildren = new Set();
+// Every child currently running, mapped to the scratch dir minted for it, so a
+// cancelled run can take both the processes AND their temp trees with it.
+const liveChildren = new Map();
 
-/** Signal a child's whole process group, falling back to the pid alone. */
+/**
+ * Signal a child's whole process TREE, not just the Bun parent it points at.
+ *
+ * POSIX: `detached: true` gave the child its own process group, and a negative pid
+ * signals that whole group. Windows has no process groups in this sense and
+ * rejects a negative pid, so shell out to `taskkill /T` (which walks the child
+ * tree) and fall back to the direct kill only if that is unavailable — a bare
+ * `child.kill()` there would leave the servers and ptys the test spawned running.
+ */
 function killTree(child, signal) {
   if (child.pid === undefined) return;
-  try {
-    // Negative pid targets the process group created by `detached: true`.
-    process.kill(-child.pid, signal);
-  } catch {
-    try { child.kill(signal); } catch { /* already gone */ }
+  if (process.platform === 'win32') {
+    // `spawnSync` reports a missing/unstartable binary through the RETURN VALUE
+    // (`{ error: ENOENT, status: null }`), not by throwing — verified. Returning
+    // unconditionally here would treat "taskkill never ran" as success and skip the
+    // fallback entirely, so check both fields before trusting it.
+    let killed = false;
+    try {
+      const res = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+      killed = !res.error && res.status === 0;
+    } catch { /* fall through to the direct kill below */ }
+    if (killed) return;
+  } else {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch { /* group already gone, or never created — fall through */ }
   }
+  try { child.kill(signal); } catch { /* already gone */ }
 }
 
 // Without this, killing the runner (Ctrl-C, an outer timeout, a supervisor) leaves
@@ -183,7 +204,12 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(sig, () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    for (const child of liveChildren) killTree(child, 'SIGKILL');
+    for (const [child, scratch] of liveChildren) {
+      killTree(child, 'SIGKILL');
+      // Cancellation is exactly when these would otherwise accumulate: the close
+      // handler that normally removes them never runs.
+      try { rmSync(scratch, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
     process.exit(sig === 'SIGINT' ? 130 : 143);
   });
 }
@@ -237,7 +263,7 @@ function runOne(file) {
       env: childEnv,
       detached: process.platform !== 'win32',
     });
-    liveChildren.add(child);
+    liveChildren.set(child, scratch);
     let out = '';
     const cap = chunk => { if (out.length < 200_000) out += chunk; };
     child.stdout.on('data', cap);
