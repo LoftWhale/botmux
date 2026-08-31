@@ -31,9 +31,19 @@ const CLI = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
  *  **嵌套**路径，而往一个已存在的目录里写东西，顶层列表一个字都不会变。
  *  夹具里放一个 `mutation-sentinel` 文件，是为了让「就地改写」这一维**有被试对象**
  *  —— 没有任何既存文件时，那一维在构造上就没有主语，快照永远测不到它。
- *  它是这条断言的输入，不是第二条断言。 */
+ *  它是这条断言的输入，不是第二条断言。
+ *
+ *  `.bun` 在**根一级**被跳过：那是 Bun 运行时自己的 install cache
+ *  （`.bun/install/cache/@t@/*.pile`），由跑子进程的**解释器**写入，与被测命令
+ *  无关 —— 只在本套件跑在 `bun test` 下时出现，Node 下永远没有。实测在
+ *  `bun test` 里它会铺开 300+ 个文件，把这条断言整片染红。
+ *  ⚠️ 只预置一个空 `.bun/` 目录**不够**：递归快照会看见里面新铺的整棵缓存树。
+ *  也不能靠 env 挡（实测 `BUN_INSTALL` / `BUN_INSTALL_CACHE_DIR` 都不改这个位置）。
+ *  所以按仓内既有做法过滤这一个条目（同 `test/cli-root-help.test.ts`），
+ *  而不是把断言弱化成子集匹配 —— 任何 botmux 自己创建的文件仍然会让它红。 */
 function snapshot(dir: string, root = dir, out: string[] = []): string[] {
   for (const e of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    if (dir === root && e.name === '.bun') continue;
     const p = join(dir, e.name);
     if (e.isDirectory()) { out.push(relative(root, p) + '/'); snapshot(p, root, out); }
     else if (e.isFile()) out.push(`${relative(root, p)}:${createHash('sha256').update(readFileSync(p)).digest('hex').slice(0, 12)}`);
