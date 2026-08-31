@@ -1784,7 +1784,22 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
   } while (pageToken);
 
   allMessages.sort((a, b) => (a.create_time ?? '').localeCompare(b.create_time ?? ''));
-  return unlimited ? allMessages : allMessages.slice(0, pageSize);
+  // Take the TAIL, matching `listByThread` above and the chat-scope sibling.
+  // The loop above pages in Desc order and breaks on `>= pageSize`, so a single
+  // 50-item page can overshoot: what we hold is the newest N+k. After the
+  // ascending sort, `slice(0, pageSize)` would hand back the OLDEST N of those
+  // — i.e. silently drop the newest k, which is exactly the end the caller
+  // asked for. `limit > 50` always pages, and the dashboard history popover
+  // defaults to 80 (`src/core/dashboard-ipc-server.ts`), so this is the common
+  // path, not a corner.
+  //
+  // ⚠️ `Math.max(0, …)` is load-bearing, not defensive dressing: when fewer
+  // than `pageSize` messages were collected — a thread shorter than the limit,
+  // which is the NORMAL case — `allMessages.length - pageSize` is negative and
+  // `slice(negative)` counts from the end, dropping the OLDEST messages
+  // instead. Without the guard this trades a rare bug for a common one.
+  // Same idiom as `filterAmbientChatMessages` above.
+  return unlimited ? allMessages : allMessages.slice(Math.max(0, allMessages.length - pageSize));
 }
 
 /**

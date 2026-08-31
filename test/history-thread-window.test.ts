@@ -128,6 +128,45 @@ describe('botmux history — thread window endpoint', () => {
     expect(fast).toEqual(fallback);
   });
 
+  // ── 跨页：上面每一条都落在单页内（12 条，limit 均 ≤ 12），`page_token` 循环
+  //    与跨页截断零覆盖，而那正是 Desc + reverse 最容易出错的地方。
+  //    这两条必须成对：单独任何一条都挡不住另一种错法。
+  //      · 只补「长于 limit」→ 放过 `slice(len - pageSize)` 的负索引错法
+  //      · 只补「短于 limit」→ 放过当前的 overshoot
+  //    两条同时在，`slice(Math.max(0, len - pageSize))` 是唯一双绿的写法。
+  it('长于 limit：跨页时两条分支返回同一个窗口，且含最新一条', async () => {
+    buildThread(120);
+    const { listThreadMessages } = await import('../src/im/lark/client.js');
+    state.threadIdResolvable = true;
+    const fast = ids(await listThreadMessages('cli_x', 'oc_x', ROOT, 80));
+    state.threadIdResolvable = false;
+    const fallback = ids(await listThreadMessages('cli_x', 'oc_x', ROOT, 80));
+
+    // limit 80 > 单页上限 50 ⇒ 必然多页；dashboard 历史弹窗的默认 limit 正是 80。
+    expect(fast).toHaveLength(80);
+    expect(fast).toEqual(fallback);
+    // 尾部窗口：含最新一条，不含最早那批。断言「最新一条在」是这条用例的本体 ——
+    // 回退路径的 overshoot 恰恰是把最新的 k 条静默换成更老的 k 条，而条数不变，
+    // 所以只断言长度和「两分支相等」都抓不到它（错法下两分支会不等，但若有人
+    // 把两条分支改成同一种错法，长度断言仍然全绿）。
+    expect(fast[fast.length - 1]).toBe('m120');
+    expect(fast[0]).toBe('m41');
+    expect(fast).not.toContain('m01');
+  });
+
+  it('短于 limit（回退路径）：条数不足时最早一条不能丢', async () => {
+    buildThread(3);
+    // ⚠️ 必须走回退路径。快路径的 thread 容器里只有本话题消息，`length < pageSize`
+    //    时两种写法恰好同解，这条用例会**假绿** —— 它的区分力全部依赖 mock 的
+    //    message.get 不返回 thread_id 这一行。
+    state.threadIdResolvable = false;
+    const { listThreadMessages } = await import('../src/im/lark/client.js');
+    const out = await listThreadMessages('cli_x', 'oc_x', ROOT, 5);
+
+    // 3 - 5 = -2；`slice(-2)` 会从尾部重新起算，m01 消失。
+    expect(ids(out)).toEqual(['m01', 'm02', 'm03']);
+  });
+
   it('a limit at or above the thread length returns the whole thread', async () => {
     const { listThreadMessages } = await import('../src/im/lark/client.js');
     const out = await listThreadMessages('cli_x', 'oc_x', ROOT, 50);
