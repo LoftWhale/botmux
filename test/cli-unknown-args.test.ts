@@ -84,9 +84,13 @@ function runCli(args: string[]): { status: number | null; stdout: string; stderr
 }
 
 describe('fleet 变更类命令：未知参数一律中止', () => {
-  // 这五个命令在 dispatch 处都是零参数调用（`cmdStart()` / `cmdStop()` /
-  // `cmdRestart()` / `cmdUpgrade()`），所以「它们不接受任何参数」是由构造判定的，
-  // 不需要维护一张 flag 白名单。
+  // 放行哪些参数由 `FLEET_KNOWN_FLAGS` 这张显式的表决定，**不是**由「dispatch 处
+  // 零参数调用」推出来的。那条推论在本仓库不成立：`cmdStop()` / `cmdRestart()`
+  // 同样是零参数调用，却直接从全局 `process.argv` 里读 `--with-plugin`
+  // （`cmdLogs` / `cmdList` / `cmdSuspend` / `cmdSlash` 是同一个形状）。
+  // 函数签名管不住 `process.argv`，所以「这个命令接受哪些参数」只有那张表说了算。
+  // 下面「合法参数不被误杀」那一组就是这条推论的被试对象 —— 少了它，
+  // 把一个真参数闸掉的改动在这个文件里不会有任何一格变红。
   // 第三列是**这条命令进了 dispatch 之后打的第一行字**。断言它缺席，证明的是
   // 「根本没进去过」，而不只是「进去了但恰好失败了」—— PATH 为空时命令落进去
   // 也会失败、退出码同样非 0，所以只看退出码分不开这两件事。
@@ -122,6 +126,62 @@ describe('fleet 变更类命令：未知参数一律中止', () => {
     const r = runCli(['update', '--help']);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('botmux v');
+  });
+
+  // ── 合法参数不被误杀 ────────────────────────────────────────────────────
+  // `--with-plugin` 是 `stop` / `restart` 的正式参数：`cmdStop` (`process.argv
+  // .includes('--with-plugin')`) 与 `cmdRestart` 都读它，`showHelp()` 也在教用户
+  // 用它。一道只按「有没有多余 token」判断的闸会把它一起拒掉，而帮助里那一行仍在
+  // 宣传它 —— 那正是这道闸最容易犯的错，所以它必须在这里有被试对象。
+  //
+  // 判据不用退出码：`stop` 在空 HOME 下 rc=0、`restart` rc=1，两者都不为 2 只说明
+  // 「不是被这道闸拒的」，说明不了「进了 dispatch」。所以两条一起断言 ——
+  // 没有「未知参数」，且**打出了这条命令进 dispatch 之后的第一行字**。
+  // 这两个串同样是在 master 上实测出来的，与上面 it.each 第三列同源。
+  it.each([
+    ['stop', 'daemon 未在运行'],
+    ['restart', '未找到配置文件'],
+  ])('botmux %s --with-plugin 照常放行', (command, dispatchMarker) => {
+    const r = runCli([command, '--with-plugin']);
+    expect(r.stderr).not.toContain('未知参数');
+    expect(r.stdout + r.stderr).toContain(dispatchMarker);
+  });
+
+  // 白名单是**按命令**的，不是全局的：同一个 flag 在没声明它的命令上仍是未知参数。
+  // 少了这条，把 FLEET_KNOWN_FLAGS 摊平成一个全局集合不会有任何一格变红。
+  //
+  // `start --with-plugin` 落在这里是有意的，不是遗漏：`startConfiguredFleet` 无条件
+  // 调 `reconcilePluginServicesForCli(undefined, { autoOnly: true })`，start 本来就
+  // 永远拉起 auto plugin service；`--with-plugin` 在 stop/restart 上的语义是「额外
+  // 把 plugin service 也停掉」，start 没有「停」这一段，加上去是个不生效的参数。
+  it.each([
+    ['start', '未找到配置文件'],
+    ['update', '本地 checkout 更新'],
+  ])('botmux %s --with-plugin → rc=2（这条命令没声明它）', (command, dispatchMarker) => {
+    const r = runCli([command, '--with-plugin']);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('未知参数');
+    expect(r.stderr).toContain('--with-plugin');
+    expect(r.stdout + r.stderr).not.toContain(dispatchMarker);
+  });
+
+  // 位置参数也要拦住。这一格不是顺带 —— 它排除了「用 `unknownFlags()` 实现这道闸」
+  // 这条改法：那个 helper 只报以 `-` 开头的 token（是为 `history om_xxx` 这类命令
+  // 设计的），照搬会让 `botmux stop foo` 静默通过，退回本 PR 之前的行为。
+  it('botmux stop foo → rc=2（位置参数同样是未知参数）', () => {
+    const r = runCli(['stop', 'foo']);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('未知参数');
+    expect(r.stderr).toContain('foo');
+    expect(r.stdout + r.stderr).not.toContain('daemon 未在运行');
+  });
+
+  // 报错文案要按命令说出它到底接受什么，否则 stop/restart 上那句「只有 --help」
+  // 本身就是错的，用户会照着它把一个能用的参数当成不存在。
+  it('报错文案按命令列出可接受的参数', () => {
+    expect(runCli(['stop', '--force']).stderr).toContain('只接受: --help --with-plugin');
+    expect(runCli(['update', '--check']).stderr).toContain('只接受: --help');
+    expect(runCli(['update', '--check']).stderr).not.toContain('--with-plugin');
   });
 });
 

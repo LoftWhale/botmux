@@ -12342,23 +12342,48 @@ if (command === '__self-update') {
 
 
 const ROOT_FLEET_MUTATION_COMMANDS = new Set(['start', 'stop', 'restart', 'upgrade', 'update']);
+// Flags each fleet command legitimately accepts, on top of --help/-h.
+// This has to be an explicit table and cannot be inferred from the handler
+// signature: `cmdStart` / `cmdStop` / `cmdRestart` / `cmdUpgrade` are all
+// declared with zero parameters and still read `process.argv` directly.
+// `cmdStop` and `cmdRestart` pull `--with-plugin` out of it, and the same shape
+// exists elsewhere in this file — `cmdLogs` (`--lines` / `--no-follow` /
+// `--bot`), `cmdList` (`--plain`), `cmdSuspend`, `cmdSlash`. A zero-parameter
+// handler therefore says nothing about which flags a command accepts; the only
+// thing that does is this table, so a new flag must be added here as well.
+// `start` is deliberately empty: `startConfiguredFleet` unconditionally calls
+// `reconcilePluginServicesForCli(undefined, { autoOnly: true })`, so start
+// already brings auto plugin services up and `--with-plugin` would be a no-op
+// there — its meaning on stop/restart is "also tear the plugin service down",
+// and start has no tear-down phase.
+const FLEET_KNOWN_FLAGS: Record<string, readonly string[]> = {
+  start: [],
+  stop: ['--with-plugin'],
+  restart: ['--with-plugin'],
+  upgrade: [],
+  update: [],
+};
 if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
   const fleetArgs = process.argv.slice(3);
   if (fleetArgs.some(arg => arg === '--help' || arg === '-h')) {
     showHelp();
     process.exit(0);
   }
-  // Fail closed on anything else. `cmdStart` / `cmdStop` / `cmdRestart` /
-  // `cmdUpgrade` are all declared with zero parameters, so every one of these
-  // commands accepts exactly one flag: --help. Without this branch an
-  // unrecognized flag falls through and the command runs at FULL effect —
-  // `botmux update --check` and `botmux update --dry-run` read like probes and
-  // upgrade the whole fleet. The failure is silent and one-directional: the
-  // user who typed a guess gets the most destructive interpretation of it,
-  // and the flags most likely to be guessed are exactly the read-only ones.
-  if (fleetArgs.length > 0) {
-    console.error(`未知参数: ${fleetArgs.join(' ')}`);
-    console.error(`  \`botmux ${command}\` 不接受任何参数（只有 --help）。`);
+  // Fail closed on anything else. Without this branch an unrecognized flag
+  // falls through and the command runs at FULL effect — `botmux update --check`
+  // and `botmux update --dry-run` read like probes and upgrade the whole fleet.
+  // The failure is silent and one-directional: the user who typed a guess gets
+  // the most destructive interpretation of it, and the flags most likely to be
+  // guessed are exactly the read-only ones.
+  // Exact set difference rather than `unknownFlags()`: that helper only reports
+  // tokens starting with `-`, so `botmux stop foo` would be waved through. None
+  // of these commands takes a positional argument either, so anything outside
+  // the table above is unknown, flag-shaped or not.
+  const knownFleetFlags = FLEET_KNOWN_FLAGS[command ?? ''] ?? [];
+  const unknownFleetArgs = fleetArgs.filter(arg => !knownFleetFlags.includes(arg));
+  if (unknownFleetArgs.length > 0) {
+    console.error(`未知参数: ${unknownFleetArgs.join(' ')}`);
+    console.error(`  \`botmux ${command}\` 只接受: ${['--help', ...knownFleetFlags].join(' ')}。`);
     console.error('  为避免把一个看起来像「只检查」的参数当成「执行」，这里直接中止，不做任何改动。');
     process.exit(2);
   }
