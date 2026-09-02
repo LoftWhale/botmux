@@ -6120,7 +6120,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   schedule add <schedule> <prompt>     添加任务（ex: "30m" / "every 2h" / "每日9:00" / "0 9 * * *"）
        --top-level                     在群消息顶层执行（后续会话形态跟随普通群会话模式）
        --topic --root-msg-id <om_...>  固定在指定话题下执行
-       --follow-active                 每次投到本群里人最近说话的那个话题（起点＝当前话题或 --root-msg-id；找不到沿用上次落点）
+       --follow-active                 上次落点话题没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点＝当前话题或 --root-msg-id）
        --new-topic [--topic-title ...] 每次创建新话题和独立会话
        --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
   schedule remove <id>                 删除任务
@@ -6795,7 +6795,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.log(`   工作目录: ${workingDir}`);
     console.log(`   执行位置: ${executionPosition === 'new-topic' ? '每次新话题' : executionPosition === 'top-level' ? '群消息顶层' : '话题下'}`);
     if (executionPosition === 'new-topic' && topicTitle?.trim()) console.log(`   新话题标题: ${topicTitle.trim()}`);
-    if (wantsFollowActive) console.log(`   跟随活跃话题: 每次投到本群里人最近说话的话题；找不到就沿用上次落点（起点 ${rootMessageId}）`);
+    if (wantsFollowActive) console.log(`   跟随活跃话题: 上次落点没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点 ${rootMessageId}）`);
     if (silent) console.log('   静默: 触发时不发「执行中」提示，由模型判断是否需要 botmux send 报警');
     return;
   }

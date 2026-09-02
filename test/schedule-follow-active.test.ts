@@ -1,17 +1,25 @@
 /**
  * schedule-follow-active.test.ts
  *
- * `botmux schedule add --follow-active`: at fire time the task re-targets to the
- * topic in its chat where a HUMAN most recently spoke.
+ * `botmux schedule add --follow-active`: at fire time the task resolves its
+ * landing point in three steps —
  *
- *  - pickMostRecentHumanTopic: newest lastHumanMessageAt wins; chat-scope rows,
- *    rows without a root, rows from other chats and rows with only bot activity
- *    (no lastHumanMessageAt) are ignored
- *  - resolveFollowActiveRoot: falls back to the retained root when nothing
- *    qualifies or the lookup throws; never invents a topic
+ *  1. the topic it last landed in is still open (an active thread session
+ *     exists under that root, any bot) → fire there, nothing persisted
+ *  2. it was closed → the topic in this chat where a HUMAN most recently
+ *     spoke; persisted as the new landing point
+ *  3. no open human-active topic → this fire runs as `new-topic`; the fire
+ *     path reports the fresh root via recordFollowActiveFreshTopic so the next
+ *     fire finds it under step 1
+ *
+ *  - isTopicOpen / pickMostRecentHumanTopic: pure predicates over the active
+ *    thread-session list (chat-scope rows, rows without a root, rows from
+ *    other chats are ignored; bot-only activity never qualifies for step 2)
+ *  - resolveFollowActiveRoot: the three steps + a failing lookup keeps the
+ *    last landing point ('unknown') instead of moving on a missing reading
  *  - applyFollowActive: no-op for non-follow tasks and for tasks parked away
- *    from topic execution; persists the landing point only when it changes;
- *    a failing persist does not block the fire
+ *    from topic execution; a failing persist does not block the fire
+ *  - followActiveOpenedFreshTopic / recordFollowActiveFreshTopic: step 3 wiring
  *  - default deps reach the cross-bot session-store lookup and schedule-store
  *    (stubbed here)
  *  - markSessionActivity({ human: true }) stamps lastHumanMessageAt; a bot
@@ -42,7 +50,14 @@ vi.mock('../src/core/dashboard-events.js', () => ({ dashboardEventBus: { publish
 vi.mock('../src/core/dashboard-rows.js', () => ({ composeRowFromActive: vi.fn(() => ({})) }));
 vi.mock('../src/core/session-message-preview.js', () => ({ buildSessionMessagePreview: vi.fn(() => undefined) }));
 
-const { pickMostRecentHumanTopic, resolveFollowActiveRoot, applyFollowActive } = await import('../src/core/schedule-follow-active.js');
+const {
+  isTopicOpen,
+  pickMostRecentHumanTopic,
+  resolveFollowActiveRoot,
+  applyFollowActive,
+  followActiveOpenedFreshTopic,
+  recordFollowActiveFreshTopic,
+} = await import('../src/core/schedule-follow-active.js');
 const { markSessionActivity, stampHumanActivity } = await import('../src/core/session-activity.js');
 
 const CHAT = 'oc_chat_A';
@@ -78,12 +93,36 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
   } as ScheduledTask;
 }
 
+// The origin topic still has an active session (bot-only is enough: "open" is
+// about the session existing, not about who spoke last).
+const originOpen = () => session({ rootMessageId: 'om_origin', lastMessageAt: '2026-01-01T05:00:00.000Z' });
+const liveHuman = (root = 'om_live', at = '2026-01-01T12:00:00.000Z') => session({ rootMessageId: root, lastHumanMessageAt: at });
+
 beforeEach(() => {
   findActiveThreadSessionsByChat.mockReset();
   findActiveThreadSessionsByChat.mockImplementation(() => []);
   storeUpdateTask.mockReset();
   updateSession.mockReset();
   publish.mockReset();
+});
+
+describe('isTopicOpen', () => {
+  it('is true when an active thread session exists under the root, regardless of who spoke', () => {
+    expect(isTopicOpen(CHAT, 'om_origin', [originOpen()])).toBe(true);
+    expect(isTopicOpen(CHAT, 'om_origin', [liveHuman('om_origin')])).toBe(true);
+  });
+
+  it('is false when no active session holds the root — closed, or never engaged', () => {
+    expect(isTopicOpen(CHAT, 'om_origin', [])).toBe(false);
+    expect(isTopicOpen(CHAT, 'om_origin', [liveHuman('om_other')])).toBe(false);
+    expect(isTopicOpen(CHAT, undefined, [originOpen()])).toBe(false);
+  });
+
+  it('ignores chat-scope rows, other chats and roots equal to the chat id', () => {
+    expect(isTopicOpen(CHAT, 'om_origin', [session({ rootMessageId: 'om_origin', scope: 'chat' })])).toBe(false);
+    expect(isTopicOpen(CHAT, 'om_origin', [session({ chatId: OTHER_CHAT, rootMessageId: 'om_origin' })])).toBe(false);
+    expect(isTopicOpen(CHAT, CHAT, [session({ rootMessageId: CHAT })])).toBe(false);
+  });
 });
 
 describe('pickMostRecentHumanTopic', () => {
@@ -124,22 +163,31 @@ describe('pickMostRecentHumanTopic', () => {
   });
 });
 
-describe('resolveFollowActiveRoot', () => {
-  it('keeps the retained root when nothing qualifies — never a new topic', () => {
-    const r = resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => []);
+describe('resolveFollowActiveRoot — three steps', () => {
+  it('step 1: the last landing point is still open → stay, even if a human spoke elsewhere more recently', () => {
+    const r = resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => [originOpen(), liveHuman()]);
     expect(r).toEqual({ rootMessageId: 'om_origin', source: 'retained' });
   });
 
-  it('keeps the retained root when the lookup throws', () => {
-    const r = resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => { throw new Error('sqlite unavailable'); });
-    expect(r).toEqual({ rootMessageId: 'om_origin', source: 'retained' });
-  });
-
-  it('reports the active topic when one qualifies', () => {
+  it('step 2: the last landing point was closed → the most recently human-active open topic', () => {
     const r = resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => [
-      session({ rootMessageId: 'om_live', lastHumanMessageAt: '2026-01-01T12:00:00.000Z' }),
+      liveHuman('om_older', '2026-01-01T10:00:00.000Z'),
+      liveHuman('om_live', '2026-01-01T12:00:00.000Z'),
     ]);
     expect(r).toEqual({ rootMessageId: 'om_live', source: 'active' });
+  });
+
+  it('step 3: closed and no open topic with human activity → fresh topic (bot-only topics do not count)', () => {
+    expect(resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => []))
+      .toEqual({ rootMessageId: undefined, source: 'fresh' });
+    expect(resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => [
+      session({ rootMessageId: 'om_other_sentinel', lastMessageAt: '2026-01-01T23:00:00.000Z' }),
+    ])).toEqual({ rootMessageId: undefined, source: 'fresh' });
+  });
+
+  it('a failing lookup keeps the last landing point instead of moving on a reading it does not have', () => {
+    const r = resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => { throw new Error('sqlite unavailable'); });
+    expect(r).toEqual({ rootMessageId: 'om_origin', source: 'unknown' });
   });
 });
 
@@ -147,13 +195,13 @@ describe('applyFollowActive', () => {
   it('returns the task untouched when followActive is not set', () => {
     const persist = vi.fn();
     const t = task({ followActive: undefined });
-    expect(applyFollowActive(t, { listCandidates: () => [session({ rootMessageId: 'om_live', lastHumanMessageAt: '2026-01-01T12:00:00.000Z' })], persist })).toBe(t);
+    expect(applyFollowActive(t, { listCandidates: () => [liveHuman()], persist })).toBe(t);
     expect(persist).not.toHaveBeenCalled();
   });
 
   it('leaves tasks parked at top-level / new-topic alone even if the flag is still set', () => {
     const persist = vi.fn();
-    const list = () => [session({ rootMessageId: 'om_live', lastHumanMessageAt: '2026-01-01T12:00:00.000Z' })];
+    const list = () => [liveHuman()];
     for (const executionPosition of ['top-level', 'new-topic'] as const) {
       const t = task({ executionPosition, scope: 'chat', rootMessageId: undefined });
       expect(applyFollowActive(t, { listCandidates: list, persist })).toBe(t);
@@ -161,55 +209,94 @@ describe('applyFollowActive', () => {
     expect(persist).not.toHaveBeenCalled();
   });
 
-  it('re-targets to the human-active topic and persists the new landing point (with the task appId)', () => {
+  it('step 1: an open landing point is kept as-is and nothing is persisted', () => {
+    const persist = vi.fn();
+    const t = task();
+    expect(applyFollowActive(t, { listCandidates: () => [originOpen(), liveHuman()], persist })).toBe(t);
+    expect(persist).not.toHaveBeenCalled();
+  });
+
+  it('step 2: re-targets to the human-active topic and persists the new landing point (with the task appId)', () => {
     const persist = vi.fn();
     const out = applyFollowActive(task(), {
-      listCandidates: () => [
-        session({ rootMessageId: 'om_origin', lastHumanMessageAt: '2026-01-01T08:00:00.000Z' }),
-        session({ rootMessageId: 'om_live', lastHumanMessageAt: '2026-01-01T12:00:00.000Z' }),
-      ],
+      listCandidates: () => [liveHuman('om_live', '2026-01-01T12:00:00.000Z'), liveHuman('om_older', '2026-01-01T08:00:00.000Z')],
       persist,
     });
     expect(out.rootMessageId).toBe('om_live');
     expect(out.scope).toBe('thread');
+    expect(out.executionPosition).toBe('topic');
     expect(persist).toHaveBeenCalledTimes(1);
     expect(persist).toHaveBeenCalledWith('task-1', 'om_live', 'cli_app_1');
   });
 
-  it('does not persist when the active topic is already the retained one', () => {
-    const persist = vi.fn();
-    const t = task();
-    const out = applyFollowActive(t, {
-      listCandidates: () => [session({ rootMessageId: 'om_origin', lastHumanMessageAt: '2026-01-01T12:00:00.000Z' })],
-      persist,
-    });
-    expect(out).toBe(t);
-    expect(persist).not.toHaveBeenCalled();
-  });
-
-  it('falls back to the retained root on an empty lookup without persisting', () => {
-    const persist = vi.fn();
-    const t = task();
-    expect(applyFollowActive(t, { listCandidates: () => [], persist })).toBe(t);
-    expect(persist).not.toHaveBeenCalled();
-  });
-
-  it('still fires into the resolved topic when persisting fails', () => {
+  it('step 2: still fires into the resolved topic when persisting fails', () => {
     const out = applyFollowActive(task(), {
-      listCandidates: () => [session({ rootMessageId: 'om_live', lastHumanMessageAt: '2026-01-01T12:00:00.000Z' })],
+      listCandidates: () => [liveHuman()],
       persist: () => { throw new Error('disk full'); },
     });
     expect(out.rootMessageId).toBe('om_live');
   });
 
+  it('step 3: switches THIS fire to new-topic without touching the stored task', () => {
+    const persist = vi.fn();
+    const t = task();
+    const out = applyFollowActive(t, { listCandidates: () => [], persist });
+    expect(out).not.toBe(t);
+    expect(out.executionPosition).toBe('new-topic');
+    expect(out.scope).toBe('chat');
+    expect(out.followActive).toBe(true);
+    expect(out.rootMessageId).toBe('om_origin');
+    expect(persist).not.toHaveBeenCalled();
+    expect(followActiveOpenedFreshTopic(t, out)).toBe(true);
+  });
+
+  it('a failing lookup keeps the task as-is (no move, no fresh topic, nothing persisted)', () => {
+    const persist = vi.fn();
+    const t = task();
+    expect(applyFollowActive(t, { listCandidates: () => { throw new Error('sqlite unavailable'); }, persist })).toBe(t);
+    expect(persist).not.toHaveBeenCalled();
+    expect(followActiveOpenedFreshTopic(t, t)).toBe(false);
+  });
+
   it('by default reads candidates across bots via session-store and persists via schedule-store', () => {
-    findActiveThreadSessionsByChat.mockImplementation(() => [
-      session({ rootMessageId: 'om_other_bot_topic', lastHumanMessageAt: '2026-01-01T12:00:00.000Z' }),
-    ]);
+    findActiveThreadSessionsByChat.mockImplementation(() => [liveHuman('om_other_bot_topic')]);
     const out = applyFollowActive(task());
     expect(findActiveThreadSessionsByChat).toHaveBeenCalledWith(CHAT);
     expect(out.rootMessageId).toBe('om_other_bot_topic');
     expect(storeUpdateTask).toHaveBeenCalledWith('task-1', { rootMessageId: 'om_other_bot_topic' }, 'cli_app_1');
+  });
+});
+
+describe('step 3 completion', () => {
+  it('followActiveOpenedFreshTopic is false for a genuine new-topic task', () => {
+    const t = task({ executionPosition: 'new-topic', scope: 'chat', followActive: undefined });
+    expect(followActiveOpenedFreshTopic(t, t)).toBe(false);
+  });
+
+  it('recordFollowActiveFreshTopic persists the fresh root as the landing point and swallows persist errors', () => {
+    const persist = vi.fn();
+    recordFollowActiveFreshTopic(task(), 'om_fresh', persist);
+    expect(persist).toHaveBeenCalledWith('task-1', 'om_fresh', 'cli_app_1');
+    expect(() => recordFollowActiveFreshTopic(task(), 'om_fresh', () => { throw new Error('disk full'); })).not.toThrow();
+  });
+
+  it('by default persists via schedule-store', () => {
+    recordFollowActiveFreshTopic(task(), 'om_fresh');
+    expect(storeUpdateTask).toHaveBeenCalledWith('task-1', { rootMessageId: 'om_fresh' }, 'cli_app_1');
+  });
+
+  it('the fresh topic, once open, is found under step 1 on the next fire — no second topic', () => {
+    const persist = vi.fn();
+    const first = applyFollowActive(task(), { listCandidates: () => [], persist });
+    expect(first.executionPosition).toBe('new-topic');
+    recordFollowActiveFreshTopic(task(), 'om_fresh', persist);
+    const next = task({ rootMessageId: 'om_fresh' });
+    const out = applyFollowActive(next, {
+      listCandidates: () => [session({ rootMessageId: 'om_fresh', lastMessageAt: '2026-01-02T00:00:00.000Z' })],
+      persist,
+    });
+    expect(out).toBe(next);
+    expect(persist).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -71,7 +71,7 @@ import {
 import type { DaemonSession } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
-import { applyFollowActive } from './schedule-follow-active.js';
+import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { repoPickerScanOptions } from '../global-config.js';
@@ -3293,11 +3293,14 @@ export async function executeScheduledTask(
   }
   const larkAppId = bot.config.larkAppId;
 
-  // --follow-active: re-target the retained topic to wherever a human spoke
-  // most recently in this chat (persisting the new landing point). Runs
-  // before position/scope resolution so the rest of the fire path sees an
-  // ordinary retained-topic task.
+  // --follow-active: keep the last landing point while it is still open;
+  // once closed, re-target to where a human spoke most recently (persisting
+  // the new landing point); with nothing open, run this fire as new-topic.
+  // Runs before position/scope resolution so the rest of the fire path sees
+  // an ordinary retained-topic / new-topic task.
+  const taskBeforeFollowActive = task;
   task = applyFollowActive(task);
+  const followActiveFreshTopic = followActiveOpenedFreshTopic(taskBeforeFollowActive, task);
 
   const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');
 
@@ -3365,6 +3368,11 @@ export async function executeScheduledTask(
         || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
       anchor = await sendMessage(larkAppId, task.chatId, topicSeed);
       isContinuation = false;
+      // Follow-active step 3: the fresh topic becomes the landing point, so the
+      // next fire lands here (step 1) instead of opening one more topic. A
+      // silent fresh topic has no real root yet (deferred until the first
+      // `botmux send`), so it is not recorded and the next fire re-resolves.
+      if (followActiveFreshTopic) recordFollowActiveFreshTopic(taskBeforeFollowActive, anchor);
     }
   } else if (scope === 'chat') {
     // Explicit task choice: chat scope always starts at the group top level.

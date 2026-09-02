@@ -1009,13 +1009,15 @@ export interface ScheduledTask {
    *  first successful `botmux send`. */
   silent?: boolean;
   /** `--follow-active`: resolve the target topic at fire time instead of
-   *  pinning one at creation. Each fire picks the thread-scope session in
-   *  `chatId` whose `lastHumanMessageAt` is newest — looked up across every
-   *  bot's session store, because "where the person is" is a property of the
-   *  person, not of the bot that owns the task. `rootMessageId` then records
-   *  the last landing point (the creation topic until the first fire) and is
-   *  reused when no human-active topic can be resolved; a follow-active task
-   *  never opens a new topic. Only meaningful with executionPosition 'topic'. */
+   *  pinning one at creation. `rootMessageId` records the last landing point
+   *  (the creation topic until the first fire). Each fire: (1) that topic is
+   *  still open (an active session exists under its root, any bot) → fire
+   *  there; (2) it was closed → the thread-scope session in `chatId` whose
+   *  `lastHumanMessageAt` is newest, looked up across every bot's session
+   *  store because "where the person is" is a property of the person, not of
+   *  the bot that owns the task; (3) nothing open with human activity → this
+   *  fire opens a fresh top-level topic, which then becomes the landing
+   *  point. Only meaningful with executionPosition 'topic'. */
   followActive?: boolean;
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
