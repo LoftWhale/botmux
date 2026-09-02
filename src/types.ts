@@ -389,6 +389,12 @@ export interface Session {
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
+  /** Last input from a HUMAN sender (senderType 'user', not a peer bot)
+   *  routed into this session. Unlike `lastMessageAt` it ignores bot turns
+   *  and scheduled fires, so `schedule add --follow-active` can pick the
+   *  topic where a person most recently spoke without being dragged along by
+   *  a bot's own output. */
+  lastHumanMessageAt?: string;
   closedAt?: string;
   /** Last cumulative token usage persisted at close time. Dashboard list
    *  reads this durable snapshot without rescanning historical transcripts. */
@@ -1002,6 +1008,15 @@ export interface ScheduledTask {
    *  and fresh-topic schedules; a silent fresh topic is created lazily by the
    *  first successful `botmux send`. */
   silent?: boolean;
+  /** `--follow-active`: resolve the target topic at fire time instead of
+   *  pinning one at creation. Each fire picks the thread-scope session in
+   *  `chatId` whose `lastHumanMessageAt` is newest — looked up across every
+   *  bot's session store, because "where the person is" is a property of the
+   *  person, not of the bot that owns the task. `rootMessageId` then records
+   *  the last landing point (the creation topic until the first fire) and is
+   *  reused when no human-active topic can be resolved; a follow-active task
+   *  never opens a new topic. Only meaningful with executionPosition 'topic'. */
+  followActive?: boolean;
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }

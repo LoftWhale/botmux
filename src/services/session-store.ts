@@ -349,7 +349,7 @@ function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | unde
 /** The active rows of one store, optionally narrowed by an indexed hint. */
 function readStoreActiveRows(
   ref: StoreFileRef,
-  hint?: { rootMessageId?: string; chatScopeChatId?: string },
+  hint?: { rootMessageId?: string; chatScopeChatId?: string; threadScopeChatId?: string },
 ): Session[] {
   if (ref.kind === 'json') {
     const parsed = JSON.parse(readFileSync(ref.path, 'utf-8')) as unknown;
@@ -367,6 +367,10 @@ function readStoreActiveRows(
     if (hint?.chatScopeChatId !== undefined) {
       sql += " AND chat_id = ? AND scope = 'chat'";
       params.push(hint.chatScopeChatId);
+    }
+    if (hint?.threadScopeChatId !== undefined) {
+      sql += " AND chat_id = ? AND (scope IS NULL OR scope <> 'chat')";
+      params.push(hint.threadScopeChatId);
     }
     const rows = db.prepare(sql).all(...params) as { row: string }[];
     const out: Session[] = [];
@@ -2127,6 +2131,28 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
 }
 
 /**
+ * Cross-store lookup: every active thread-scope session in `chatId`, across
+ * all bots. Backs `schedule add --follow-active`: at fire time the scheduler
+ * needs "the topic in this chat where a human most recently spoke", and that
+ * person may have been talking to a different bot — the bot boundary is a
+ * property of the daemon layout, not of the human, so the lookup must not
+ * stop at the current store.
+ *
+ * Chat-scope sessions are excluded (they have no topic to land in), as are
+ * rows whose rootMessageId is missing or equals the chat id.
+ */
+export function findActiveThreadSessionsByChat(chatId: string): Session[] {
+  return findActiveSessionsMatching(
+    s => s.chatId === chatId
+      && s.scope !== 'chat'
+      && typeof s.rootMessageId === 'string'
+      && s.rootMessageId.length > 0
+      && s.rootMessageId !== chatId,
+    { threadScopeChatId: chatId },
+  );
+}
+
+/**
  * Count active sessions across every bot's on-disk session store. A pure disk
  * read (no in-memory state) so it's correct at daemon startup regardless of
  * which bot owns this process — used by the restart-report DM after a restart.
@@ -2406,7 +2432,7 @@ export function mutateSessionRowOffline(
 
 function findActiveSessionsMatching(
   predicate: (s: Session) => boolean,
-  hint?: { rootMessageId?: string; chatScopeChatId?: string },
+  hint?: { rootMessageId?: string; chatScopeChatId?: string; threadScopeChatId?: string },
 ): Session[] {
   load();
   const matches: Session[] = [];

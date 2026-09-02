@@ -45,6 +45,26 @@ botmux schedule add "每日17:30" "generate digest" --deliver new-topic
 
 You can also flip an existing task between "original thread" and "new topic each run" from the **Delivery** column toggle on the dashboard's Schedules page.
 
+## Follow the Active Topic
+
+A topic-pinned task keeps firing into the topic it was created in; once the conversation has moved to another topic, reminders land where nobody is looking. `--follow-active` makes the task pick its target **at every fire**: the topic in this chat where a **human most recently spoke**.
+
+```bash
+# Created from inside a topic session: that topic is the starting point
+botmux schedule add "every 30m" "check the service, alert only on failure" --follow-active
+
+# Or give the starting point explicitly
+botmux schedule add "每日9:00" "standup reminder" --follow-active --root-msg-id om_xxx
+```
+
+Three rules:
+
+- **Only human messages count as activity.** Bot replies and scheduled-task output are ignored — otherwise a task firing every 30 minutes would keep its own topic "most active" and follow itself forever.
+- **Judged across every bot.** Where the person is, is a property of the person, not of one bot. Each bot in the chat keeps its own session records; all of them are consulted.
+- **On no match, keep the last landing point; never open a new topic.** If no topic has any human activity on record (fresh restart, records not built up yet), the task fires into the topic it last landed in — the creation topic until the first fire.
+
+`--follow-active` only makes sense for topic execution and cannot be combined with `--top-level` / `--new-topic`. Tasks of this kind show a `↷跟随活跃话题` marker in `schedule list`.
+
 ## Management
 
 ```bash

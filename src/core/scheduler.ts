@@ -587,6 +587,8 @@ export function addTask(params: {
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  /** See ScheduledTask.followActive. Requires executionPosition 'topic'. */
+  followActive?: boolean;
 }): ScheduledTask {
   const parsed = params.parsed ?? parseSchedule(params.schedule);
   const nextRunAt = computeNextRun(parsed) ?? undefined;
@@ -598,6 +600,11 @@ export function addTask(params: {
         : params.rootMessageId ? 'topic' : 'top-level');
   if (executionPosition === 'topic' && !params.rootMessageId) {
     throw new Error('topic_root_required');
+  }
+  // Following the active topic only makes sense when the task lands in a
+  // topic at all; at top level / new-topic there is nothing to follow.
+  if (params.followActive === true && executionPosition !== 'topic') {
+    throw new Error('follow_active_requires_topic');
   }
   const topicTitle = normalizeTopicTitle(params.topicTitle);
   const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
@@ -817,6 +824,7 @@ export function updateTask(
     executionPosition?: ScheduleExecutionPosition;
     rootMessageId?: string;
     topicTitle?: string;
+    followActive?: boolean;
   },
 ): { ok: boolean; error?: string } {
   const task = scheduleStore.getTask(id);
@@ -838,6 +846,21 @@ export function updateTask(
   const nextRootMessageId = updates.rootMessageId ?? task.rootMessageId;
   if (executionPosition === 'topic' && !nextRootMessageId) {
     return { ok: false, error: 'topic_root_required' };
+  }
+  const nextPosition = executionPosition ?? resolveTaskExecutionPosition(task);
+  const nextFollowActive = updates.followActive ?? task.followActive;
+  if (updates.followActive === true && nextPosition !== 'topic') {
+    return { ok: false, error: 'follow_active_requires_topic' };
+  }
+  if (updates.followActive !== undefined) {
+    patch.followActive = updates.followActive === true ? true : undefined;
+    eventPatch.followActive = updates.followActive === true;
+  }
+  if (nextFollowActive === true && nextPosition !== 'topic') {
+    // Moving a follow-active task away from topic execution drops the flag:
+    // there is no topic to follow at top level / new-topic.
+    patch.followActive = undefined;
+    eventPatch.followActive = false;
   }
   if (updates.topicTitle !== undefined) {
     try { patch.topicTitle = normalizeTopicTitle(updates.topicTitle); }

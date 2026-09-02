@@ -6120,6 +6120,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   schedule add <schedule> <prompt>     添加任务（ex: "30m" / "every 2h" / "每日9:00" / "0 9 * * *"）
        --top-level                     在群消息顶层执行（后续会话形态跟随普通群会话模式）
        --topic --root-msg-id <om_...>  固定在指定话题下执行
+       --follow-active                 每次投到本群里人最近说话的那个话题（起点＝当前话题或 --root-msg-id；找不到沿用上次落点）
        --new-topic [--topic-title ...] 每次创建新话题和独立会话
        --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
   schedule remove <id>                 删除任务
@@ -6653,7 +6654,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       const prompt = t.prompt ?? '';
       const chatId = t.chatId ?? '—';
       const rootId = t.rootMessageId ?? '—';
-      console.log(`${status} [${t.id}] ${display} | ${t.name}${t.silent ? ' 🔇静默' : ''}`);
+      console.log(`${status} [${t.id}] ${display} | ${t.name}${t.silent ? ' 🔇静默' : ''}${t.followActive ? ' ↷跟随活跃话题' : ''}`);
       console.log(`   prompt: ${prompt.length > 60 ? prompt.slice(0, 60) + '…' : prompt}`);
       console.log(`   chat: ${chatId.slice(0, 12)}…   thread: ${rootId.slice(0, 16)}…`);
       console.log(`   next: ${next}   last: ${last}${t.lastStatus === 'error' ? ' ❌' : ''}`);
@@ -6663,9 +6664,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 
   if (sub === 'add') {
-    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent']);
+    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--lark-app-id APP] [--workdir DIR] [--silent]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -6692,6 +6693,13 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     const wantsNewTopic = rest.includes('--new-topic') || legacyDeliver === 'new-topic';
     const wantsTopLevel = rest.includes('--top-level');
     const wantsTopic = rest.includes('--topic');
+    const wantsFollowActive = rest.includes('--follow-active');
+    // --follow-active is a refinement of topic execution: the task starts in
+    // the current (or --root-msg-id) topic and re-targets at every fire.
+    if (wantsFollowActive && (wantsNewTopic || wantsTopLevel)) {
+      console.error('--follow-active 只在话题下执行时有意义，不能与 --top-level / --new-topic 同时使用。');
+      process.exit(1);
+    }
     if ([wantsNewTopic, wantsTopLevel, wantsTopic].filter(Boolean).length > 1) {
       console.error('--top-level、--topic 与 --new-topic 只能选择一个。');
       process.exit(1);
@@ -6712,14 +6720,16 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       ? 'new-topic'
       : wantsTopLevel
         ? 'top-level'
-        : wantsTopic
+        : wantsTopic || wantsFollowActive
           ? 'topic'
           : cur?.chatType === 'p2p'
             ? (cur?.scope === 'chat' ? 'top-level' : rootMessageId ? 'topic' : 'top-level')
             : 'top-level';
     const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
     if (scope === 'thread' && !rootMessageId) {
-      console.error('话题下执行需要 --root-msg-id <ROOT_MESSAGE_ID>，或从 Lark 话题会话中运行。');
+      console.error(wantsFollowActive
+        ? '--follow-active 需要一个起始话题：从 Lark 话题会话中运行，或传 --root-msg-id <ROOT_MESSAGE_ID>。'
+        : '话题下执行需要 --root-msg-id <ROOT_MESSAGE_ID>，或从 Lark 话题会话中运行。');
       process.exit(1);
     }
     const topicTitle = argValue(rest, '--topic-title');
@@ -6766,6 +6776,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         topicTitle,
         deliver,
         silent,
+        followActive: wantsFollowActive ? true : undefined,
       });
     } catch (err) {
       // Sandboxed sessions can only write their OWN bot's store — a cross-bot
@@ -6784,6 +6795,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.log(`   工作目录: ${workingDir}`);
     console.log(`   执行位置: ${executionPosition === 'new-topic' ? '每次新话题' : executionPosition === 'top-level' ? '群消息顶层' : '话题下'}`);
     if (executionPosition === 'new-topic' && topicTitle?.trim()) console.log(`   新话题标题: ${topicTitle.trim()}`);
+    if (wantsFollowActive) console.log(`   跟随活跃话题: 每次投到本群里人最近说话的话题；找不到就沿用上次落点（起点 ${rootMessageId}）`);
     if (silent) console.log('   静默: 触发时不发「执行中」提示，由模型判断是否需要 botmux send 报警');
     return;
   }

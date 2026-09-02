@@ -88,6 +88,8 @@ export interface DaemonSession {
   spawnedAt: number;
   cliVersion: string;
   lastMessageAt: number;
+  /** Epoch ms of the last HUMAN input routed here (see Session.lastHumanMessageAt). */
+  lastHumanMessageAt?: number;
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart

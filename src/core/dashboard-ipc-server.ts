@@ -2895,6 +2895,7 @@ export interface ScheduleRow {
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  followActive?: boolean;
   feishuChatLink: string;
 }
 
@@ -2922,6 +2923,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     repeat: t.repeat,
     deliver: t.deliver ?? 'origin',
     silent: t.silent,
+    followActive: t.followActive === true ? true : undefined,
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }

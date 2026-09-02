@@ -71,6 +71,7 @@ import {
 import type { DaemonSession } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
+import { applyFollowActive } from './schedule-follow-active.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { repoPickerScanOptions } from '../global-config.js';
@@ -3291,6 +3292,12 @@ export async function executeScheduledTask(
     );
   }
   const larkAppId = bot.config.larkAppId;
+
+  // --follow-active: re-target the retained topic to wherever a human spoke
+  // most recently in this chat (persisting the new landing point). Runs
+  // before position/scope resolution so the rest of the fire path sees an
+  // ordinary retained-topic task.
+  task = applyFollowActive(task);
 
   const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');
 
