@@ -632,6 +632,7 @@ export function addTask(params: {
     // local-vs-chat distinction; schedule-store also normalizes legacy values.
     deliver: params.deliver === 'local' ? 'local' : 'origin',
     silent: params.silent,
+    followActive: params.followActive === true ? true : undefined,
   });
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${parsed.display}, next: ${nextRunAt ?? 'N/A'}`);
   return task;

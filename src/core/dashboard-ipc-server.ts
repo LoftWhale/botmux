@@ -2982,6 +2982,15 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
     }
     silent = b.silent;
   }
+  // followActive — if present, must be boolean; topic-only (scheduler.addTask
+  // rejects the rest with follow_active_requires_topic).
+  let followActive = false;
+  if (b.followActive !== undefined) {
+    if (typeof b.followActive !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'followActive' });
+    }
+    followActive = b.followActive;
+  }
   let executionPosition: ScheduleExecutionPosition = 'top-level';
   if (b.executionPosition !== undefined) {
     if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic') {
@@ -3043,6 +3052,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       ownerOpenId: getOwnerOpenId(cachedLarkAppId),
       deliver,
       silent,
+      followActive: followActive || undefined,
     });
     dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: composeScheduleRow(task) } });
     jsonRes(res, 200, { ok: true, task: composeScheduleRow(task) });

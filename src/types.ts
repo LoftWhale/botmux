@@ -1011,13 +1011,17 @@ export interface ScheduledTask {
   /** `--follow-active`: resolve the target topic at fire time instead of
    *  pinning one at creation. `rootMessageId` records the last landing point
    *  (the creation topic until the first fire). Each fire: (1) that topic is
-   *  still open (an active session exists under its root, any bot) → fire
-   *  there; (2) it was closed → the thread-scope session in `chatId` whose
-   *  `lastHumanMessageAt` is newest, looked up across every bot's session
-   *  store because "where the person is" is a property of the person, not of
-   *  the bot that owns the task; (3) nothing open with human activity → this
-   *  fire opens a fresh top-level topic, which then becomes the landing
-   *  point. Only meaningful with executionPosition 'topic'. */
+   *  still open (an active session exists under its root, any bot) AND a
+   *  human has spoken in it → fire there; (2) otherwise → the thread-scope
+   *  session in `chatId` whose `lastHumanMessageAt` is newest, looked up
+   *  across every bot's session store because "where the person is" is a
+   *  property of the person, not of the bot that owns the task (this lands
+   *  inside the person's live session, so the task's own workingDir does not
+   *  apply there); (3) no human-active topic anywhere but the landing point
+   *  is still open (bot-only, e.g. the fresh topic this task opened) → stay;
+   *  (4) nothing open → this fire opens a fresh top-level topic, which then
+   *  becomes the landing point. Only meaningful with executionPosition
+   *  'topic'. */
   followActive?: boolean;
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';

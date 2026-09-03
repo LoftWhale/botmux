@@ -52,6 +52,7 @@ vi.mock('../src/core/session-message-preview.js', () => ({ buildSessionMessagePr
 
 const {
   isTopicOpen,
+  isTopicHumanHeld,
   pickMostRecentHumanTopic,
   resolveFollowActiveRoot,
   applyFollowActive,
@@ -163,13 +164,26 @@ describe('pickMostRecentHumanTopic', () => {
   });
 });
 
-describe('resolveFollowActiveRoot — three steps', () => {
-  it('step 1: the last landing point is still open → stay, even if a human spoke elsewhere more recently', () => {
-    const r = resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => [originOpen(), liveHuman()]);
+describe('isTopicHumanHeld', () => {
+  it('needs an open session under the root that has seen a human message', () => {
+    expect(isTopicHumanHeld(CHAT, 'om_origin', [liveHuman('om_origin')])).toBe(true);
+    expect(isTopicHumanHeld(CHAT, 'om_origin', [originOpen()])).toBe(false);
+    expect(isTopicHumanHeld(CHAT, 'om_origin', [liveHuman('om_other')])).toBe(false);
+    expect(isTopicHumanHeld(CHAT, 'om_origin', [session({ rootMessageId: 'om_origin', lastHumanMessageAt: 'not-a-date' })])).toBe(false);
+    expect(isTopicHumanHeld(CHAT, undefined, [liveHuman('om_origin')])).toBe(false);
+  });
+});
+
+describe('resolveFollowActiveRoot — four steps', () => {
+  it('step 1: the landing point is open AND human-held → stay, even if a human spoke elsewhere more recently', () => {
+    const r = resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => [
+      liveHuman('om_origin', '2026-01-01T08:00:00.000Z'),
+      liveHuman('om_live', '2026-01-01T12:00:00.000Z'),
+    ]);
     expect(r).toEqual({ rootMessageId: 'om_origin', source: 'retained' });
   });
 
-  it('step 2: the last landing point was closed → the most recently human-active open topic', () => {
+  it('step 2: the landing point was closed → the most recently human-active open topic', () => {
     const r = resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => [
       liveHuman('om_older', '2026-01-01T10:00:00.000Z'),
       liveHuman('om_live', '2026-01-01T12:00:00.000Z'),
@@ -177,7 +191,27 @@ describe('resolveFollowActiveRoot — three steps', () => {
     expect(r).toEqual({ rootMessageId: 'om_live', source: 'active' });
   });
 
-  it('step 3: closed and no open topic with human activity → fresh topic (bot-only topics do not count)', () => {
+  it('step 2 also applies to a landing point that is open but bot-only: the task does not pin itself', () => {
+    // The task opened om_origin itself (step 4 on an earlier fire) and is the
+    // only writer there; a person is active in om_live. Before the reorder,
+    // the bot-only session counted as "open" under step 1 and the task never
+    // left its own topic.
+    const r = resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => [originOpen(), liveHuman()]);
+    expect(r).toEqual({ rootMessageId: 'om_live', source: 'active' });
+  });
+
+  it('step 3: no human-active topic anywhere but the landing point is open → kept (no second topic)', () => {
+    expect(resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => [originOpen()]))
+      .toEqual({ rootMessageId: 'om_origin', source: 'kept' });
+    // Upgrade window: sessions created before lastHumanMessageAt existed carry
+    // no human clock at all. The landing point still counts as open → stay.
+    expect(resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => [
+      session({ rootMessageId: 'om_origin' }),
+      session({ rootMessageId: 'om_other' }),
+    ])).toEqual({ rootMessageId: 'om_origin', source: 'kept' });
+  });
+
+  it('step 4: nothing open → fresh topic (bot-only topics elsewhere do not count)', () => {
     expect(resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => []))
       .toEqual({ rootMessageId: undefined, source: 'fresh' });
     expect(resolveFollowActiveRoot({ chatId: CHAT, rootMessageId: 'om_origin' }, () => [
@@ -209,11 +243,19 @@ describe('applyFollowActive', () => {
     expect(persist).not.toHaveBeenCalled();
   });
 
-  it('step 1: an open landing point is kept as-is and nothing is persisted', () => {
+  it('step 1: a human-held landing point is kept as-is and nothing is persisted', () => {
     const persist = vi.fn();
     const t = task();
-    expect(applyFollowActive(t, { listCandidates: () => [originOpen(), liveHuman()], persist })).toBe(t);
+    expect(applyFollowActive(t, { listCandidates: () => [liveHuman('om_origin', '2026-01-01T08:00:00.000Z'), liveHuman()], persist })).toBe(t);
     expect(persist).not.toHaveBeenCalled();
+  });
+
+  it('step 3: a bot-only landing point with no human topic anywhere is kept as-is, nothing persisted', () => {
+    const persist = vi.fn();
+    const t = task();
+    expect(applyFollowActive(t, { listCandidates: () => [originOpen()], persist })).toBe(t);
+    expect(persist).not.toHaveBeenCalled();
+    expect(followActiveOpenedFreshTopic(t, t)).toBe(false);
   });
 
   it('step 2: re-targets to the human-active topic and persists the new landing point (with the task appId)', () => {
@@ -237,7 +279,7 @@ describe('applyFollowActive', () => {
     expect(out.rootMessageId).toBe('om_live');
   });
 
-  it('step 3: switches THIS fire to new-topic without touching the stored task', () => {
+  it('step 4: switches THIS fire to new-topic without touching the stored task', () => {
     const persist = vi.fn();
     const t = task();
     const out = applyFollowActive(t, { listCandidates: () => [], persist });
@@ -267,7 +309,7 @@ describe('applyFollowActive', () => {
   });
 });
 
-describe('step 3 completion', () => {
+describe('step 4 completion', () => {
   it('followActiveOpenedFreshTopic is false for a genuine new-topic task', () => {
     const t = task({ executionPosition: 'new-topic', scope: 'chat', followActive: undefined });
     expect(followActiveOpenedFreshTopic(t, t)).toBe(false);
@@ -285,7 +327,7 @@ describe('step 3 completion', () => {
     expect(storeUpdateTask).toHaveBeenCalledWith('task-1', { rootMessageId: 'om_fresh' }, 'cli_app_1');
   });
 
-  it('the fresh topic, once open, is found under step 1 on the next fire — no second topic', () => {
+  it('the fresh topic, once open, is kept under step 3 on the next fire — no second topic', () => {
     const persist = vi.fn();
     const first = applyFollowActive(task(), { listCandidates: () => [], persist });
     expect(first.executionPosition).toBe('new-topic');
@@ -297,6 +339,20 @@ describe('step 3 completion', () => {
     });
     expect(out).toBe(next);
     expect(persist).toHaveBeenCalledTimes(1);
+  });
+
+  it('the fresh topic does not pin the task: a human speaking elsewhere pulls it there on the next fire', () => {
+    const persist = vi.fn();
+    const next = task({ rootMessageId: 'om_fresh' });
+    const out = applyFollowActive(next, {
+      listCandidates: () => [
+        session({ rootMessageId: 'om_fresh', lastMessageAt: '2026-01-02T00:00:00.000Z' }),
+        liveHuman('om_live', '2026-01-01T23:00:00.000Z'),
+      ],
+      persist,
+    });
+    expect(out.rootMessageId).toBe('om_live');
+    expect(persist).toHaveBeenCalledWith('task-1', 'om_live', 'cli_app_1');
   });
 });
 

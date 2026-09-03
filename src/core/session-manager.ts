@@ -3293,9 +3293,11 @@ export async function executeScheduledTask(
   }
   const larkAppId = bot.config.larkAppId;
 
-  // --follow-active: keep the last landing point while it is still open;
-  // once closed, re-target to where a human spoke most recently (persisting
-  // the new landing point); with nothing open, run this fire as new-topic.
+  // --follow-active: keep the last landing point while a human holds it open;
+  // otherwise re-target to where a human spoke most recently (persisting the
+  // new landing point); with no human-active topic, stay in the landing point
+  // if it is still open (bot-only); with nothing open, run this fire as
+  // new-topic.
   // Runs before position/scope resolution so the rest of the fire path sees
   // an ordinary retained-topic / new-topic task.
   const taskBeforeFollowActive = task;
@@ -3368,8 +3370,8 @@ export async function executeScheduledTask(
         || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
       anchor = await sendMessage(larkAppId, task.chatId, topicSeed);
       isContinuation = false;
-      // Follow-active step 3: the fresh topic becomes the landing point, so the
-      // next fire lands here (step 1) instead of opening one more topic. A
+      // Follow-active step 4: the fresh topic becomes the landing point, so the
+      // next fire stays here (step 3) instead of opening one more topic. A
       // silent fresh topic has no real root yet (deferred until the first
       // `botmux send`), so it is not recorded and the next fire re-resolves.
       if (followActiveFreshTopic) recordFollowActiveFreshTopic(taskBeforeFollowActive, anchor);
@@ -3435,10 +3437,16 @@ export async function executeScheduledTask(
     }
   } else {
     // thread-scope path (existing logic)
-    const isCrossThread =
-      !!task.creatorRootMessageId &&
-      !!task.rootMessageId &&
-      task.creatorRootMessageId !== task.rootMessageId;
+    // A follow-active task moves its landing point by design, so "creator root
+    // ≠ landing root" would read as cross-thread forever after the first move
+    // (a notice into the closed creation topic on every fire, and no banner in
+    // the topic it actually landed in). For those, only a different CHAT is
+    // "somewhere else"; inside the creator's chat the fire is in-thread.
+    const isCrossThread = task.followActive === true
+      ? (!!task.creatorRootMessageId && !!task.creatorChatId && task.creatorChatId !== task.chatId)
+      : (!!task.creatorRootMessageId &&
+        !!task.rootMessageId &&
+        task.creatorRootMessageId !== task.rootMessageId);
 
     if (isCrossThread) {
       if (!silent) {
