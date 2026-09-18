@@ -18486,10 +18486,12 @@ function withDroppedMessageIdentity(
 ): string {
   const digest = crossPrincipalDroppedMessageDigest(record);
   if (!digest) return text;
-  return `${text}\n${tr('xpi.terminal.dropped', {
-    turnId: digest.turnId,
-    excerpt: digest.excerpt,
-  }, loc)}`;
+  // A whitespace-only or attachment-only body leaves no excerpt. The turn id
+  // alone still names the message, and beats rendering an empty quote.
+  const line = digest.excerpt
+    ? tr('xpi.terminal.dropped', { turnId: digest.turnId, excerpt: digest.excerpt }, loc)
+    : tr('xpi.terminal.dropped_turn_only', { turnId: digest.turnId }, loc);
+  return `${text}\n${line}`;
 }
 
 async function notifyCrossPrincipalTerminal(
@@ -19020,7 +19022,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         if (record.proposer.senderType === 'bot') {
           if ((record.waitDecisionRound ?? 0) > 0) {
             removeCrossPrincipalRecord(ds, record.id);
-            await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.still_busy', undefined, loc));
+            await notifyCrossPrincipalTerminal(ds, record, withDroppedMessageIdentity(tr('xpi.timeout.still_busy', undefined, loc), record, loc));
             return;
           }
           await sessionReply(
@@ -19058,7 +19060,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         await notifyCrossPrincipalTerminal(
           ds,
           record,
-          tr('xpi.timeout.still_busy', undefined, loc),
+          withDroppedMessageIdentity(tr('xpi.timeout.still_busy', undefined, loc), record, loc),
         );
         return;
       }
